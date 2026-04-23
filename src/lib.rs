@@ -19,6 +19,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
+pub mod audblk;
 pub mod bsi;
 pub mod decoder;
 pub mod syncinfo;

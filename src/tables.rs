@@ -131,9 +131,10 @@ pub const SLOWGAIN: [i32; 4] = [0x540, 0x4d8, 0x478, 0x410];
 /// Table 7.9 — dB/Bit Table.
 pub const DBPBTAB: [i32; 4] = [0x000, 0x700, 0x900, 0xb00];
 
-/// Table 7.10 — Floor Table.
+/// Table 7.10 — Floor Table. Entries are 16-bit signed integers in the
+/// spec; address 7 (0xf800) represents –2048.
 pub const FLOORTAB: [i32; 8] = [
-    0x2f0, 0x2b0, 0x270, 0x230, 0x1f0, 0x170, 0x0f0, 0xf800,
+    0x2f0, 0x2b0, 0x270, 0x230, 0x1f0, 0x170, 0x0f0, -2048,
 ];
 
 /// Table 7.11 — Fast Gain Table.

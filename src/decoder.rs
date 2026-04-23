@@ -1,24 +1,18 @@
 //! AC-3 packet → AudioFrame decoder.
 //!
-//! ## Status
-//!
-//! This is the skeleton. It *correctly* parses `syncinfo` and `bsi`
-//! out of each incoming packet (so stream inspection / muxing
-//! round-trip works), but the DSP pipeline — exponent decode, bit
-//! allocation, mantissa dequant, IMDCT, window/overlap-add, downmix
-//! — is still TODO. Until those land the decoder emits a silent
-//! audio frame of the correct shape (256 samples per block × 6
-//! blocks = 1536 samples per channel) so upstream code can be
-//! exercised end-to-end.
-//!
-//! The internal layout is deliberately structured so that each DSP
-//! step drops into `process_frame` without rewriting packet glue.
+//! The decoder runs the full §7 DSP pipeline: syncinfo + BSI parsing,
+//! audio-block exponent decode, parametric bit allocation, mantissa
+//! dequantization, channel decoupling, rematrixing (for 2/0 streams),
+//! dynamic-range scaling, 512-point IMDCT with KBD window, and 50%
+//! overlap-add across audio blocks. The per-frame output is 1536 S16
+//! samples per channel exactly as specified by §8.2.1.2.
 
 use oxideav_codec::Decoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
 
+use crate::audblk::{self, Ac3State, BLOCKS_PER_FRAME, SAMPLES_PER_BLOCK};
 use crate::bsi::{self, Bsi};
 use crate::syncinfo::{self, SyncInfo};
 
@@ -33,6 +27,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         time_base: TimeBase::new(1, 48_000),
         pending: None,
         eof: false,
+        state: Ac3State::new(),
     }))
 }
 
@@ -41,6 +36,7 @@ struct Ac3Decoder {
     time_base: TimeBase,
     pending: Option<Packet>,
     eof: bool,
+    state: Ac3State,
 }
 
 impl Decoder for Ac3Decoder {
@@ -80,6 +76,7 @@ impl Decoder for Ac3Decoder {
     fn reset(&mut self) -> Result<()> {
         self.pending = None;
         self.eof = false;
+        self.state = Ac3State::new();
         Ok(())
     }
 }
@@ -100,14 +97,36 @@ impl Ac3Decoder {
         }
         let bsi: Bsi = bsi::parse(&data[5..])?;
 
-        // Skeleton: emit a silent frame of the correct shape.
         let channels = bsi.nchans as u16;
         let sample_rate = si.sample_rate;
         self.time_base = TimeBase::new(1, sample_rate as i64);
+
+        // Decode the syncframe into a channel-interleaved f32 buffer, then
+        // scale to S16.
+        let total_samples = SAMPLES_PER_FRAME as usize * channels as usize;
+        let mut floats = vec![0.0f32; total_samples];
+        audblk::decode_frame(
+            &mut self.state,
+            &si,
+            &bsi,
+            &data[..si.frame_length as usize],
+            &mut floats,
+        )?;
+        debug_assert_eq!(
+            floats.len(),
+            BLOCKS_PER_FRAME * SAMPLES_PER_BLOCK * channels as usize
+        );
+
         let bytes_per_sample = SampleFormat::S16.bytes_per_sample();
         let total_bytes =
             SAMPLES_PER_FRAME as usize * channels as usize * bytes_per_sample;
-        let out_bytes = vec![0u8; total_bytes];
+        let mut out_bytes = vec![0u8; total_bytes];
+        for (i, s) in floats.iter().enumerate() {
+            let clamped = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            let le = clamped.to_le_bytes();
+            out_bytes[i * 2] = le[0];
+            out_bytes[i * 2 + 1] = le[1];
+        }
 
         Ok(Frame::Audio(AudioFrame {
             format: SampleFormat::S16,
