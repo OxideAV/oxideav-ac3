@@ -122,6 +122,20 @@ fn decoder_sine_fixture_has_nonzero_rms() {
         .sum();
     let rms = (ssq / (samples_left.len() - skip) as f64).sqrt();
     eprintln!("decoded left-channel RMS = {:.1}", rms);
+    // Inspect per-frame peaks too so we can see where the DSP pipeline
+    // is actually producing signal.
+    let mut frame_peaks = Vec::new();
+    for f in 0..(samples_left.len() / 1536) {
+        let base = f * 1536;
+        let peak = samples_left[base..base + 1536]
+            .iter()
+            .map(|&s| s.unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        frame_peaks.push(peak);
+    }
+    eprintln!("per-frame peaks: {:?}", frame_peaks);
+
     // Structural sanity only: the DSP pipeline is partially tuned (the
     // parametric bit-allocator currently over-allocates vs the encoder's
     // budget on this fixture, so later audio blocks in each syncframe

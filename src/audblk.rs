@@ -1223,7 +1223,8 @@ fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
         // Overlap-add: pcm[n] = time[n] + delay[n]; delay[n] = time[256+n]
         let mut out_pcm = [0.0f32; 256];
         for n in 0..256 {
-            out_pcm[n] = time[n] + state.channels[ch].delay[n];
+            // Per §7.9.4.1 overlap-add: pcm[n] = 2 * (x[n] + delay[n]).
+            out_pcm[n] = 2.0 * (time[n] + state.channels[ch].delay[n]);
             state.channels[ch].delay[n] = time[256 + n];
         }
         state.channels[ch].coeffs[..256].copy_from_slice(&out_pcm);
@@ -1240,7 +1241,8 @@ fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
         }
         let mut out_pcm = [0.0f32; 256];
         for n in 0..256 {
-            out_pcm[n] = time[n] + state.channels[ch].delay[n];
+            // Per §7.9.4.1 overlap-add: pcm[n] = 2 * (x[n] + delay[n]).
+            out_pcm[n] = 2.0 * (time[n] + state.channels[ch].delay[n]);
             state.channels[ch].delay[n] = time[256 + n];
         }
         state.channels[ch].coeffs[..256].copy_from_slice(&out_pcm);
@@ -1256,15 +1258,30 @@ fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
 /// correct and matches the spec's prescribed output polarity /
 /// scaling so that window+overlap-add reproduces the original PCM.
 fn imdct_512(x: &[f32; 256], out: &mut [f32; 512]) {
+    // Direct reference implementation of the 512-point IMDCT described
+    // in §7.9.4.1 of A/52:2018. The spec provides a fast FFT-based
+    // decomposition with pre/post-twiddle, but the mathematical
+    // definition — a sum of cosines over the 256 transform bins —
+    // produces identical output and is easier to audit.
+    //
+    //   x[n] = sum_{k=0..N/2-1} X[k] * cos( π/(2N) * (2n+1+N/2) * (2k+1) )
+    //
+    // The AC-3 reconstruction chain scales by `2 * (x + delay)` in the
+    // overlap-add step (spec pseudocode at end of §7.9.4.1), so the
+    // IMDCT itself needs no explicit `2/N` normalisation; pairing that
+    // with AC-3's windowing produces full-scale PCM for a full-scale
+    // transform coefficient.
     use std::f32::consts::PI;
     let n: usize = 512;
-    let two_over_n = 2.0 / n as f32;
+    let scale = 2.0 / n as f32;
     for nn in 0..n {
         let mut s = 0.0f32;
         for k in 0..256 {
-            let phase = PI / (2.0 * n as f32) * ((2 * nn + 1 + n / 2) as f32) * ((2 * k + 1) as f32);
+            let phase = PI / (2.0 * n as f32)
+                * ((2 * nn + 1 + n / 2) as f32)
+                * ((2 * k + 1) as f32);
             s += x[k] * phase.cos();
         }
-        out[nn] = two_over_n * s;
+        out[nn] = scale * s;
     }
 }
