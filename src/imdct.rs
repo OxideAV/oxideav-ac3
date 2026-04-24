@@ -282,23 +282,46 @@ pub fn imdct_256_pair_fft(x: &[f32; 256], out: &mut [f32; 512]) {
     // without the window multiplication. N=512 so N/8=64, N/4=128,
     // N/2=256, 3N/4=384. The 256-pair steps iterate n in 0..N/8.
     //
-    //   x[2n]         = -yi1[n]
-    //   x[2n+1]       =  yr1[N/8-n-1]
-    //   x[N/4+2n]     = -yr1[n]
-    //   x[N/4+2n+1]   =  yi1[N/8-n-1]
-    //   x[N/2+2n]     = -yr2[n]
-    //   x[N/2+2n+1]   =  yi2[N/8-n-1]
-    //   x[3N/4+2n]    =  yi2[n]
-    //   x[3N/4+2n+1]  = -yr2[N/8-n-1]
+    // ATSC A/52:2018 §7.9.4.2 step 5 reads literally:
+    //
+    //   x[N/2+2n]   = -yr2[n]
+    //   x[N/2+2n+1] =  yi2[N/8-n-1]
+    //   x[3N/4+2n]  =  yi2[n]
+    //   x[3N/4+2n+1]= -yr2[N/8-n-1]
+    //
+    // Transcribing this verbatim produces an output whose upper half
+    // satisfies `x[256+n] == x[511-n]` (perfectly mirror-symmetric)
+    // instead of the MDCT TDAC antisymmetry `x[384+n] = -x[383-n]`
+    // that short1 does achieve. The two sub-IMDCTs thus have different
+    // structural properties, which cannot be right — X1 and X2 are
+    // drawn from the same transform definition, just on the even/odd
+    // interleave of X. We instead apply the short1 indexing pattern
+    // `(-yi, yr, -yr, yi)` to short2 as well:
+    //
+    //   x[N/2+2n]   = -yi2[n]
+    //   x[N/2+2n+1] =  yr2[N/8-n-1]
+    //   x[3N/4+2n]  = -yr2[n]
+    //   x[3N/4+2n+1]=  yi2[N/8-n-1]
+    //
+    // With that swap short2 regains antisymmetric TDAC, the two
+    // sub-transforms are structurally identical, and the short-block
+    // output satisfies the MDCT time-aliasing-cancellation property
+    // that overlap-add needs. Transient-burst PSNR on the current
+    // fixture doesn't actually move when this branch is taken — the
+    // dominant error is upstream in FBW coefficient decoding at
+    // bins 4-5 during bursts (see "remaining drift sources" in the
+    // round-5 notes) — but the swap is needed for correctness when
+    // those earlier stages are fixed, so the short-block path stops
+    // contributing a silent TDAC violation.
     for n in 0..NOVER8 {
         out[2 * n] = -yi1[n] * SCALE_SHORT;
         out[2 * n + 1] = yr1[NOVER8 - n - 1] * SCALE_SHORT;
         out[128 + 2 * n] = -yr1[n] * SCALE_SHORT;
         out[128 + 2 * n + 1] = yi1[NOVER8 - n - 1] * SCALE_SHORT;
-        out[256 + 2 * n] = -yr2[n] * SCALE_SHORT;
-        out[256 + 2 * n + 1] = yi2[NOVER8 - n - 1] * SCALE_SHORT;
-        out[384 + 2 * n] = yi2[n] * SCALE_SHORT;
-        out[384 + 2 * n + 1] = -yr2[NOVER8 - n - 1] * SCALE_SHORT;
+        out[256 + 2 * n] = -yi2[n] * SCALE_SHORT;
+        out[256 + 2 * n + 1] = yr2[NOVER8 - n - 1] * SCALE_SHORT;
+        out[384 + 2 * n] = -yr2[n] * SCALE_SHORT;
+        out[384 + 2 * n + 1] = yi2[NOVER8 - n - 1] * SCALE_SHORT;
     }
 }
 
@@ -417,5 +440,43 @@ mod tests {
         // Envelope should be bounded; a runaway scale would blow this out.
         assert!(peak < 200.0, "peak={peak} too large — scale runaway?");
         assert!(rms > 0.001, "rms={rms} — output essentially zero?");
+    }
+
+    /// Both sub-IMDCTs of the 256-pair path must satisfy the MDCT
+    /// time-aliasing-cancellation property `x[N/4+n] = -x[N/4-1-n]`
+    /// within each 256-sample half of the 512-sample output buffer.
+    /// A literal transcription of §7.9.4.2 step 5 produces a
+    /// mirror-symmetric (not antisymmetric) upper half; we swap the
+    /// yr/yi assignment pattern for short2 to match short1, which
+    /// restores TDAC on both halves. This test is the direct gate for
+    /// that swap and fails loudly if the spec-text version is ever
+    /// reinstated.
+    #[test]
+    fn imdct_256_pair_fft_tdac_holds_on_both_halves() {
+        // LCG-based deterministic random input.
+        let mut x = [0.0f32; 256];
+        let mut s: u32 = 0x1234_5678;
+        for v in x.iter_mut() {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            *v = (s as i32 as f32) / (i32::MAX as f32);
+        }
+        let mut f = [0.0f32; 512];
+        imdct_256_pair_fft(&x, &mut f);
+        // short1 TDAC: x[128+n] + x[127-n] = 0 for n in 0..128.
+        let max_s1 = (0..128usize)
+            .map(|n| (f[128 + n] + f[127 - n]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_s1 < 1e-3,
+            "short1 TDAC broken: max |x[128+n]+x[127-n]| = {max_s1}"
+        );
+        // short2 TDAC: x[384+n] + x[383-n] = 0 for n in 0..128.
+        let max_s2 = (0..128usize)
+            .map(|n| (f[384 + n] + f[383 - n]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_s2 < 1e-3,
+            "short2 TDAC broken: max |x[384+n]+x[383-n]| = {max_s2}"
+        );
     }
 }
