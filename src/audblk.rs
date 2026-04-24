@@ -154,6 +154,12 @@ pub struct ChannelState {
     pub dynrng: f32,
 }
 
+impl Default for ChannelState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ChannelState {
     pub fn new() -> Self {
         Self {
@@ -225,6 +231,12 @@ pub struct Ac3State {
     /// (§7.3.4). Persisted across audio blocks and syncframes so the
     /// dither sequence has a smooth long-period character.
     pub dither_lfsr_state: u32,
+}
+
+impl Default for Ac3State {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Ac3State {
@@ -617,6 +629,9 @@ pub(crate) fn parse_audblk_into(
             };
             state.channels[ch].end_mant = end;
 
+            // reason: kept as a compile-time-disabled debug probe that is flipped
+            // to `true` locally when inspecting exponent strategy bit alignment.
+            #[allow(clippy::overly_complex_bool_expr)]
             if false && blk == 0 {
                 eprintln!(
                     "ch{} exps start at bit {}, end_mant={}, strategy={}",
@@ -870,17 +885,14 @@ pub(crate) fn parse_audblk_into(
         let total_bits: u32 = histo
             .iter()
             .enumerate()
-            .map(|(b, n)| {
-                let nbits = match b {
-                    0 => 0,
-                    1 => 5 * n / 3 + (if n % 3 != 0 { 5 } else { 0 }),
-                    2 => 7 * n / 3 + (if n % 3 != 0 { 7 } else { 0 }),
-                    3 => 3 * n,
-                    4 => 7 * n / 2 + (if n % 2 != 0 { 7 } else { 0 }),
-                    5 => 4 * n,
-                    _ => crate::tables::QUANTIZATION_BITS[b] as u32 * n,
-                };
-                nbits
+            .map(|(b, n)| match b {
+                0 => 0,
+                1 => 5 * n / 3 + (if n % 3 != 0 { 5 } else { 0 }),
+                2 => 7 * n / 3 + (if n % 3 != 0 { 7 } else { 0 }),
+                3 => 3 * n,
+                4 => 7 * n / 2 + (if n % 2 != 0 { 7 } else { 0 }),
+                5 => 4 * n,
+                _ => crate::tables::QUANTIZATION_BITS[b] as u32 * n,
             })
             .sum();
         eprintln!(
@@ -912,6 +924,11 @@ fn dynrng_to_linear(dynrng: u8) -> f32 {
 }
 
 /// Number of rematrix bands (Table 5.15).
+//
+// reason: the two `4` arms are spec-faithful — Table 5.15 lists nrematbnd=4
+// for both "coupling not in use" and "cplbegf > 2". Collapsing them would
+// obscure the table structure for future audits.
+#[allow(clippy::if_same_then_else)]
 fn remat_band_count(cplinu: bool, cplbegf: u8) -> usize {
     if !cplinu {
         4
@@ -983,7 +1000,7 @@ fn run_bit_allocation(
     }
     // 2) PSD integration (§7.2.2.3).
     let bndstrt = MASKTAB[start] as usize;
-    let bndend = MASKTAB[(end - 1) as usize] as usize + 1;
+    let bndend = MASKTAB[end - 1] as usize + 1;
     {
         let mut j = start;
         let mut k = bndstrt;
@@ -1367,7 +1384,7 @@ fn fetch_mantissa(
             let code = br.read_u32(4)? as usize;
             Ok(MANT_LEVEL_15[code.min(14)])
         }
-        b if b >= 6 && b <= 15 => {
+        b if (6..=15).contains(&b) => {
             let nbits = QUANTIZATION_BITS[b as usize] as u32;
             let raw = br.read_u32(nbits)? as i32;
             // Sign-extend the top bit as a signed two's-complement fraction.
@@ -1503,14 +1520,14 @@ fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
     }
 }
 
-/// Naive reference 512-point IMDCT (§7.9.4.1). Given N/2=256 transform
-/// coefficients, produces 512 time-domain samples prior to windowing.
-///
-/// IMDCT formula: x[n] = (2/N) * sum_{k=0..N/2-1} X[k] * cos( (π/(2N)) * (2n+1+N/2) * (2k+1) ).
-///
-/// This is the DFT-style reference implementation — not fast, but
-/// correct and matches the spec's prescribed output polarity /
-/// scaling so that window+overlap-add reproduces the original PCM.
+// Naive reference 512-point IMDCT (§7.9.4.1). Given N/2=256 transform
+// coefficients, produces 512 time-domain samples prior to windowing.
+//
+// IMDCT formula: x[n] = (2/N) * sum_{k=0..N/2-1} X[k] * cos( (π/(2N)) * (2n+1+N/2) * (2k+1) ).
+//
+// This is the DFT-style reference implementation — not fast, but
+// correct and matches the spec's prescribed output polarity /
+// scaling so that window+overlap-add reproduces the original PCM.
 
 // ---------------------------------------------------------------------
 // `imdct_256_pair`: DEPRECATED reference — NOT the canonical short-block
