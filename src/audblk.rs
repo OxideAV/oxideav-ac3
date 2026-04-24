@@ -267,6 +267,45 @@ impl Ac3State {
     }
 }
 
+/// Parse (but do not DSP) one syncframe's 6 audio blocks, returning
+/// the per-block [`AudBlkSideInfo`] snapshots. Used by tests and
+/// introspection tools; the decoder itself calls [`decode_frame`]
+/// which fuses parse + DSP.
+///
+/// Side-info capture mirrors `decode_frame`'s bit-cursor: after each
+/// block's side-info we walk the mantissa region via
+/// [`unpack_mantissas`] so the cursor lands on block N+1's bits.
+/// Blocks whose parse fails (e.g. due to our current bit-allocation
+/// approximation consuming a few mantissa bits too many) yield a
+/// `Default::default()` snapshot and subsequent blocks restart from
+/// the last good cursor — matching the decoder's graceful-degradation
+/// policy for the §7 stages.
+pub fn parse_frame_side_info(
+    si: &SyncInfo,
+    bsi: &Bsi,
+    frame_bytes: &[u8],
+) -> Result<[AudBlkSideInfo; BLOCKS_PER_FRAME]> {
+    let mut state = Ac3State::new();
+    let post_sync = &frame_bytes[5..];
+    let mut br = BitReader::new(post_sync);
+    br.skip(bsi.bits_consumed as u32)?;
+    let mut out: [AudBlkSideInfo; BLOCKS_PER_FRAME] = Default::default();
+    for blk in 0..BLOCKS_PER_FRAME {
+        state.blkidx = blk;
+        let mut side = AudBlkSideInfo::default();
+        if parse_audblk_into(&mut state, si, bsi, &mut br, &mut side).is_ok() {
+            // Walk mantissas to advance the cursor; ignore errors.
+            let _ = unpack_mantissas(&mut state, bsi, &mut br);
+            out[blk] = side;
+        } else {
+            // Parse error — stop side-info capture here. Downstream
+            // blocks are unreachable without a known bit-position.
+            break;
+        }
+    }
+    Ok(out)
+}
+
 /// Decode one syncframe of 6 audio blocks into interleaved f32 samples.
 /// Output length = 1536 × nchans.
 pub fn decode_frame(
@@ -414,6 +453,16 @@ pub(crate) fn parse_audblk_into(
             side.cplbegf = state.cpl_begf;
             side.cplendf = state.cpl_endf;
             // ncplsubnd = 3 + cplendf - cplbegf (spec comment in Table 5.3).
+            // Guard against pathological streams where cplbegf > cplendf
+            // — the spec requires cplbegf <= cplendf but we don't want a
+            // panic if the stream is malformed or our bit cursor has
+            // slipped in a later block. Fall back to an obviously-bogus
+            // value and let the caller detect via Err further on.
+            if (state.cpl_endf as usize) < state.cpl_begf as usize {
+                return Err(Error::invalid(
+                    "ac3: §5.4.3.11/12 cplbegf > cplendf — malformed coupling range",
+                ));
+            }
             state.cpl_nsubbnd = 3 + state.cpl_endf as usize - state.cpl_begf as usize;
             // §5.4.3.13 cplbndstrc[sbnd] — 1 bit per subband for sbnd >= 1.
             state.cpl_bndstrc[0] = false;

@@ -12,6 +12,7 @@
 //! - The decoded PCM has non-zero RMS (DSP pipeline is producing audio,
 //!   not silence).
 
+use oxideav_ac3::audblk::{self, BLOCKS_PER_FRAME};
 use oxideav_ac3::{bsi, decoder::SAMPLES_PER_FRAME, syncinfo};
 use oxideav_codec::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
@@ -74,6 +75,65 @@ fn decoder_produces_frames_of_correct_shape() {
         offset += flen;
     }
     assert!(produced >= 10);
+}
+
+/// Parse every frame's 6 audio blocks via `parse_frame_side_info` and
+/// assert structural invariants on the §5.4.3 fields without running
+/// the DSP pipeline. This exercises the parser half of the
+/// audio-block stage independently of the IMDCT path.
+#[test]
+fn side_info_extraction_is_consistent() {
+    let mut offset = 0;
+    let mut blocks_inspected = 0;
+    let mut frames = 0;
+    while offset < FIXTURE.len() {
+        let si = syncinfo::parse(&FIXTURE[offset..]).unwrap();
+        let flen = si.frame_length as usize;
+        let b = bsi::parse(&FIXTURE[offset + 5..]).unwrap();
+        let frame = &FIXTURE[offset..offset + flen];
+        let side = audblk::parse_frame_side_info(&si, &b, frame)
+            .expect("parse_frame_side_info");
+        assert_eq!(side.len(), BLOCKS_PER_FRAME);
+        for (i, s) in side.iter().enumerate() {
+            // Fixture is 2/0 stereo → acmod=2 → no dynrng2e/dynrng2.
+            assert!(!s.dynrng2e, "blk{i}: dual-mono dynrng2e must be absent in 2/0");
+            // chbwcod must be in [0, 60] for uncoupled fbw channels that
+            // carry new exponents (spec §5.4.3.24 limit).
+            for ch in 0..b.nfchans as usize {
+                if s.chexpstr[ch] != 0 && !s.chincpl[ch] {
+                    assert!(
+                        s.chbwcod[ch] <= 60,
+                        "blk{i} ch{ch} chbwcod={} exceeds §5.4.3.24 limit",
+                        s.chbwcod[ch]
+                    );
+                }
+            }
+            // Block 0 must carry new coupling strategy + new exponents
+            // per §5.4.3.7 and §5.4.3.21-22. (baie / snroffste /
+            // deltbaie are block-level info flags and the encoder is
+            // free to leave them 0 in block 0 — only the semantics
+            // are mandatory, not the explicit transmission.)
+            if i == 0 {
+                assert!(s.cplstre, "blk0 must have cplstre=1");
+                for ch in 0..b.nfchans as usize {
+                    assert_ne!(
+                        s.chexpstr[ch], 0,
+                        "blk0 ch{ch} exponent strategy must be 'new' (!=reuse)"
+                    );
+                }
+            }
+            // rematflg_count always falls in [0, 4] — the table reads
+            // 2, 3, or 4 depending on cplbegf (§5.4.3.19 Rematrix Rules).
+            if s.rematstr {
+                assert!(s.rematflg_count <= 4);
+            }
+            blocks_inspected += 1;
+        }
+        offset += flen;
+        frames += 1;
+    }
+    assert_eq!(blocks_inspected, frames * BLOCKS_PER_FRAME);
+    assert!(frames > 0);
 }
 
 /// Decode the whole fixture and compute channel-0 RMS. A 440 Hz sine
@@ -142,4 +202,68 @@ fn decoder_sine_fixture_has_nonzero_rms() {
     // 20% tolerance the task allows.
     assert!(rms > 1600.0, "RMS too low: {rms:.1}");
     assert!(rms < 2400.0, "RMS too high: {rms:.1}");
+}
+
+/// Generate a fresh 1/0 mono AC-3 stream via the `ffmpeg` binary (as a
+/// black box — we do not read its source) and verify our §5.4.3
+/// side-info parser survives 1-channel mode. Skips gracefully if
+/// `ffmpeg` is absent.
+#[test]
+fn side_info_on_fresh_mono_ffmpeg_stream() {
+    use std::process::Command;
+    let tmp_path = std::env::temp_dir().join("oxideav_ac3_mono_test.ac3");
+    let out = Command::new("ffmpeg")
+        .args([
+            "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi",
+            "-i", "sine=frequency=660:duration=0.3:sample_rate=48000",
+            "-c:a", "ac3",
+            "-ac", "1",
+            "-b:a", "96k",
+            "-f", "ac3",
+        ])
+        .arg(&tmp_path)
+        .status();
+    let Ok(status) = out else {
+        eprintln!("ffmpeg unavailable — skipping mono side-info test");
+        return;
+    };
+    if !status.success() {
+        eprintln!("ffmpeg returned non-zero status — skipping");
+        return;
+    }
+    let Ok(stream) = std::fs::read(&tmp_path) else {
+        eprintln!("ffmpeg produced no output — skipping");
+        return;
+    };
+    let _ = std::fs::remove_file(&tmp_path);
+
+    let mut offset = 0;
+    let mut frames = 0;
+    while offset < stream.len() {
+        let si = match syncinfo::parse(&stream[offset..]) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        let flen = si.frame_length as usize;
+        if offset + flen > stream.len() {
+            break;
+        }
+        let b = bsi::parse(&stream[offset + 5..]).unwrap();
+        assert_eq!(b.acmod, 1, "mono 1/0");
+        assert_eq!(b.nfchans, 1);
+        assert!(!b.lfeon);
+        let frame = &stream[offset..offset + flen];
+        let side = audblk::parse_frame_side_info(&si, &b, frame)
+            .expect("mono fixture: parse_frame_side_info");
+        // Block 0 must carry new exponent strategy and, because 1/0
+        // mode has no coupling, cplinu must be false.
+        assert!(side[0].cplstre, "blk0 cplstre=1 mandatory");
+        assert!(!side[0].cplinu, "mono has no coupling channel");
+        assert_ne!(side[0].chexpstr[0], 0, "blk0 chexpstr must be != reuse");
+        assert!(side[0].chbwcod[0] <= 60, "§5.4.3.24 chbwcod limit");
+        frames += 1;
+        offset += flen;
+    }
+    assert!(frames > 0, "no frames extracted from ffmpeg-generated mono ac3");
 }

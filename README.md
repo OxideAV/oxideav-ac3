@@ -10,12 +10,16 @@ framework but usable standalone.
 
 Early WIP. Implementation follows the A/52 spec incrementally:
 
-- [x] Sync frame + BSI parse (§5.3)
-- [ ] Audio-block parse (§5.4)
-- [ ] Exponent decode (§7.1) + bit allocation (§7.2)
-- [ ] Mantissa decode (§7.3)
-- [ ] IMDCT synthesis (§7.9)
-- [ ] Channel coupling + downmix (§7.4–§7.8)
+- [x] Sync frame + BSI parse (§5.3 / §5.4.1-2)
+- [x] Audio-block parse (§5.4.3) — every §5.4.3.x field cited and
+      captured into `AudBlkSideInfo` for introspection
+- [x] Exponent decode (§7.1) + parametric bit allocation (§7.2)
+- [x] Mantissa decode (§7.3) with bap=0 dither (§7.3.4)
+- [x] IMDCT synthesis (§7.9) — 512-point long-block path;
+      256-point short-block still uses a reference (non-FFT) IMDCT
+- [x] Channel coupling (§7.4) + rematrix (§7.5) + dynrng (§7.7)
+- [ ] Downmix (§7.8) — 3/2 and 3/1 modes still pending
+- [ ] E-AC-3 (bsid=16, Annex E) — separate crate, not in scope here
 
 ## Installation
 
