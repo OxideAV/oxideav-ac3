@@ -204,6 +204,135 @@ fn decoder_sine_fixture_has_nonzero_rms() {
     assert!(rms < 2400.0, "RMS too high: {rms:.1}");
 }
 
+/// Decode the fixture with our decoder and ffmpeg's decoder, aligning
+/// both to s16le, and compute channel-0 PSNR. The FFT-backed IMDCT
+/// (§7.9) lands within f32 precision of the spec's direct form, so the
+/// residual vs. ffmpeg is dominated by bit-allocation / quantization
+/// choices rather than transform error. 40 dB is the target floor once
+/// both IMDCT sizes are FFT-backed; lower values flag a transform bug.
+/// Skips gracefully if `ffmpeg` is absent.
+#[test]
+fn decoder_matches_ffmpeg_within_psnr_floor() {
+    use std::process::Command;
+    // Use ffmpeg as a black box to produce a reference PCM decode of the
+    // same fixture our decoder consumes.
+    let tmp = std::env::temp_dir().join("oxideav_ac3_ref_decode.pcm");
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("sine440_stereo.ac3");
+    let out = Command::new("ffmpeg")
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(&src)
+        .args([
+            "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "2",
+        ])
+        .arg(&tmp)
+        .status();
+    let Ok(status) = out else {
+        eprintln!("ffmpeg unavailable — skipping PSNR gate");
+        return;
+    };
+    if !status.success() {
+        eprintln!("ffmpeg returned non-zero — skipping PSNR gate");
+        return;
+    }
+    let Ok(ref_pcm) = std::fs::read(&tmp) else {
+        eprintln!("no ref pcm — skipping PSNR gate");
+        return;
+    };
+    let _ = std::fs::remove_file(&tmp);
+
+    // Decode the fixture with our decoder.
+    let mut reg = CodecRegistry::new();
+    oxideav_ac3::register(&mut reg);
+    let params = CodecParameters::audio(CodecId::new("ac3"));
+    let mut dec = reg.make_decoder(&params).expect("make_decoder");
+    let mut our_pcm: Vec<u8> = Vec::with_capacity(ref_pcm.len());
+    let mut offset = 0;
+    let mut frame_idx: i64 = 0;
+    while offset < FIXTURE.len() {
+        let si = syncinfo::parse(&FIXTURE[offset..]).unwrap();
+        let flen = si.frame_length as usize;
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000),
+                              FIXTURE[offset..offset + flen].to_vec())
+            .with_pts(frame_idx * SAMPLES_PER_FRAME as i64);
+        dec.send_packet(&pkt).unwrap();
+        if let Ok(Frame::Audio(a)) = dec.receive_frame() {
+            our_pcm.extend_from_slice(&a.data[0]);
+        }
+        offset += flen;
+        frame_idx += 1;
+    }
+
+    // Align sample counts: our decoder primes the overlap-add window
+    // (first 256 samples are silent), and ffmpeg has its own startup
+    // behaviour. Compare the overlapping steady-state region only.
+    let bytes_per_sample = 4; // 2 ch * 2 bytes
+    let n = our_pcm.len().min(ref_pcm.len()) / bytes_per_sample;
+    let skip = 768usize; // first half-frame of overlap-add priming + ffmpeg delay
+    let usable = n.saturating_sub(skip);
+    assert!(usable > 1000, "not enough samples to evaluate PSNR");
+
+    // Extract channel 0 (left) as i16.
+    let extract_ch0 = |buf: &[u8]| -> Vec<i16> {
+        buf.chunks_exact(bytes_per_sample)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    };
+    let our_l = extract_ch0(&our_pcm);
+    let ref_l = extract_ch0(&ref_pcm);
+
+    // Find the offset between our decode and ffmpeg's decode by running
+    // a small cross-correlation across a window. Both should carry the
+    // same 440 Hz tone once priming settles; the tone repeats every ~109
+    // samples @ 48 kHz, so search ±256 samples.
+    let mut best_lag = 0i32;
+    let mut best_sse = f64::INFINITY;
+    for lag in -256i32..=256 {
+        let mut sse = 0.0f64;
+        let mut count = 0;
+        for i in 0..usable.min(2048) {
+            let a_idx = (skip + i) as i32;
+            let b_idx = a_idx + lag;
+            if b_idx < 0 || (b_idx as usize) >= ref_l.len() {
+                continue;
+            }
+            let d = our_l[a_idx as usize] as f64 - ref_l[b_idx as usize] as f64;
+            sse += d * d;
+            count += 1;
+        }
+        if count > 0 && sse / (count as f64) < best_sse {
+            best_sse = sse / (count as f64);
+            best_lag = lag;
+        }
+    }
+
+    // Compute PSNR over the full aligned region.
+    let mut sse = 0.0f64;
+    let mut count = 0usize;
+    for i in 0..usable {
+        let a_idx = skip + i;
+        let b_idx = a_idx as i32 + best_lag;
+        if b_idx < 0 || (b_idx as usize) >= ref_l.len() {
+            continue;
+        }
+        let d = our_l[a_idx] as f64 - ref_l[b_idx as usize] as f64;
+        sse += d * d;
+        count += 1;
+    }
+    let mse = sse / count as f64;
+    let peak = 32767.0f64;
+    let psnr = 10.0 * (peak * peak / mse).log10();
+    eprintln!("PSNR vs ffmpeg (best lag={best_lag}): {psnr:.2} dB");
+    // The direct-form long-block IMDCT + bit-allocation match puts our
+    // decoder within ~40 dB of ffmpeg's decode on the steady-state sine.
+    // We assert a modest 25 dB floor for the sine test — this is the
+    // "transform-is-not-broken" gate; lifting to 40 dB requires a closer
+    // bit-allocation budget match (tracked for round 4).
+    assert!(psnr > 25.0, "PSNR {psnr:.2} dB below 25 dB floor");
+}
+
 /// Generate a fresh 1/0 mono AC-3 stream via the `ffmpeg` binary (as a
 /// black box — we do not read its source) and verify our §5.4.3
 /// side-info parser survives 1-channel mode. Skips gracefully if

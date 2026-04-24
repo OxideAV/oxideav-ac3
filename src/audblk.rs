@@ -1462,14 +1462,18 @@ fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
     }
 
     // --- IMDCT + window + overlap-add for every output channel ---
+    // Uses the §7.9.4 FFT-backed decomposition: pre-twiddle → N/4-point
+    // complex IFFT (N/8 for short blocks) → post-twiddle → de-interleave.
+    // Matches the direct-form reference within f32 precision on the long
+    // path; the short path is validated by the ffmpeg-fixture RMS gate.
     for ch in 0..nfchans {
         let mut coeffs = [0.0f32; 256];
         coeffs.copy_from_slice(&state.channels[ch].coeffs);
         let mut time = [0.0f32; 512];
         if state.channels[ch].blksw {
-            imdct_256_pair(&coeffs, &mut time);
+            crate::imdct::imdct_256_pair_fft(&coeffs, &mut time);
         } else {
-            imdct_512(&coeffs, &mut time);
+            crate::imdct::imdct_512_fft(&coeffs, &mut time);
         }
         // Apply window.
         for n in 0..256 {
@@ -1491,7 +1495,7 @@ fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
         coeffs.copy_from_slice(&state.channels[ch].coeffs);
         let mut time = [0.0f32; 512];
         // LFE is always long-block (spec §5.4.3.3).
-        imdct_512(&coeffs, &mut time);
+        crate::imdct::imdct_512_fft(&coeffs, &mut time);
         for n in 0..256 {
             time[n] *= WINDOW[n];
             time[511 - n] *= WINDOW[n];

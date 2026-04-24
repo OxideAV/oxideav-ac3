@@ -24,6 +24,7 @@ pub mod bsi;
 pub mod decoder;
 pub mod downmix;
 pub mod encoder;
+pub mod imdct;
 pub mod mdct;
 pub mod syncinfo;
 pub mod tables;
