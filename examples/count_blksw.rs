@@ -11,9 +11,7 @@ use std::fs;
 use oxideav_ac3::{audblk, bsi, syncinfo};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = env::args()
-        .nth(1)
-        .ok_or("usage: count_blksw <file.ac3>")?;
+    let path = env::args().nth(1).ok_or("usage: count_blksw <file.ac3>")?;
     let data = fs::read(&path)?;
 
     let mut offset = 0usize;
@@ -41,7 +39,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if any_short {
                 short_blocks += 1;
-                eprintln!("frame {frame_idx} blk {i}: blksw = {:?}", &s.blksw[..b.nfchans as usize]);
+                eprintln!(
+                    "frame {frame_idx} blk {i}: blksw = {:?}",
+                    &s.blksw[..b.nfchans as usize]
+                );
             }
         }
         offset += flen;

@@ -20,7 +20,8 @@ use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 /// that the downmix matrix actually exercises non-zero weights on L, C,
 /// R, Ls, Rs — a raw mono tone routed to 5.1 by ffmpeg would zero out
 /// the surround slots and mask any matrix bug.
-const LAVFI_GRAPH: &str = "sine=frequency=440:duration=0.3:sample_rate=48000,aformat=channel_layouts=5.1";
+const LAVFI_GRAPH: &str =
+    "sine=frequency=440:duration=0.3:sample_rate=48000,aformat=channel_layouts=5.1";
 
 fn ffmpeg_available() -> bool {
     Command::new("ffmpeg")
@@ -49,7 +50,11 @@ fn decode_ac3_fully(data: &[u8], target_channels: Option<u16>) -> (u16, Vec<i16>
         if offset + flen > data.len() {
             break;
         }
-        let pkt = Packet::new(0, TimeBase::new(1, 48_000), data[offset..offset + flen].to_vec());
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, 48_000),
+            data[offset..offset + flen].to_vec(),
+        );
         dec.send_packet(&pkt).unwrap();
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
             out_channels = a.channels;
@@ -74,13 +79,22 @@ fn downmix_to_stereo_uses_two_channels() {
     let tmp = std::env::temp_dir().join("oxideav_ac3_51.ac3");
     let status = Command::new("ffmpeg")
         .args([
-            "-y", "-hide_banner", "-loglevel", "error",
-            "-f", "lavfi",
-            "-i", LAVFI_GRAPH,
-            "-c:a", "ac3",
-            "-ac", "6",
-            "-b:a", "448k",
-            "-f", "ac3",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            LAVFI_GRAPH,
+            "-c:a",
+            "ac3",
+            "-ac",
+            "6",
+            "-b:a",
+            "448k",
+            "-f",
+            "ac3",
         ])
         .arg(&tmp)
         .status();
@@ -143,13 +157,22 @@ fn downmix_stereo_envelope_tracks_ffmpeg() {
     // 1. 5.1 AC-3 source.
     let gen = Command::new("ffmpeg")
         .args([
-            "-y", "-hide_banner", "-loglevel", "error",
-            "-f", "lavfi",
-            "-i", LAVFI_GRAPH,
-            "-c:a", "ac3",
-            "-ac", "6",
-            "-b:a", "448k",
-            "-f", "ac3",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            LAVFI_GRAPH,
+            "-c:a",
+            "ac3",
+            "-ac",
+            "6",
+            "-b:a",
+            "448k",
+            "-f",
+            "ac3",
         ])
         .arg(&src_path)
         .status();
@@ -163,11 +186,7 @@ fn downmix_stereo_envelope_tracks_ffmpeg() {
     let down = Command::new("ffmpeg")
         .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
         .arg(&src_path)
-        .args([
-            "-ac", "2",
-            "-f", "s16le",
-            "-ar", "48000",
-        ])
+        .args(["-ac", "2", "-f", "s16le", "-ar", "48000"])
         .arg(&ref_path)
         .status();
     if down.map(|s| !s.success()).unwrap_or(true) {
@@ -176,9 +195,13 @@ fn downmix_stereo_envelope_tracks_ffmpeg() {
     }
 
     // 3. Decode with ours.
-    let Ok(bitstream) = std::fs::read(&src_path) else { return };
+    let Ok(bitstream) = std::fs::read(&src_path) else {
+        return;
+    };
     let (ch, ours) = decode_ac3_fully(&bitstream, Some(2));
-    let Ok(reference) = std::fs::read(&ref_path) else { return };
+    let Ok(reference) = std::fs::read(&ref_path) else {
+        return;
+    };
     let _ = std::fs::remove_file(&src_path);
     let _ = std::fs::remove_file(&ref_path);
 
@@ -276,5 +299,8 @@ fn matrix_mapping_for_3_2_matches_spec() {
     eprintln!("dmx: L={l:.4} R={r:.4}");
     assert!(l > 0.0, "left output should be positive");
     assert!(r < l, "Rs=-1 must pull right output below left");
-    assert!(l.abs() <= 1.0 && r.abs() <= 1.0, "outputs must stay in range");
+    assert!(
+        l.abs() <= 1.0 && r.abs() <= 1.0,
+        "outputs must stay in range"
+    );
 }

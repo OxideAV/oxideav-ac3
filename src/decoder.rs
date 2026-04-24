@@ -141,8 +141,7 @@ impl Ac3Decoder {
             let nfchans = bsi.nfchans as usize;
             let nchans = src_channels as usize;
             for blk in 0..BLOCKS_PER_FRAME {
-                let mut per_ch: [[f32; SAMPLES_PER_BLOCK]; 5] =
-                    [[0.0; SAMPLES_PER_BLOCK]; 5];
+                let mut per_ch: [[f32; SAMPLES_PER_BLOCK]; 5] = [[0.0; SAMPLES_PER_BLOCK]; 5];
                 let base = blk * SAMPLES_PER_BLOCK * nchans;
                 for n in 0..SAMPLES_PER_BLOCK {
                     for ch in 0..nfchans.min(5) {
@@ -161,8 +160,7 @@ impl Ac3Decoder {
 
         // 3) Pack f32 → S16 interleaved.
         let bytes_per_sample = SampleFormat::S16.bytes_per_sample();
-        let total_bytes =
-            SAMPLES_PER_FRAME as usize * out_channels as usize * bytes_per_sample;
+        let total_bytes = SAMPLES_PER_FRAME as usize * out_channels as usize * bytes_per_sample;
         let mut out_bytes = vec![0u8; total_bytes];
         for (i, s) in out_samples.iter().enumerate() {
             let clamped = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;

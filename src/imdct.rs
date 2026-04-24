@@ -179,7 +179,7 @@ pub fn imdct_512_fft(x: &[f32; 256], out: &mut [f32; 512]) {
     let mut z = [(0.0f32, 0.0f32); NOVER4];
     for k in 0..NOVER4 {
         let a = x[256 - 2 * k - 1]; // real part of (X[N/2-2k-1] + j*X[2k])
-        let b = x[2 * k];           // imag part
+        let b = x[2 * k]; // imag part
         let cr = tw.xcos[k];
         let ci = tw.xsin[k];
         z[k] = (a * cr - b * ci, b * cr + a * ci);
@@ -337,9 +337,8 @@ mod tests {
         for nn in 0..n {
             let mut s = 0.0f32;
             for k in 0..256 {
-                let phase = PI / (2.0 * n as f32)
-                    * ((2 * nn + 1 + n / 2) as f32)
-                    * ((2 * k + 1) as f32);
+                let phase =
+                    PI / (2.0 * n as f32) * ((2 * nn + 1 + n / 2) as f32) * ((2 * k + 1) as f32);
                 s += x[k] * phase.cos();
             }
             out[nn] = scale * s;
@@ -347,7 +346,10 @@ mod tests {
     }
 
     fn cmp_max_abs(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b.iter()).map(|(&x, &y)| (x - y).abs()).fold(0.0f32, f32::max)
+        a.iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
     }
 
     /// Sanity-check the radix-2 IFFT kernel: a length-8 impulse response

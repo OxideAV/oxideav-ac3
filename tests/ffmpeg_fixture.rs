@@ -25,17 +25,15 @@ const FIXTURE: &[u8] = include_bytes!("fixtures/sine440_stereo.ac3");
 /// the 378 audio blocks — enough coverage to gate short-block IMDCT
 /// correctness directly, unlike the pure-sine fixture which only
 /// exercises the long transform.
-const TRANSIENT_FIXTURE: &[u8] =
-    include_bytes!("fixtures/transient_bursts_stereo.ac3");
+const TRANSIENT_FIXTURE: &[u8] = include_bytes!("fixtures/transient_bursts_stereo.ac3");
 
 #[test]
 fn fixture_is_pure_ac3_syncframes() {
     let mut offset = 0;
     let mut frames = 0;
     while offset < FIXTURE.len() {
-        let si = syncinfo::parse(&FIXTURE[offset..]).unwrap_or_else(|e| {
-            panic!("syncinfo parse at offset {offset} failed: {e:?}")
-        });
+        let si = syncinfo::parse(&FIXTURE[offset..])
+            .unwrap_or_else(|e| panic!("syncinfo parse at offset {offset} failed: {e:?}"));
         assert_eq!(si.sample_rate, 48_000);
         assert_eq!(si.frame_length, 768, "192 kbps @ 48 kHz ⇒ 768-byte frames");
         assert_eq!(si.frmsizecod, 20);
@@ -100,12 +98,14 @@ fn side_info_extraction_is_consistent() {
         let flen = si.frame_length as usize;
         let b = bsi::parse(&FIXTURE[offset + 5..]).unwrap();
         let frame = &FIXTURE[offset..offset + flen];
-        let side = audblk::parse_frame_side_info(&si, &b, frame)
-            .expect("parse_frame_side_info");
+        let side = audblk::parse_frame_side_info(&si, &b, frame).expect("parse_frame_side_info");
         assert_eq!(side.len(), BLOCKS_PER_FRAME);
         for (i, s) in side.iter().enumerate() {
             // Fixture is 2/0 stereo → acmod=2 → no dynrng2e/dynrng2.
-            assert!(!s.dynrng2e, "blk{i}: dual-mono dynrng2e must be absent in 2/0");
+            assert!(
+                !s.dynrng2e,
+                "blk{i}: dual-mono dynrng2e must be absent in 2/0"
+            );
             // chbwcod must be in [0, 60] for uncoupled fbw channels that
             // carry new exponents (spec §5.4.3.24 limit).
             for ch in 0..b.nfchans as usize {
@@ -233,9 +233,7 @@ fn decoder_matches_ffmpeg_within_psnr_floor() {
     let out = Command::new("ffmpeg")
         .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
         .arg(&src)
-        .args([
-            "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "2",
-        ])
+        .args(["-f", "s16le", "-acodec", "pcm_s16le", "-ac", "2"])
         .arg(&tmp)
         .status();
     let Ok(status) = out else {
@@ -263,9 +261,12 @@ fn decoder_matches_ffmpeg_within_psnr_floor() {
     while offset < FIXTURE.len() {
         let si = syncinfo::parse(&FIXTURE[offset..]).unwrap();
         let flen = si.frame_length as usize;
-        let pkt = Packet::new(0, TimeBase::new(1, 48_000),
-                              FIXTURE[offset..offset + flen].to_vec())
-            .with_pts(frame_idx * SAMPLES_PER_FRAME as i64);
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, 48_000),
+            FIXTURE[offset..offset + flen].to_vec(),
+        )
+        .with_pts(frame_idx * SAMPLES_PER_FRAME as i64);
         dec.send_packet(&pkt).unwrap();
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
             our_pcm.extend_from_slice(&a.data[0]);
@@ -356,8 +357,8 @@ fn transient_fixture_has_short_blocks() {
         let flen = si.frame_length as usize;
         let b = bsi::parse(&TRANSIENT_FIXTURE[offset + 5..]).unwrap();
         let frame = &TRANSIENT_FIXTURE[offset..offset + flen];
-        let side = audblk::parse_frame_side_info(&si, &b, frame)
-            .expect("transient fixture: side-info");
+        let side =
+            audblk::parse_frame_side_info(&si, &b, frame).expect("transient fixture: side-info");
         for s in side.iter() {
             total_blocks += 1;
             if s.blksw.iter().take(b.nfchans as usize).any(|&x| x) {
@@ -484,9 +485,7 @@ fn decoder_matches_ffmpeg_on_transient_fixture() {
     let mse = sse / count as f64;
     let peak = 32767.0f64;
     let psnr = 10.0 * (peak * peak / mse).log10();
-    eprintln!(
-        "transient PSNR vs ffmpeg (best lag={best_lag}): {psnr:.2} dB (n={count})"
-    );
+    eprintln!("transient PSNR vs ffmpeg (best lag={best_lag}): {psnr:.2} dB (n={count})");
     // 10 dB floor: confirms the short-block path produces coherent audio.
     // Without a correct short-block IMDCT the transient frames invert the
     // signal or fill it with impulse noise, which pushes PSNR below 0 dB.
@@ -506,13 +505,22 @@ fn side_info_on_fresh_mono_ffmpeg_stream() {
     let tmp_path = std::env::temp_dir().join("oxideav_ac3_mono_test.ac3");
     let out = Command::new("ffmpeg")
         .args([
-            "-y", "-hide_banner", "-loglevel", "error",
-            "-f", "lavfi",
-            "-i", "sine=frequency=660:duration=0.3:sample_rate=48000",
-            "-c:a", "ac3",
-            "-ac", "1",
-            "-b:a", "96k",
-            "-f", "ac3",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=660:duration=0.3:sample_rate=48000",
+            "-c:a",
+            "ac3",
+            "-ac",
+            "1",
+            "-b:a",
+            "96k",
+            "-f",
+            "ac3",
         ])
         .arg(&tmp_path)
         .status();
@@ -557,5 +565,8 @@ fn side_info_on_fresh_mono_ffmpeg_stream() {
         frames += 1;
         offset += flen;
     }
-    assert!(frames > 0, "no frames extracted from ffmpeg-generated mono ac3");
+    assert!(
+        frames > 0,
+        "no frames extracted from ffmpeg-generated mono ac3"
+    );
 }

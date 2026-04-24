@@ -17,13 +17,14 @@ use std::fs::File;
 use std::io::Write;
 
 use oxideav_ac3::encoder;
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat, TimeBase,
-};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat, TimeBase};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    let out_path = args.get(1).cloned().unwrap_or_else(|| "/tmp/sine440.ac3".to_string());
+    let out_path = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "/tmp/sine440.ac3".to_string());
 
     let sr = 48_000u32;
     let dur_s = 2.0f32;

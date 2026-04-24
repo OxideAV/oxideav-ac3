@@ -29,7 +29,9 @@ fn ac3_crc(init: u16, data: &[u8]) -> u16 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = env::args().nth(1).unwrap_or_else(|| "/tmp/sine440.ac3".into());
+    let path = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/tmp/sine440.ac3".into());
     let data = fs::read(&path)?;
 
     let mut offset = 0;
@@ -44,9 +46,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let fscod = (data[offset + 4] >> 6) & 0x3;
         let frmsizecod = data[offset + 4] & 0x3F;
         let words_48k: &[u32] = &[
-            64, 64, 80, 80, 96, 96, 112, 112, 128, 128, 160, 160, 192, 192, 224, 224,
-            256, 256, 320, 320, 384, 384, 448, 448, 512, 512, 640, 640, 768, 768, 896,
-            896, 1024, 1024, 1152, 1152, 1280, 1280,
+            64, 64, 80, 80, 96, 96, 112, 112, 128, 128, 160, 160, 192, 192, 224, 224, 256, 256,
+            320, 320, 384, 384, 448, 448, 512, 512, 640, 640, 768, 768, 896, 896, 1024, 1024, 1152,
+            1152, 1280, 1280,
         ];
         let words = words_48k[frmsizecod as usize];
         let _ = fscod;

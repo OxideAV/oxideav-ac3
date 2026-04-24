@@ -31,9 +31,9 @@ use oxideav_core::{Error, Result};
 use crate::bsi::Bsi;
 use crate::syncinfo::SyncInfo;
 use crate::tables::{
-    BAPTAB, BNDSZ, BNDTAB, DBPBTAB, FASTDEC, FASTGAIN, FLOORTAB, HTH, LATAB,
-    MANT_LEVEL_11, MANT_LEVEL_15, MANT_LEVEL_3, MANT_LEVEL_5, MANT_LEVEL_7, MASKTAB,
-    QUANTIZATION_BITS, SLOWDEC, SLOWGAIN, WINDOW,
+    BAPTAB, BNDSZ, BNDTAB, DBPBTAB, FASTDEC, FASTGAIN, FLOORTAB, HTH, LATAB, MANT_LEVEL_11,
+    MANT_LEVEL_15, MANT_LEVEL_3, MANT_LEVEL_5, MANT_LEVEL_7, MASKTAB, QUANTIZATION_BITS, SLOWDEC,
+    SLOWGAIN, WINDOW,
 };
 
 /// Maximum fbw channels (3/2 mode).
@@ -359,12 +359,7 @@ pub fn decode_frame(
     Ok(())
 }
 
-fn parse_audblk(
-    state: &mut Ac3State,
-    si: &SyncInfo,
-    bsi: &Bsi,
-    br: &mut BitReader,
-) -> Result<()> {
+fn parse_audblk(state: &mut Ac3State, si: &SyncInfo, bsi: &Bsi, br: &mut BitReader) -> Result<()> {
     let mut side = AudBlkSideInfo::default();
     parse_audblk_into(state, si, bsi, br, &mut side)
 }
@@ -445,7 +440,11 @@ pub(crate) fn parse_audblk_into(
                 side.chincpl[ch] = v;
             }
             // §5.4.3.10 phsflginu — phase flags in use (only in 2/0 mode).
-            state.phsflginu = if acmod == 0x2 { br.read_u32(1)? != 0 } else { false };
+            state.phsflginu = if acmod == 0x2 {
+                br.read_u32(1)? != 0
+            } else {
+                false
+            };
             side.phsflginu = state.phsflginu;
             // §5.4.3.11 cplbegf (4 bits), §5.4.3.12 cplendf (4 bits).
             state.cpl_begf = br.read_u32(4)? as u8;
@@ -619,7 +618,13 @@ pub(crate) fn parse_audblk_into(
             state.channels[ch].end_mant = end;
 
             if false && blk == 0 {
-                eprintln!("ch{} exps start at bit {}, end_mant={}, strategy={}", ch, br.bit_position(), end, chexpstr[ch]);
+                eprintln!(
+                    "ch{} exps start at bit {}, end_mant={}, strategy={}",
+                    ch,
+                    br.bit_position(),
+                    end,
+                    chexpstr[ch]
+                );
             }
             let absexp = br.read_u32(4)? as i32;
             let grpsize = match chexpstr[ch] {
@@ -819,40 +824,29 @@ pub(crate) fn parse_audblk_into(
         eprintln!("block 0 bap histogram (incl cpl): {:?}", histo);
         eprintln!(
             "ch_cpl bap[begf..end]: {:?}",
-            &state.channels[MAX_FBW].bap[state.cpl_begf_mant..state.cpl_endf_mant.min(state.cpl_begf_mant+30)]
+            &state.channels[MAX_FBW].bap
+                [state.cpl_begf_mant..state.cpl_endf_mant.min(state.cpl_begf_mant + 30)]
         );
         eprintln!(
             "ch_cpl exp[begf..end]: {:?}",
-            &state.channels[MAX_FBW].exp[state.cpl_begf_mant..state.cpl_endf_mant.min(state.cpl_begf_mant+30)]
+            &state.channels[MAX_FBW].exp
+                [state.cpl_begf_mant..state.cpl_endf_mant.min(state.cpl_begf_mant + 30)]
         );
-        eprintln!(
-            "ch0 bap[0..133]: {:?}",
-            &state.channels[0].bap[0..133]
-        );
-        eprintln!(
-            "ch1 bap[0..133]: {:?}",
-            &state.channels[1].bap[0..133]
-        );
-        eprintln!(
-            "ch1 exp[0..133]: {:?}",
-            &state.channels[1].exp[0..133]
-        );
-        eprintln!(
-            "ch0 exp[0..40]: {:?}",
-            &state.channels[0].exp[0..40]
-        );
-        eprintln!(
-            "ch0 psd[0..10]: {:?}",
-            &state.channels[0].psd[0..10]
-        );
-        eprintln!(
-            "ch0 bndpsd[0..10]: {:?}",
-            &state.channels[0].bndpsd[0..10]
-        );
+        eprintln!("ch0 bap[0..133]: {:?}", &state.channels[0].bap[0..133]);
+        eprintln!("ch1 bap[0..133]: {:?}", &state.channels[1].bap[0..133]);
+        eprintln!("ch1 exp[0..133]: {:?}", &state.channels[1].exp[0..133]);
+        eprintln!("ch0 exp[0..40]: {:?}", &state.channels[0].exp[0..40]);
+        eprintln!("ch0 psd[0..10]: {:?}", &state.channels[0].psd[0..10]);
+        eprintln!("ch0 bndpsd[0..10]: {:?}", &state.channels[0].bndpsd[0..10]);
         eprintln!(
             "cpl in_use: {} begf: {} endf: {} begf_mant: {} endf_mant: {} nsubbnd: {} nbnd: {}",
-            state.cpl_in_use, state.cpl_begf, state.cpl_endf,
-            state.cpl_begf_mant, state.cpl_endf_mant, state.cpl_nsubbnd, state.cpl_nbnd
+            state.cpl_in_use,
+            state.cpl_begf,
+            state.cpl_endf,
+            state.cpl_begf_mant,
+            state.cpl_endf_mant,
+            state.cpl_nsubbnd,
+            state.cpl_nbnd
         );
         eprintln!(
             "ch0 end_mant: {}, ch1 end_mant: {}",
@@ -860,11 +854,16 @@ pub(crate) fn parse_audblk_into(
         );
         eprintln!(
             "snroffst: csnr={} cpl_fsnr={} cpl_fgain={} cpl_fleak={} cpl_sleak={}",
-            state.snroffst_coarse, state.cpl_fsnroffst, state.cpl_fgaincod,
-            state.cpl_fleak, state.cpl_sleak
+            state.snroffst_coarse,
+            state.cpl_fsnroffst,
+            state.cpl_fgaincod,
+            state.cpl_fleak,
+            state.cpl_sleak
         );
-        eprintln!("sdcy={} fdcy={} sgain={} dbpb={} floor={}",
-            state.sdcycod, state.fdcycod, state.sgaincod, state.dbpbcod, state.floorcod);
+        eprintln!(
+            "sdcy={} fdcy={} sgain={} dbpb={} floor={}",
+            state.sdcycod, state.fdcycod, state.sgaincod, state.dbpbcod, state.floorcod
+        );
         eprintln!("ch0 psd[0..20]: {:?}", &state.channels[0].psd[0..20]);
         eprintln!("ch0 bndpsd[0..20]: {:?}", &state.channels[0].bndpsd[0..20]);
         eprintln!("ch0 mask[0..20]: {:?}", &state.channels[0].mask[0..20]);
@@ -884,7 +883,11 @@ pub(crate) fn parse_audblk_into(
                 nbits
             })
             .sum();
-        eprintln!("block 0 pre-mantissa bit pos {}, estimated mantissa bits {}", br.bit_position(), total_bits);
+        eprintln!(
+            "block 0 pre-mantissa bit pos {}, estimated mantissa bits {}",
+            br.bit_position(),
+            total_bits
+        );
     }
     unpack_mantissas(state, bsi, br)?;
 
@@ -1011,10 +1014,7 @@ fn run_bit_allocation(
     let snroffset = (((state.snroffst_coarse as i32 - 15) << 4) + fsnroffst as i32) << 2;
 
     let (fastleak_init, slowleak_init) = if is_coupling {
-        (
-            (state.cpl_fleak as i32) << 8,
-            (state.cpl_sleak as i32) << 8,
-        )
+        ((state.cpl_fleak as i32) << 8, (state.cpl_sleak as i32) << 8)
     } else {
         (0i32, 0i32)
     };
@@ -1038,9 +1038,7 @@ fn run_bit_allocation(
     } else if bndstrt == 0 {
         // fbw channel path (and LFE with same start=0)
         let lfe_last = end == 7;
-        let bpsd = |i: usize| -> i32 {
-            state.channels[ch].bndpsd[i.min(49)] as i32
-        };
+        let bpsd = |i: usize| -> i32 { state.channels[ch].bndpsd[i.min(49)] as i32 };
         if 0 < bndend {
             lowcomp = calc_lowcomp(lowcomp, bpsd(0), bpsd(1), 0);
             excite[0] = bpsd(0) - fgain - lowcomp;
@@ -1427,12 +1425,7 @@ fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
 
     // --- Rematrixing (§7.5) ---
     if acmod == 0x2 {
-        let remat_bands: &[(usize, usize)] = &[
-            (13, 25),
-            (25, 37),
-            (37, 61),
-            (61, 253),
-        ];
+        let remat_bands: &[(usize, usize)] = &[(13, 25), (25, 37), (37, 61), (61, 253)];
         let n = remat_band_count(state.cpl_in_use, state.cpl_begf);
         for (i, (lo, hi)) in remat_bands.iter().take(n).enumerate() {
             if !state.rematflg[i] {
@@ -1548,8 +1541,7 @@ fn imdct_256_pair(x: &[f32; 256], out: &mut [f32; 512]) {
     for nn in 0..n {
         let mut s = 0.0f32;
         for k in 0..128 {
-            let phase =
-                PI / (2.0 * n as f32) * ((2 * nn + 1) as f32) * ((2 * k + 1) as f32);
+            let phase = PI / (2.0 * n as f32) * ((2 * nn + 1) as f32) * ((2 * k + 1) as f32);
             s += x1[k] * phase.cos();
         }
         out[nn] = scale * s;
@@ -1558,9 +1550,8 @@ fn imdct_256_pair(x: &[f32; 256], out: &mut [f32; 512]) {
     for nn in 0..n {
         let mut s = 0.0f32;
         for k in 0..128 {
-            let phase = PI / (2.0 * n as f32)
-                * ((2 * nn + 1 + n / 2) as f32)
-                * ((2 * k + 1) as f32);
+            let phase =
+                PI / (2.0 * n as f32) * ((2 * nn + 1 + n / 2) as f32) * ((2 * k + 1) as f32);
             s += x2[k] * phase.cos();
         }
         out[256 + nn] = scale * s;
@@ -1594,9 +1585,8 @@ pub fn imdct_512(x: &[f32; 256], out: &mut [f32; 512]) {
     for nn in 0..n {
         let mut s = 0.0f32;
         for k in 0..256 {
-            let phase = PI / (2.0 * n as f32)
-                * ((2 * nn + 1 + n / 2) as f32)
-                * ((2 * k + 1) as f32);
+            let phase =
+                PI / (2.0 * n as f32) * ((2 * nn + 1 + n / 2) as f32) * ((2 * k + 1) as f32);
             s += x[k] * phase.cos();
         }
         out[nn] = scale * s;

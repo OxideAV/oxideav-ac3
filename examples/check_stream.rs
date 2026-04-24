@@ -10,7 +10,9 @@ use oxideav_ac3::{bsi, syncinfo};
 use oxideav_core::bits::BitReader;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = env::args().nth(1).unwrap_or_else(|| "/tmp/sine440.ac3".into());
+    let path = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/tmp/sine440.ac3".into());
     let data = fs::read(&path)?;
 
     let mut offset = 0;
@@ -35,10 +37,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         br.skip(nfchans as u32)?;
         // dynrnge
         let dynrnge = br.read_u32(1)? != 0;
-        if dynrnge { br.skip(8)?; }
-        if acmod == 0 { // 1+1 dual-mono, second dynrng
+        if dynrnge {
+            br.skip(8)?;
+        }
+        if acmod == 0 {
+            // 1+1 dual-mono, second dynrng
             let d2 = br.read_u32(1)? != 0;
-            if d2 { br.skip(8)?; }
+            if d2 {
+                br.skip(8)?;
+            }
         }
 
         // cplstre / cplinu — block 0 always sends cplstre.

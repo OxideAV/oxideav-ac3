@@ -11,7 +11,9 @@ use oxideav_codec::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = env::args().nth(1).ok_or("usage: psnr_per_frame <file.ac3>")?;
+    let path = env::args()
+        .nth(1)
+        .ok_or("usage: psnr_per_frame <file.ac3>")?;
     let data = fs::read(&path)?;
 
     // ffmpeg reference decode.
@@ -41,8 +43,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let si = syncinfo::parse(&data[offset..])?;
         let _ = bsi::parse(&data[offset + 5..])?;
         let flen = si.frame_length as usize;
-        let pkt = Packet::new(0, TimeBase::new(1, 48_000), data[offset..offset + flen].to_vec())
-            .with_pts(frame_idx * SAMPLES_PER_FRAME as i64);
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, 48_000),
+            data[offset..offset + flen].to_vec(),
+        )
+        .with_pts(frame_idx * SAMPLES_PER_FRAME as i64);
         dec.send_packet(&pkt)?;
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
             our_pcm.extend_from_slice(&a.data[0]);
@@ -59,10 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect()
     };
-    let ch_pick: usize = env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let ch_pick: usize = env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0);
     let our_l = extract_ch(&our_pcm, ch_pick);
     let ref_l = extract_ch(&ref_pcm, ch_pick);
     eprintln!("examining channel {ch_pick}");

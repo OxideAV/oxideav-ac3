@@ -60,9 +60,8 @@ pub fn parse(data: &[u8]) -> Result<SyncInfo> {
     let frmsizecod = b4 & 0x3F;
     let sample_rate = sample_rate_hz(fscod)
         .ok_or_else(|| Error::invalid("ac3: reserved fscod '11' — decoder must mute"))?;
-    let frame_length = frame_length_bytes(fscod, frmsizecod).ok_or_else(|| {
-        Error::invalid(format!("ac3: invalid frmsizecod {frmsizecod}"))
-    })?;
+    let frame_length = frame_length_bytes(fscod, frmsizecod)
+        .ok_or_else(|| Error::invalid(format!("ac3: invalid frmsizecod {frmsizecod}")))?;
     Ok(SyncInfo {
         crc1,
         fscod,

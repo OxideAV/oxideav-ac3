@@ -71,10 +71,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     };
 
     // Bit-rate → frmsizecod lookup. 192 kbps maps to frmsizecod=20.
-    let target_kbps: u32 = params
-        .bit_rate
-        .map(|b| (b / 1000) as u32)
-        .unwrap_or(192);
+    let target_kbps: u32 = params.bit_rate.map(|b| (b / 1000) as u32).unwrap_or(192);
     let frmsizecod = pick_frmsizecod(target_kbps).ok_or_else(|| {
         Error::Unsupported(format!(
             "ac3 encoder: bit rate {target_kbps} kbps has no frmsizecod mapping"
@@ -304,8 +301,9 @@ impl Ac3Encoder {
                     win_buf[511 - n] = in_buf[511 - n] * WINDOW[n];
                 }
                 // Update delay line to right-half of the next block.
-                self.delay_line[ch]
-                    .copy_from_slice(&drain[blk * SAMPLES_PER_BLOCK..(blk + 1) * SAMPLES_PER_BLOCK]);
+                self.delay_line[ch].copy_from_slice(
+                    &drain[blk * SAMPLES_PER_BLOCK..(blk + 1) * SAMPLES_PER_BLOCK],
+                );
                 // Forward MDCT.
                 mdct_512(&win_buf, &mut coeffs[ch][blk]);
             }
@@ -370,7 +368,14 @@ impl Ac3Encoder {
         // Iteratively tune csnroffst+fsnroffst so the encoded mantissa
         // bits + side-info fit the frame payload. This is the minimal
         // loop §8.2.12 describes.
-        let tuned_ba = tune_snroffst(&ba, &exps, end_mant, self.channels, self.fscod, self.frame_bytes);
+        let tuned_ba = tune_snroffst(
+            &ba,
+            &exps,
+            end_mant,
+            self.channels,
+            self.fscod,
+            self.frame_bytes,
+        );
 
         // Compute bap arrays per channel per block using the tuned params.
         let mut baps: Vec<Vec<[u8; N_COEFFS]>> =
@@ -400,8 +405,8 @@ impl Ac3Encoder {
         bw.write_u32(8, 5); // bsid
         bw.write_u32(0, 3); // bsmod
         bw.write_u32(2, 3); // acmod = 2/0 stereo
-        // cmixlev — absent for acmod=2.
-        // surmixlev — absent (acmod bit 2 is 0).
+                            // cmixlev — absent for acmod=2.
+                            // surmixlev — absent (acmod bit 2 is 0).
         bw.write_u32(0, 2); // dsurmod = not indicated
         bw.write_u32(0, 1); // lfeon
         bw.write_u32(27, 5); // dialnorm = -27 dB
@@ -434,7 +439,7 @@ impl Ac3Encoder {
             // rematstr (acmod == 2): block 0 sends "no rematrix" (rematstr=1, all flags=0).
             if blk == 0 {
                 bw.write_u32(1, 1); // rematstr
-                // With cplinu=0 → 4 rematrix bands (Table 5.15).
+                                    // With cplinu=0 → 4 rematrix bands (Table 5.15).
                 for _ in 0..4 {
                     bw.write_u32(0, 1);
                 }
@@ -446,7 +451,7 @@ impl Ac3Encoder {
             let exp_strategy: u8 = if blk == 0 { 1 } else { 0 };
             bw.write_u32(exp_strategy as u32, 2); // ch0
             bw.write_u32(exp_strategy as u32, 2); // ch1
-            // chbwcod (only when exp strategy != reuse, and channel not coupled).
+                                                  // chbwcod (only when exp strategy != reuse, and channel not coupled).
             if exp_strategy != 0 {
                 bw.write_u32(chbwcod as u32, 6); // ch0
                 bw.write_u32(chbwcod as u32, 6); // ch1
@@ -570,8 +575,7 @@ impl Ac3Encoder {
         );
 
         self.packet_queue.push(
-            Packet::new(0, TimeBase::new(1, self.sample_rate as i64), frame)
-                .with_pts(self.pts),
+            Packet::new(0, TimeBase::new(1, self.sample_rate as i64), frame).with_pts(self.pts),
         );
         self.pts += SAMPLES_PER_FRAME as i64;
         Ok(())
@@ -638,7 +642,11 @@ fn write_exponents_d15(bw: &mut BitWriter, exp: &[u8; N_COEFFS], end: usize) {
     let ngrps = (end - 1) / 3;
     for grp in 0..ngrps {
         let base = 1 + grp * 3;
-        let e_prev_0 = if base == 1 { absexp as i32 } else { exp[base - 1] as i32 };
+        let e_prev_0 = if base == 1 {
+            absexp as i32
+        } else {
+            exp[base - 1] as i32
+        };
         let e0 = exp[base] as i32;
         let e1 = exp[base + 1] as i32;
         let e2 = exp[base + 2] as i32;
@@ -836,10 +844,7 @@ fn calc_lowcomp(a: i32, b0: i32, b1: i32, bin: usize) -> i32 {
 /// Count mantissa bits used by a bap histogram over all channels and
 /// blocks. Grouped bap values (1, 2, 4) charge per-group cost; other
 /// values charge nbits per mantissa. Returns the total in bits.
-fn mantissa_bits_total(
-    baps: &[Vec<[u8; N_COEFFS]>],
-    end: usize,
-) -> u32 {
+fn mantissa_bits_total(baps: &[Vec<[u8; N_COEFFS]>], end: usize) -> u32 {
     // Because groups for bap=1/2/4 are shared across channels in frequency
     // order within a block (spec §7.3.5), we walk channels within each
     // block and accumulate a running count of pending group slots.
