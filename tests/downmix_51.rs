@@ -286,9 +286,7 @@ fn matrix_mapping_for_3_2_matches_spec() {
     // Build a per-channel block where every channel is a constant 1.0
     // except right-surround which is -1.0 (so we can tell it apart).
     let mut src: [[f32; 256]; 5] = [[1.0; 256]; 5];
-    for n in 0..256 {
-        src[4][n] = -1.0; // Rs
-    }
+    src[4].fill(-1.0); // Rs
     let mut out = vec![0.0f32; 256 * 2];
     dmx.apply(&src, 256, &mut out);
     // After normalisation the rows sum to 1, so constant inputs of 1.0

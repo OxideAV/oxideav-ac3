@@ -142,7 +142,7 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
     // addbsi — up to 64 bytes of trailing info we can safely skip.
     let addbsie = br.read_u32(1)? != 0;
     if addbsie {
-        let addbsil = br.read_u32(6)? as u32; // 0..=63, meaning 1..=64 bytes
+        let addbsil = br.read_u32(6)?; // 0..=63, meaning 1..=64 bytes
         let nbits = (addbsil + 1) * 8;
         br.skip(nbits)?;
     }

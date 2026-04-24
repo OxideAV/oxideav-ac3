@@ -102,7 +102,7 @@ mod tests {
         buf[2] = 0xAB;
         buf[3] = 0xCD;
         // fscod=0 (48 kHz), frmsizecod=20
-        buf[4] = (0 << 6) | 20;
+        buf[4] = 20;
         let si = parse(&buf).unwrap();
         assert_eq!(si.sample_rate, 48_000);
         assert_eq!(si.frame_length, 768);
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn rejects_reserved_frmsizecod() {
         // frmsizecod = 38 is past the end of Table 5.18.
-        let buf = [0x0B, 0x77, 0, 0, 0 | 38];
+        let buf = [0x0B, 0x77, 0, 0, 38];
         assert!(parse(&buf).is_err());
     }
 
