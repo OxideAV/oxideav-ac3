@@ -138,6 +138,10 @@ pub struct Ac3State {
     pub audblk_start_bits: u64,
     /// Which block we are currently parsing (0..6).
     pub blkidx: usize,
+    /// 16-bit LFSR state driving the `bap=0` dither replacement
+    /// (§7.3.4). Persisted across audio blocks and syncframes so the
+    /// dither sequence has a smooth long-period character.
+    pub dither_lfsr_state: u32,
 }
 
 impl Ac3State {
@@ -173,6 +177,9 @@ impl Ac3State {
             lfefgaincod: 0,
             audblk_start_bits: 0,
             blkidx: 0,
+            // Non-zero seed so the LFSR doesn't get stuck on all-zeros.
+            // Arbitrary fixed value keeps decodes byte-reproducible.
+            dither_lfsr_state: 0x1234,
         }
     }
 }
@@ -962,6 +969,25 @@ fn calc_lowcomp(a: i32, b0: i32, b1: i32, bin: usize) -> i32 {
     a
 }
 
+/// 16-bit Galois LFSR used to generate dither for `bap=0` mantissas
+/// (§7.3.4). The spec says "any reasonably random sequence may be
+/// used" — we use the classic x^16 + x^14 + x^13 + x^11 + 1 polynomial
+/// because it has a maximal 65535-sample period and the output looks
+/// like white noise to within a few bits. Seed is arbitrary but
+/// fixed so decodes are deterministic.
+fn dither_lfsr(state: &mut u32) -> f32 {
+    // Advance the 16-bit LFSR one step and return a uniform value in
+    // the range `[-0.707, 0.707)` — the spec's "optimum" scaling
+    // (0.707 ≈ 1/√2). Uses the classic Fibonacci taps at bits
+    // 15, 13, 12, 10 of a 16-bit state.
+    let bit = ((*state >> 15) ^ (*state >> 13) ^ (*state >> 12) ^ (*state >> 10)) & 1;
+    *state = ((*state << 1) | bit) & 0xFFFF;
+    // Center around zero: bit15 of the 16-bit state becomes the sign,
+    // lower 15 bits provide magnitude.
+    let signed = (*state as i32).wrapping_sub(0x8000) as f32 / 32768.0;
+    signed * 0.707
+}
+
 /// Unpack + dequantize mantissas for all channels (§7.3).
 /// Populates ChannelState.coeffs with dequantized transform coefficients.
 fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitReader) -> Result<()> {
@@ -992,6 +1018,7 @@ fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitReader) -> Resu
 
     for ch in 0..nfchans {
         let end = state.channels[ch].end_mant;
+        let dith = state.channels[ch].dithflag;
         for bin in 0..end {
             let bap = state.channels[ch].bap[bin];
             let val = fetch_mantissa(
@@ -1003,10 +1030,22 @@ fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitReader) -> Resu
                 &mut grp2_n,
                 &mut grp4,
                 &mut grp4_n,
-                state.channels[ch].dithflag,
+                false,
             )?;
+            // Dither for bap=0 mantissas (§7.3.4): when dithflag is
+            // set, replace the zero-level mantissa with an LFSR-driven
+            // pseudo-random value scaled by 0.707 before the standard
+            // `>> exponent` coefficient reconstruction. This fills
+            // inaudible masked bands with near-noise instead of
+            // silence, preventing coloration of subsequent DSP stages
+            // (especially rematrix and the IMDCT post-chain).
+            let final_val = if bap == 0 && dith {
+                dither_lfsr(&mut state.dither_lfsr_state)
+            } else {
+                val
+            };
             let e = state.channels[ch].exp[bin] as i32;
-            state.channels[ch].coeffs[bin] = val * 2f32.powi(-e);
+            state.channels[ch].coeffs[bin] = final_val * 2f32.powi(-e);
         }
         if state.cpl_in_use && state.channels[ch].in_coupling && !got_cplchan {
             let start = state.cpl_begf_mant;
@@ -1014,6 +1053,9 @@ fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitReader) -> Resu
             let cplc = MAX_FBW;
             for bin in start..end_c {
                 let bap = state.channels[cplc].bap[bin];
+                // Coupling-channel mantissas are never dithered — the
+                // spec explicitly says dither is applied after a channel
+                // is extracted from the coupling channel (§7.3.4 para 1).
                 let val = fetch_mantissa(
                     br,
                     bap,
@@ -1033,6 +1075,7 @@ fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitReader) -> Resu
     }
     if bsi.lfeon {
         let lfe_ch = MAX_FBW + 1;
+        let dith = state.channels[lfe_ch].dithflag;
         for bin in 0..7 {
             let bap = state.channels[lfe_ch].bap[bin];
             let val = fetch_mantissa(
@@ -1044,10 +1087,15 @@ fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitReader) -> Resu
                 &mut grp2_n,
                 &mut grp4,
                 &mut grp4_n,
-                state.channels[lfe_ch].dithflag,
+                false,
             )?;
+            let final_val = if bap == 0 && dith {
+                dither_lfsr(&mut state.dither_lfsr_state)
+            } else {
+                val
+            };
             let e = state.channels[lfe_ch].exp[bin] as i32;
-            state.channels[lfe_ch].coeffs[bin] = val * 2f32.powi(-e);
+            state.channels[lfe_ch].coeffs[bin] = final_val * 2f32.powi(-e);
         }
     }
     Ok(())
@@ -1065,16 +1113,13 @@ fn fetch_mantissa(
     g4n: &mut usize,
     dithflag: bool,
 ) -> Result<f32> {
+    let _ = dithflag;
     match bap {
         0 => {
-            if dithflag {
-                // Small uniform pseudo-random between -0.707..0.707.
-                // For reproducible testing we use a simple LCG-ish variant.
-                // We don't rely on dither for the sine fixture, so zero is fine.
-                Ok(0.0)
-            } else {
-                Ok(0.0)
-            }
+            // Dither replacement for bap=0 is handled by the caller
+            // (unpack_mantissas) after we return. Here we just signal
+            // "no bits consumed" by returning 0.
+            Ok(0.0)
         }
         1 => {
             if *g1n == 0 {
@@ -1224,7 +1269,11 @@ fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
         let mut coeffs = [0.0f32; 256];
         coeffs.copy_from_slice(&state.channels[ch].coeffs);
         let mut time = [0.0f32; 512];
-        imdct_512(&coeffs, &mut time);
+        if state.channels[ch].blksw {
+            imdct_256_pair(&coeffs, &mut time);
+        } else {
+            imdct_512(&coeffs, &mut time);
+        }
         // Apply window.
         for n in 0..256 {
             time[n] *= WINDOW[n];
@@ -1244,6 +1293,7 @@ fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
         let mut coeffs = [0.0f32; 256];
         coeffs.copy_from_slice(&state.channels[ch].coeffs);
         let mut time = [0.0f32; 512];
+        // LFE is always long-block (spec §5.4.3.3).
         imdct_512(&coeffs, &mut time);
         for n in 0..256 {
             time[n] *= WINDOW[n];
@@ -1267,6 +1317,47 @@ fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
 /// This is the DFT-style reference implementation — not fast, but
 /// correct and matches the spec's prescribed output polarity /
 /// scaling so that window+overlap-add reproduces the original PCM.
+/// Short-block 256-point IMDCT pair (§7.9.4.2). The 256 interleaved
+/// coefficients `x[]` are split into even/odd halves — `X1[k] = x[2k]`
+/// and `X2[k] = x[2k+1]` — each inverse-transformed into a 256-sample
+/// half-block. The two halves are concatenated into the 512-sample
+/// time-domain buffer, which is then windowed + overlap-added by the
+/// caller exactly like the long-block path. No FFT decomposition here
+/// (matching the long-block's direct-form IMDCT); the `-1.0` scale
+/// keeps gain parity with `imdct_512`, so short/long blocks in the
+/// same syncframe transition without a level jump.
+pub fn imdct_256_pair(x: &[f32; 256], out: &mut [f32; 512]) {
+    use std::f32::consts::PI;
+    let n: usize = 256;
+    let scale = -1.0f32;
+    let mut x1 = [0.0f32; 128];
+    let mut x2 = [0.0f32; 128];
+    for k in 0..128 {
+        x1[k] = x[2 * k];
+        x2[k] = x[2 * k + 1];
+    }
+    for nn in 0..n {
+        let mut s = 0.0f32;
+        for k in 0..128 {
+            let phase = PI / (2.0 * n as f32)
+                * ((2 * nn + 1 + n / 2) as f32)
+                * ((2 * k + 1) as f32);
+            s += x1[k] * phase.cos();
+        }
+        out[nn] = scale * s;
+    }
+    for nn in 0..n {
+        let mut s = 0.0f32;
+        for k in 0..128 {
+            let phase = PI / (2.0 * n as f32)
+                * ((2 * nn + 1 + n / 2) as f32)
+                * ((2 * k + 1) as f32);
+            s += x2[k] * phase.cos();
+        }
+        out[256 + nn] = scale * s;
+    }
+}
+
 pub fn imdct_512(x: &[f32; 256], out: &mut [f32; 512]) {
     // Direct reference implementation of the 512-point IMDCT described
     // in §7.9.4.1 of A/52:2018. The spec provides a fast FFT-based

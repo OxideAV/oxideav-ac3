@@ -590,11 +590,25 @@ fn extract_exponent(x: f32) -> u8 {
 }
 
 /// Pre-process the D15 exponent run so that successive differences
-/// stay in `[-2, +2]`. Walks forward and clamps deltas; this is the
-/// classic "legalise" step §8.2.10 describes. Mutates `exp` in-place.
+/// stay in `[-2, +2]` **and** the absolute-value constraints of the
+/// bitstream layout hold (absolute exponent fits in 4 bits → `0..=15`;
+/// subsequent exponents remain ≥0 after the decoder replays the
+/// differences). Walks forward clamping both axes; this is the
+/// "legalise" step §8.2.10 describes. Mutates `exp` in-place.
+///
+/// The clamping is conservative — when the raw exponent sequence
+/// descends faster than D15 can represent, this routine floors it at
+/// the minimum representable slope, which causes some high-frequency
+/// coefficients to be reconstructed with a slightly larger-than-ideal
+/// exponent. That costs SNR on those bins but keeps the stream legal
+/// for every A/52 decoder.
 fn preprocess_d15(exp: &mut [u8]) {
     if exp.is_empty() {
         return;
+    }
+    // absexp (exps[0]) is transmitted in 4 bits → 0..=15.
+    if exp[0] > 15 {
+        exp[0] = 15;
     }
     for i in 1..exp.len() {
         let prev = exp[i - 1] as i32;
