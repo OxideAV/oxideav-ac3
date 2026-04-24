@@ -610,6 +610,7 @@ fn preprocess_d15(exp: &mut [u8]) {
     if exp[0] > 15 {
         exp[0] = 15;
     }
+    // Forward pass: clamp each delta to ±2 and the running value to [0, 24].
     for i in 1..exp.len() {
         let prev = exp[i - 1] as i32;
         let cur = exp[i] as i32;

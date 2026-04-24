@@ -17,7 +17,6 @@ use std::fs::File;
 use std::io::Write;
 
 use oxideav_ac3::encoder;
-use oxideav_codec::Encoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat, TimeBase,
 };
