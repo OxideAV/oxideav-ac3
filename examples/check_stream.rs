@@ -3,6 +3,11 @@
 //! [0..=24] range — matching the consistency check ffmpeg performs
 //! (`prevexp > 24U` rejects both >24 and < 0 values).
 
+// reason: the channel loops call `br.read_u32(...)` on a stateful bit reader
+// where the iteration order is significant; rewriting to iter_mut() obscures
+// the per-channel bitstream ordering in a debug example.
+#![allow(clippy::needless_range_loop)]
+
 use std::env;
 use std::fs;
 

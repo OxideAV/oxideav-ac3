@@ -327,6 +327,9 @@ pub const MANT_LEVEL_15: [f32; 15] = [
 /// window is symmetric with w[511-n] = w[n] for an MDCT window. AC-3's
 /// KBD window meets the TDAC constraint that w[n]^2 + w[n+256]^2 = 1.
 /// Values given to 5 decimals — accurate enough for 16-bit PCM output.
+// reason: one KBD sample (0.78530) coincidentally matches FRAC_PI_4 to five
+// decimals but is a tabulated window coefficient, not π/4.
+#[allow(clippy::approx_constant)]
 pub const WINDOW: [f32; 256] = [
     0.00014, 0.00024, 0.00037, 0.00051, 0.00067, 0.00086, 0.00107, 0.00130, 0.00157, 0.00187,
     0.00220, 0.00256, 0.00297, 0.00341, 0.00390, 0.00443, 0.00501, 0.00564, 0.00632, 0.00706,

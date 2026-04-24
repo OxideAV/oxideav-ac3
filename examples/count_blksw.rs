@@ -5,6 +5,11 @@
 //!
 //! Usage: `cargo run --example count_blksw -- path/to/file.ac3`
 
+// reason: channel loops use an index both to read `blksw[ch]` and update
+// `short_by_ch[ch]`; rewriting to zipped iterators is noisier than it's worth
+// for a debug example.
+#![allow(clippy::needless_range_loop)]
+
 use std::env;
 use std::fs;
 
