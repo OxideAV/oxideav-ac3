@@ -1107,7 +1107,6 @@ fn ac3_crc_inverse(data_with_zero_crc: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_codec::Decoder as _;
     use oxideav_core::{CodecId, CodecParameters, SampleFormat};
 
     /// Encode a 440 Hz sine, then decode it back through our own
