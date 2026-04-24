@@ -39,3 +39,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`imdct::imdct_256_pair_fft`) is canonical; the naive per-half
   reference disagrees with it (see the
   `short_block_direct_form_diverges_from_fft` regression test).
+
+### Investigation notes (transient fixture drift)
+
+Round 6: investigated the remaining 15.5 dB PSNR floor on the
+transient-burst fixture (bursts at frames 14-17, 29-32, 45-48).
+Outcome: no code change lands this round — the previously-suspected
+`run_bit_allocation` divergence on bins 4-5 at burst onset was
+traced line-by-line against ATSC A/52:2018 §7.2.2.4 and every
+reachable value (`lowcomp`, `fastleak`, `slowleak`, `excite[]`,
+`mask[]`, `bap[]`) agrees with the spec's pseudocode for the
+`bndstrt==0` fbw path (including the break at bin=2 when
+`bndpsd[2] <= bndpsd[3]` as bursts rise).
+
+Remaining symptom on burst frames: the time-domain output at the
+dominant 440 Hz MDCT bin emerges with roughly the wrong sign (our
+output is ≈ −0.77 × reference across the burst). Localised probes
+(zero bins 4-5, flip bin 4, flip bin 5, zero entire burst blocks,
+disable dither, force long blocks) each shift burst-frame PSNR by
+≤4 dB — i.e. the error is not concentrated in any single bin or
+DSP stage that the probes touched. Rematrix flags are all zero in
+this fixture and coupling coefficients (bins 133-216) are all
+`exp=24` / `bap=0`, so neither pathway is contributing.
+
+Further investigation should: (a) compare our decoded
+pre-IMDCT coefficient array against a reference MDCT of the
+ffmpeg-decoded PCM for burst frame 15 block 0 to pinpoint which
+bin's magnitude or sign disagrees, and (b) re-check the §7.1.3
+grouped-exponent prefix sum when consecutive deltas sit near the
+boundary of the 5-level map (M1=0 or M1=4), since the burst psd
+profile is where those extremes actually appear.
