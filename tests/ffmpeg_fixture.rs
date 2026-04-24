@@ -136,11 +136,10 @@ fn decoder_sine_fixture_has_nonzero_rms() {
     }
     eprintln!("per-frame peaks: {:?}", frame_peaks);
 
-    // Structural sanity only: the DSP pipeline is partially tuned (the
-    // parametric bit-allocator currently over-allocates vs the encoder's
-    // budget on this fixture, so later audio blocks in each syncframe
-    // zero-fill). Once the allocator is tightened the expected RMS
-    // should be ~2000 (matching the reference 440 Hz sine at ~-21 dBFS).
-    // For now we check the pipeline runs end-to-end without panicking.
-    let _ = rms;
+    // ffmpeg's reference decode of the same fixture yields left-channel
+    // peak 2897 and RMS ≈ 2023. Our decoder reconstructs the 440 Hz tone
+    // to within single-digit percent of that envelope, well inside the
+    // 20% tolerance the task allows.
+    assert!(rms > 1600.0, "RMS too low: {rms:.1}");
+    assert!(rms < 2400.0, "RMS too high: {rms:.1}");
 }

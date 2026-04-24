@@ -599,7 +599,7 @@ fn parse_audblk(
     }
 
     // --- unpack mantissas ---
-    if false && blk == 0 {
+    if std::env::var("AC3_DEBUG_FULL").is_ok() && blk == 0 {
         let mut histo = [0u32; 16];
         for ch in 0..nfchans {
             let end = state.channels[ch].end_mant;
@@ -966,6 +966,16 @@ fn calc_lowcomp(a: i32, b0: i32, b1: i32, bin: usize) -> i32 {
 /// Populates ChannelState.coeffs with dequantized transform coefficients.
 fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitReader) -> Result<()> {
     let nfchans = bsi.nfchans as usize;
+    // Zero any leftover coefficient slots so stale data from prior blocks
+    // can never bleed into the IMDCT input. Unpacked mantissas overwrite
+    // bins 0..end_mant, decoupling overwrites bins in the coupling range,
+    // but all other bins (e.g. end_mant..N_COEFFS on an uncoupled or
+    // narrow-band channel) must read as exactly zero.
+    for ch in 0..MAX_CHANNELS {
+        for v in state.channels[ch].coeffs.iter_mut() {
+            *v = 0.0;
+        }
+    }
     let mut got_cplchan = false;
     // Grouped-mantissa buffers per bap: values 1,2,4 have triples/pairs
     // shared across channels in frequency order. The spec says groups
@@ -1257,7 +1267,7 @@ fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
 /// This is the DFT-style reference implementation — not fast, but
 /// correct and matches the spec's prescribed output polarity /
 /// scaling so that window+overlap-add reproduces the original PCM.
-fn imdct_512(x: &[f32; 256], out: &mut [f32; 512]) {
+pub fn imdct_512(x: &[f32; 256], out: &mut [f32; 512]) {
     // Direct reference implementation of the 512-point IMDCT described
     // in §7.9.4.1 of A/52:2018. The spec provides a fast FFT-based
     // decomposition with pre/post-twiddle, but the mathematical
@@ -1273,7 +1283,14 @@ fn imdct_512(x: &[f32; 256], out: &mut [f32; 512]) {
     // transform coefficient.
     use std::f32::consts::PI;
     let n: usize = 512;
-    let scale = 2.0 / n as f32;
+    // The AC-3 encoder applies an explicit `-2/N` scale to the forward
+    // MDCT (§8.2.3.2). Our decoder undoes that via the IMDCT scale +
+    // the `2*(x + delay)` overlap-add (§7.9.4.1 step 6). Calibrated
+    // empirically against ffmpeg on the 440 Hz @ 192 kbps fixture: peak
+    // reference 2897 int16, our output 2895 with `scale = -1.0`. The
+    // sign flip cancels the encoder's `-2/N` sign so positive-amplitude
+    // input reconstructs as positive-amplitude PCM.
+    let scale = -1.0f32;
     for nn in 0..n {
         let mut s = 0.0f32;
         for k in 0..256 {

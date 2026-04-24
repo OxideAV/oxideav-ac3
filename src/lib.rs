@@ -22,6 +22,8 @@
 pub mod audblk;
 pub mod bsi;
 pub mod decoder;
+pub mod encoder;
+pub mod mdct;
 pub mod syncinfo;
 pub mod tables;
 
