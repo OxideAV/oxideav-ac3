@@ -47,6 +47,89 @@ pub const BLOCKS_PER_FRAME: usize = 6;
 /// New samples per block per channel after overlap-add.
 pub const SAMPLES_PER_BLOCK: usize = 256;
 
+/// Snapshot of every side-info field decoded out of an `audblk()`
+/// element per §5.4.3. This is purely the "parse" half of the pipeline
+/// — no exponents, no mantissas, no DSP state. It gives tests and the
+/// downstream §7 stages a single inspectable record of what the
+/// bit-stream actually said, keyed to the spec clause numbers.
+///
+/// Every field here cites its §5.4.3.x subsection in the doc comment
+/// so an auditor can verify the parser against the spec table by table.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudBlkSideInfo {
+    // ---- §5.4.3.1 blksw[ch] / §5.4.3.2 dithflag[ch] ----
+    /// `blksw[ch]` — per-channel block-switch flag (§5.4.3.1, 1 bit).
+    pub blksw: [bool; MAX_FBW],
+    /// `dithflag[ch]` — per-channel dither flag (§5.4.3.2, 1 bit).
+    pub dithflag: [bool; MAX_FBW],
+    // ---- §5.4.3.3-6 dynamic range control ----
+    /// `dynrnge` — dynamic-range word present (§5.4.3.3, 1 bit).
+    pub dynrnge: bool,
+    /// `dynrng` — 8-bit dynamic-range gain word (§5.4.3.4). Only
+    /// meaningful when `dynrnge == true`.
+    pub dynrng: u8,
+    /// `dynrng2e` — dual-mono ch2 dynamic-range present (§5.4.3.5,
+    /// 1 bit). Only present when `acmod == 0`.
+    pub dynrng2e: bool,
+    /// `dynrng2` — dual-mono ch2 dynamic-range word (§5.4.3.6, 8 bits).
+    pub dynrng2: u8,
+    // ---- §5.4.3.7-18 coupling strategy + coordinates ----
+    /// `cplstre` — coupling strategy present in this block (§5.4.3.7).
+    pub cplstre: bool,
+    /// `cplinu` — coupling in use (§5.4.3.8). Valid only when `cplstre`.
+    pub cplinu: bool,
+    /// `chincpl[ch]` — channel is part of the coupling group
+    /// (§5.4.3.9). Valid only when `cplinu`.
+    pub chincpl: [bool; MAX_FBW],
+    /// `phsflginu` — coupling phase flags in use for 2/0 (§5.4.3.10).
+    pub phsflginu: bool,
+    /// `cplbegf` — coupling begin frequency code (§5.4.3.11, 4 bits).
+    pub cplbegf: u8,
+    /// `cplendf` — coupling end frequency code (§5.4.3.12, 4 bits).
+    pub cplendf: u8,
+    /// `cplbndstrc[sbnd]` — coupling band structure (§5.4.3.13).
+    pub cplbndstrc: [bool; 18],
+    /// `cplcoe[ch]` — coupling-coordinates-present flag per channel
+    /// (§5.4.3.14).
+    pub cplcoe: [bool; MAX_FBW],
+    // ---- §5.4.3.19-20 rematrix ----
+    /// `rematstr` — rematrix strategy present (§5.4.3.19).
+    pub rematstr: bool,
+    /// Number of rematrix bands actually carried in `rematflg` per
+    /// §5.4.3.19 rules and Table — 2/3/4 depending on `cplbegf`.
+    pub rematflg_count: u8,
+    /// `rematflg[rbnd]` — per-band rematrix flag (§5.4.3.20).
+    pub rematflg: [bool; 4],
+    // ---- §5.4.3.21-24 exponent strategy ----
+    /// `cplexpstr` — coupling exponent strategy (§5.4.3.21, 2 bits).
+    /// 0=reuse, 1=D15, 2=D25, 3=D45.
+    pub cplexpstr: u8,
+    /// `chexpstr[ch]` — full-bandwidth exponent strategy per channel
+    /// (§5.4.3.22, 2 bits).
+    pub chexpstr: [u8; MAX_FBW],
+    /// `lfeexpstr` — LFE exponent strategy (§5.4.3.23, 1 bit).
+    pub lfeexpstr: u8,
+    /// `chbwcod[ch]` — channel bandwidth code (§5.4.3.24, 6 bits).
+    /// Only meaningful when `chexpstr[ch] != 0 && !chincpl[ch]`.
+    pub chbwcod: [u8; MAX_FBW],
+    // ---- §5.4.3.30-46 bit-allocation parametric side-info ----
+    /// `baie` — bit-allocation-info exists (§5.4.3.30).
+    pub baie: bool,
+    /// `snroffste` — SNR-offset block-level flag (§5.4.3.36).
+    pub snroffste: bool,
+    /// `cplleake` — coupling-leak-init flag (§5.4.3.44). Only when
+    /// `cplinu`.
+    pub cplleake: bool,
+    // ---- §5.4.3.47 delta bit allocation ----
+    /// `deltbaie` — delta-bit-allocation info exists (§5.4.3.47).
+    pub deltbaie: bool,
+    // ---- §5.4.3.58-59 skip field ----
+    /// `skiple` — skip-field-exists flag (§5.4.3.58).
+    pub skiple: bool,
+    /// `skipl` — number of skip *bytes* (§5.4.3.59, 9 bits).
+    pub skipl: u16,
+}
+
 /// Per-channel persistent state: exponents, bit-allocation pointers,
 /// bandwidth, gain-range, and the 256-sample overlap-add delay line.
 #[derive(Clone)]
@@ -243,22 +326,48 @@ fn parse_audblk(
     bsi: &Bsi,
     br: &mut BitReader,
 ) -> Result<()> {
+    let mut side = AudBlkSideInfo::default();
+    parse_audblk_into(state, si, bsi, br, &mut side)
+}
+
+/// Parse one `audblk()` element into [`Ac3State`] (for DSP) and
+/// [`AudBlkSideInfo`] (for tests / introspection). Every bit field
+/// cites its §5.4.3.x clause; the pseudo-code in Table 5.3 was the
+/// authoritative reference for bit-order. Consumes exactly as many
+/// bits as the spec prescribes, up to the end of the skip field; the
+/// tail-end mantissas are then parsed by [`unpack_mantissas`].
+pub(crate) fn parse_audblk_into(
+    state: &mut Ac3State,
+    si: &SyncInfo,
+    bsi: &Bsi,
+    br: &mut BitReader,
+    side: &mut AudBlkSideInfo,
+) -> Result<()> {
+    let _ = si;
     let nfchans = bsi.nfchans as usize;
     let acmod = bsi.acmod;
     let blk = state.blkidx;
 
-    // --- blksw + dithflag per channel ---
+    // §5.4.3.1 blksw[ch] — per-channel block-switch flag (1 bit each).
     for ch in 0..nfchans {
-        state.channels[ch].blksw = br.read_u32(1)? != 0;
+        let v = br.read_u32(1)? != 0;
+        state.channels[ch].blksw = v;
+        side.blksw[ch] = v;
     }
+    // §5.4.3.2 dithflag[ch] — per-channel dither flag (1 bit each).
     for ch in 0..nfchans {
-        state.channels[ch].dithflag = br.read_u32(1)? != 0;
+        let v = br.read_u32(1)? != 0;
+        state.channels[ch].dithflag = v;
+        side.dithflag[ch] = v;
     }
 
-    // --- dynrng ---
+    // §5.4.3.3 dynrnge — dynamic-range word present (1 bit).
     let dynrnge = br.read_u32(1)? != 0;
+    side.dynrnge = dynrnge;
     if dynrnge {
+        // §5.4.3.4 dynrng — 8-bit dynamic-range gain word.
         let dynrng = br.read_u32(8)? as u8;
+        side.dynrng = dynrng;
         let g = dynrng_to_linear(dynrng);
         for ch in 0..nfchans {
             state.channels[ch].dynrng = g;
@@ -268,38 +377,56 @@ fn parse_audblk(
             state.channels[ch].dynrng = 1.0;
         }
     }
+    // §5.4.3.5 dynrng2e — dual-mono ch2 dynamic-range present (1 bit),
+    // §5.4.3.6 dynrng2 — dual-mono ch2 dynamic-range word (8 bits).
     if acmod == 0 {
         let dynrng2e = br.read_u32(1)? != 0;
+        side.dynrng2e = dynrng2e;
         if dynrng2e {
             let d2 = br.read_u32(8)? as u8;
+            side.dynrng2 = d2;
             state.channels[1].dynrng = dynrng_to_linear(d2);
         } else if blk == 0 {
             state.channels[1].dynrng = 1.0;
         }
     }
 
-    // --- cplstre + coupling strategy info ---
-    if false && blk == 0 {
-        eprintln!("pre-cplstre bit pos: {}", br.bit_position());
-    }
+    // §5.4.3.7 cplstre — coupling strategy present (1 bit).
     let cplstre = br.read_u32(1)? != 0;
+    side.cplstre = cplstre;
     if cplstre {
+        // §5.4.3.8 cplinu — coupling in use (1 bit).
         state.cpl_in_use = br.read_u32(1)? != 0;
+        side.cplinu = state.cpl_in_use;
         if state.cpl_in_use {
+            // §5.4.3.9 chincpl[ch] — per-channel coupling membership (1 bit).
             for ch in 0..nfchans {
-                state.channels[ch].in_coupling = br.read_u32(1)? != 0;
+                let v = br.read_u32(1)? != 0;
+                state.channels[ch].in_coupling = v;
+                side.chincpl[ch] = v;
             }
+            // §5.4.3.10 phsflginu — phase flags in use (only in 2/0 mode).
             state.phsflginu = if acmod == 0x2 { br.read_u32(1)? != 0 } else { false };
+            side.phsflginu = state.phsflginu;
+            // §5.4.3.11 cplbegf (4 bits), §5.4.3.12 cplendf (4 bits).
             state.cpl_begf = br.read_u32(4)? as u8;
             state.cpl_endf = br.read_u32(4)? as u8;
+            side.cplbegf = state.cpl_begf;
+            side.cplendf = state.cpl_endf;
+            // ncplsubnd = 3 + cplendf - cplbegf (spec comment in Table 5.3).
             state.cpl_nsubbnd = 3 + state.cpl_endf as usize - state.cpl_begf as usize;
+            // §5.4.3.13 cplbndstrc[sbnd] — 1 bit per subband for sbnd >= 1.
             state.cpl_bndstrc[0] = false;
             for bnd in 1..state.cpl_nsubbnd {
-                state.cpl_bndstrc[bnd] = br.read_u32(1)? != 0;
+                let v = br.read_u32(1)? != 0;
+                state.cpl_bndstrc[bnd] = v;
+                side.cplbndstrc[bnd] = v;
             }
+            // Mantissa-domain coupling range: bins [37 + 12*cplbegf,
+            // 37 + 12*(cplendf+3)) per §7.4.2.
             state.cpl_begf_mant = 37 + 12 * state.cpl_begf as usize;
             state.cpl_endf_mant = 37 + 12 * (state.cpl_endf as usize + 3);
-            // Derived nbnd
+            // Derive ncplbnd by merging sub-bands whose cplbndstrc=1.
             let mut n = state.cpl_nsubbnd;
             for bnd in 1..state.cpl_nsubbnd {
                 if state.cpl_bndstrc[bnd] {
@@ -310,20 +437,23 @@ fn parse_audblk(
         }
     }
 
-    // --- cplco, phsflg ---
-    if false && blk == 0 {
-        eprintln!("pre-cplco bit pos: {}", br.bit_position());
-    }
+    // §5.4.3.14 cplcoe[ch], §5.4.3.15 mstrcplco[ch], §5.4.3.16 cplcoexp,
+    // §5.4.3.17 cplcomant, §5.4.3.18 phsflg[bnd].
     if state.cpl_in_use {
         let mut any = false;
         for ch in 0..nfchans {
             if state.channels[ch].in_coupling {
+                // §5.4.3.14 cplcoe[ch] — coupling coordinates present (1 bit).
                 let cplcoe = br.read_u32(1)? != 0;
+                side.cplcoe[ch] = cplcoe;
                 if cplcoe {
                     any = true;
+                    // §5.4.3.15 mstrcplco[ch] — master coupling coord (2 bits).
                     let mstrcplco = br.read_u32(2)? as i32;
                     for bnd in 0..state.cpl_nbnd {
+                        // §5.4.3.16 cplcoexp[ch][bnd] — 4 bits.
                         let cplcoexp = br.read_u32(4)? as i32;
+                        // §5.4.3.17 cplcomant[ch][bnd] — 4 bits.
                         let cplcomant = br.read_u32(4)? as i32;
                         let mant = if cplcoexp == 15 {
                             cplcomant as f32 / 16.0
@@ -337,6 +467,8 @@ fn parse_audblk(
                 }
             }
         }
+        // §5.4.3.18 phsflg[bnd] — only when 2/0, phsflginu, and at
+        // least one channel emitted coupling coordinates this block.
         if acmod == 0x2 && state.phsflginu && any {
             for bnd in 0..state.cpl_nbnd {
                 state.cpl_phsflg[bnd] = br.read_u32(1)? != 0;
@@ -344,46 +476,47 @@ fn parse_audblk(
         }
     }
 
-    // --- rematrixing (only in 2/0 mode) ---
+    // §5.4.3.19 rematstr — rematrix strategy (only in 2/0 mode).
+    // §5.4.3.20 rematflg[rbnd] — per-band rematrix flag.
     if acmod == 0x2 {
         let rematstr = br.read_u32(1)? != 0;
+        side.rematstr = rematstr;
         if rematstr {
             let n_remat = remat_band_count(state.cpl_in_use, state.cpl_begf);
+            side.rematflg_count = n_remat as u8;
             for rbnd in 0..n_remat {
-                state.rematflg[rbnd] = br.read_u32(1)? != 0;
+                let v = br.read_u32(1)? != 0;
+                state.rematflg[rbnd] = v;
+                side.rematflg[rbnd] = v;
             }
         }
     }
 
-    // --- exponent strategy ---
+    // §5.4.3.21 cplexpstr — coupling exponent strategy (2 bits).
+    // §5.4.3.22 chexpstr[ch] — fbw channel exponent strategy (2 bits).
+    // §5.4.3.23 lfeexpstr — LFE exponent strategy (1 bit).
+    // §5.4.3.24 chbwcod[ch] — channel bandwidth code (6 bits).
     let mut cplexpstr = 0u8;
     let mut chexpstr = [0u8; MAX_FBW];
     let mut lfeexpstr = 0u8;
-    if false && blk == 0 {
-        eprintln!(
-            "pre-expstr bit pos: {}, rematflg={:?} in_cpl={:?}",
-            br.bit_position(),
-            &state.rematflg,
-            [state.channels[0].in_coupling, state.channels[1].in_coupling]
-        );
-    }
     if state.cpl_in_use {
         cplexpstr = br.read_u32(2)? as u8;
     }
+    side.cplexpstr = cplexpstr;
     for ch in 0..nfchans {
         chexpstr[ch] = br.read_u32(2)? as u8;
-    }
-    if false && blk == 0 {
-        eprintln!("cplexpstr={} chexpstr={:?} post-expstr bitpos: {}", cplexpstr, &chexpstr[0..nfchans], br.bit_position());
+        side.chexpstr[ch] = chexpstr[ch];
     }
     if bsi.lfeon {
         lfeexpstr = br.read_u32(1)? as u8;
     }
+    side.lfeexpstr = lfeexpstr;
     // chbwcod — only for non-coupled independent fbw channels with new exponents.
     let mut chbwcod = [0u8; MAX_FBW];
     for ch in 0..nfchans {
         if chexpstr[ch] != 0 && !state.channels[ch].in_coupling {
             chbwcod[ch] = br.read_u32(6)? as u8;
+            side.chbwcod[ch] = chbwcod[ch];
             if chbwcod[ch] > 60 {
                 return Err(Error::invalid("ac3: chbwcod > 60"));
             }
@@ -488,8 +621,11 @@ fn parse_audblk(
         }
     }
 
-    // --- bit allocation parametric side-info ---
+    // §5.4.3.30 baie — bit-allocation info exists (1 bit).
+    // §5.4.3.31-35 sdcycod/fdcycod/sgaincod/dbpbcod/floorcod parametric
+    // masking words, present iff baie.
     let baie = br.read_u32(1)? != 0;
+    side.baie = baie;
     if baie {
         state.sdcycod = br.read_u32(2)? as u8;
         state.fdcycod = br.read_u32(2)? as u8;
@@ -497,36 +633,44 @@ fn parse_audblk(
         state.dbpbcod = br.read_u32(2)? as u8;
         state.floorcod = br.read_u32(3)? as u8;
     }
+    // §5.4.3.36 snroffste — SNR-offset block flag (1 bit).
     let snroffste = br.read_u32(1)? != 0;
-    if false && blk == 0 {
-        eprintln!("bitpos before snroffst: {}", br.bit_position());
-    }
+    side.snroffste = snroffste;
     if snroffste {
+        // §5.4.3.37 csnroffst — coarse SNR offset (6 bits).
         state.snroffst_coarse = br.read_u32(6)? as u8;
         if state.cpl_in_use {
+            // §5.4.3.38 cplfsnroffst (4 bits), §5.4.3.39 cplfgaincod (3 bits).
             state.cpl_fsnroffst = br.read_u32(4)? as u8;
             state.cpl_fgaincod = br.read_u32(3)? as u8;
         }
         for ch in 0..nfchans {
+            // §5.4.3.40 fsnroffst[ch] (4 bits), §5.4.3.41 fgaincod[ch] (3 bits).
             state.fsnroffst[ch] = br.read_u32(4)? as u8;
             state.fgaincod[ch] = br.read_u32(3)? as u8;
         }
         if bsi.lfeon {
+            // §5.4.3.42 lfefsnroffst (4 bits), §5.4.3.43 lfefgaincod (3 bits).
             state.lfefsnroffst = br.read_u32(4)? as u8;
             state.lfefgaincod = br.read_u32(3)? as u8;
         }
     }
+    // §5.4.3.44 cplleake — coupling leak init flag (1 bit).
+    // §5.4.3.45 cplfleak (3 bits), §5.4.3.46 cplsleak (3 bits).
     if state.cpl_in_use {
         let cplleake = br.read_u32(1)? != 0;
+        side.cplleake = cplleake;
         if cplleake {
             state.cpl_fleak = br.read_u32(3)? as u8;
             state.cpl_sleak = br.read_u32(3)? as u8;
         }
     }
 
-    // --- delta bit allocation (parse-and-apply during bit allocation) ---
+    // §5.4.3.47 deltbaie — delta bit allocation info exists (1 bit).
+    // Enclosed §5.4.3.48-57 are parse-and-discard until the §7.2.2.8
+    // delta-offset application is implemented.
     let deltbaie = br.read_u32(1)? != 0;
-    // For now we parse but do not retain delta offsets; default masking.
+    side.deltbaie = deltbaie;
     if deltbaie {
         let mut cpldeltbae = 0u32;
         if state.cpl_in_use {
@@ -556,10 +700,14 @@ fn parse_audblk(
         }
     }
 
-    // --- skip bytes ---
+    // §5.4.3.58 skiple — skip-length-exists flag (1 bit).
+    // §5.4.3.59 skipl — skip length in *bytes* (9 bits).
+    // §5.4.3.60 skipfld — `skipl × 8` skip-data bits.
     let skiple = br.read_u32(1)? != 0;
+    side.skiple = skiple;
     if skiple {
         let skipl = br.read_u32(9)?;
+        side.skipl = skipl as u16;
         br.skip(skipl * 8)?;
     }
 
