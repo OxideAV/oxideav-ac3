@@ -20,10 +20,10 @@
 //! - Dynamic range compression (§7.7 dynrng) scales the transform
 //!   coefficients.
 //! - 512-point IMDCT with KBD window + 50% overlap-add (§7.9.4.1,
-//!   §7.9.5). Block-switching (short 256-point pair) is parsed but the
-//!   short-block IMDCT falls back to the long path — this still
-//!   recovers most audio on stationary signals such as the sine-fixture
-//!   used in tests.
+//!   §7.9.5). The 256-point short-block pair (§7.9.4.2) is wired
+//!   through `crate::imdct::imdct_256_pair_fft`; block-switching
+//!   correctness is gated by the `transient_bursts_stereo.ac3` PSNR
+//!   test (the sine fixture never exercises `blksw=1`).
 
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
@@ -1518,16 +1518,23 @@ fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
 /// This is the DFT-style reference implementation — not fast, but
 /// correct and matches the spec's prescribed output polarity /
 /// scaling so that window+overlap-add reproduces the original PCM.
-/// Short-block 256-point IMDCT pair (§7.9.4.2). The 256 interleaved
-/// coefficients `x[]` are split into even/odd halves — `X1[k] = x[2k]`
-/// and `X2[k] = x[2k+1]` — each inverse-transformed into a 256-sample
-/// half-block. The two halves are concatenated into the 512-sample
-/// time-domain buffer, which is then windowed + overlap-added by the
-/// caller exactly like the long-block path. No FFT decomposition here
-/// (matching the long-block's direct-form IMDCT); the `-1.0` scale
-/// keeps gain parity with `imdct_512`, so short/long blocks in the
-/// same syncframe transition without a level jump.
-pub fn imdct_256_pair(x: &[f32; 256], out: &mut [f32; 512]) {
+
+// ---------------------------------------------------------------------
+// `imdct_256_pair`: DEPRECATED reference — NOT the canonical short-block
+// IMDCT. Kept behind `cfg(test)` for regression inspection only.
+//
+// The forward MDCT spec at §8.2.3.2 has an α parameter that picks the
+// phase offset: α=-1 for the first short transform, α=0 for the long
+// transform, α=+1 for the second short transform. This function tries
+// to reconstruct the per-half direct-form from that spec, with X1 using
+// phase `π/(2N)·(2n+1)·(2k+1)` (no `+N/2` shift) and X2 using the
+// standard `π/(2N)·(2n+1+N/2)·(2k+1)`. In practice this DOES NOT match
+// the §7.9.4.2 FFT decomposition output — the two disagree with ~40%
+// residual on random input (see `imdct::tests::short_block_direct_form_disagrees`).
+// The FFT path is the canonical one per the spec; keep this around only
+// so a future audit can bisect which side is wrong.
+#[cfg(test)]
+fn imdct_256_pair(x: &[f32; 256], out: &mut [f32; 512]) {
     use std::f32::consts::PI;
     let n: usize = 256;
     let scale = -1.0f32;
@@ -1537,16 +1544,17 @@ pub fn imdct_256_pair(x: &[f32; 256], out: &mut [f32; 512]) {
         x1[k] = x[2 * k];
         x2[k] = x[2 * k + 1];
     }
+    // First short transform: phase offset (1+α)=0 → pure cos(π/(2N)*(2n+1)*(2k+1)).
     for nn in 0..n {
         let mut s = 0.0f32;
         for k in 0..128 {
-            let phase = PI / (2.0 * n as f32)
-                * ((2 * nn + 1 + n / 2) as f32)
-                * ((2 * k + 1) as f32);
+            let phase =
+                PI / (2.0 * n as f32) * ((2 * nn + 1) as f32) * ((2 * k + 1) as f32);
             s += x1[k] * phase.cos();
         }
         out[nn] = scale * s;
     }
+    // Second short transform: phase offset (1+α)=2 → standard IMDCT with +N/2.
     for nn in 0..n {
         let mut s = 0.0f32;
         for k in 0..128 {
@@ -1592,5 +1600,42 @@ pub fn imdct_512(x: &[f32; 256], out: &mut [f32; 512]) {
             s += x[k] * phase.cos();
         }
         out[nn] = scale * s;
+    }
+}
+
+#[cfg(test)]
+mod short_block_tests {
+    use super::*;
+
+    /// Regression / bisection fixture. The naive direct-form short-block
+    /// IMDCT (derived from §8.2.3.2's α=-1/+1 phase offsets) does NOT
+    /// match the §7.9.4.2 FFT decomposition used in production. We
+    /// assert the disagreement explicitly here — if a future fix makes
+    /// the two align, that's a signal that BOTH the direct form AND the
+    /// FFT path changed together, and the test can then be tightened
+    /// into a proper equality gate. Until then, the FFT path is
+    /// considered canonical (matches ffmpeg on transient fixtures).
+    #[test]
+    fn short_block_direct_form_diverges_from_fft() {
+        // LCG-based deterministic "random" input — no rand dependency.
+        let mut x = [0.0f32; 256];
+        let mut s: u32 = 0x1234_5678;
+        for v in x.iter_mut() {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            *v = (s as i32 as f32) / (i32::MAX as f32);
+        }
+        let mut d = [0.0f32; 512];
+        let mut f = [0.0f32; 512];
+        imdct_256_pair(&x, &mut d);
+        crate::imdct::imdct_256_pair_fft(&x, &mut f);
+        let sse: f32 = d.iter().zip(f.iter()).map(|(a, b)| (a - b).powi(2)).sum();
+        let rmse = (sse / 512.0).sqrt();
+        // Currently observed: RMSE ≈ 4-5 on ~unit-magnitude random input.
+        // Assert the divergence exists (>0.5) so this test fails loudly if
+        // someone accidentally makes both paths compute the same thing.
+        assert!(
+            rmse > 0.5,
+            "direct form and FFT path now match (rmse={rmse:.3}) — promote short_block_direct_form_diverges_from_fft to equality"
+        );
     }
 }

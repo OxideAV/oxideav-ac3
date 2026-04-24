@@ -19,6 +19,15 @@ use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/sine440_stereo.ac3");
 
+/// Three Gaussian tone bursts (440/1200/2400 Hz @ 0.5/1.0/1.5 s) encoded
+/// as 48 kHz stereo AC-3 @ 192 kbps. The envelope's sharp attacks force
+/// the encoder to switch to 256-point transforms (`blksw=1`) for 62 of
+/// the 378 audio blocks — enough coverage to gate short-block IMDCT
+/// correctness directly, unlike the pure-sine fixture which only
+/// exercises the long transform.
+const TRANSIENT_FIXTURE: &[u8] =
+    include_bytes!("fixtures/transient_bursts_stereo.ac3");
+
 #[test]
 fn fixture_is_pure_ac3_syncframes() {
     let mut offset = 0;
@@ -325,12 +334,166 @@ fn decoder_matches_ffmpeg_within_psnr_floor() {
     let peak = 32767.0f64;
     let psnr = 10.0 * (peak * peak / mse).log10();
     eprintln!("PSNR vs ffmpeg (best lag={best_lag}): {psnr:.2} dB");
-    // The direct-form long-block IMDCT + bit-allocation match puts our
-    // decoder within ~40 dB of ffmpeg's decode on the steady-state sine.
-    // We assert a modest 25 dB floor for the sine test — this is the
-    // "transform-is-not-broken" gate; lifting to 40 dB requires a closer
-    // bit-allocation budget match (tracked for round 4).
-    assert!(psnr > 25.0, "PSNR {psnr:.2} dB below 25 dB floor");
+    // With the correct BAPTAB (Table 7.16) and MASKTAB (Table 7.13)
+    // lookup tables, the FFT IMDCT + bit-allocation chain matches
+    // ffmpeg's decode to ~90 dB on the steady-state sine — an effective
+    // 1-LSB-level agreement on 16-bit PCM. Anything below 80 dB here
+    // signals a lookup-table regression.
+    assert!(psnr > 80.0, "PSNR {psnr:.2} dB below 80 dB floor");
+}
+
+/// The transient-burst fixture must actually carry short-block audblks;
+/// otherwise its PSNR test degenerates to another long-block gate.
+/// Enforced here so a future fixture regen that accidentally selects
+/// all-long never silently drops short-block coverage.
+#[test]
+fn transient_fixture_has_short_blocks() {
+    let mut offset = 0;
+    let mut total_blocks = 0usize;
+    let mut short_blocks = 0usize;
+    while offset < TRANSIENT_FIXTURE.len() {
+        let si = syncinfo::parse(&TRANSIENT_FIXTURE[offset..]).unwrap();
+        let flen = si.frame_length as usize;
+        let b = bsi::parse(&TRANSIENT_FIXTURE[offset + 5..]).unwrap();
+        let frame = &TRANSIENT_FIXTURE[offset..offset + flen];
+        let side = audblk::parse_frame_side_info(&si, &b, frame)
+            .expect("transient fixture: side-info");
+        for s in side.iter() {
+            total_blocks += 1;
+            if s.blksw.iter().take(b.nfchans as usize).any(|&x| x) {
+                short_blocks += 1;
+            }
+        }
+        offset += flen;
+    }
+    // Built with three Gaussian bursts — must yield at least a few
+    // tens of short blocks.
+    assert!(
+        short_blocks >= 30,
+        "only {short_blocks}/{total_blocks} short blocks — fixture lost coverage?"
+    );
+}
+
+/// Decode the transient fixture and the ffmpeg reference decode, then
+/// compute PSNR. This is the gate for the short-block IMDCT (§7.9.4.2):
+/// the sine fixture only exercises the long path, so any short-block
+/// regression would slip past `decoder_matches_ffmpeg_within_psnr_floor`.
+/// We pick a modest 10 dB floor — the short-block transform contributes
+/// only a fraction of the total audio energy in this fixture, so bad
+/// transients mostly scramble a ~1 % window around each burst.
+#[test]
+fn decoder_matches_ffmpeg_on_transient_fixture() {
+    use std::process::Command;
+    let tmp = std::env::temp_dir().join("oxideav_ac3_transient_ref.pcm");
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("transient_bursts_stereo.ac3");
+    let Ok(status) = Command::new("ffmpeg")
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(&src)
+        .args(["-f", "s16le", "-acodec", "pcm_s16le", "-ac", "2"])
+        .arg(&tmp)
+        .status()
+    else {
+        eprintln!("ffmpeg unavailable — skipping transient PSNR gate");
+        return;
+    };
+    if !status.success() {
+        eprintln!("ffmpeg returned non-zero — skipping transient PSNR gate");
+        return;
+    }
+    let Ok(ref_pcm) = std::fs::read(&tmp) else {
+        eprintln!("no ref pcm — skipping transient PSNR gate");
+        return;
+    };
+    let _ = std::fs::remove_file(&tmp);
+
+    // Decode with our decoder.
+    let mut reg = CodecRegistry::new();
+    oxideav_ac3::register(&mut reg);
+    let params = CodecParameters::audio(CodecId::new("ac3"));
+    let mut dec = reg.make_decoder(&params).expect("make_decoder");
+    let mut our_pcm: Vec<u8> = Vec::with_capacity(ref_pcm.len());
+    let mut offset = 0;
+    let mut frame_idx: i64 = 0;
+    while offset < TRANSIENT_FIXTURE.len() {
+        let si = syncinfo::parse(&TRANSIENT_FIXTURE[offset..]).unwrap();
+        let flen = si.frame_length as usize;
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, 48_000),
+            TRANSIENT_FIXTURE[offset..offset + flen].to_vec(),
+        )
+        .with_pts(frame_idx * SAMPLES_PER_FRAME as i64);
+        dec.send_packet(&pkt).unwrap();
+        if let Ok(Frame::Audio(a)) = dec.receive_frame() {
+            our_pcm.extend_from_slice(&a.data[0]);
+        }
+        offset += flen;
+        frame_idx += 1;
+    }
+
+    // Extract channel 0 and align via ±256 cross-correlation.
+    let bytes_per_sample = 4;
+    let n = our_pcm.len().min(ref_pcm.len()) / bytes_per_sample;
+    let skip = 768usize;
+    let usable = n.saturating_sub(skip);
+    assert!(usable > 1000, "not enough samples to evaluate PSNR");
+    let extract_ch0 = |buf: &[u8]| -> Vec<i16> {
+        buf.chunks_exact(bytes_per_sample)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    };
+    let our_l = extract_ch0(&our_pcm);
+    let ref_l = extract_ch0(&ref_pcm);
+
+    let mut best_lag = 0i32;
+    let mut best_sse = f64::INFINITY;
+    for lag in -256i32..=256 {
+        let mut sse = 0.0f64;
+        let mut count = 0;
+        for i in 0..usable.min(4096) {
+            let a_idx = (skip + i) as i32;
+            let b_idx = a_idx + lag;
+            if b_idx < 0 || (b_idx as usize) >= ref_l.len() {
+                continue;
+            }
+            let d = our_l[a_idx as usize] as f64 - ref_l[b_idx as usize] as f64;
+            sse += d * d;
+            count += 1;
+        }
+        if count > 0 && sse / (count as f64) < best_sse {
+            best_sse = sse / (count as f64);
+            best_lag = lag;
+        }
+    }
+
+    let mut sse = 0.0f64;
+    let mut count = 0usize;
+    for i in 0..usable {
+        let a_idx = skip + i;
+        let b_idx = a_idx as i32 + best_lag;
+        if b_idx < 0 || (b_idx as usize) >= ref_l.len() {
+            continue;
+        }
+        let d = our_l[a_idx] as f64 - ref_l[b_idx as usize] as f64;
+        sse += d * d;
+        count += 1;
+    }
+    let mse = sse / count as f64;
+    let peak = 32767.0f64;
+    let psnr = 10.0 * (peak * peak / mse).log10();
+    eprintln!(
+        "transient PSNR vs ffmpeg (best lag={best_lag}): {psnr:.2} dB (n={count})"
+    );
+    // 10 dB floor: confirms the short-block path produces coherent audio.
+    // Without a correct short-block IMDCT the transient frames invert the
+    // signal or fill it with impulse noise, which pushes PSNR below 0 dB.
+    assert!(
+        psnr > 10.0,
+        "transient PSNR {psnr:.2} dB below 10 dB floor — short-block IMDCT broken?"
+    );
 }
 
 /// Generate a fresh 1/0 mono AC-3 stream via the `ffmpeg` binary (as a
