@@ -297,12 +297,17 @@ fn decoder_matches_ffmpeg_within_psnr_floor() {
     // a small cross-correlation across a window. Both should carry the
     // same 440 Hz tone once priming settles; the tone repeats every ~109
     // samples @ 48 kHz, so search ±256 samples.
+    // Cross-correlation lag search across the full usable region. The
+    // narrow `usable.min(2048)` window used previously was sufficient for
+    // a pure sine (the lag is genuinely 0 here once priming settles) but
+    // sets a bad pattern for periodic signals — see the round-14 fix in
+    // `decoder_matches_ffmpeg_on_transient_fixture` for the failure mode.
     let mut best_lag = 0i32;
     let mut best_sse = f64::INFINITY;
     for lag in -256i32..=256 {
         let mut sse = 0.0f64;
         let mut count = 0;
-        for i in 0..usable.min(2048) {
+        for i in 0..usable {
             let a_idx = (skip + i) as i32;
             let b_idx = a_idx + lag;
             if b_idx < 0 || (b_idx as usize) >= ref_l.len() {
@@ -461,12 +466,28 @@ fn decoder_matches_ffmpeg_on_transient_fixture() {
     let our_l = extract_ch0(&our_pcm);
     let ref_l = extract_ch0(&ref_pcm);
 
+    // Cross-correlation lag search.
+    //
+    // ROUND-14 BUG FIX: previously this search used only the first 4096
+    // samples of the aligned region to pick the best lag. The transient
+    // fixture's pre-burst region is a near-pure 440 Hz sine (period ≈ 109
+    // samples @ 48 kHz), so any lag of the form `k * 109 + true_lag` is
+    // an equally good local minimum within that window. The search would
+    // settle on lag = 252 (≈ 2.3 cycles) instead of the true lag = 0,
+    // which then made the *whole-fixture* PSNR computation align ref to
+    // our PCM with a 252-sample shift through the burst. Local-RMS
+    // analysis at the 252-shift gives "transient PSNR" 15.55 dB; at the
+    // true lag = 0 the same computation gives ~92.7 dB (essentially the
+    // 1-LSB f32-quantization floor).
+    //
+    // The fix: search across the *entire* usable region. The transient
+    // burst breaks the sinusoidal periodicity and disambiguates the lag.
     let mut best_lag = 0i32;
     let mut best_sse = f64::INFINITY;
     for lag in -256i32..=256 {
         let mut sse = 0.0f64;
         let mut count = 0;
-        for i in 0..usable.min(4096) {
+        for i in 0..usable {
             let a_idx = (skip + i) as i32;
             let b_idx = a_idx + lag;
             if b_idx < 0 || (b_idx as usize) >= ref_l.len() {
@@ -498,12 +519,14 @@ fn decoder_matches_ffmpeg_on_transient_fixture() {
     let peak = 32767.0f64;
     let psnr = 10.0 * (peak * peak / mse).log10();
     eprintln!("transient PSNR vs ffmpeg (best lag={best_lag}): {psnr:.2} dB (n={count})");
-    // 10 dB floor: confirms the short-block path produces coherent audio.
-    // Without a correct short-block IMDCT the transient frames invert the
-    // signal or fill it with impulse noise, which pushes PSNR below 0 dB.
+    // With the bug fix above, the transient fixture should match ffmpeg
+    // to ~90 dB — essentially 1-LSB-level agreement on s16 PCM. The
+    // dominant residual is f32 round-off accumulated through the IMDCT.
+    // Anything below 80 dB now indicates a real DSP regression, not a
+    // periodic-lag-search artefact.
     assert!(
-        psnr > 10.0,
-        "transient PSNR {psnr:.2} dB below 10 dB floor — short-block IMDCT broken?"
+        psnr > 80.0,
+        "transient PSNR {psnr:.2} dB below 80 dB floor — DSP regression?"
     );
 }
 
