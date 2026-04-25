@@ -316,6 +316,73 @@ impl Ac3Encoder {
         // Use chbwcod=60 → end_mant=253 (full bandwidth minus the top 3 bins).
         let chbwcod: u8 = 60;
         let end_mant: usize = 37 + 3 * (chbwcod as usize + 12);
+
+        // Rematrixing decision (§7.5.3) — only meaningful for 2/0 stereo.
+        // For each block and each of the 4 rematrix bands (Table 7.25
+        // "Coupling Not in Use" since this encoder doesn't emit coupling
+        // yet) compare Σ|L|² + Σ|R|² against Σ|L+R|² + Σ|L-R|² and pick
+        // the smaller-energy pair. When (L+R, L-R) wins we replace the L
+        // and R coefficients in that band with their sum/difference
+        // forms scaled by 0.5 — the spec's "transmitted left = 0.5*(L+R)"
+        // formula. The decoder reverses with `L = L'+R'`, `R = L'-R'`.
+        //
+        // Rationale for picking 0.5 vs leaving the unscaled sum:
+        //   * `L_recv = 0.5*(L+R)`, `R_recv = 0.5*(L-R)`
+        //   * `L_dec = L_recv + R_recv = 0.5*(L+R) + 0.5*(L-R) = L`  ✓
+        //
+        // The 0.5 keeps the rematrixed coefficient magnitudes in the
+        // same range as the original L/R, so quantiser exponents do
+        // not jump by a stage.
+        const REMAT_BANDS: [(usize, usize); 4] = [(13, 25), (25, 37), (37, 61), (61, 253)];
+        let nrematbd = if self.channels == 2 { 4 } else { 0 };
+        let mut rematflg: Vec<[bool; 4]> = vec![[false; 4]; BLOCKS_PER_FRAME];
+        if nrematbd > 0 {
+            for blk in 0..BLOCKS_PER_FRAME {
+                for (bnd_idx, &(lo, hi_full)) in REMAT_BANDS.iter().enumerate() {
+                    let hi = hi_full.min(end_mant);
+                    if lo >= hi {
+                        continue;
+                    }
+                    let mut e_l = 0.0f64;
+                    let mut e_r = 0.0f64;
+                    let mut e_s = 0.0f64;
+                    let mut e_d = 0.0f64;
+                    for bin in lo..hi {
+                        let l = coeffs[0][blk][bin] as f64;
+                        let r = coeffs[1][blk][bin] as f64;
+                        e_l += l * l;
+                        e_r += r * r;
+                        let s = l + r;
+                        let d = l - r;
+                        e_s += s * s;
+                        e_d += d * d;
+                    }
+                    // §7.5.3 picks the minimum-energy combination among the
+                    // 4 candidates {L, R, L+R, L-R}. Rematrix if the minimum
+                    // belongs to the {L+R, L-R} pair: that is, the smaller
+                    // of the sum/difference energies undercuts the smaller
+                    // of the L/R energies. The scaling-by-0.5 we apply on
+                    // the transmitted side only changes the magnitude — the
+                    // *relative* ranking is preserved, so we compare the
+                    // unscaled energies here.
+                    if e_s.min(e_d) < e_l.min(e_r) {
+                        rematflg[blk][bnd_idx] = true;
+                        for bin in lo..hi {
+                            let l = coeffs[0][blk][bin];
+                            let r = coeffs[1][blk][bin];
+                            coeffs[0][blk][bin] = 0.5 * (l + r);
+                            coeffs[1][blk][bin] = 0.5 * (l - r);
+                        }
+                    }
+                    if std::env::var("AC3_TRACE_REMAT_ENC").is_ok() {
+                        eprintln!(
+                            "REMAT-ENC blk={} bnd={} lo={} hi={} e_l={:.3e} e_r={:.3e} e_s={:.3e} e_d={:.3e} flg={}",
+                            blk, bnd_idx, lo, hi, e_l, e_r, e_s, e_d, rematflg[blk][bnd_idx]
+                        );
+                    }
+                }
+            }
+        }
         // Step 1: raw exponent extraction per block, per channel.
         for ch in 0..self.channels {
             for blk in 0..BLOCKS_PER_FRAME {
@@ -467,15 +534,19 @@ impl Ac3Encoder {
             } else {
                 bw.write_u32(0, 1); // reuse
             }
-            // rematstr (acmod == 2): block 0 sends "no rematrix" (rematstr=1, all flags=0).
-            if blk == 0 {
-                bw.write_u32(1, 1); // rematstr
-                                    // With cplinu=0 → 4 rematrix bands (Table 5.15).
-                for _ in 0..4 {
-                    bw.write_u32(0, 1);
+            // rematstr (acmod == 2): we refresh rematflg every block so the
+            // encoder can adapt the L/R vs L+R/L-R decision per block. Cost
+            // is 1 + nrematbd bits per block (5 bits at nrematbd=4) and the
+            // quality win on stereo material with varying inter-channel
+            // correlation is worth far more than that. With cplinu=0 we have
+            // 4 rematrix bands per Table 5.15. When the channel layout has no
+            // rematrix bands at all (e.g. mono — which this encoder does not
+            // currently emit) the field is omitted entirely.
+            if nrematbd > 0 {
+                bw.write_u32(1, 1); // rematstr — flags follow
+                for bnd in 0..nrematbd {
+                    bw.write_u32(rematflg[blk][bnd] as u32, 1);
                 }
-            } else {
-                bw.write_u32(0, 1); // no rematrix this block
             }
 
             // chexpstr: per-block strategy chosen above.
@@ -962,8 +1033,13 @@ fn overhead_bits_for(exp_strategies: &[u8; BLOCKS_PER_FRAME], end: usize, nchan:
         bits += nchan as u32 * 2 + 1;
         // cplstre + cplinu (block 0 only signals 2 bits, others 1 bit)
         bits += if s == 1 { 2 } else { 1 };
-        // rematstr(1); if block 0, 4 rematrix-band flags
-        bits += if s == 1 { 1 + 4 } else { 1 };
+        // rematstr (1 bit) + nrematbd flags. We emit rematstr=1 every block
+        // so the per-block decision can change; for acmod=2/0 with no
+        // coupling there are 4 rematrix bands per Table 5.15. For mono /
+        // other layouts the field is omitted entirely (handled by caller).
+        if nchan >= 2 {
+            bits += 1 + 4;
+        }
         // chexpstr × nchan (2 bits each)
         bits += 2 * nchan as u32;
         // chbwcod × nchan (6 bits) only when exp strategy != reuse
