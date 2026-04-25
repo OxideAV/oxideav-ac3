@@ -1,6 +1,6 @@
 //! Forward MDCT (Modified Discrete Cosine Transform) for AC-3 encoding.
 //!
-//! Per §8.2.3.2 (A/52:2018), the 512-sample-long AC-3 transform is
+//! Per §8.2.3.2 (A/52:2018), the AC-3 forward transform is
 //!
 //! ```text
 //!   X_D[k] = (-2/N) * sum_{n=0..N-1} x[n] *
@@ -8,10 +8,13 @@
 //!                  + (π/4) * (2k+1) * (1+α) )
 //! ```
 //!
-//! with N = 512 and α = 0 for the long transform (we do not emit
-//! block-switched short blocks here — the encoder always uses long
-//! blocks, matching the `blksw=0` path the decoder already handles
-//! most carefully).
+//! with **N = 512** for the long block (α = 0) and **two N = 256
+//! transforms** for a short-block pair. The pair is built with the
+//! same kernel offset on both halves (matching the decoder's FFT-path
+//! short-block IMDCT — see `crate::imdct::imdct_256_pair_fft` and the
+//! `(-yi, yr)` swap rationale documented there). The 128 coefficients
+//! from each short transform are interleaved into a single 256-coeff
+//! buffer per §7.9.4.2 step 1: `X[2k] = X1[k]`, `X[2k+1] = X2[k]`.
 //!
 //! The 256-coefficient output of this transform, when fed back through
 //! our [`super::audblk::imdct_512`] reference, recovers the windowed
@@ -51,6 +54,81 @@ pub fn mdct_512(input: &[f32; 512], output: &mut [f32; 256]) {
             s += input[nn] * phase.cos();
         }
         output[k] = scale * s;
+    }
+}
+
+/// 256-point forward MDCT used for one half of a short-block pair
+/// (§8.2.3.2). Both halves of the AC-3 short block share the same
+/// kernel — the decoder's FFT-path short IMDCT (`imdct_256_pair_fft`)
+/// applies the **same** `(-yi, yr, -yr, yi)` de-interleave pattern to
+/// short1 and short2 (see the swap rationale in `imdct.rs` around the
+/// `out[256+2*n]` lines), which means the forward step does the same.
+///
+/// The kernel is the standard MDCT-IV cosine `cos(π/(2N) * (2n+1) * (2k+1))`
+/// with N=256; this is the α=−1 form of §8.2.3.2 with the constant
+/// `+ (π/4)·(2k+1)·(1+α)` term collapsed to zero. The `-2/N` scale
+/// pairs with the decoder's IMDCT scale + overlap-add gain so the
+/// analysis-synthesis chain lands on unity gain when run alongside
+/// the spec's KBD window.
+///
+/// `input`  : 256 windowed time-domain samples (one half of the
+///            short-block pair).
+/// `output` : 128 MDCT coefficients.
+fn mdct_256_half(input: &[f32; 256], output: &mut [f32; 128]) {
+    let n: usize = 256;
+    // α=-1 form (no `+N/2` time shift) — matches the FFT-path
+    // inverse for *both* halves, which uses the short1 indexing
+    // pattern on short2 as well (see the `(-yi, yr)` swap rationale
+    // in `imdct.rs`).
+    //
+    //   X[k] = (-2/N) * Σ x[n] * cos( π/(2N) * (2n+1) * (2k+1) )
+    let scale: f32 = -2.0 / n as f32;
+    let pi_over_2n = PI / (2.0 * n as f32);
+    for k in 0..128 {
+        let mut s = 0.0f32;
+        let two_k_plus_1 = (2 * k + 1) as f32;
+        for nn in 0..n {
+            let phase = pi_over_2n * (2 * nn + 1) as f32 * two_k_plus_1;
+            s += input[nn] * phase.cos();
+        }
+        output[k] = scale * s;
+    }
+}
+
+/// Forward short-block MDCT pair (§8.2.3.2 + §7.9.4.2).
+///
+/// The 512-sample windowed input is split into two 256-sample halves;
+/// each half is run through [`mdct_256_half`] to produce 128
+/// coefficients, then the two coefficient sets are **interleaved** per
+/// §7.9.4.2 step 1: `X[2k] = X1[k]`, `X[2k+1] = X2[k]`. This is the
+/// exact layout `imdct_256_pair_fft` reads on the decoder side.
+///
+/// Note that AC-3's per-channel windowing differs slightly between
+/// long-only / short-only / long-to-short / short-to-long block-type
+/// transitions (§7.9.5). For now the encoder applies the symmetric
+/// 512-point KBD window in **all** cases — long-only and short-only —
+/// which is identical to the long-only window the decoder applies
+/// after IMDCT regardless of `blksw[ch]`. The transition cases (where
+/// one neighbour is long and the other short) introduce a small TDAC
+/// mismatch in the overlap region; the encoder's transient-detection
+/// heuristic deliberately picks short blocks in *runs* of 1+ blocks
+/// to keep transitions outside the burst peak's overlap window, which
+/// keeps the residual below the per-block quantisation noise floor.
+///
+/// `input`  : 512 windowed time-domain samples (covers two short halves).
+/// `output` : 256 interleaved MDCT coefficients.
+pub fn mdct_256_pair(input: &[f32; 512], output: &mut [f32; 256]) {
+    let mut h1 = [0.0f32; 256];
+    let mut h2 = [0.0f32; 256];
+    h1.copy_from_slice(&input[..256]);
+    h2.copy_from_slice(&input[256..]);
+    let mut x1 = [0.0f32; 128];
+    let mut x2 = [0.0f32; 128];
+    mdct_256_half(&h1, &mut x1);
+    mdct_256_half(&h2, &mut x2);
+    for k in 0..128 {
+        output[2 * k] = x1[k];
+        output[2 * k + 1] = x2[k];
     }
 }
 
@@ -146,5 +224,80 @@ mod tests {
         // a few 1e-3 worst-case error is acceptable here.
         assert!(worst < 0.01, "worst {worst} too large");
         assert!(rms < 5e-3, "rms {rms} too large");
+    }
+
+    /// The 128 inverse-basis vectors for a short-block half (X1) span a
+    /// 128-dimensional subspace of R^256. The encoder's forward MDCT is
+    /// the orthogonal projector onto that subspace; the per-half
+    /// MDCT-then-IMDCT round-trip recovers exactly the projection of
+    /// the input. We assert the basis is orthogonal with uniform norm
+    /// `N/2 = 128` here so any future change to the IMDCT polarity /
+    /// scale is caught at this gate (and the encoder's scale stays
+    /// derivable as `1/‖basis‖² = 2/N`).
+    #[test]
+    fn imdct_short_basis_is_uniform_orthogonal() {
+        let mut basis = vec![[0.0f32; 256]; 128];
+        for k in 0..128 {
+            let mut x = [0.0f32; 256];
+            x[2 * k] = 1.0;
+            let mut t = [0.0f32; 512];
+            crate::imdct::imdct_256_pair_fft(&x, &mut t);
+            basis[k].copy_from_slice(&t[..256]);
+        }
+        let mut max_off = 0.0f32;
+        let mut min_norm = f32::INFINITY;
+        let mut max_norm = 0.0f32;
+        for k in 0..128 {
+            let n: f32 = basis[k].iter().map(|&v| v * v).sum();
+            min_norm = min_norm.min(n);
+            max_norm = max_norm.max(n);
+            for j in (k + 1)..128 {
+                let dot: f32 = basis[k]
+                    .iter()
+                    .zip(basis[j].iter())
+                    .map(|(&a, &b)| a * b)
+                    .sum();
+                max_off = max_off.max(dot.abs());
+            }
+        }
+        // Norm = N/2 = 128 (basis vectors are unit-amplitude cosines).
+        assert!((min_norm - 128.0).abs() < 0.01, "min_norm={min_norm}");
+        assert!((max_norm - 128.0).abs() < 0.01, "max_norm={max_norm}");
+        assert!(max_off < 0.01, "off-diagonal {max_off}");
+    }
+
+    /// End-to-end forward + inverse round-trip on a TDAC-compatible
+    /// input. Because the per-half MDCT only spans a 128-dim subspace
+    /// of R^256, we feed an input that is *already in the subspace* —
+    /// constructed by inverting an arbitrary 128-coeff bin pattern.
+    /// The forward must then exactly recover those coefficients, and
+    /// re-inverting must reproduce the original signal to f32
+    /// precision.
+    #[test]
+    fn mdct_256_pair_recovers_subspace_signal() {
+        // Pick an arbitrary 128-coefficient pattern for short1 +
+        // short2 (X2 chosen to be a different low-order pattern so
+        // the full 256 input has harmonic content in both halves).
+        let mut x_target = [0.0f32; 256];
+        for k in 0..16 {
+            x_target[2 * k] = 0.7 * (k as f32).sin();
+            x_target[2 * k + 1] = 0.5 * (k as f32 * 1.3).cos();
+        }
+        // Inverse → 512-sample signal (which lives in the subspace
+        // by construction).
+        let mut sig = [0.0f32; 512];
+        crate::imdct::imdct_256_pair_fft(&x_target, &mut sig);
+        // Forward → should recover x_target exactly.
+        let mut x_back = [0.0f32; 256];
+        mdct_256_pair(&sig, &mut x_back);
+        let mut max_err: f32 = 0.0;
+        for k in 0..256 {
+            max_err = max_err.max((x_back[k] - x_target[k]).abs());
+        }
+        eprintln!("subspace round-trip: max coeff err = {max_err:.6e}");
+        assert!(
+            max_err < 1e-3,
+            "forward/inverse mismatch on basis-subspace input: {max_err}"
+        );
     }
 }
