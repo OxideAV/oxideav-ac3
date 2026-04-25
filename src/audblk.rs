@@ -1034,7 +1034,7 @@ fn dynrng_to_linear(dynrng: u8) -> f32 {
 // for both "coupling not in use" and "cplbegf > 2". Collapsing them would
 // obscure the table structure for future audits.
 #[allow(clippy::if_same_then_else)]
-fn remat_band_count(cplinu: bool, cplbegf: u8) -> usize {
+pub(crate) fn remat_band_count(cplinu: bool, cplbegf: u8) -> usize {
     if !cplinu {
         4
     } else if cplbegf > 2 {
