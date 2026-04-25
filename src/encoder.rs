@@ -23,8 +23,8 @@
 //! implementation produces a syntactically-valid syncframe for the
 //! 48 kHz stereo 192 kbps mode.
 
-use oxideav_codec::Encoder;
 use oxideav_core::bits::BitWriter;
+use oxideav_core::Encoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };

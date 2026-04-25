@@ -12,7 +12,7 @@
 use std::process::Command;
 
 use oxideav_ac3::downmix::{Downmix, DownmixMode};
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
 /// Test content: 0.5 s stereo sine burst mixed against a quiet pink

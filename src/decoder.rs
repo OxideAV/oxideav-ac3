@@ -7,7 +7,7 @@
 //! overlap-add across audio blocks. The per-frame output is 1536 S16
 //! samples per channel exactly as specified by §8.2.1.2.
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };

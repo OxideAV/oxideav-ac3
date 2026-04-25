@@ -14,7 +14,7 @@
 
 use oxideav_ac3::audblk::{self, BLOCKS_PER_FRAME};
 use oxideav_ac3::{bsi, decoder::SAMPLES_PER_FRAME, syncinfo};
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/sine440_stereo.ac3");

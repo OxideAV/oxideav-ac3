@@ -7,7 +7,7 @@ use std::fs;
 use std::process::Command;
 
 use oxideav_ac3::{bsi, decoder::SAMPLES_PER_FRAME, syncinfo};
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
