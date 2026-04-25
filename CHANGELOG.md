@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.1...v0.0.2) - 2026-04-25
+
+### Fixed
+
+- drop crc2 residue debug_assert (wrong invariant)
+
+### Other
+
+- drop oxideav-codec/oxideav-container shims, import from oxideav-core
+- encoder quality lift — group-synced mantissa emit + per-block D15 refresh
+- clippy sweep — allows for approx_constant + needless_range_loop
+- clippy sweep in audblk — auto-fix + spec-faithful allows
+- clippy sweep — unnecessary_cast, identity_op, needless_range_loop
+- cargo fmt sweep (14 files)
+- document round-6 transient-burst PSNR investigation
+- fix §7.9.4.2 short2 IMDCT TDAC — restore antisymmetric upper half
+- fix BAPTAB/MASKTAB/LATAB off-by-ones, add transient PSNR gate
+- FFT-backed 512-pt + 256-pt IMDCT (§7.9.4) + PSNR gate
+- §7.8 downmix matrix (3/2, 3/1, 2/1 → stereo/mono)
+- parse_frame_side_info helper + fixture-backed §5.4.3 tests
+- annotate audblk parser with §5.4.3 clause citations + side-info struct
+- ac3 encoder: solve crc1 via GF(2) Gaussian elimination
+- ac3 encoder: encode_sine + check_stream examples, preprocess comment
+- short-block 256-point IMDCT + bap=0 dither
+- ac3 encoder: register in CodecRegistry as make_encoder
+- fix IMDCT scale + zero stale coeffs, RMS within 3% of ffmpeg
+- IMDCT overlap-add applies spec factor-of-2 scaling
+- add audio-block DSP pipeline (exp, bit-alloc, mantissa, IMDCT)
+- add bit-allocation / mantissa / window / hth tables
+- switch workflows to master branch
+
 ### Fixed
 
 - `BAPTAB` (Table 7.16): off-by-one at positions 26 and 30 that was
