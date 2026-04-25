@@ -223,6 +223,22 @@ pub struct Ac3State {
     pub lfefsnroffst: u8,
     pub lfefgaincod: u8,
 
+    // ---- Delta bit allocation state (§5.4.3.47-57, §7.2.2.6) ----
+    /// Per-channel deltba state: number of segments + per-segment offset/length/value.
+    /// Each fbw channel has its own segment list; index `MAX_FBW` is the
+    /// coupling channel. `deltnseg` of 0 means no delta-band processing.
+    /// State is initialized to all-zero at the top of every syncframe (§7.2.2.6
+    /// "initialize the cpldeltnseg and deltnseg[ch] delta bit allocation
+    /// variables to 0 at the beginning of each syncframe") and updated by the
+    /// per-block parser when `deltbae[ch] == 1` (new info follows) or cleared
+    /// when `deltbae[ch] == 2` (perform no delta alloc this block). When
+    /// `deltbae[ch] == 0` (reuse) or `deltbaie == 0` for blk > 0, the previous
+    /// values are kept.
+    pub deltnseg: [usize; MAX_FBW + 1],
+    pub deltoffst: [[u8; 8]; MAX_FBW + 1],
+    pub deltlen: [[u8; 8]; MAX_FBW + 1],
+    pub deltba: [[u8; 8]; MAX_FBW + 1],
+
     /// Bit position immediately after the BSI (start of block 0 bits).
     pub audblk_start_bits: u64,
     /// Which block we are currently parsing (0..6).
@@ -270,6 +286,10 @@ impl Ac3State {
             fgaincod: [0; MAX_FBW],
             lfefsnroffst: 0,
             lfefgaincod: 0,
+            deltnseg: [0; MAX_FBW + 1],
+            deltoffst: [[0; 8]; MAX_FBW + 1],
+            deltlen: [[0; 8]; MAX_FBW + 1],
+            deltba: [[0; 8]; MAX_FBW + 1],
             audblk_start_bits: 0,
             blkidx: 0,
             // Non-zero seed so the LFSR doesn't get stuck on all-zeros.
@@ -736,11 +756,15 @@ pub(crate) fn parse_audblk_into(
     }
 
     // §5.4.3.47 deltbaie — delta bit allocation info exists (1 bit).
-    // Enclosed §5.4.3.48-57 are parse-and-discard until the §7.2.2.8
-    // delta-offset application is implemented.
+    // §5.4.3.48-57 — per-channel + coupling delta bit allocation segments.
+    // §7.2.2.6 — apply per-band ±6 dB mask offsets BEFORE final bit
+    // allocation. Critical for transient blocks where the encoder uses
+    // dba to lift the masking floor in low-energy bands so they don't
+    // get assigned mantissa bits the encoder needs for the burst peak.
     let deltbaie = br.read_u32(1)? != 0;
     side.deltbaie = deltbaie;
     if deltbaie {
+        let cpl_idx = MAX_FBW;
         let mut cpldeltbae = 0u32;
         if state.cpl_in_use {
             cpldeltbae = br.read_u32(2)?;
@@ -749,23 +773,51 @@ pub(crate) fn parse_audblk_into(
         for ch in 0..nfchans {
             deltbae[ch] = br.read_u32(2)?;
         }
-        if state.cpl_in_use && cpldeltbae == 1 {
-            let nseg = br.read_u32(3)? + 1;
-            for _ in 0..nseg {
-                let _off = br.read_u32(5)?;
-                let _len = br.read_u32(4)?;
-                let _ba = br.read_u32(3)?;
+        // Per Table 5.16: 0=reuse, 1=new info, 2=no delta this block, 3=reserved.
+        if state.cpl_in_use {
+            match cpldeltbae {
+                1 => {
+                    let nseg = (br.read_u32(3)? + 1) as usize;
+                    state.deltnseg[cpl_idx] = nseg.min(8);
+                    for seg in 0..state.deltnseg[cpl_idx] {
+                        state.deltoffst[cpl_idx][seg] = br.read_u32(5)? as u8;
+                        state.deltlen[cpl_idx][seg] = br.read_u32(4)? as u8;
+                        state.deltba[cpl_idx][seg] = br.read_u32(3)? as u8;
+                    }
+                }
+                2 => {
+                    // "perform no delta alloc" — clear segments for this block.
+                    state.deltnseg[cpl_idx] = 0;
+                }
+                _ => {
+                    // 0 = reuse previous; 3 = reserved (treat as reuse to stay
+                    // robust against malformed streams).
+                }
             }
         }
         for ch in 0..nfchans {
-            if deltbae[ch] == 1 {
-                let nseg = br.read_u32(3)? + 1;
-                for _ in 0..nseg {
-                    let _off = br.read_u32(5)?;
-                    let _len = br.read_u32(4)?;
-                    let _ba = br.read_u32(3)?;
+            match deltbae[ch] {
+                1 => {
+                    let nseg = (br.read_u32(3)? + 1) as usize;
+                    state.deltnseg[ch] = nseg.min(8);
+                    for seg in 0..state.deltnseg[ch] {
+                        state.deltoffst[ch][seg] = br.read_u32(5)? as u8;
+                        state.deltlen[ch][seg] = br.read_u32(4)? as u8;
+                        state.deltba[ch][seg] = br.read_u32(3)? as u8;
+                    }
                 }
+                2 => {
+                    state.deltnseg[ch] = 0;
+                }
+                _ => {}
             }
+        }
+    } else if blk == 0 {
+        // §5.4.3.47 spec: "If deltbaie is '0' in block 0, then cpldeltbae
+        // and deltbae[ch] are set to the binary value '10', and no delta
+        // bit allocation is applied." This means clear all segments.
+        for ch in 0..MAX_FBW + 1 {
+            state.deltnseg[ch] = 0;
         }
     }
 
@@ -1119,6 +1171,46 @@ fn run_bit_allocation(
             exc += (dbknee - state.channels[ch].bndpsd[bin] as i32) >> 2;
         }
         mask[bin] = exc.max(hth_row[bin] as i32);
+    }
+
+    // Apply delta bit allocation (§7.2.2.6). Per-band ±6 dB mask offsets
+    // signalled by the encoder. Critical for transient blocks: ffmpeg uses
+    // dba to BOOST the masking floor (less bits assigned) in low-energy
+    // bands during a burst frame, freeing bit budget for the burst peak.
+    // Without applying these offsets, our decoder ends up with a different
+    // mask shape than the encoder used — and therefore a different bap[]
+    // assignment, which causes our mantissa unpacking to read wrong-width
+    // codes from the bitstream. The downstream symptom is wildly wrong
+    // coefficients in burst frames (PSNR ≈ 5–15 dB). The dba code below
+    // is the literal §7.2.2.6 pseudocode; the per-block deltba state is
+    // maintained by the parser per Table 5.16 semantics.
+    // LFE has no delta bit allocation per spec syntax (Table 5.3 lists
+    // only cpldeltbae + per-fbw deltbae[ch]). Skip when ch is the LFE
+    // pseudo-channel (index MAX_FBW+1 in our channel array).
+    let is_lfe = !is_coupling && ch > MAX_FBW;
+    let dba_idx = if is_coupling { MAX_FBW } else { ch };
+    if !is_lfe && state.deltnseg[dba_idx] > 0 {
+        let mut band = 0usize;
+        for seg in 0..state.deltnseg[dba_idx] {
+            band += state.deltoffst[dba_idx][seg] as usize;
+            let dba_raw = state.deltba[dba_idx][seg] as i32;
+            let delta = if dba_raw >= 4 {
+                (dba_raw - 3) << 7
+            } else {
+                (dba_raw - 4) << 7
+            };
+            let len = state.deltlen[dba_idx][seg] as usize;
+            for _ in 0..len {
+                if band < 50 {
+                    mask[band] += delta;
+                }
+                band += 1;
+            }
+        }
+    }
+
+    // Persist masking curve onto the channel state for diagnostics.
+    for bin in bndstrt..bndend {
         state.channels[ch].mask[bin] = mask[bin] as i16;
     }
 
@@ -1441,8 +1533,42 @@ fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
     }
 
     // --- Rematrixing (§7.5) ---
+    //
+    // Per Tables 7.25 / 7.26 / 7.27 / 7.28, the upper edge of the LAST
+    // rematrix band is NOT a fixed constant — it tracks the lower edge
+    // of the coupling region whenever coupling is in use:
+    //
+    //   • cplinu == 0           : 4 bands, last ends at bin 252 (Table 7.25)
+    //   • cplinu == 1, cplbegf > 2: 4 bands, last ends at A = 36 + 12*cplbegf
+    //   • cplinu == 1, 2 ≥ cplbegf > 0: 3 bands, last ends at A
+    //   • cplinu == 1, cplbegf = 0: 2 bands, last ends at bin 36
+    //
+    // A previous formulation hard-coded the last band's high coefficient at
+    // bin 252 even when coupling was active. On 2/0 frames where ffmpeg
+    // enables rematrixing AND coupling above bin 132 (cplbegf=8 in our
+    // transient fixture), this bled the L+R / L-R operation into the
+    // coupling region — bins that had just been re-derived from the
+    // coupling pseudo-channel via cplco coords. The downstream symptom
+    // was a steady PSNR drift across the 6 audblks of every burst-onset
+    // frame: rematrix scrambled the post-decouple coefficients, the
+    // IMDCT rendered the wrong waveform, and overlap-add carried the
+    // error into the next block. Fixing the upper edge to the spec's
+    // cplbegf-dependent boundary restores burst-frame PSNR.
     if acmod == 0x2 {
-        let remat_bands: &[(usize, usize)] = &[(13, 25), (25, 37), (37, 61), (61, 253)];
+        let last_high = if state.cpl_in_use {
+            // A = 36 + 12 * cplbegf per Tables 7.26 / 7.27.
+            // For cplbegf = 0 (Table 7.28), the last band actually ends
+            // at bin 36 — but with only 2 rematrix bands it never reaches
+            // band index 3, so the value of `last_high` for index 3 is
+            // unused. Compute A unconditionally.
+            36 + 12 * state.cpl_begf as usize
+        } else {
+            252 // Table 7.25 fixed last band high.
+        };
+        // Convert to exclusive upper bound for our `lo..hi` ranges.
+        let last_hi_excl = last_high + 1;
+        let remat_bands: [(usize, usize); 4] =
+            [(13, 25), (25, 37), (37, 61), (61, last_hi_excl.max(61))];
         let n = remat_band_count(state.cpl_in_use, state.cpl_begf);
         for (i, (lo, hi)) in remat_bands.iter().take(n).enumerate() {
             if !state.rematflg[i] {

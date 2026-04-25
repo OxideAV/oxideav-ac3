@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- §7.2.2.6 delta bit allocation: persistent per-channel + coupling deltba
+  segment state on `Ac3State`, parsed per Table 5.16 (`new info / reuse /
+  no delta` semantics) and applied to the masking curve before bap[]
+  computation. Dormant on the current transient-burst fixture (the
+  encoder there sets cpldeltbae and per-fbw deltbae[] to '10' = no
+  delta) but required-by-spec for any stream that does signal mask
+  offsets — without it our bap[] would diverge from the encoder's and
+  desync mantissa unpacking.
+- `examples/sample_compare.rs`: per-block PSNR + peak-diff diagnostic for
+  drilling into burst frames where the per-frame floor hides which
+  audblk is breaking. Used to characterise the round-7 drift pattern
+  (errors ramp through frame 14 blk 0..5, peak in frame 15 blk 0-1,
+  unwind through frame 15 blk 2-5).
+
+### Fixed
+
+- §7.5.2.2 / §7.5.2.3 rematrix band 3 upper bound: was hard-coded to
+  bin 252 even when coupling was active, allowing the L+R / L-R operation
+  to bleed into the just-decoupled coupling region. Now tracks
+  `36 + 12*cplbegf` per Tables 7.26 / 7.27 when `cplinu == 1`. No PSNR
+  movement on the current fixture (end_mant capped the bleed there
+  anyway) but a latent correctness fix for streams where the per-channel
+  bandwidth code reaches further.
+
+### Investigation notes (transient fixture, round 7)
+
+Root-causing the residual ≈15 dB transient PSNR floor — outcome: not
+cracked this round, but the bug is now bracketed substantially tighter
+than the round-6 notes left it.
+
+Per-block sample_compare on frame 14 of the bursts fixture shows the
+error grows monotonically through the frame (28, 22, 16, 11, 8, 6 dB
+across blocks 0..5), peaks in frame 15 blk 0-1 (4.4 / 4.7 dB), then
+unwinds symmetrically. Peak amplitudes: ours ≈ 0.36 × ffmpeg's on the
+worst blocks — i.e. our reconstruction is roughly the right *shape*
+but the wrong *magnitude*, with a partial sign inversion appearing
+specifically on burst-peak blocks. Probes that did NOT move the floor:
+
+- spec-literal vs. swapped §7.9.4.2 short2 de-interleave (round 6's
+  deviation makes no PSNR difference on this fixture either way)
+- disabling coupling decoupling entirely (`AC3_DISABLE_DECOUPLE=1`)
+- disabling rematrix entirely (`AC3_DISABLE_REMAT=1`)
+- the new dba application (encoder sends only "no delta" markers in
+  this fixture's burst blocks)
+
+These eliminate IMDCT short-block, coupling decode, rematrix matrix,
+AND dba as the dominant error sources. What remains in the per-frame
+error budget is bit allocation (bap[]) on the burst-onset blocks
+themselves — specifically the masking-curve computation around bins
+4-5 (the dominant 440 Hz tone) where calc_lowcomp's break condition
+`bndpsd[bin] <= bndpsd[bin+1]` fires under burst conditions and the
+spec-vs-implementation behaviour at that exact moment is hardest to
+verify without a known-correct reference trace.
+
+Next round should: (a) instrument bndpsd[0..7], excite[0..7], mask[0..7],
+and bap[0..7] for ch0 in frame 14 blk 0 (28 dB — easiest to reverse-
+engineer the divergence) and compare against a hand-calculated trace
+from §7.2.2.4 pseudo-code with the same exponents we decoded; and
+(b) consider whether the burst-frame bap[] divergence might come from
+our exponent decode chain itself (D15 → cumulative sum of M-2 deltas)
+when consecutive deltas straddle the 5-level map saturation boundary,
+since the burst fixture is where extreme M=0 / M=4 codes appear.
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.1...v0.0.2) - 2026-04-25
 
 ### Fixed
