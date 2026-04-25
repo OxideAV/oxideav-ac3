@@ -247,6 +247,10 @@ pub struct Ac3State {
     /// (§7.3.4). Persisted across audio blocks and syncframes so the
     /// dither sequence has a smooth long-period character.
     pub dither_lfsr_state: u32,
+    /// Monotonically increasing syncframe counter used for trace gating
+    /// (e.g. `AC3_TRACE_FRAME=14`). Incremented at the top of every
+    /// `decode_frame` call. Not part of the spec — diagnostic only.
+    pub frame_counter: u64,
 }
 
 impl Default for Ac3State {
@@ -295,6 +299,7 @@ impl Ac3State {
             // Non-zero seed so the LFSR doesn't get stuck on all-zeros.
             // Arbitrary fixed value keeps decodes byte-reproducible.
             dither_lfsr_state: 0x1234,
+            frame_counter: 0,
         }
     }
 }
@@ -388,6 +393,10 @@ pub fn decode_frame(
             }
         }
     }
+    // Diagnostic frame counter (gated by `AC3_TRACE_FRAME=N`). Increment
+    // *after* the frame so frame 0 == first decoded frame; not part of
+    // the spec.
+    state.frame_counter = state.frame_counter.saturating_add(1);
     Ok(())
 }
 
@@ -1239,6 +1248,81 @@ fn run_bit_allocation(
             j += 1;
         }
     }
+
+    // ---- Diagnostic trace (gated by `AC3_TRACE_FRAME=N` and `AC3_TRACE_BLK=B`) ----
+    // Dumps bndpsd / excite / mask / bap for the requested frame+block. Used
+    // to compare against ffmpeg's reference decode of the same fixture.
+    // Cheap when the env vars aren't set.
+    let trace_frame = std::env::var("AC3_TRACE_FRAME")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    let trace_blk = std::env::var("AC3_TRACE_BLK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    if let Some(tf) = trace_frame {
+        if tf == state.frame_counter && state.blkidx == trace_blk {
+            let label = if is_coupling {
+                "cpl".to_string()
+            } else if ch == MAX_FBW + 1 {
+                "lfe".to_string()
+            } else {
+                format!("ch{ch}")
+            };
+            eprintln!(
+                "TRACE frame={} blk={} {} bndstrt={} bndend={} start={} end={} fgain={:#x} sgain={:#x} fdecay={:#x} sdecay={:#x} dbknee={:#x} floor={:#x} snroffset={:#x}",
+                state.frame_counter,
+                state.blkidx,
+                label,
+                bndstrt,
+                bndend,
+                start,
+                end,
+                fgain,
+                sgain,
+                fdecay,
+                sdecay,
+                dbknee,
+                floor,
+                snroffset
+            );
+            eprintln!(
+                "TRACE  exp[0..bndend]: {:?}",
+                &state.channels[ch].exp[start..start + bndend.min(20)]
+            );
+            eprintln!(
+                "TRACE  psd[0..bndend]: {:?}",
+                &state.channels[ch].psd[start..start + bndend.min(20)]
+            );
+            eprintln!(
+                "TRACE  bndpsd[bndstrt..bndend]: {:?}",
+                &state.channels[ch].bndpsd[bndstrt..bndend]
+            );
+            eprintln!(
+                "TRACE  excite[bndstrt..bndend]: {:?}",
+                &excite[bndstrt..bndend]
+            );
+            eprintln!("TRACE  mask[bndstrt..bndend]: {:?}", &mask[bndstrt..bndend]);
+            eprintln!(
+                "TRACE  bap[start..end]: {:?}",
+                &state.channels[ch].bap[start..end.min(start + 30)]
+            );
+            // Re-derive the lowcomp progression for the first 7 bins so we
+            // can audit calc_lowcomp by hand against the spec table.
+            if bndstrt == 0 && !is_coupling {
+                let mut lc = 0i32;
+                let bp = |i: usize| state.channels[ch].bndpsd[i.min(49)] as i32;
+                eprint!("TRACE  lowcomp progression: ");
+                for bin in 0..7.min(bndend) {
+                    if bin + 1 < 50 {
+                        lc = calc_lowcomp(lc, bp(bin), bp(bin + 1), bin);
+                    }
+                    eprint!("[bin={} lc={}] ", bin, lc);
+                }
+                eprintln!();
+            }
+        }
+    }
 }
 
 /// Log-addition (§7.2.2.3 logadd).
@@ -1320,11 +1404,33 @@ fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitReader) -> Resu
     let mut grp4: [f32; 2] = [0.0; 2];
     let mut grp4_n = 0usize;
 
+    // Optional per-block mantissa trace gated by `AC3_TRACE_FRAME=N` and
+    // `AC3_TRACE_BLK=B` plus `AC3_TRACE_MANT=1`. Used by maintainers when
+    // chasing bit-stream alignment issues; off by default to keep the
+    // hot path clean.
+    let trace_mant_frame = std::env::var("AC3_TRACE_FRAME")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    let trace_mant_blk = std::env::var("AC3_TRACE_BLK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let trace_mant_on = std::env::var("AC3_TRACE_MANT").is_ok();
     for ch in 0..nfchans {
         let end = state.channels[ch].end_mant;
         let dith = state.channels[ch].dithflag;
+        let trace_this = trace_mant_on
+            && trace_mant_frame == Some(state.frame_counter)
+            && state.blkidx == trace_mant_blk;
+        if trace_this {
+            eprintln!(
+                "TRACE-MANT ch{} mantissa decode (end={}, dith={}):",
+                ch, end, dith
+            );
+        }
         for bin in 0..end {
             let bap = state.channels[ch].bap[bin];
+            let bit_pos_before = if trace_this { br.bit_position() } else { 0 };
             let val = fetch_mantissa(
                 br,
                 bap,
@@ -1350,6 +1456,19 @@ fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitReader) -> Resu
             };
             let e = state.channels[ch].exp[bin] as i32;
             state.channels[ch].coeffs[bin] = final_val * 2f32.powi(-e);
+            if trace_this && bin < 32 {
+                eprintln!(
+                    "TRACE-MANT ch{} bin={:3} bap={:2} exp={:2} bit_pos_before={} mant={:.5} dither_used={} coeff={:.5e}",
+                    ch,
+                    bin,
+                    bap,
+                    e,
+                    bit_pos_before,
+                    val,
+                    bap == 0 && dith,
+                    state.channels[ch].coeffs[bin]
+                );
+            }
         }
         if state.cpl_in_use && state.channels[ch].in_coupling && !got_cplchan {
             let start = state.cpl_begf_mant;
@@ -1602,9 +1721,36 @@ fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
     // complex IFFT (N/8 for short blocks) → post-twiddle → de-interleave.
     // Matches the direct-form reference within f32 precision on the long
     // path; the short path is validated by the ffmpeg-fixture RMS gate.
+    let trace_frame_dsp = std::env::var("AC3_TRACE_FRAME")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    let trace_blk_dsp = std::env::var("AC3_TRACE_BLK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
     for ch in 0..nfchans {
         let mut coeffs = [0.0f32; 256];
         coeffs.copy_from_slice(&state.channels[ch].coeffs);
+        if let Some(tf) = trace_frame_dsp {
+            if tf == state.frame_counter && state.blkidx == trace_blk_dsp {
+                let max_abs = coeffs.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+                let nonzero = coeffs.iter().filter(|&&v| v != 0.0).count();
+                eprintln!(
+                    "TRACE-DSP ch{} pre-IMDCT max|coeff|={:.6e} nonzero_bins={} blksw={} dynrng={}",
+                    ch, max_abs, nonzero, state.channels[ch].blksw, state.channels[ch].dynrng
+                );
+                eprint!("TRACE-DSP ch{} coeff[0..16]: ", ch);
+                for v in &coeffs[..16] {
+                    eprint!("{:.4e} ", v);
+                }
+                eprintln!();
+                eprint!("TRACE-DSP ch{} coeff[16..32]: ", ch);
+                for v in &coeffs[16..32] {
+                    eprint!("{:.4e} ", v);
+                }
+                eprintln!();
+            }
+        }
         let mut time = [0.0f32; 512];
         if state.channels[ch].blksw {
             crate::imdct::imdct_256_pair_fft(&coeffs, &mut time);
