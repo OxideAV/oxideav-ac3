@@ -310,8 +310,12 @@ impl Ac3State {
 /// which fuses parse + DSP.
 ///
 /// Side-info capture mirrors `decode_frame`'s bit-cursor: after each
-/// block's side-info we walk the mantissa region via
-/// [`unpack_mantissas`] so the cursor lands on block N+1's bits.
+/// block's side-info `parse_audblk_into` itself consumes the mantissa
+/// region via [`unpack_mantissas`], so the cursor naturally lands on
+/// block N+1's bits without a second walk here (a previous version
+/// double-consumed the mantissas, which made every block N>0 read its
+/// side-info bits from somewhere inside the previous block's mantissa
+/// region).
 /// Blocks whose parse fails (e.g. due to our current bit-allocation
 /// approximation consuming a few mantissa bits too many) yield a
 /// `Default::default()` snapshot and subsequent blocks restart from
@@ -331,8 +335,6 @@ pub fn parse_frame_side_info(
         state.blkidx = blk;
         let mut side = AudBlkSideInfo::default();
         if parse_audblk_into(&mut state, si, bsi, &mut br, &mut side).is_ok() {
-            // Walk mantissas to advance the cursor; ignore errors.
-            let _ = unpack_mantissas(&mut state, bsi, &mut br);
             out[blk] = side;
         } else {
             // Parse error — stop side-info capture here. Downstream
@@ -377,6 +379,21 @@ pub fn decode_frame(
                     *v = 0.0;
                 }
             }
+        }
+        if std::env::var("AC3_TRACE_BITPOS").is_ok() {
+            // Round-12 diagnostic: verify per-block bit-cursor lands inside
+            // the syncframe (frame_bits ≈ 6104 for a 192 kbps frame; CRC
+            // and a few padding bits sit between the last block's end and
+            // the frame end). If `end_pos` ever exceeds `frame_bits` the
+            // parser is over-consuming and every later block's side-info
+            // bits will be misread.
+            eprintln!(
+                "TRACE-BITPOS frame={} blk={} end_pos={} frame_bits={}",
+                state.frame_counter,
+                blk,
+                br.bit_position(),
+                (frame_bytes.len() as u64 - 5) * 8
+            );
         }
         dsp_block(state, si, bsi);
         // Write this block's SAMPLES_PER_BLOCK samples per channel
@@ -579,6 +596,12 @@ pub(crate) fn parse_audblk_into(
                 side.rematflg[rbnd] = v;
             }
         }
+        if std::env::var("AC3_TRACE_REMAT").is_ok() {
+            eprintln!(
+                "TRACE-REMAT blk={} rematstr={} rematflg={:?}",
+                blk, rematstr, state.rematflg
+            );
+        }
     }
 
     // §5.4.3.21 cplexpstr — coupling exponent strategy (2 bits).
@@ -644,6 +667,27 @@ pub(crate) fn parse_audblk_into(
                     state.channels[ch_idx].exp[idx + j] = (*e).clamp(0, 24) as u8;
                 }
             }
+        }
+        if std::env::var("AC3_TRACE_CPL").is_ok() {
+            eprintln!(
+                "TRACE-CPL blk={} cplexpstr={} cplabsexp={} (<<1={}) ncplgrps={} grpsize={}",
+                blk,
+                cplexpstr,
+                cplabsexp,
+                cplabsexp << 1,
+                ncplgrps,
+                grpsize
+            );
+            eprintln!(
+                "TRACE-CPL raw_exp first 12: {:?}",
+                &raw_exp[..raw_exp.len().min(12)]
+            );
+            eprintln!(
+                "TRACE-CPL placed cpl exp[{}..{}]: {:?}",
+                cpl_start,
+                cpl_end,
+                &state.channels[ch_idx].exp[cpl_start..cpl_end.min(cpl_start + 30)]
+            );
         }
     }
 
