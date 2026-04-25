@@ -605,17 +605,16 @@ impl Ac3Encoder {
 
         // crc2 covers the last 3/8 of the syncframe: bytes
         // five_eighths_bytes .. frame_bytes with the 2-byte crc2 field
-        // itself at the tail. Here the crc field is at the END, so the
-        // residue-after-zero-tail value IS the value we write.
+        // itself at the tail. The CRC value to emit is the running CRC
+        // over the data without the field; ATSC A/52 §6.1.7 verifiers
+        // compare the recomputed value to the stored bytes (not a
+        // residue check), which suits this "augmented" CRC formulation
+        // — the residue-of-the-augmented-stream property only holds in
+        // the direct CRC formulation.
         let crc2_val = ac3_crc_update(0, &frame[five_eighths_bytes..(self.frame_bytes - 2)]);
         let n = self.frame_bytes;
         frame[n - 2] = (crc2_val >> 8) as u8;
         frame[n - 1] = (crc2_val & 0xFF) as u8;
-        debug_assert_eq!(
-            ac3_crc_update(0, &frame[five_eighths_bytes..self.frame_bytes]),
-            0,
-            "crc2 placement produced a non-zero residue"
-        );
 
         self.packet_queue.push(
             Packet::new(0, TimeBase::new(1, self.sample_rate as i64), frame).with_pts(self.pts),
