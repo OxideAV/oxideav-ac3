@@ -17,7 +17,7 @@ use std::fs::File;
 use std::io::Write;
 
 use oxideav_ac3::encoder;
-use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat, TimeBase};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();

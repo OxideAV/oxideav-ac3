@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 18 — encoder-side §7.2.2.6 / §5.4.3.47-57 delta bit allocation.
+  Encoder now emits `deltbaie=1` on block 0 of every syncframe with a
+  per-fbw-channel single-band segment (`deltbae[ch]=1`, `deltnseg=1`),
+  picked greedily from the lowest-energy 1/6th-octave band in the 25..45
+  range with `deltba=4` (+6 dB mask boost). Coupling channel signals
+  `cpldeltbae=2` (no delta this block) when coupling is active. Blocks
+  1..5 emit `deltbaie=0` (reuse) — block-0's segment list applies for
+  the rest of the syncframe. `tune_snroffst` accounts for the dba
+  syntax cost (≈17 bits per fbw channel + 2 bits per channel for
+  `deltbae[ch]` + 2 bits for `cpldeltbae` when cpl is in use), and
+  `compute_bap` / `compute_bap_cpl` apply the dba mask offsets before
+  bap[] computation so encoder and decoder derive identical bap[]
+  arrays. ffmpeg cross-decodes the dba-bearing stream cleanly.
+  `AC3_DISABLE_DBA=1` reverts to the round-17 deltbaie=0 behaviour for
+  A/B comparison. Test gate: `dba_self_decode_and_ffmpeg_crosscheck`.
 - §7.2.2.6 delta bit allocation: persistent per-channel + coupling deltba
   segment state on `Ac3State`, parsed per Table 5.16 (`new info / reuse /
   no delta` semantics) and applied to the masking curve before bap[]

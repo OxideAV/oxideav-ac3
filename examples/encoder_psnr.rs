@@ -13,7 +13,7 @@ use std::env;
 
 use oxideav_ac3::decoder;
 use oxideav_ac3::encoder;
-use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat, TimeBase};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat};
 
 const SR: u32 = 48_000;
 

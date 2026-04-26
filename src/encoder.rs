@@ -225,11 +225,7 @@ impl Encoder for Ac3Encoder {
 /// Convert a decoded [`AudioFrame`] into normalized f32 samples per
 /// channel. Supports the two formats most commonly supplied by
 /// upstream demuxers / resamplers: interleaved S16 and interleaved F32.
-fn decode_input_samples(
-    a: &AudioFrame,
-    nch: usize,
-    fmt: SampleFormat,
-) -> Result<Vec<Vec<f32>>> {
+fn decode_input_samples(a: &AudioFrame, nch: usize, fmt: SampleFormat) -> Result<Vec<Vec<f32>>> {
     let nsamp = a.samples as usize;
     let mut out = vec![Vec::with_capacity(nsamp); nch];
     match fmt {
@@ -776,6 +772,18 @@ impl Ac3Encoder {
             lfefgaincod: 4,
         };
 
+        // §7.2.2.6 / §5.4.3.47-57 — build the per-frame DBA plan.
+        // Done BEFORE snroffst tuning so the bit budget the tuner sees
+        // already accounts for the dba syntax cost AND the bap[] arrays
+        // tune_snroffst computes use the dba-modified mask. The
+        // AC3_DISABLE_DBA env var pins the plan to all-zero (no
+        // segments) — useful for A/B-ing the dba contribution.
+        let dba_plan = if std::env::var("AC3_DISABLE_DBA").is_ok() {
+            DbaPlan::default()
+        } else {
+            build_dba_plan(&exps, self.channels, ch_end_mant, &cpl)
+        };
+
         // Iteratively tune csnroffst+fsnroffst so the encoded mantissa
         // bits + side-info fit the frame payload. This is the minimal
         // loop §8.2.12 describes.
@@ -788,6 +796,7 @@ impl Ac3Encoder {
             self.frame_bytes,
             &exp_strategies,
             &cpl,
+            &dba_plan,
         );
 
         // Compute bap arrays per channel per block using the tuned
@@ -803,6 +812,7 @@ impl Ac3Encoder {
                     self.fscod,
                     &tuned_ba,
                     &mut baps[ch][blk],
+                    Some((&dba_plan, ch)),
                 );
             }
         }
@@ -833,6 +843,7 @@ impl Ac3Encoder {
                     self.fscod,
                     &cpl_ba,
                     &mut baps[cpl_idx][blk],
+                    Some((&dba_plan, MAX_FBW)),
                 );
             }
         }
@@ -1037,8 +1048,60 @@ impl Ac3Encoder {
                     bw.write_u32(0, 1); // cplleake = 0 (reuse)
                 }
             }
-            // deltbaie = 0 (no delta bit allocation).
-            bw.write_u32(0, 1);
+            // §5.4.3.47-57 deltbaie + delta bit allocation. v1 policy:
+            //
+            //   Block 0: deltbaie=1, then per-channel deltbae[ch]∈{1,2}
+            //     and (when cpl.in_use) cpldeltbae∈{1,2}. Channels with
+            //     `dba_plan.nseg[ch] > 0` emit '01' (new info follows)
+            //     plus their segment list (cpldeltnseg/cpldeltoffst/...
+            //     for cpl, deltnseg/deltoffst/... for fbw); channels
+            //     with no segments emit '10' (perform no delta alloc).
+            //
+            //   Blocks 1..5: deltbaie=0. Per §5.4.3.47, "the previously
+            //     transmitted delta bit allocation information still
+            //     applies" — i.e. the decoder keeps applying block 0's
+            //     segments for the rest of the syncframe. The encoder
+            //     side mirrors this by computing bap[] with the same
+            //     dba_plan applied on every block.
+            //
+            // Per Table 5.16 ('00' = reuse) is illegal in block 0, so
+            // channels without segments use '10' there instead.
+            let any_fbw_dba = (0..self.channels).any(|c| dba_plan.nseg[c] > 0);
+            let any_cpl_dba = cpl.in_use && dba_plan.nseg[MAX_FBW] > 0;
+            let any_dba = any_fbw_dba || any_cpl_dba;
+            if blk == 0 && (any_dba || cpl.in_use) {
+                bw.write_u32(1, 1); // deltbaie = 1
+                if cpl.in_use {
+                    let code = if dba_plan.nseg[MAX_FBW] > 0 { 1 } else { 2 };
+                    bw.write_u32(code as u32, 2); // cpldeltbae
+                }
+                for ch in 0..self.channels {
+                    let code = if dba_plan.nseg[ch] > 0 { 1 } else { 2 };
+                    bw.write_u32(code as u32, 2); // deltbae[ch]
+                }
+                if cpl.in_use && dba_plan.nseg[MAX_FBW] > 0 {
+                    let nseg = dba_plan.nseg[MAX_FBW] as u32;
+                    bw.write_u32(nseg - 1, 3); // cpldeltnseg
+                    for seg in 0..nseg as usize {
+                        bw.write_u32(dba_plan.offst[MAX_FBW][seg] as u32, 5);
+                        bw.write_u32(dba_plan.len[MAX_FBW][seg] as u32, 4);
+                        bw.write_u32(dba_plan.ba[MAX_FBW][seg] as u32, 3);
+                    }
+                }
+                for ch in 0..self.channels {
+                    if dba_plan.nseg[ch] > 0 {
+                        let nseg = dba_plan.nseg[ch] as u32;
+                        bw.write_u32(nseg - 1, 3); // deltnseg[ch]
+                        for seg in 0..nseg as usize {
+                            bw.write_u32(dba_plan.offst[ch][seg] as u32, 5);
+                            bw.write_u32(dba_plan.len[ch][seg] as u32, 4);
+                            bw.write_u32(dba_plan.ba[ch][seg] as u32, 3);
+                        }
+                    }
+                }
+            } else {
+                bw.write_u32(0, 1); // deltbaie = 0 (reuse on blocks 1..5)
+            }
 
             // skiple / skipl: potentially used at frame-end to pad out to
             // frame_bytes; for now, none per block.
@@ -1401,12 +1464,19 @@ struct BitAllocParams {
 
 /// Run the parametric bit allocator for one channel (start=0..end)
 /// and fill `bap_out` with the resulting pointers.
+///
+/// `dba_segments`: optional borrow of `(plan, idx)` selecting which
+/// channel's dba segments to apply to the masking curve before bap[]
+/// is computed. Pass `None` when the encoder will signal deltbae==2 for
+/// this channel (no delta this block) — the decoder behaves the same
+/// way under that signal.
 fn compute_bap(
     exp: &[u8; N_COEFFS],
     end: usize,
     fscod: u8,
     ba: &BitAllocParams,
     bap_out: &mut [u8; N_COEFFS],
+    dba: Option<(&DbaPlan, usize)>,
 ) {
     if end == 0 {
         return;
@@ -1497,6 +1567,14 @@ fn compute_bap(
         }
         mask[bin] = exc.max(hth_row[bin] as i32);
     }
+    // §7.2.2.6 delta bit allocation — apply BEFORE bap[] computation,
+    // exactly mirroring the decoder. The mask offsets in dba can be
+    // either negative (more bits assigned in that band) or positive
+    // (fewer bits — what our encoder picks by default to free budget
+    // for snroffst).
+    if let Some((plan, idx)) = dba {
+        apply_dba_segments(plan, idx, &mut mask);
+    }
     // bap.
     let mut i = 0usize;
     let mut j = MASKTAB[0] as usize;
@@ -1543,6 +1621,7 @@ fn compute_bap_cpl(
     fscod: u8,
     ba: &BitAllocParams,
     bap_out: &mut [u8; N_COEFFS],
+    dba: Option<(&DbaPlan, usize)>,
 ) {
     if end <= start {
         return;
@@ -1599,6 +1678,13 @@ fn compute_bap_cpl(
             exc += (dbknee - bndpsd[bin]) >> 2;
         }
         mask[bin] = exc.max(hth_row[bin] as i32);
+    }
+    // §7.2.2.6 dba — coupling-channel variant. The decoder applies the
+    // cpl-channel deltba segments to the same `mask[]` array before
+    // bap[] is computed, even though the cpl excitation path is the
+    // simpler `fastleak.max(slowleak)` branch.
+    if let Some((plan, idx)) = dba {
+        apply_dba_segments(plan, idx, &mut mask);
     }
     let mut i = start;
     let mut j = MASKTAB[start] as usize;
@@ -1752,6 +1838,7 @@ fn overhead_bits_for(
     end: usize,
     nchan: usize,
     cpl: &CouplingPlan,
+    dba: &DbaPlan,
 ) -> u32 {
     // syncinfo: 16 (sync) + 16 (crc1) + 2 (fscod) + 6 (frmsizecod) = 40
     // BSI for 2/0 stereo: 5+3+3+2+1+5+1+1+1+1+1+1+1+1 = 27
@@ -1780,7 +1867,7 @@ fn overhead_bits_for(
     } else {
         0
     };
-    for &s in exp_strategies.iter() {
+    for (blk_i, &s) in exp_strategies.iter().enumerate() {
         // blksw per ch (1 bit × nchan), dithflag × nchan, dynrnge(1)
         bits += nchan as u32 * 2 + 1;
         // cplstre + cplinu + (block 0 only) the cpl strategy fields.
@@ -1853,7 +1940,31 @@ fn overhead_bits_for(
         if cpl.in_use {
             bits += 1;
         }
-        bits += 1; // deltbaie=0
+        // §5.4.3.47-57 deltbaie + dba payload. We emit dba info on
+        // block 0 only: deltbaie=1, then per-channel deltbae[ch]==1
+        // for channels with segments + per-segment payload, plus
+        // cpldeltbae=2 (no delta this block) when cpl is active and
+        // we have no cpl-channel dba in v1. Blocks 1..5 emit
+        // deltbaie=0 (reuse), and the decoder keeps applying the
+        // block-0 segment list for the remainder of the syncframe.
+        let any_dba = (0..nchan).any(|c| dba.nseg[c] > 0) || (cpl.in_use && dba.nseg[MAX_FBW] > 0);
+        if blk_i == 0 && (any_dba || cpl.in_use) {
+            bits += 1; // deltbaie=1
+            if cpl.in_use {
+                bits += 2; // cpldeltbae (we send 2='no delta' when cpl seg list is empty)
+            }
+            bits += 2 * nchan as u32; // deltbae[ch]
+            if cpl.in_use && dba.nseg[MAX_FBW] > 0 {
+                bits += 3 + dba.nseg[MAX_FBW] as u32 * 12;
+            }
+            for c in 0..nchan {
+                if dba.nseg[c] > 0 {
+                    bits += 3 + dba.nseg[c] as u32 * 12;
+                }
+            }
+        } else {
+            bits += 1; // deltbaie=0 (reuse on non-block-0; or no dba at all)
+        }
         bits += 1; // skiple=0
     }
     // §5.4.3.45-46 cplfleak/cplsleak — 3+3 bits, sent once on
@@ -1887,8 +1998,9 @@ fn tune_snroffst(
     frame_bytes: usize,
     exp_strategies: &[u8; BLOCKS_PER_FRAME],
     cpl: &CouplingPlan,
+    dba: &DbaPlan,
 ) -> BitAllocParams {
-    let overhead = overhead_bits_for(exp_strategies, end, nchan, cpl) + 32 /* safety */;
+    let overhead = overhead_bits_for(exp_strategies, end, nchan, cpl, dba) + 32 /* safety */;
     let total_bits = (frame_bytes * 8) as u32;
     if overhead >= total_bits {
         return *ba;
@@ -1918,7 +2030,14 @@ fn tune_snroffst(
                 vec![vec![[0u8; N_COEFFS]; exps[0].len()]; nchan + 1];
             for ch in 0..nchan {
                 for blk in 0..exps[ch].len() {
-                    compute_bap(&exps[ch][blk], end, fscod, &cand, &mut baps[ch][blk]);
+                    compute_bap(
+                        &exps[ch][blk],
+                        end,
+                        fscod,
+                        &cand,
+                        &mut baps[ch][blk],
+                        Some((dba, ch)),
+                    );
                 }
             }
             if cpl.in_use {
@@ -1936,6 +2055,7 @@ fn tune_snroffst(
                         fscod,
                         &cpl_ba,
                         &mut baps[cpl_idx][blk],
+                        Some((dba, MAX_FBW)),
                     );
                 }
             }
@@ -2429,6 +2549,158 @@ impl CouplingPlan {
         }
         out
     }
+}
+
+// ---------------------------------------------------------------------------
+// Delta Bit Allocation (§7.2.2.6, §5.4.3.47-57) — encoder-side helpers
+// ---------------------------------------------------------------------------
+
+/// Per-frame delta bit allocation plan. Holds the segments transmitted on
+/// block 0 of each syncframe (deltbae[ch]==1 / cpldeltbae==1 → "new info
+/// follows") and reused for blocks 1..5 via deltbae==0. The decoder
+/// applies these segments before the §7.2.2.7 bap[] computation; the
+/// encoder must apply *exactly* the same offsets so encoder and decoder
+/// derive the same bap[] arrays.
+///
+/// Index `MAX_FBW` is the coupling pseudo-channel; indices 0..nfchans
+/// are the fbw channels.
+///
+/// `nseg == 0` means no segments are emitted for that channel (the
+/// encoder will signal deltbae==2 = "perform no delta alloc").
+/// `nseg > 0` means deltbae==1 on block 0 (transmit the segments).
+///
+/// Encoder policy (round-18 v1):
+///   * One segment per fbw channel, spanning a single 1/6th-octave
+///     band picked by `pick_dba_band`. The delta is `+6 dB` (deltba=4)
+///     which raises the masking floor in that band — ffmpeg uses this
+///     to free a few mantissa bits in psychoacoustically-unimportant
+///     bands during bursts. We pick a band where the band PSD is well
+///     below the channel average, which approximates the "this band
+///     is masked harder than the parametric model thinks" decision.
+///   * No coupling-channel dba in v1 (cpldeltbae==2 emitted on block 0
+///     when coupling is active).
+#[derive(Clone, Copy)]
+struct DbaPlan {
+    /// Per-channel segment count (0..=8).
+    nseg: [u8; MAX_FBW + 1],
+    /// Per-channel segment offsets (5 bits each). For seg=0 this is
+    /// the absolute starting band; for seg>0 it's the gap from the
+    /// previous segment's end.
+    offst: [[u8; 8]; MAX_FBW + 1],
+    /// Per-channel segment lengths in bands (4 bits each, 1..=15).
+    len: [[u8; 8]; MAX_FBW + 1],
+    /// Per-channel segment dba codes (3 bits each, Table 5.17).
+    ba: [[u8; 8]; MAX_FBW + 1],
+}
+
+impl Default for DbaPlan {
+    fn default() -> Self {
+        Self {
+            nseg: [0; MAX_FBW + 1],
+            offst: [[0; 8]; MAX_FBW + 1],
+            len: [[0; 8]; MAX_FBW + 1],
+            ba: [[0; 8]; MAX_FBW + 1],
+        }
+    }
+}
+
+/// Convert a Table 5.17 dba code (0..7) into the §7.2.2.6 mask delta
+/// (in the same fixed-point units as `mask[]`: each LSB = 1/128 dB,
+/// step is ±6 dB = 768 = 6<<7). Mirrors the decoder's branch in
+/// `audblk.rs::run_bit_allocation`.
+fn dba_delta_for_code(code: u8) -> i32 {
+    let raw = code as i32;
+    if raw >= 4 {
+        (raw - 3) << 7
+    } else {
+        (raw - 4) << 7
+    }
+}
+
+/// Apply a channel's dba segments to a `mask[]` array in place. Must
+/// be called with the *same* segment list the encoder will transmit so
+/// that the decoder reproduces the same mask exactly. Mirrors
+/// `audblk.rs::run_bit_allocation` dba branch.
+fn apply_dba_segments(plan: &DbaPlan, idx: usize, mask: &mut [i32; 50]) {
+    if plan.nseg[idx] == 0 {
+        return;
+    }
+    let mut band: usize = 0;
+    for seg in 0..plan.nseg[idx] as usize {
+        band += plan.offst[idx][seg] as usize;
+        let delta = dba_delta_for_code(plan.ba[idx][seg]);
+        let len = plan.len[idx][seg] as usize;
+        for _ in 0..len {
+            if band < 50 {
+                mask[band] += delta;
+            }
+            band += 1;
+        }
+    }
+}
+
+/// Build a per-frame DBA plan. For each fbw channel we pick a single
+/// mid/high frequency band (band 30..45 region) whose summed PSD over
+/// the frame is the lowest in that range — i.e. perceptually quietest
+/// relative to its neighbours — and tag it with `+6 dB` to raise the
+/// masking floor. This frees ~3 mantissas per block (one band ≈ 3 bins
+/// in this range) to be reallocated by the snroffst tuner without
+/// changing the overall sound character.
+///
+/// Always conservative: only one band per channel, with the smallest
+/// possible segment count (nseg=1). This guarantees the dba syntax cost
+/// per channel per frame is `2 (deltbae) + 3 (nseg) + 5 (offst) + 4
+/// (len) + 3 (ba) = 17 bits` — under 1% of a 192 kbps frame.
+///
+/// Cpl-channel dba is left empty (cpldeltbae=2 on block 0).
+fn build_dba_plan(
+    exps: &[Vec<[u8; N_COEFFS]>],
+    nchan: usize,
+    end: usize,
+    cpl: &CouplingPlan,
+) -> DbaPlan {
+    let mut plan = DbaPlan::default();
+    // Search range: bands 25..45 (mid frequencies, well below the
+    // coupling cut-off and above the bass region). The §7.2.2 BNDTAB
+    // covers bands 0..49; bins 25..40 cover ≈ 1.4–4.8 kHz at 48 kHz.
+    let lo_band = 25usize;
+    let hi_band = 45usize.min(MASKTAB[end.saturating_sub(1).max(1)] as usize);
+    if hi_band <= lo_band + 1 {
+        return plan; // not enough headroom — leave everything zero
+    }
+    for ch in 0..nchan {
+        // Sum the PSD over all 6 blocks to get a stable per-band
+        // estimate. PSD = 3072 - 128*exp; bigger PSD = louder bin.
+        let mut band_score = [0i64; 50];
+        for blk in 0..exps[ch].len() {
+            for bin in 0..end {
+                let psd = 3072 - ((exps[ch][blk][bin] as i32) << 7);
+                let band = MASKTAB[bin] as usize;
+                if band < 50 {
+                    band_score[band] += psd as i64;
+                }
+            }
+        }
+        // Pick the band with the smallest score in [lo_band, hi_band).
+        let mut best_band = lo_band;
+        let mut best_score = i64::MAX;
+        for b in lo_band..hi_band {
+            if band_score[b] < best_score {
+                best_score = band_score[b];
+                best_band = b;
+            }
+        }
+        plan.nseg[ch] = 1;
+        plan.offst[ch][0] = best_band as u8; // first segment: absolute starting band
+        plan.len[ch][0] = 1;
+        plan.ba[ch][0] = 4; // +6 dB → raise mask, save ~1 bit per mantissa
+    }
+    // Coupling channel: keep nseg=0 in v1. The cpl excitation path
+    // already runs on a smaller band range and the encoder bit savings
+    // from coupling are large enough that nudging the cpl mask is a
+    // second-order optimisation.
+    let _ = cpl; // unused
+    plan
 }
 
 /// Quantise a single coupling coordinate `cplco` ∈ (0, 1] into the
@@ -3203,5 +3475,170 @@ mod tests {
             drms
         );
         assert!(drms > 200.0, "ffmpeg-coupled RMS too low: {drms}");
+    }
+
+    /// Round-18 §7.2.2.6 / §5.4.3.47-57 delta bit allocation gate.
+    ///
+    /// Encode a 1-second stereo sine, parse the resulting syncframes
+    /// and verify:
+    ///   (a) deltbaie == true on block 0 of every frame (proof the dba
+    ///       syntax is now on the wire, not the round-15..17 default
+    ///       deltbaie=0 marker),
+    ///   (b) deltbaie == false on blocks 1..5 of every frame (reuse —
+    ///       block-0's segment list applies for the whole syncframe),
+    ///   (c) self-decode round-trip RMS stays > 50 (the
+    ///       sine_roundtrip_self_decode invariant — bap[] must still
+    ///       be coherent between encoder and decoder under dba), and
+    ///   (d) ffmpeg cross-decodes the dba-bearing stream (gold
+    ///       standard for spec compliance).
+    #[test]
+    fn dba_self_decode_and_ffmpeg_crosscheck() {
+        use std::process::Command;
+        let sr = 48_000u32;
+        let dur = 1.0f32;
+        let nsamp = (sr as f32 * dur) as usize;
+        let mut pcm = vec![0i16; nsamp * 2];
+        for n in 0..nsamp {
+            let t = n as f32 / sr as f32;
+            let s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.4;
+            let q = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            pcm[n * 2] = q;
+            pcm[n * 2 + 1] = q;
+        }
+        let mut bytes = Vec::with_capacity(pcm.len() * 2);
+        for s in &pcm {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(sr);
+        params.channels = Some(2);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(192_000);
+        let mut enc = make_encoder(&params).expect("make_encoder");
+        let audio = AudioFrame {
+            samples: nsamp as u32,
+            pts: Some(0),
+            data: vec![bytes],
+        };
+        enc.send_frame(&Frame::Audio(audio)).unwrap();
+        let _ = enc.flush();
+        let mut pkts = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => pkts.push(p),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        assert!(pkts.len() >= 30, "got only {} packets", pkts.len());
+
+        // (a) + (b): inspect deltbaie across every audblk.
+        let mut block0_dba = 0usize;
+        let mut blockn_no_dba = 0usize;
+        for p in &pkts {
+            let si = crate::syncinfo::parse(&p.data).expect("syncinfo");
+            let b = crate::bsi::parse(&p.data[5..]).expect("bsi");
+            let side = crate::audblk::parse_frame_side_info(&si, &b, &p.data).expect("side-info");
+            for (blk, s) in side.iter().enumerate() {
+                if blk == 0 {
+                    assert!(
+                        s.deltbaie,
+                        "deltbaie missing on block 0 of a syncframe — round-18 dba not on the wire"
+                    );
+                    block0_dba += 1;
+                } else if !s.deltbaie {
+                    blockn_no_dba += 1;
+                }
+            }
+        }
+        assert_eq!(block0_dba, pkts.len(), "block-0 dba count mismatch");
+        assert_eq!(
+            blockn_no_dba,
+            pkts.len() * 5,
+            "blocks 1..5 should all reuse (deltbaie=0)"
+        );
+
+        // (c): self-decode round-trip RMS preserved.
+        let dparams = CodecParameters::audio(CodecId::new("ac3"));
+        let mut dec = crate::decoder::make_decoder(&dparams).expect("make_decoder");
+        let mut decoded: Vec<i16> = Vec::new();
+        for p in &pkts {
+            dec.send_packet(p).unwrap();
+            if let Ok(Frame::Audio(a)) = dec.receive_frame() {
+                for s in a.data[0].chunks_exact(4) {
+                    decoded.push(i16::from_le_bytes([s[0], s[1]]));
+                }
+            }
+        }
+        let skip = 512usize.min(decoded.len());
+        let usable = decoded.len().saturating_sub(skip);
+        assert!(usable > 0, "no decoded samples to score");
+        let sq: f64 = decoded[skip..]
+            .iter()
+            .map(|&s| (s as f64) * (s as f64))
+            .sum();
+        let rms = (sq / usable as f64).sqrt();
+        eprintln!(
+            "dba self-decode RMS: {:.1} ({} decoded samples)",
+            rms,
+            decoded.len()
+        );
+        assert!(rms > 50.0, "dba self-decoded RMS too low: {rms}");
+
+        // (d): ffmpeg cross-decode (skips when ffmpeg unavailable).
+        let mut ac3_bytes: Vec<u8> = Vec::new();
+        for p in &pkts {
+            ac3_bytes.extend_from_slice(&p.data);
+        }
+        let in_path = std::env::temp_dir().join("oxideav_ac3_dba_enc.ac3");
+        let out_path = std::env::temp_dir().join("oxideav_ac3_dba_dec.pcm");
+        std::fs::write(&in_path, &ac3_bytes).expect("write ac3");
+        let _ = std::fs::remove_file(&out_path);
+        let out = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "ac3",
+                "-i",
+            ])
+            .arg(&in_path)
+            .args(["-f", "s16le", "-acodec", "pcm_s16le", "-ac", "2"])
+            .arg(&out_path)
+            .status();
+        let _ = std::fs::remove_file(&in_path);
+        let Ok(status) = out else {
+            eprintln!("ffmpeg unavailable — skipping dba cross-decode gate");
+            return;
+        };
+        assert!(
+            status.success(),
+            "ffmpeg failed to decode our dba-bearing AC-3 output"
+        );
+        let Ok(decoded_bytes) = std::fs::read(&out_path) else {
+            panic!("ffmpeg produced no decode output");
+        };
+        let _ = std::fs::remove_file(&out_path);
+        assert!(
+            decoded_bytes.len() > 1000,
+            "ffmpeg dba-stream decode too short: {} bytes",
+            decoded_bytes.len()
+        );
+        let dsq: f64 = decoded_bytes
+            .chunks_exact(4)
+            .map(|c| {
+                let l = i16::from_le_bytes([c[0], c[1]]) as f64;
+                l * l
+            })
+            .sum();
+        let drms = (dsq / (decoded_bytes.len() / 4) as f64).sqrt();
+        eprintln!(
+            "ffmpeg decode of our dba output: {} bytes, RMS {:.1}",
+            decoded_bytes.len(),
+            drms
+        );
+        assert!(drms > 200.0, "ffmpeg-decoded dba RMS too low: {drms}");
     }
 }

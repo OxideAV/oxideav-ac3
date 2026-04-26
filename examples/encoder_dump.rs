@@ -2,7 +2,7 @@
 //! as f32 LE so we can inspect externally.
 
 use oxideav_ac3::{decoder, encoder};
-use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat, TimeBase};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat};
 use std::io::Write;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

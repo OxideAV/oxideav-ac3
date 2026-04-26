@@ -18,6 +18,7 @@ Early WIP. Implementation follows the A/52 spec incrementally:
 - [x] IMDCT synthesis (§7.9) — 512-point long-block path;
       256-point short-block still uses a reference (non-FFT) IMDCT
 - [x] Channel coupling (§7.4) + rematrix (§7.5) + dynrng (§7.7)
+- [x] Delta bit allocation (§7.2.2.6) — encoder + decoder
 - [ ] Downmix (§7.8) — 3/2 and 3/1 modes still pending
 - [ ] E-AC-3 (bsid=16, Annex E) — separate crate, not in scope here
 
