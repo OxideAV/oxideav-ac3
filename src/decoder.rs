@@ -170,12 +170,8 @@ impl Ac3Decoder {
         }
 
         Ok(Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: out_channels,
-            sample_rate,
             samples: SAMPLES_PER_FRAME,
             pts: pkt.pts,
-            time_base: self.time_base,
             data: vec![out_bytes],
         }))
     }

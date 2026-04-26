@@ -70,9 +70,16 @@ fn decoder_produces_frames_of_correct_shape() {
         dec.send_packet(&pkt).unwrap();
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                assert_eq!(a.channels, 2);
-                assert_eq!(a.sample_rate, 48_000);
+                // Per-frame channels / sample_rate are no longer carried
+                // on AudioFrame. Sample-count and the implicit interleaved
+                // stereo (S16) layout are checked indirectly by the
+                // produced byte count.
                 assert_eq!(a.samples, SAMPLES_PER_FRAME);
+                assert_eq!(
+                    a.data[0].len(),
+                    SAMPLES_PER_FRAME as usize * 2 * 2,
+                    "expected stereo S16 interleaved output"
+                );
                 produced += 1;
             }
             Ok(other) => panic!("unexpected frame kind: {other:?}"),

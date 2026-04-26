@@ -111,12 +111,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pcm_bytes.extend_from_slice(&ri.to_le_bytes());
     }
     let audio = AudioFrame {
-        format: SampleFormat::S16,
-        channels: 2,
-        sample_rate: SR,
         samples: n as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, SR as i64),
         data: vec![pcm_bytes],
     };
     enc.send_frame(&Frame::Audio(audio))?;

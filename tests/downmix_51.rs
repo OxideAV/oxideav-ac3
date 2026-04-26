@@ -57,8 +57,14 @@ fn decode_ac3_fully(data: &[u8], target_channels: Option<u16>) -> (u16, Vec<i16>
         );
         dec.send_packet(&pkt).unwrap();
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-            out_channels = a.channels;
             let buf = &a.data[0];
+            // AudioFrame no longer carries per-frame channel count.
+            // Output is interleaved S16, so derive channels from the
+            // bytes-per-frame ÷ samples ÷ bytes-per-sample arithmetic.
+            if a.samples > 0 {
+                let derived = buf.len() / (a.samples as usize) / 2;
+                out_channels = derived as u16;
+            }
             for s in buf.chunks_exact(2) {
                 pcm.push(i16::from_le_bytes([s[0], s[1]]));
             }

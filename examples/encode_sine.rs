@@ -52,12 +52,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut enc = encoder::make_encoder(&params)?;
 
     let audio = AudioFrame {
-        format: SampleFormat::S16,
-        channels: 2,
-        sample_rate: sr,
         samples: nsamp as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, sr as i64),
         data: vec![bytes],
     };
     enc.send_frame(&Frame::Audio(audio))?;

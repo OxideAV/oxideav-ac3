@@ -27,12 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     p.bit_rate = Some(192_000);
     let mut enc = encoder::make_encoder(&p)?;
     enc.send_frame(&Frame::Audio(AudioFrame {
-        format: SampleFormat::S16,
-        channels: 2,
-        sample_rate: sr,
         samples: n as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, sr as i64),
         data: vec![bytes],
     }))?;
     enc.flush()?;

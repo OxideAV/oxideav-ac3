@@ -89,11 +89,13 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         p
     };
 
+    let input_sample_format = params.sample_format.unwrap_or(SampleFormat::S16);
     Ok(Box::new(Ac3Encoder {
         codec_id: CodecId::new(crate::CODEC_ID_STR),
         out_params,
         sample_rate,
         channels: channels as usize,
+        input_sample_format,
         fscod,
         frmsizecod,
         frame_bytes: frame_bytes as usize,
@@ -144,6 +146,9 @@ struct Ac3Encoder {
     out_params: CodecParameters,
     sample_rate: u32,
     channels: usize,
+    /// Input PCM sample format. Defaults to `S16` when params don't
+    /// declare one. Accepts `S16` and `F32`.
+    input_sample_format: SampleFormat,
     fscod: u8,
     frmsizecod: u8,
     frame_bytes: usize,
@@ -176,20 +181,13 @@ impl Encoder for Ac3Encoder {
                 ))
             }
         };
-        if audio.channels as usize != self.channels {
-            return Err(Error::invalid(format!(
-                "ac3 encoder: expected {} channels, got {}",
-                self.channels, audio.channels
-            )));
-        }
-        if audio.sample_rate != self.sample_rate {
-            return Err(Error::invalid(format!(
-                "ac3 encoder: expected {} Hz input, got {} Hz",
-                self.sample_rate, audio.sample_rate
-            )));
-        }
+        // Per-frame channel-count and sample-rate are no longer carried on
+        // AudioFrame; the encoder validates layout/rate at construction
+        // time via CodecParameters and trusts the caller to feed matching
+        // PCM here. Channel count and stride are taken from `self.channels`
+        // and `self.input_sample_format`.
         // Extract per-channel f32 samples from the interleaved input.
-        let per_chan = decode_input_samples(audio)?;
+        let per_chan = decode_input_samples(audio, self.channels, self.input_sample_format)?;
         for ch in 0..self.channels {
             self.pending_samples[ch].extend_from_slice(&per_chan[ch]);
         }
@@ -227,11 +225,14 @@ impl Encoder for Ac3Encoder {
 /// Convert a decoded [`AudioFrame`] into normalized f32 samples per
 /// channel. Supports the two formats most commonly supplied by
 /// upstream demuxers / resamplers: interleaved S16 and interleaved F32.
-fn decode_input_samples(a: &AudioFrame) -> Result<Vec<Vec<f32>>> {
-    let nch = a.channels as usize;
+fn decode_input_samples(
+    a: &AudioFrame,
+    nch: usize,
+    fmt: SampleFormat,
+) -> Result<Vec<Vec<f32>>> {
     let nsamp = a.samples as usize;
     let mut out = vec![Vec::with_capacity(nsamp); nch];
-    match a.format {
+    match fmt {
         SampleFormat::S16 => {
             let plane = a
                 .data
@@ -2564,12 +2565,8 @@ mod tests {
         }
 
         let audio = AudioFrame {
-            format: SampleFormat::S16,
-            channels: 2,
-            sample_rate: sr,
             samples: nsamp as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, sr as i64),
             data: vec![bytes],
         };
         enc.send_frame(&Frame::Audio(audio)).unwrap();
@@ -2747,12 +2744,8 @@ mod tests {
         params.bit_rate = Some(192_000);
         let mut enc = make_encoder(&params).expect("make_encoder");
         let audio = AudioFrame {
-            format: SampleFormat::S16,
-            channels: 2,
-            sample_rate: sr,
             samples: nsamp as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, sr as i64),
             data: vec![bytes],
         };
         enc.send_frame(&Frame::Audio(audio)).unwrap();
@@ -2947,12 +2940,8 @@ mod tests {
         params.bit_rate = Some(192_000);
         let mut enc = make_encoder(&params).expect("make_encoder");
         let audio = AudioFrame {
-            format: SampleFormat::S16,
-            channels: 2,
-            sample_rate: sr,
             samples: nsamp as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, sr as i64),
             data: vec![bytes],
         };
         enc.send_frame(&Frame::Audio(audio)).unwrap();
@@ -3054,12 +3043,8 @@ mod tests {
         params.bit_rate = Some(192_000);
         let mut enc = make_encoder(&params).expect("make_encoder");
         let audio = AudioFrame {
-            format: SampleFormat::S16,
-            channels: 2,
-            sample_rate: sr,
             samples: nsamp as u32,
             pts: Some(0),
-            time_base: TimeBase::new(1, sr as i64),
             data: vec![bytes.clone()],
         };
         enc.send_frame(&Frame::Audio(audio)).unwrap();
