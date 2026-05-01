@@ -287,7 +287,11 @@ impl Encoder for Ac3Encoder {
 /// Convert a decoded [`AudioFrame`] into normalized f32 samples per
 /// channel. Supports the two formats most commonly supplied by
 /// upstream demuxers / resamplers: interleaved S16 and interleaved F32.
-fn decode_input_samples(a: &AudioFrame, nch: usize, fmt: SampleFormat) -> Result<Vec<Vec<f32>>> {
+pub(crate) fn decode_input_samples(
+    a: &AudioFrame,
+    nch: usize,
+    fmt: SampleFormat,
+) -> Result<Vec<Vec<f32>>> {
     let nsamp = a.samples as usize;
     let mut out = vec![Vec::with_capacity(nsamp); nch];
     match fmt {
@@ -1474,7 +1478,7 @@ impl Ac3Encoder {
 /// (fc=8000, fs=48000) — the §8.2.2 spec doesn't bind the filter
 /// coefficients but does bind the topology and cutoff.
 #[derive(Clone, Default)]
-struct TransientDetector {
+pub(crate) struct TransientDetector {
     /// Direct-form-I biquad memory: [x[n-1], x[n-2], y[n-1], y[n-2]]
     /// for stage 0 (low Q) and stage 1 (high Q).
     biquad_state: [[f32; 4]; 2],
@@ -1526,7 +1530,7 @@ impl TransientDetector {
     /// Run the 256-sample second-half through the HPF and the
     /// hierarchical peak-ratio test. Returns `true` when a transient
     /// is detected per §8.2.2 step 4.
-    fn process(&mut self, block: &[f32]) -> bool {
+    pub(crate) fn process(&mut self, block: &[f32]) -> bool {
         if block.len() < 256 {
             // Pre-priming or partial input — never short-block.
             return false;
@@ -1638,7 +1642,7 @@ fn detect_transient(block: &[f32]) -> bool {
 /// Compute the AC-3 exponent for a single coefficient: the number of
 /// left shifts that would bring `|x|` to the interval `[0.5, 1)`, clamped
 /// to `0..=24` (§8.2.7 extract_exponents).
-fn extract_exponent(x: f32) -> u8 {
+pub(crate) fn extract_exponent(x: f32) -> u8 {
     let ax = x.abs();
     if ax < f32::MIN_POSITIVE {
         return 24;
@@ -1670,7 +1674,7 @@ fn extract_exponent(x: f32) -> u8 {
 ///    kept to guarantee legality for pathological inputs.
 ///
 /// `exp` is mutated in place.
-fn preprocess_d15(exp: &mut [u8]) {
+pub(crate) fn preprocess_d15(exp: &mut [u8]) {
     if exp.is_empty() {
         return;
     }
@@ -1737,7 +1741,7 @@ fn write_exponents_cpl(bw: &mut BitWriter, exp: &[u8; N_COEFFS], start: usize, e
 /// 4 bits (exps[ch][0]); subsequent exponents are packed in groups of
 /// three (ngrps = (end-1)/3) as a single 7-bit word encoding three
 /// `(dexp+2)` values via m = 25*(dexp0+2) + 5*(dexp1+2) + (dexp2+2).
-fn write_exponents_d15(bw: &mut BitWriter, exp: &[u8; N_COEFFS], end: usize) {
+pub(crate) fn write_exponents_d15(bw: &mut BitWriter, exp: &[u8; N_COEFFS], end: usize) {
     let absexp = exp[0];
     bw.write_u32(absexp as u32, 4);
     let ngrps = (end - 1) / 3;
@@ -1774,29 +1778,29 @@ fn write_exponents_d15(bw: &mut BitWriter, exp: &[u8; N_COEFFS], end: usize) {
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
-struct BitAllocParams {
-    sdcycod: u8,
-    fdcycod: u8,
-    sgaincod: u8,
-    dbpbcod: u8,
-    floorcod: u8,
-    csnroffst: u8,
+pub(crate) struct BitAllocParams {
+    pub(crate) sdcycod: u8,
+    pub(crate) fdcycod: u8,
+    pub(crate) sgaincod: u8,
+    pub(crate) dbpbcod: u8,
+    pub(crate) floorcod: u8,
+    pub(crate) csnroffst: u8,
     /// Base / "global" fsnroffst for fbw channels. After
     /// `tune_snroffst` runs, the per-channel array `fsnroffst_ch`
     /// carries the per-channel tuned values (each ≥ this base) and the
     /// bitstream emitter writes the per-channel values. The base value
     /// is also the one fed into `compute_bap_cpl` when its caller
     /// substitutes `fsnroffst = cplfsnroffst`.
-    fsnroffst: u8,
+    pub(crate) fsnroffst: u8,
     /// Per-fbw-channel fine SNR offset (§5.4.3.40). Bitstream-level
     /// width is 4 bits / channel. Defaults to `[fsnroffst; MAX_FBW]`
     /// when the per-channel tuner hasn't run yet.
-    fsnroffst_ch: [u8; MAX_FBW],
-    cplfsnroffst: u8,
-    lfefsnroffst: u8,
-    fgaincod: u8,
-    cplfgaincod: u8,
-    lfefgaincod: u8,
+    pub(crate) fsnroffst_ch: [u8; MAX_FBW],
+    pub(crate) cplfsnroffst: u8,
+    pub(crate) lfefsnroffst: u8,
+    pub(crate) fgaincod: u8,
+    pub(crate) cplfgaincod: u8,
+    pub(crate) lfefgaincod: u8,
 }
 
 /// Run the parametric bit allocator for one channel (start=0..end)
@@ -1807,7 +1811,7 @@ struct BitAllocParams {
 /// is computed. Pass `None` when the encoder will signal deltbae==2 for
 /// this channel (no delta this block) — the decoder behaves the same
 /// way under that signal.
-fn compute_bap(
+pub(crate) fn compute_bap(
     exp: &[u8; N_COEFFS],
     end: usize,
     fscod: u8,
@@ -2401,7 +2405,7 @@ fn overhead_bits_for(
 /// the frame payload, minus the exact overhead cost. The sub-optimal
 /// sweep is O(16*16) which is trivial given 6 blocks × 253 bins.
 #[allow(clippy::too_many_arguments)]
-fn tune_snroffst(
+pub(crate) fn tune_snroffst(
     ba: &BitAllocParams,
     exps: &[Vec<[u8; N_COEFFS]>],
     end: usize,
@@ -2632,7 +2636,7 @@ struct MantGroupCtx {
 /// Quantise a floating-point transform coefficient into its AC-3
 /// mantissa code for bap ∈ 1..=15. Returns `u32` (upper-bit-unused for
 /// narrow bap).
-fn quantise_mantissa(coeff: f32, exp: i32, bap: u8) -> u32 {
+pub(crate) fn quantise_mantissa(coeff: f32, exp: i32, bap: u8) -> u32 {
     // Normalised mantissa in (-1, 1): coeff * 2^exp.
     let m = (coeff * 2f32.powi(exp)).clamp(-1.0, 1.0);
     match bap {
@@ -2696,7 +2700,7 @@ fn nearest_symmetric(m: f32, table: &[f32]) -> usize {
 /// skips them when reached.
 ///
 /// Bap values 3, 5, and 6..=15 are emitted inline (no grouping).
-fn write_mantissa_stream(bw: &mut BitWriter, codes: &[(u8, u32)]) {
+pub(crate) fn write_mantissa_stream(bw: &mut BitWriter, codes: &[(u8, u32)]) {
     let n = codes.len();
     let mut consumed = vec![false; n];
     for i in 0..n {
@@ -2871,7 +2875,7 @@ fn write_mantissa(bw: &mut BitWriter, bap: u8, code: u32, ctx: &mut MantGroupCtx
 /// The register is updated one bit at a time by shifting left and
 /// XORing `0x8005` whenever the outgoing MSB is 1. The bit order of
 /// each byte is MSB-first to match the AC-3 bitstream orientation.
-fn ac3_crc_update(init: u16, data: &[u8]) -> u16 {
+pub(crate) fn ac3_crc_update(init: u16, data: &[u8]) -> u16 {
     let mut crc: u32 = init as u32;
     for &b in data {
         for i in (0..8).rev() {
@@ -3002,7 +3006,7 @@ fn gauss_gf2_16(cols: &[u16; 16], b: u16) -> u16 {
 /// always have `BLOCKS_PER_FRAME` entries; per-channel fields have
 /// `nfchans` (=2 for the encoder's currently-supported 2/0 acmod).
 #[allow(dead_code)]
-struct CouplingPlan {
+pub(crate) struct CouplingPlan {
     /// `cplinu` — whether coupling is in use for this frame. When false
     /// every other field is meaningless and the encoder emits the
     /// "coupling off" syntax (cplstre=1, cplinu=0 on block 0; reuse
@@ -3119,17 +3123,17 @@ impl CouplingPlan {
 ///   * No coupling-channel dba in v1 (cpldeltbae==2 emitted on block 0
 ///     when coupling is active).
 #[derive(Clone, Copy)]
-struct DbaPlan {
+pub(crate) struct DbaPlan {
     /// Per-channel segment count (0..=8).
-    nseg: [u8; MAX_FBW + 1],
+    pub(crate) nseg: [u8; MAX_FBW + 1],
     /// Per-channel segment offsets (5 bits each). For seg=0 this is
     /// the absolute starting band; for seg>0 it's the gap from the
     /// previous segment's end.
-    offst: [[u8; 8]; MAX_FBW + 1],
+    pub(crate) offst: [[u8; 8]; MAX_FBW + 1],
     /// Per-channel segment lengths in bands (4 bits each, 1..=15).
-    len: [[u8; 8]; MAX_FBW + 1],
+    pub(crate) len: [[u8; 8]; MAX_FBW + 1],
     /// Per-channel segment dba codes (3 bits each, Table 5.17).
-    ba: [[u8; 8]; MAX_FBW + 1],
+    pub(crate) ba: [[u8; 8]; MAX_FBW + 1],
 }
 
 impl Default for DbaPlan {
@@ -3192,7 +3196,7 @@ fn apply_dba_segments(plan: &DbaPlan, idx: usize, mask: &mut [i32; 50]) {
 /// (len) + 3 (ba) = 17 bits` — under 1% of a 192 kbps frame.
 ///
 /// Cpl-channel dba is left empty (cpldeltbae=2 on block 0).
-fn build_dba_plan(
+pub(crate) fn build_dba_plan(
     exps: &[Vec<[u8; N_COEFFS]>],
     nchan: usize,
     end: usize,

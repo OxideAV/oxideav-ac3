@@ -1,7 +1,8 @@
 # oxideav-ac3
 
-Pure-Rust **AC-3 (Dolby Digital)** audio decoder + encoder — elementary
-streams per ATSC A/52:2018 (= ETSI TS 102 366). Zero C dependencies.
+Pure-Rust **AC-3 (Dolby Digital)** + **E-AC-3 (Enhanced AC-3 / Dolby
+Digital Plus)** audio decoder + encoder — elementary streams per
+ATSC A/52:2018 (= ETSI TS 102 366). Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -34,7 +35,13 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       headroom. Bitstream syntax always allowed it; the encoder now
       uses it.
 - [ ] Downmix (§7.8) — 3/2 and 3/1 modes still pending
-- [ ] E-AC-3 (bsid=16, Annex E) — separate crate, not in scope here
+- [x] E-AC-3 (bsid=16, Annex E) — encoder, round-1 scope: independent
+      substream (`strmtyp=0`, `substreamid=0`) only, mono / stereo,
+      6 blocks per syncframe (`numblkscod=3`), no coupling, no
+      spectral extension, no Adaptive Hybrid Transform. Cross-decodes
+      cleanly through ffmpeg at PSNR equivalent to the AC-3 baseline.
+      Multichannel + dependent substreams + SPX + AHT remain out of
+      scope. Codec id = `"eac3"`.
 
 ## Installation
 

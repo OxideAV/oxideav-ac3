@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- E-AC-3 (Enhanced AC-3) encoder per ATSC A/52:2018 Annex E, round-1
+  scope: a single independent substream (`strmtyp=0`, `substreamid=0`,
+  `bsid=16`) carrying mono (acmod=1) or stereo (acmod=2) audio at
+  32 kHz / 44.1 kHz / 48 kHz, 6 audio blocks per syncframe
+  (`numblkscod=3`), no coupling, no spectral extension (`spxinu=0`),
+  no Adaptive Hybrid Transform (`ahte=0`), no transient pre-noise
+  processing. New `eac3::make_encoder` constructor and
+  `crate::CODEC_ID_STR_EAC3 = "eac3"` registration. The DSP pipeline
+  (windowing, MDCT, exponent extraction + D15 strategy, parametric bit
+  allocation, dba, mantissa quantisation) is shared with the AC-3
+  encoder via newly-pub(crate) helpers (`extract_exponent`,
+  `preprocess_d15`, `compute_bap`, `tune_snroffst`, `build_dba_plan`,
+  `quantise_mantissa`, `write_exponents_d15`, `write_mantissa_stream`,
+  `ac3_crc_update`, `BitAllocParams`, `CouplingPlan`, `DbaPlan`,
+  `TransientDetector`, `decode_input_samples`). Framing diverges:
+    - **syncinfo** (§E.2.2.1) is just the 16-bit syncword `0x0B77`;
+      no `crc1` field.
+    - **bsi** (§E.2.2.2) replaces AC-3's `bsid≤8` layout with
+      `strmtyp(2) + substreamid(3) + frmsiz(11) + fscod(2) +
+      numblkscod(2) + acmod(3) + lfeon(1) + bsid=16(5) + dialnorm(5)
+      + compre(1) + mixmdate(1) + infomdate(1) + addbsie(1)`.
+      `frmsiz = (frame_size_in_words - 1)` per §E.2.3.1.3 — the size
+      table from AC-3's §5.4.1.4 is gone.
+    - **audfrm** (§E.2.2.3) sits between bsi and the audblks and
+      carries frame-level strategy flags (`expstre=1, ahte=0,
+      snroffststr=0, transproce=0, blkswe=1, dithflage=1, bamode=1,
+      frmfgaincode=1, dbaflde=1, skipflde=1, spxattene=0`), per-block
+      coupling-strategy flags (`cplinu[0..5]=0`), per-block per-channel
+      `chexpstr[blk][ch]` (2 bits each), per-channel `convexpstr[ch]`
+      (5 bits each, value=0 = D15 + 5×REUSE per Table E2.10), and the
+      shared frame-level `frmcsnroffst(6) + frmfsnroffst(4)`.
+    - **audblk** (§E.2.2.4) emits `blksw + dithflag + dynrnge=0 +
+      spxinu=0 + (rematrix flags when acmod==2) + chbwcod (D15 blocks
+      only) + exponents (D15 blocks only) + bamode params (block 0)
+      + fgaincode=0 (default fgaincod=4 for all chans) + convsnroffste=0
+      + dba + skiple=0 + mantissas`. The `snroffststr=0` choice means
+      every channel reads the same `frmfsnroffst` from the audfrm —
+      `compute_bap` is fed the base `fsnroffst` (NOT the per-channel
+      `fsnroffst_ch[ch]` array the AC-3 path uses) so encoder and
+      decoder derive identical bap[] arrays.
+    - **errorcheck** (§E.2.2.6) is just `encinfo(1) + crc2(16) = 17
+      bits`. crc2 covers bytes `[2..frame_bytes-2]` with the same
+      polynomial and initial value as AC-3 §6.1.7 (Annex E doesn't
+      redefine the CRC).
+  Test gates (3 new tests, total = 56):
+    - `eac3_first_frame_is_syncframe` — every 768-byte boundary in
+      a 192 kbps stereo stream starts with `0x0B 0x77`.
+    - `eac3_stereo_192k_decodes_through_ffmpeg` — encode 1 s of
+      440 Hz stereo, decode through `ffmpeg -f eac3 -i …`, assert
+      PSNR ≥ 18 dB. Measured: **20.21 dB** (matches the AC-3 baseline
+      encoder's PSNR-vs-ffmpeg on the same input — ~20.7 dB).
+    - `eac3_mono_96k_decodes_through_ffmpeg` — same shape for mono,
+      96 kbps. Measured: **20.21 dB**.
+
 ### Fixed
 
 - Round 24 (task #103) — replaced the ad-hoc first-difference + 4×
