@@ -45,7 +45,7 @@ pub fn register(reg: &mut CodecRegistry) {
     let enc_caps = CodecCapabilities::audio("ac3_sw_enc")
         .with_lossy(true)
         .with_intra_only(true)
-        .with_max_channels(2)
+        .with_max_channels(6)
         .with_max_sample_rate(48_000);
     // Container tag claims. AC-3 is identified by:
     //   - WAVEFORMATEX::wFormatTag = 0x2000 (AVI / WAV)

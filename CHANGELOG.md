@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 19 — multichannel encoder. The encoder now accepts `channels`
+  ∈ 1..=6 with per-channel-count acmod selection per A/52 Table 5.8:
+    - `1` → acmod=1 (1/0 mono)
+    - `2` → acmod=2 (2/0 L,R)             — unchanged from earlier rounds
+    - `3` → acmod=3 (3/0 L,C,R)
+    - `4` → acmod=6 (2/2 L,R,Ls,Rs)
+    - `5` → acmod=7 (3/2 L,C,R,Ls,Rs)
+    - `6` → acmod=7 + lfeon=1 (3/2 + LFE — canonical 5.1 layout
+      L,C,R,Ls,Rs,LFE)
+  BSI emission switches on acmod for the `cmixlev` / `surmixlev` /
+  `dsurmod` optional fields per §5.4.2.4-7 + Tables 5.9 / 5.10 (we
+  emit the spec-default `01` = -3 dB centre/surround coefficient when
+  applicable). LFE pipeline added end-to-end: separate exponent
+  extraction over bins 0..7 (§5.4.3.29), `lfeexpstr` 1-bit per block
+  per §5.4.3.23, LFE-specific bap routine (LFE never short-blocks
+  per §5.4.3.1, no DBA per §5.4.3.47, dedicated `lfefsnroffst /
+  lfefgaincod` SNR knobs per §5.4.3.42-43), and LFE mantissas
+  emitted last per the §7.3.2 read order. Coupling and rematrix
+  remain 2/0-only as the spec requires (`acmod==2` gate). Default
+  bit rates per channel count: 1→96, 2→192, 3→256, 4→320, 5→384,
+  6→448 kbps. Test gates:
+    - `mono_self_decode_roundtrip`
+    - `three_zero_self_decode_roundtrip`
+    - `three_two_self_decode_roundtrip`
+    - `five_one_self_decode_roundtrip`
+    - `five_one_ffmpeg_crossdecode` — encodes 5.1 input with a
+      unique tone per channel + an 80 Hz sub-bass on LFE, decodes
+      via ffmpeg, asserts every channel survived (per-channel RMS
+      gate) and reports per-channel PSNR after WAVEEX channel
+      reorder. Measured per-channel PSNR on 0.5s tonal fixture at
+      448 kbps: L 14.4 dB, C 24.1 dB, R 44.7 dB, Ls 24.2 dB,
+      Rs 24.7 dB, LFE 28.4 dB.
 - Round 18 — encoder-side §7.2.2.6 / §5.4.3.47-57 delta bit allocation.
   Encoder now emits `deltbaie=1` on block 0 of every syncframe with a
   per-fbw-channel single-band segment (`deltbae[ch]=1`, `deltnseg=1`),

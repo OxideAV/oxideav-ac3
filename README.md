@@ -1,7 +1,7 @@
 # oxideav-ac3
 
-Pure-Rust **AC-3 (Dolby Digital)** audio decoder — elementary streams per
-ATSC A/52:2018 (= ETSI TS 102 366). Zero C dependencies.
+Pure-Rust **AC-3 (Dolby Digital)** audio decoder + encoder — elementary
+streams per ATSC A/52:2018 (= ETSI TS 102 366). Zero C dependencies.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
 framework but usable standalone.
@@ -19,6 +19,10 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       256-point short-block still uses a reference (non-FFT) IMDCT
 - [x] Channel coupling (§7.4) + rematrix (§7.5) + dynrng (§7.7)
 - [x] Delta bit allocation (§7.2.2.6) — encoder + decoder
+- [x] Multichannel encode — 1/0, 2/0, 3/0, 2/2, 3/2, and 3/2 + LFE
+      (the canonical 5.1 layout: L,C,R,Ls,Rs,LFE) with per-acmod BSI
+      emission, LFE exponent + bap + mantissa pipeline (§5.4.3.23
+      / §5.4.3.29 / §5.4.3.42-43), and ffmpeg cross-decode validation
 - [ ] Downmix (§7.8) — 3/2 and 3/1 modes still pending
 - [ ] E-AC-3 (bsid=16, Annex E) — separate crate, not in scope here
 

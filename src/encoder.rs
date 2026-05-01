@@ -30,6 +30,12 @@ use oxideav_core::{
 };
 
 use crate::audblk::{remat_band_count, BLOCKS_PER_FRAME, MAX_FBW, N_COEFFS, SAMPLES_PER_BLOCK};
+
+/// LFE channel mantissa-bin upper bound. Per §7.1.3 / §5.4.3.23 the LFE
+/// is fixed at 7 mantissa bins (one D15 absexp + 2 groups of 3 deltas →
+/// `nlfegrps = 2`). The decoder hard-codes `state.channels[lfe].end_mant
+/// = 7` and we mirror that bound on every LFE exp/mantissa loop.
+pub(crate) const LFE_END_MANT: usize = 7;
 use crate::decoder::SAMPLES_PER_FRAME;
 use crate::mdct::{mdct_256_pair, mdct_512};
 use crate::tables::{
@@ -42,11 +48,19 @@ use crate::tables::{
 /// [`CodecParameters::audio`]):
 ///
 /// * `sample_rate` — 48 000, 44 100, or 32 000 Hz
-/// * `channels`    — only 2 (2/0 stereo) is currently supported
+/// * `channels`    — 1..=6. Mapping to AC-3 acmod (Table 5.8):
+///   - `1` → acmod=1 (1/0 mono)
+///   - `2` → acmod=2 (2/0 L,R)
+///   - `3` → acmod=3 (3/0 L,C,R)
+///   - `4` → acmod=6 (2/2 L,R,Ls,Rs)
+///   - `5` → acmod=7 (3/2 L,C,R,Ls,Rs)
+///   - `6` → acmod=7 + lfeon=1 (3/2 + LFE — the canonical "5.1" layout
+///     L,C,R,Ls,Rs,LFE)
 ///
-/// The bit rate defaults to 192 kbps (frmsizecod = 20 for 48 kHz);
-/// callers may override via `bit_rate` on [`CodecParameters`] if it
-/// maps to a valid row of Table 5.18.
+/// The bit rate defaults per channel-count to a sensible level
+/// (mono=96 kbps, stereo=192 kbps, 3ch=256 kbps, 4ch=320 kbps, 5ch=384
+/// kbps, 5.1=448 kbps); callers may override via `bit_rate` on
+/// [`CodecParameters`] if it maps to a valid row of Table 5.18.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let sample_rate = params.sample_rate.ok_or_else(|| {
         Error::invalid("ac3 encoder: sample_rate is required (48000/44100/32000)")
@@ -54,11 +68,19 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let channels = params
         .channels
         .ok_or_else(|| Error::invalid("ac3 encoder: channels is required"))?;
-    if channels != 2 {
-        return Err(Error::Unsupported(format!(
-            "ac3 encoder: only 2-channel stereo is currently supported (got {channels})"
-        )));
-    }
+    let (acmod, lfeon, nfchans) = match channels {
+        1 => (1u8, false, 1usize), // 1/0 mono
+        2 => (2u8, false, 2usize), // 2/0 L,R
+        3 => (3u8, false, 3usize), // 3/0 L,C,R
+        4 => (6u8, false, 4usize), // 2/2 L,R,Ls,Rs
+        5 => (7u8, false, 5usize), // 3/2 L,C,R,Ls,Rs
+        6 => (7u8, true, 5usize),  // 3/2 + LFE (5.1: L,C,R,Ls,Rs,LFE)
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "ac3 encoder: unsupported channel count {channels} (must be 1..=6)"
+            )))
+        }
+    };
     let fscod: u8 = match sample_rate {
         48_000 => 0,
         44_100 => 1,
@@ -70,8 +92,23 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         }
     };
 
-    // Bit-rate → frmsizecod lookup. 192 kbps maps to frmsizecod=20.
-    let target_kbps: u32 = params.bit_rate.map(|b| (b / 1000) as u32).unwrap_or(192);
+    // Bit-rate → frmsizecod lookup. Default per channel count chosen so
+    // the per-channel bit budget stays roughly constant (~80 kbps/ch
+    // for fbw, plus a small premium for LFE side-info), matching the
+    // long-standing AC-3 production defaults documented in Annex A.
+    let default_kbps: u32 = match channels {
+        1 => 96,
+        2 => 192,
+        3 => 256,
+        4 => 320,
+        5 => 384,
+        6 => 448,
+        _ => 192,
+    };
+    let target_kbps: u32 = params
+        .bit_rate
+        .map(|b| (b / 1000) as u32)
+        .unwrap_or(default_kbps);
     let frmsizecod = pick_frmsizecod(target_kbps).ok_or_else(|| {
         Error::Unsupported(format!(
             "ac3 encoder: bit rate {target_kbps} kbps has no frmsizecod mapping"
@@ -90,18 +127,22 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     };
 
     let input_sample_format = params.sample_format.unwrap_or(SampleFormat::S16);
+    let total_chans = nfchans + usize::from(lfeon);
     Ok(Box::new(Ac3Encoder {
         codec_id: CodecId::new(crate::CODEC_ID_STR),
         out_params,
         sample_rate,
-        channels: channels as usize,
+        channels: nfchans,
+        lfeon,
+        acmod,
         input_sample_format,
         fscod,
         frmsizecod,
         frame_bytes: frame_bytes as usize,
         // 256 samples of left-context per channel feed the first MDCT.
-        delay_line: vec![vec![0.0f32; SAMPLES_PER_BLOCK]; channels as usize],
-        pending_samples: vec![Vec::<f32>::new(); channels as usize],
+        // Includes the LFE channel (last interleaved slot when lfeon=1).
+        delay_line: vec![vec![0.0f32; SAMPLES_PER_BLOCK]; total_chans],
+        pending_samples: vec![Vec::<f32>::new(); total_chans],
         packet_queue: Vec::new(),
         pts: 0,
     }))
@@ -145,7 +186,16 @@ struct Ac3Encoder {
     codec_id: CodecId,
     out_params: CodecParameters,
     sample_rate: u32,
+    /// Number of full-bandwidth channels (1..=5). LFE is *not* counted
+    /// here; see [`Ac3Encoder::lfeon`]. Mirrors `nfchans` from BSI.
     channels: usize,
+    /// Whether the LFE channel is present. When `true`, the input PCM
+    /// stride is `channels + 1` and the LFE samples come last in
+    /// interleaved order (canonical 5.1 layout: L,C,R,Ls,Rs,LFE).
+    lfeon: bool,
+    /// AC-3 audio coding mode (Table 5.8). One of {1,2,3,6,7} for the
+    /// channel counts we accept.
+    acmod: u8,
     /// Input PCM sample format. Defaults to `S16` when params don't
     /// declare one. Accepts `S16` and `F32`.
     input_sample_format: SampleFormat,
@@ -153,10 +203,12 @@ struct Ac3Encoder {
     frmsizecod: u8,
     frame_bytes: usize,
     /// Last block's right-half (256 samples) per channel, forming the
-    /// left context for the next MDCT window.
+    /// left context for the next MDCT window. Includes the LFE channel
+    /// at index `channels` when `lfeon`.
     delay_line: Vec<Vec<f32>>,
     /// Samples that have been sent via `send_frame` but not yet
-    /// consumed into a syncframe. Each inner `Vec` is per-channel.
+    /// consumed into a syncframe. Each inner `Vec` is per-channel
+    /// (fbw 0..channels, then LFE when present).
     pending_samples: Vec<Vec<f32>>,
     packet_queue: Vec<Packet>,
     /// Running sample PTS. Each produced syncframe carries SAMPLES_PER_FRAME.
@@ -185,10 +237,10 @@ impl Encoder for Ac3Encoder {
         // AudioFrame; the encoder validates layout/rate at construction
         // time via CodecParameters and trusts the caller to feed matching
         // PCM here. Channel count and stride are taken from `self.channels`
-        // and `self.input_sample_format`.
-        // Extract per-channel f32 samples from the interleaved input.
-        let per_chan = decode_input_samples(audio, self.channels, self.input_sample_format)?;
-        for ch in 0..self.channels {
+        // (fbw) plus an optional LFE slot at the end.
+        let total_chans = self.channels + usize::from(self.lfeon);
+        let per_chan = decode_input_samples(audio, total_chans, self.input_sample_format)?;
+        for ch in 0..total_chans {
             self.pending_samples[ch].extend_from_slice(&per_chan[ch]);
         }
         // Flush whole syncframes while we have enough.
@@ -213,7 +265,8 @@ impl Encoder for Ac3Encoder {
         }
         let missing = SAMPLES_PER_FRAME as usize - self.pending_samples[0].len();
         if missing > 0 {
-            for ch in 0..self.channels {
+            let total_chans = self.channels + usize::from(self.lfeon);
+            for ch in 0..total_chans {
                 self.pending_samples[ch].extend(std::iter::repeat(0.0).take(missing));
             }
         }
@@ -278,19 +331,28 @@ fn decode_input_samples(a: &AudioFrame, nch: usize, fmt: SampleFormat) -> Result
 impl Ac3Encoder {
     fn emit_syncframe(&mut self) -> Result<()> {
         let n_per = SAMPLES_PER_FRAME as usize;
-        // Run the 6-block MDCT pipeline per channel and stash coefficient
-        // blocks per channel: blocks × N_COEFFS.
+        let total_chans = self.channels + usize::from(self.lfeon);
+        let lfe_idx = self.channels; // index into pending_samples / delay_line for LFE
+                                     // Run the 6-block MDCT pipeline per channel and stash coefficient
+                                     // blocks per channel: blocks × N_COEFFS.
+                                     // We allocate `channels + 1` slots so LFE coefficients can live
+                                     // at index `self.channels` when present, mirroring the source-
+                                     // interleaved layout (LFE last). Index isn't a coupling
+                                     // pseudo-channel here — that lives at index `self.channels` in a
+                                     // *separate* `+1`-sized exps array allocated below.
         let mut coeffs: Vec<Vec<[f32; N_COEFFS]>> =
-            vec![vec![[0.0; N_COEFFS]; BLOCKS_PER_FRAME]; self.channels];
+            vec![vec![[0.0; N_COEFFS]; BLOCKS_PER_FRAME]; total_chans];
         // §5.4.3.1 blksw[ch][blk] — per-block per-channel block-switch
         // flag. Decided per block from the time-domain transient
         // detector (see `detect_transient`). When `true`, the encoder
         // runs the 256-sample MDCT pair (§7.6 / §8.2.3.2 short
         // transform) instead of the long 512-sample MDCT, and the
         // decoder swaps to the matching IMDCT path on the same flag.
+        // LFE has no blksw bit per spec — the LFE channel always uses
+        // the long-block MDCT (§5.4.3.1 lists blksw[ch] only for fbw).
         let mut blksw: Vec<[bool; BLOCKS_PER_FRAME]> =
             vec![[false; BLOCKS_PER_FRAME]; self.channels];
-        for ch in 0..self.channels {
+        for ch in 0..total_chans {
             let drain: Vec<f32> = self.pending_samples[ch].drain(0..n_per).collect();
             for blk in 0..BLOCKS_PER_FRAME {
                 // Build 512-sample input: left context + next 256.
@@ -313,12 +375,16 @@ impl Ac3Encoder {
                 // useful when bisecting whether a quality regression
                 // is short-block-related, and for the round-15 A/B
                 // PSNR measurement.
-                let is_short = if std::env::var("AC3_DISABLE_BLKSW").is_ok() {
+                // LFE never short-blocks (no blksw bit per §5.4.3.1).
+                let is_lfe_chan = self.lfeon && ch == lfe_idx;
+                let is_short = if is_lfe_chan || std::env::var("AC3_DISABLE_BLKSW").is_ok() {
                     false
                 } else {
                     detect_transient(&in_buf[256..])
                 };
-                blksw[ch][blk] = is_short;
+                if !is_lfe_chan {
+                    blksw[ch][blk] = is_short;
+                }
                 // Windowing (symmetric 512-sample AC-3 window). The
                 // window is the same regardless of long/short — the
                 // decoder applies the same 256-coeff KBD window after
@@ -348,12 +414,16 @@ impl Ac3Encoder {
         }
 
         // Per-block exponents: channels × blocks × N_COEFFS (u8 in 0..=24).
-        // Index `self.channels` (one past the last fbw channel) is the
-        // coupling pseudo-channel's exponent buffer when coupling is
-        // active; we always allocate `self.channels + 1` slots so the
-        // index arithmetic stays uniform regardless of `cpl.in_use`.
+        // Layout (mirrors audblk's `state.channels[..]`):
+        //   0..nfchans                  → fbw channels
+        //   nfchans                     → coupling pseudo-channel
+        //   nfchans + 1                 → LFE pseudo-channel (when lfeon)
+        // We always allocate `nfchans + 2` slots so the index arithmetic
+        // stays uniform regardless of `cpl.in_use` / `self.lfeon`.
+        let cpl_idx_in_exps = self.channels;
+        let lfe_idx_in_exps = self.channels + 1;
         let mut exps: Vec<Vec<[u8; N_COEFFS]>> =
-            vec![vec![[24u8; N_COEFFS]; BLOCKS_PER_FRAME]; self.channels + 1];
+            vec![vec![[24u8; N_COEFFS]; BLOCKS_PER_FRAME]; self.channels + 2];
         // Limit active bins: the decoder starts from end_mant = 37 + 3*(chbwcod+12).
         // Use chbwcod=60 → end_mant=253 (full bandwidth minus the top 3 bins).
         let chbwcod: u8 = 60;
@@ -681,12 +751,24 @@ impl Ac3Encoder {
         // (`cplabsexp << 1`) is just a starting reference; the
         // actual bin-aligned exponents start at `cpl_start`.
         if cpl.in_use {
-            let cpl_idx = self.channels;
+            let cpl_idx = cpl_idx_in_exps;
             let begf_mant = cpl.begf_mant();
             let endf_mant = cpl.endf_mant();
             for blk in 0..BLOCKS_PER_FRAME {
                 for k in begf_mant..endf_mant {
                     exps[cpl_idx][blk][k] = extract_exponent(cpl_coeffs[blk][k]);
+                }
+            }
+        }
+        // LFE exponents (§5.4.3.23 / §7.1.3 — bins 0..7 only). The
+        // decoder treats the LFE pseudo-channel like an fbw channel
+        // limited to end_mant=7 with `nlfegrps=2` (i.e. 6 D15 deltas
+        // covering bins 1..7). Encoder mirrors that: extract on each
+        // block, with the same D15-on-blocks-0/3 strategy.
+        if self.lfeon {
+            for blk in 0..BLOCKS_PER_FRAME {
+                for k in 0..LFE_END_MANT {
+                    exps[lfe_idx_in_exps][blk][k] = extract_exponent(coeffs[lfe_idx][blk][k]);
                 }
             }
         }
@@ -730,7 +812,7 @@ impl Ac3Encoder {
         // 0 and 3, REUSE elsewhere) so the cpl side info adds no
         // new strategy decisions to track.
         if cpl.in_use {
-            let cpl_idx = self.channels;
+            let cpl_idx = cpl_idx_in_exps;
             let begf_mant = cpl.begf_mant();
             let endf_mant = cpl.endf_mant();
             for blk in 0..BLOCKS_PER_FRAME {
@@ -746,6 +828,28 @@ impl Ac3Encoder {
                     let src: [u8; N_COEFFS] = exps[cpl_idx][last];
                     exps[cpl_idx][blk][begf_mant..endf_mant]
                         .copy_from_slice(&src[begf_mant..endf_mant]);
+                }
+            }
+        }
+        // LFE exponent preprocessing + REUSE block fill. Same per-block
+        // strategy choice as fbw, but lfeexpstr is a *1-bit* flag in the
+        // bitstream (§5.4.3.23) rather than 2 bits — value 0 means
+        // REUSE, 1 means new D15. We map exp_strategies==1 → lfeexpstr=1
+        // and exp_strategies==0 → lfeexpstr=0, matching the fbw cadence.
+        if self.lfeon {
+            for blk in 0..BLOCKS_PER_FRAME {
+                if exp_strategies[blk] == 1 {
+                    preprocess_d15(&mut exps[lfe_idx_in_exps][blk][..LFE_END_MANT]);
+                }
+            }
+            let mut last = 0usize;
+            for blk in 0..BLOCKS_PER_FRAME {
+                if exp_strategies[blk] == 1 {
+                    last = blk;
+                } else {
+                    let src: [u8; N_COEFFS] = exps[lfe_idx_in_exps][last];
+                    exps[lfe_idx_in_exps][blk][..LFE_END_MANT]
+                        .copy_from_slice(&src[..LFE_END_MANT]);
                 }
             }
         }
@@ -797,13 +901,15 @@ impl Ac3Encoder {
             &exp_strategies,
             &cpl,
             &dba_plan,
+            self.acmod,
+            self.lfeon,
         );
 
         // Compute bap arrays per channel per block using the tuned
-        // params. We allocate `self.channels + 1` slots so the cpl
-        // pseudo-channel's bap lives at index `self.channels`.
+        // params. Layout matches `exps`:
+        //   0..nfchans → fbw, nfchans → cpl, nfchans+1 → LFE.
         let mut baps: Vec<Vec<[u8; N_COEFFS]>> =
-            vec![vec![[0u8; N_COEFFS]; BLOCKS_PER_FRAME]; self.channels + 1];
+            vec![vec![[0u8; N_COEFFS]; BLOCKS_PER_FRAME]; self.channels + 2];
         for ch in 0..self.channels {
             for blk in 0..BLOCKS_PER_FRAME {
                 compute_bap(
@@ -826,7 +932,7 @@ impl Ac3Encoder {
         // wrapper around compute_bap) that masks with the cpl-specific
         // snroffset.
         if cpl.in_use {
-            let cpl_idx = self.channels;
+            let cpl_idx = cpl_idx_in_exps;
             let begf_mant = cpl.begf_mant();
             let endf_mant = cpl.endf_mant();
             // Build a BitAllocParams variant where csnr/fsnr are the
@@ -847,6 +953,26 @@ impl Ac3Encoder {
                 );
             }
         }
+        // LFE bap. The decoder treats LFE as a fbw channel with start=0,
+        // end=7 and `is_coupling=false`, using the LFE-specific
+        // (lfefsnroffst, lfefgaincod) pair. We run `compute_bap` with a
+        // `lfe_ba` variant carrying those values into fsnroffst/fgaincod
+        // so the masking-curve arithmetic picks them up.
+        if self.lfeon {
+            let mut lfe_ba = tuned_ba;
+            lfe_ba.fsnroffst = tuned_ba.lfefsnroffst;
+            lfe_ba.fgaincod = tuned_ba.lfefgaincod;
+            for blk in 0..BLOCKS_PER_FRAME {
+                compute_bap(
+                    &exps[lfe_idx_in_exps][blk],
+                    LFE_END_MANT,
+                    self.fscod,
+                    &lfe_ba,
+                    &mut baps[lfe_idx_in_exps][blk],
+                    None, // §5.4.3.47 forbids LFE dba — pass None.
+                );
+            }
+        }
 
         // --------- Pack the syncframe ---------
         let mut bw = BitWriter::with_capacity(self.frame_bytes);
@@ -857,14 +983,32 @@ impl Ac3Encoder {
         bw.write_u32(self.fscod as u32, 2);
         bw.write_u32(self.frmsizecod as u32, 6);
 
-        // BSI — 2/0 stereo, bsid=8, bsmod=0, dialnorm=27, no optional fields.
+        // BSI — bsid=8, bsmod=0, dialnorm=27, no optional fields.
+        // §5.4.2.3 acmod (3 bits) per Table 5.8 — supplied at make-encoder
+        // time. The optional `cmixlev` / `surmixlev` / `dsurmod` fields
+        // are only present for the acmods that actually carry a centre
+        // channel / surround channel / 2-front-only respectively
+        // (§5.4.2.4-7); we emit them with a neutral default per Tables
+        // 5.9, 5.10 (`01` = -3 dB).
         bw.write_u32(8, 5); // bsid
         bw.write_u32(0, 3); // bsmod
-        bw.write_u32(2, 3); // acmod = 2/0 stereo
-                            // cmixlev — absent for acmod=2.
-                            // surmixlev — absent (acmod bit 2 is 0).
-        bw.write_u32(0, 2); // dsurmod = not indicated
-        bw.write_u32(0, 1); // lfeon
+        bw.write_u32(self.acmod as u32, 3);
+        // §5.4.2.4 cmixlev — present when the 3 LSBs of acmod include a
+        // centre channel: `(acmod & 0x1) != 0 && acmod != 0x1` (i.e.
+        // acmod ∈ {3, 5, 7}). Value 1 = -3 dB centre downmix.
+        if (self.acmod & 0x1) != 0 && self.acmod != 0x1 {
+            bw.write_u32(1, 2);
+        }
+        // §5.4.2.5 surmixlev — present when a surround channel exists
+        // (acmod & 0x4 set, i.e. acmod ∈ {4, 5, 6, 7}). Value 1 = -3 dB.
+        if (self.acmod & 0x4) != 0 {
+            bw.write_u32(1, 2);
+        }
+        // §5.4.2.6 dsurmod — Dolby Surround flag, only in 2/0.
+        if self.acmod == 0x2 {
+            bw.write_u32(0, 2);
+        }
+        bw.write_u32(self.lfeon as u32, 1);
         bw.write_u32(27, 5); // dialnorm = -27 dB
         bw.write_u32(0, 1); // compre
         bw.write_u32(0, 1); // langcode
@@ -893,8 +1037,9 @@ impl Ac3Encoder {
             // `2^-exp` which can be perceptible; however disabling
             // dither globally is worse than enabling it (we measured
             // ~2 dB PSNR regression on speech fixtures with dith off).
-            bw.write_u32(1, 1);
-            bw.write_u32(1, 1);
+            for _ in 0..self.channels {
+                bw.write_u32(1, 1);
+            }
             // dynrnge = 0 (no dynrng transmitted; block 0 sets gain=1).
             bw.write_u32(0, 1);
             // §5.4.3.7-13 cplstre + cplinu + (when cplinu) the
@@ -973,11 +1118,19 @@ impl Ac3Encoder {
             if cpl.in_use {
                 bw.write_u32(exp_strategy as u32, 2);
             }
-            bw.write_u32(exp_strategy as u32, 2); // ch0
-            bw.write_u32(exp_strategy as u32, 2); // ch1
-                                                  // chbwcod (only when exp strategy != reuse, AND channel not
-                                                  // coupled). When coupling is active, channels do not
-                                                  // transmit their own bandwidth code.
+            // §5.4.3.22 chexpstr[ch] — 2 bits per fbw channel.
+            for _ in 0..self.channels {
+                bw.write_u32(exp_strategy as u32, 2);
+            }
+            // §5.4.3.23 lfeexpstr — 1 bit when lfeon. We mirror fbw
+            // strategy: 1 bit set when exp_strategy is "new" (D15),
+            // 0 bit when REUSE.
+            if self.lfeon {
+                bw.write_u32(if exp_strategy == 1 { 1 } else { 0 }, 1);
+            }
+            // chbwcod (only when exp strategy != reuse, AND channel not
+            // coupled). When coupling is active, channels do not
+            // transmit their own bandwidth code.
             if exp_strategy != 0 {
                 for ch in 0..self.channels {
                     if !(cpl.in_use && cpl.chincpl[ch]) {
@@ -995,7 +1148,7 @@ impl Ac3Encoder {
             // the 4-bit cplabsexp left-shifted by 1.
             if exp_strategy == 1 {
                 if cpl.in_use {
-                    let cpl_idx = self.channels;
+                    let cpl_idx = cpl_idx_in_exps;
                     let begf_mant = cpl.begf_mant();
                     let endf_mant = cpl.endf_mant();
                     write_exponents_cpl(&mut bw, &exps[cpl_idx][blk], begf_mant, endf_mant);
@@ -1003,6 +1156,12 @@ impl Ac3Encoder {
                 for ch in 0..self.channels {
                     write_exponents_d15(&mut bw, &exps[ch][blk], ch_end_mant);
                     bw.write_u32(0, 2); // gainrng = 0
+                }
+                // §5.4.3.29 LFE exponents — D15 over bins 0..7, with
+                // `nlfegrps=2` (2 groups of 3 deltas after the 4-bit
+                // absexp).
+                if self.lfeon {
+                    write_exponents_d15(&mut bw, &exps[lfe_idx_in_exps][blk], LFE_END_MANT);
                 }
             }
 
@@ -1026,10 +1185,17 @@ impl Ac3Encoder {
                     bw.write_u32(tuned_ba.cplfsnroffst as u32, 4);
                     bw.write_u32(tuned_ba.cplfgaincod as u32, 3);
                 }
-                bw.write_u32(tuned_ba.fsnroffst as u32, 4); // ch0
-                bw.write_u32(tuned_ba.fgaincod as u32, 3); // ch0
-                bw.write_u32(tuned_ba.fsnroffst as u32, 4); // ch1
-                bw.write_u32(tuned_ba.fgaincod as u32, 3); // ch1
+                // §5.4.3.40-41 fsnroffst[ch] (4 bits) + fgaincod[ch]
+                // (3 bits) per fbw channel.
+                for _ in 0..self.channels {
+                    bw.write_u32(tuned_ba.fsnroffst as u32, 4);
+                    bw.write_u32(tuned_ba.fgaincod as u32, 3);
+                }
+                // §5.4.3.42 lfefsnroffst (4 bits) + §5.4.3.43 lfefgaincod (3 bits).
+                if self.lfeon {
+                    bw.write_u32(tuned_ba.lfefsnroffst as u32, 4);
+                    bw.write_u32(tuned_ba.lfefgaincod as u32, 3);
+                }
             }
             // §5.4.3.44-46 cplleake / cplfleak / cplsleak. The spec
             // requires cplleake=1 on the first block where coupling
@@ -1127,7 +1293,7 @@ impl Ac3Encoder {
             // [cpl_begf_mant, cpl_endf_mant) bap sequence appended to
             // that channel's mantissa stream. The encoder must emit
             // codes in exactly the same order.
-            let mut codes: Vec<(u8, u32)> = Vec::with_capacity((self.channels + 1) * ch_end_mant);
+            let mut codes: Vec<(u8, u32)> = Vec::with_capacity((self.channels + 2) * ch_end_mant);
             let mut got_cplchan = false;
             for ch in 0..self.channels {
                 for bin in 0..ch_end_mant {
@@ -1141,7 +1307,7 @@ impl Ac3Encoder {
                 }
                 if cpl.in_use && cpl.chincpl[ch] && !got_cplchan {
                     got_cplchan = true;
-                    let cpl_idx = self.channels;
+                    let cpl_idx = cpl_idx_in_exps;
                     let begf_mant = cpl.begf_mant();
                     let endf_mant = cpl.endf_mant();
                     for bin in begf_mant..endf_mant {
@@ -1153,6 +1319,20 @@ impl Ac3Encoder {
                         let mant = quantise_mantissa(cpl_coeffs[blk][bin], e, bap);
                         codes.push((bap, mant));
                     }
+                }
+            }
+            // §7.3.2 — LFE mantissas come last, over bins 0..7. We use
+            // the LFE channel's own coefficients (live in
+            // `coeffs[lfe_idx][blk]`).
+            if self.lfeon {
+                for bin in 0..LFE_END_MANT {
+                    let bap = baps[lfe_idx_in_exps][blk][bin];
+                    if bap == 0 {
+                        continue;
+                    }
+                    let e = exps[lfe_idx_in_exps][blk][bin] as i32;
+                    let mant = quantise_mantissa(coeffs[lfe_idx][blk][bin], e, bap);
+                    codes.push((bap, mant));
                 }
             }
             write_mantissa_stream(&mut bw, &codes);
@@ -1518,7 +1698,11 @@ fn compute_bap(
 
     let mut excite = [0i32; 50];
     let mut lowcomp = 0i32;
-    // §7.2.2.4 fbw path (start == 0).
+    // §7.2.2.4 fbw path (start == 0). The `lfe_last` flag mirrors the
+    // decoder's same-named branch: when this channel is the LFE
+    // (end == 7), we skip the calc_lowcomp call at bin=6 so encoder
+    // and decoder derive the same excitation/mask/bap[] arrays.
+    let lfe_last = end == 7;
     if bndend > 0 {
         lowcomp = calc_lowcomp(lowcomp, bndpsd[0], bndpsd[1], 0);
         excite[0] = bndpsd[0] - fgain - lowcomp;
@@ -1531,17 +1715,21 @@ fn compute_bap(
     let mut fastleak = 0i32;
     let mut slowleak = 0i32;
     for bin in 2..7.min(bndend) {
-        lowcomp = calc_lowcomp(lowcomp, bndpsd[bin], bndpsd[bin + 1], bin);
+        if !(lfe_last && bin == 6) {
+            lowcomp = calc_lowcomp(lowcomp, bndpsd[bin], bndpsd[bin + 1], bin);
+        }
         fastleak = bndpsd[bin] - fgain;
         slowleak = bndpsd[bin] - sgain;
         excite[bin] = fastleak - lowcomp;
-        if bndpsd[bin] <= bndpsd[bin + 1] {
+        if !(lfe_last && bin == 6) && bndpsd[bin] <= bndpsd[bin + 1] {
             begin = bin + 1;
             break;
         }
     }
     for bin in begin..22.min(bndend) {
-        lowcomp = calc_lowcomp(lowcomp, bndpsd[bin], bndpsd[bin + 1], bin);
+        if !(lfe_last && bin == 6) {
+            lowcomp = calc_lowcomp(lowcomp, bndpsd[bin], bndpsd[bin + 1], bin);
+        }
         fastleak -= fdecay;
         fastleak = fastleak.max(bndpsd[bin] - fgain);
         slowleak -= sdecay;
@@ -1744,20 +1932,24 @@ fn calc_lowcomp(a: i32, b0: i32, b1: i32, bin: usize) -> i32 {
 /// blocks. Grouped bap values (1, 2, 4) charge per-group cost; other
 /// values charge nbits per mantissa. Returns the total in bits.
 ///
-/// `nchan` excludes the cpl pseudo-channel; `end` is the per-channel
-/// upper bound (= cpl_begf_mant when coupling is in use). The cpl
-/// pseudo-channel's bap (when active) is appended into the same group
-/// stream right after the first coupled channel — same order as the
-/// decoder's read schedule (`unpack_mantissas`).
+/// `nchan` excludes the cpl pseudo-channel and the LFE pseudo-channel;
+/// `end` is the per-fbw-channel upper bound (= cpl_begf_mant when
+/// coupling is in use). The cpl pseudo-channel's bap (when active) is
+/// appended into the same group stream right after the first coupled
+/// channel — same order as the decoder's read schedule
+/// (`unpack_mantissas`). When `lfeon`, the LFE channel's bap (lives at
+/// `baps[nchan + 1]`) is walked last over bins 0..LFE_END_MANT.
 fn mantissa_bits_total(
     baps: &[Vec<[u8; N_COEFFS]>],
     end: usize,
     nchan: usize,
     cpl: &CouplingPlan,
+    lfeon: bool,
 ) -> u32 {
     let blocks = baps[0].len();
     let mut total = 0u32;
     let cpl_idx = nchan;
+    let lfe_idx = nchan + 1;
     let begf_mant = cpl.begf_mant();
     let endf_mant = cpl.endf_mant();
     for blk in 0..blocks {
@@ -1826,6 +2018,36 @@ fn mantissa_bits_total(
                 }
             }
         }
+        if lfeon {
+            for bin in 0..LFE_END_MANT {
+                let bap = baps[lfe_idx][blk][bin];
+                match bap {
+                    0 => {}
+                    1 => {
+                        if g1_left == 0 {
+                            total += 5;
+                            g1_left = 3;
+                        }
+                        g1_left -= 1;
+                    }
+                    2 => {
+                        if g2_left == 0 {
+                            total += 7;
+                            g2_left = 3;
+                        }
+                        g2_left -= 1;
+                    }
+                    4 => {
+                        if g4_left == 0 {
+                            total += 7;
+                            g4_left = 2;
+                        }
+                        g4_left -= 1;
+                    }
+                    b => total += QUANTIZATION_BITS[b as usize] as u32,
+                }
+            }
+        }
     }
     total
 }
@@ -1839,10 +2061,28 @@ fn overhead_bits_for(
     nchan: usize,
     cpl: &CouplingPlan,
     dba: &DbaPlan,
+    acmod: u8,
+    lfeon: bool,
 ) -> u32 {
     // syncinfo: 16 (sync) + 16 (crc1) + 2 (fscod) + 6 (frmsizecod) = 40
-    // BSI for 2/0 stereo: 5+3+3+2+1+5+1+1+1+1+1+1+1+1 = 27
-    let mut bits: u32 = 40 + 27;
+    // BSI fixed: bsid(5) + bsmod(3) + acmod(3) + lfeon(1) + dialnorm(5)
+    //            + 8 single-bit flags (compre/langcode/audprodie/copyrightb/
+    //              origbs/timecod1e/timecod2e/addbsie) = 25
+    // BSI variable per acmod:
+    //   + cmixlev(2)   when acmod has centre + isn't 1/0 (acmod ∈ {3,5,7})
+    //   + surmixlev(2) when acmod has surround (acmod ∈ {4,5,6,7})
+    //   + dsurmod(2)   when acmod == 2/0 (acmod == 2)
+    let mut bsi_bits = 25u32;
+    if (acmod & 0x1) != 0 && acmod != 0x1 {
+        bsi_bits += 2;
+    }
+    if (acmod & 0x4) != 0 {
+        bsi_bits += 2;
+    }
+    if acmod == 0x2 {
+        bsi_bits += 2;
+    }
+    let mut bits: u32 = 40 + bsi_bits;
     // D15 ngrps for the per-channel exponents (over [0, end)).
     let ngrps = (end - 1) / 3;
     let d15_bits_per_ch = 4 + 7 * ngrps as u32;
@@ -1855,7 +2095,10 @@ fn overhead_bits_for(
     } else {
         0
     };
-    let nrematbd_bits = if nchan >= 2 {
+    // §5.4.3.19-20 rematstr + per-band rematflg. Only present in
+    // 2/0 stereo (acmod == 2) per the audblk syntax — multichannel
+    // modes carry no rematrix syntax at all.
+    let nrematbd_bits = if acmod == 2 {
         // 1 bit rematstr + nrematbd flags. With cplinu the band count
         // tracks Table 5.15.
         1 + remat_band_count(cpl.in_use, cpl.begf) as u32
@@ -1904,6 +2147,10 @@ fn overhead_bits_for(
         }
         // chexpstr × nchan (2 bits each)
         bits += 2 * nchan as u32;
+        // §5.4.3.23 lfeexpstr — 1 bit per block when lfeon.
+        if lfeon {
+            bits += 1;
+        }
         // chbwcod × nchan (6 bits) only when exp strategy != reuse and
         // channel not coupled.
         if s != 0 {
@@ -1915,21 +2162,29 @@ fn overhead_bits_for(
             bits += 6 * n_indep;
         }
         // exponents when new: cpl D15 (when cplexpstr=new) +
-        // per-channel D15 + 2 bits gainrng × nchan.
+        // per-channel D15 + 2 bits gainrng × nchan + LFE D15.
         if s == 1 {
             if cpl.in_use {
                 bits += cpl_d15_bits;
             }
             bits += (d15_bits_per_ch + 2) * nchan as u32;
+            // §5.4.3.29 LFE D15 exponents over bins 0..7 = 4 bits absexp
+            // + 2 groups × 7 bits = 18 bits. No gainrng for LFE.
+            if lfeon {
+                bits += 4 + 2 * 7;
+            }
         }
         // baie(1) + bit-alloc side info
         if s == 1 {
             // baie=1: sdcycod(2)+fdcycod(2)+sgaincod(2)+dbpbcod(2)+floorcod(3)=11
             bits += 1 + 11;
             // snroffste=1: csnr(6) + (cpl: cplfsnr(4)+cplfgain(3)) +
-            // fsnr(4)+fgain(3) per ch.
+            // fsnr(4)+fgain(3) per ch + (lfe: lfefsnr(4)+lfefgain(3)).
             bits += 1 + 6 + nchan as u32 * (4 + 3);
             if cpl.in_use {
+                bits += 4 + 3;
+            }
+            if lfeon {
                 bits += 4 + 3;
             }
         } else {
@@ -1999,8 +2254,11 @@ fn tune_snroffst(
     exp_strategies: &[u8; BLOCKS_PER_FRAME],
     cpl: &CouplingPlan,
     dba: &DbaPlan,
+    acmod: u8,
+    lfeon: bool,
 ) -> BitAllocParams {
-    let overhead = overhead_bits_for(exp_strategies, end, nchan, cpl, dba) + 32 /* safety */;
+    let overhead =
+        overhead_bits_for(exp_strategies, end, nchan, cpl, dba, acmod, lfeon) + 32 /* safety */;
     let total_bits = (frame_bytes * 8) as u32;
     if overhead >= total_bits {
         return *ba;
@@ -2026,8 +2284,10 @@ fn tune_snroffst(
             cand.csnroffst = csnr;
             cand.fsnroffst = fsnr;
             cand.cplfsnroffst = fsnr;
+            cand.lfefsnroffst = fsnr;
+            // baps slot layout: 0..nchan = fbw, nchan = cpl, nchan+1 = lfe.
             let mut baps: Vec<Vec<[u8; N_COEFFS]>> =
-                vec![vec![[0u8; N_COEFFS]; exps[0].len()]; nchan + 1];
+                vec![vec![[0u8; N_COEFFS]; exps[0].len()]; nchan + 2];
             for ch in 0..nchan {
                 for blk in 0..exps[ch].len() {
                     compute_bap(
@@ -2059,7 +2319,23 @@ fn tune_snroffst(
                     );
                 }
             }
-            let used = mantissa_bits_total(&baps, end, nchan, cpl);
+            if lfeon {
+                let lfe_idx = nchan + 1;
+                let mut lfe_ba = cand;
+                lfe_ba.fsnroffst = cand.lfefsnroffst;
+                lfe_ba.fgaincod = cand.lfefgaincod;
+                for blk in 0..exps[lfe_idx].len() {
+                    compute_bap(
+                        &exps[lfe_idx][blk],
+                        LFE_END_MANT,
+                        fscod,
+                        &lfe_ba,
+                        &mut baps[lfe_idx][blk],
+                        None,
+                    );
+                }
+            }
+            let used = mantissa_bits_total(&baps, end, nchan, cpl, lfeon);
             if used <= budget {
                 let combined = (csnr as i32) * 16 + fsnr as i32;
                 if combined > best_offset {
@@ -3640,5 +3916,321 @@ mod tests {
             drms
         );
         assert!(drms > 200.0, "ffmpeg-decoded dba RMS too low: {drms}");
+    }
+
+    // -----------------------------------------------------------------
+    // Round-19 — multichannel encode (mono, 3/0, 3/2, 5.1).
+    // -----------------------------------------------------------------
+
+    /// Helper: build N seconds of an N-channel S16 PCM buffer where
+    /// channel `c` carries a sine at `base_hz * (c + 1)` for fbw
+    /// channels and a fixed sub-bass tone (~80 Hz) when `c` is the
+    /// LFE slot in 5.1 layout. The LFE channel in AC-3 is band-
+    /// limited to ~656 Hz (end_mant=7) so high-frequency tones get
+    /// filtered out; an 80 Hz fundamental survives cleanly.
+    fn build_multichan_pcm(channels: u16, sr: u32, dur_s: f32, base_hz: f32) -> (usize, Vec<u8>) {
+        let nsamp = (sr as f32 * dur_s) as usize;
+        let mut pcm = vec![0i16; nsamp * channels as usize];
+        // For 6-channel input the last slot is LFE.
+        let lfe_idx: Option<usize> = if channels == 6 { Some(5) } else { None };
+        for n in 0..nsamp {
+            let t = n as f32 / sr as f32;
+            for c in 0..channels as usize {
+                let freq = if Some(c) == lfe_idx {
+                    80.0 // sub-bass — well inside the LFE bandwidth
+                } else {
+                    // Per-channel tone — distinct frequencies so a per-
+                    // channel decode test can spot mis-routing.
+                    base_hz * (c as f32 + 1.0)
+                };
+                let s = (2.0 * std::f32::consts::PI * freq * t).sin() * 0.30;
+                let q = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                pcm[n * channels as usize + c] = q;
+            }
+        }
+        let mut bytes = Vec::with_capacity(pcm.len() * 2);
+        for s in &pcm {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        (nsamp, bytes)
+    }
+
+    /// Common roundtrip+verify routine. Encodes the supplied PCM,
+    /// parses the BSI of every produced syncframe to assert it carries
+    /// the expected acmod / lfeon, then self-decodes and asserts the
+    /// per-channel RMS is non-zero (i.e. each fbw channel's tone made
+    /// it through the codec).
+    fn encode_decode_multichan(channels: u16, expected_acmod: u8, expected_lfeon: bool) {
+        let sr = 48_000u32;
+        let dur = 0.5f32;
+        let (nsamp, bytes) = build_multichan_pcm(channels, sr, dur, 220.0);
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(sr);
+        params.channels = Some(channels);
+        params.sample_format = Some(SampleFormat::S16);
+        let mut enc = make_encoder(&params).expect("make_encoder");
+        let audio = AudioFrame {
+            samples: nsamp as u32,
+            pts: Some(0),
+            data: vec![bytes.clone()],
+        };
+        enc.send_frame(&Frame::Audio(audio)).unwrap();
+        let _ = enc.flush();
+        let mut pkts = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => pkts.push(p),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        assert!(pkts.len() >= 10, "got only {} packets", pkts.len());
+
+        // Verify BSI on every frame matches the expected layout.
+        for p in &pkts {
+            assert_eq!(p.data[0], 0x0B);
+            assert_eq!(p.data[1], 0x77);
+            let bsi = crate::bsi::parse(&p.data[5..]).expect("bsi");
+            assert_eq!(bsi.acmod, expected_acmod);
+            assert_eq!(bsi.lfeon, expected_lfeon);
+        }
+
+        // Self-decode and check per-channel RMS. The decoder always
+        // emits in source layout (passthrough — we don't request a
+        // downmix), so each channel's tone shows up in its slot.
+        let dparams = CodecParameters::audio(CodecId::new("ac3"));
+        let mut dec = crate::decoder::make_decoder(&dparams).expect("make_decoder");
+        let mut decoded: Vec<i16> = Vec::new();
+        for p in &pkts {
+            dec.send_packet(p).unwrap();
+            if let Ok(Frame::Audio(a)) = dec.receive_frame() {
+                for s in a.data[0].chunks_exact(2) {
+                    decoded.push(i16::from_le_bytes([s[0], s[1]]));
+                }
+            }
+        }
+        let nch = channels as usize;
+        let frames = decoded.len() / nch;
+        // Skip the first 768 samples to let overlap-add prime.
+        let skip = 768usize.min(frames);
+        let usable = frames.saturating_sub(skip);
+        assert!(usable > sr as usize / 4, "decoded too few samples");
+        // Per-channel RMS — every channel must carry signal. (LFE is
+        // the exception: its band-limited 220 Hz fundamental might or
+        // might not survive depending on its low-pass shape, but on
+        // the test signal — fundamental at 220 Hz × 6 = 1320 Hz for
+        // ch5 in 6ch — the LFE channel actually receives the *first*
+        // tone (220 Hz) which sits inside the LFE band-limit.)
+        let mut per_ch_rms = vec![0.0f64; nch];
+        for ch in 0..nch {
+            let sq: f64 = (skip..frames)
+                .map(|n| decoded[n * nch + ch] as f64)
+                .map(|s| s * s)
+                .sum();
+            per_ch_rms[ch] = (sq / usable as f64).sqrt();
+        }
+        eprintln!(
+            "{}-channel self-decode per-ch RMS: {:?}",
+            channels, per_ch_rms
+        );
+        for (ch, rms) in per_ch_rms.iter().enumerate() {
+            assert!(*rms > 50.0, "channel {ch} RMS too low: {rms}");
+        }
+    }
+
+    /// Round-19: 1/0 mono encode + self-decode roundtrip.
+    #[test]
+    fn mono_self_decode_roundtrip() {
+        encode_decode_multichan(1, 1, false);
+    }
+
+    /// Round-19: 3/0 (L,C,R) encode + self-decode roundtrip.
+    #[test]
+    fn three_zero_self_decode_roundtrip() {
+        encode_decode_multichan(3, 3, false);
+    }
+
+    /// Round-19: 3/2 (L,C,R,Ls,Rs) encode + self-decode roundtrip.
+    #[test]
+    fn three_two_self_decode_roundtrip() {
+        encode_decode_multichan(5, 7, false);
+    }
+
+    /// Round-19: 5.1 (L,C,R,Ls,Rs + LFE) encode + self-decode
+    /// roundtrip. This is the canonical Dolby Digital home-theatre
+    /// layout — the new headline capability of the encoder.
+    #[test]
+    fn five_one_self_decode_roundtrip() {
+        encode_decode_multichan(6, 7, true);
+    }
+
+    /// Round-19: ffmpeg cross-decode of a 5.1 stream. Encodes a 5.1
+    /// signal with a unique tone per channel, writes the syncframes to
+    /// disk, and pipes the file through ffmpeg's AC-3 decoder. The
+    /// produced PCM is compared per-channel against the original — a
+    /// mis-aligned channel (e.g. encoder swapping the surround pair)
+    /// would show up as one channel's tone being dropped.
+    ///
+    /// Skips when ffmpeg is missing.
+    #[test]
+    fn five_one_ffmpeg_crossdecode() {
+        use std::process::Command;
+        let sr = 48_000u32;
+        let channels = 6u16;
+        let (nsamp, bytes) = build_multichan_pcm(channels, sr, 0.5, 220.0);
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(sr);
+        params.channels = Some(channels);
+        params.sample_format = Some(SampleFormat::S16);
+        let mut enc = make_encoder(&params).expect("make_encoder");
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: nsamp as u32,
+            pts: Some(0),
+            data: vec![bytes],
+        }))
+        .unwrap();
+        let _ = enc.flush();
+        let mut ac3_bytes: Vec<u8> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => ac3_bytes.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        let in_path = std::env::temp_dir().join("oxideav_ac3_51_enc.ac3");
+        let out_path = std::env::temp_dir().join("oxideav_ac3_51_dec.pcm");
+        std::fs::write(&in_path, &ac3_bytes).expect("write ac3");
+        let _ = std::fs::remove_file(&out_path);
+        let out = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "ac3",
+                "-i",
+            ])
+            .arg(&in_path)
+            .args([
+                "-f",
+                "s16le",
+                "-acodec",
+                "pcm_s16le",
+                "-ac",
+                "6",
+                "-ar",
+                "48000",
+            ])
+            .arg(&out_path)
+            .status();
+        let _ = std::fs::remove_file(&in_path);
+        let Ok(status) = out else {
+            eprintln!("ffmpeg unavailable — skipping 5.1 cross-decode gate");
+            return;
+        };
+        if !status.success() {
+            panic!("ffmpeg failed to decode our 5.1 AC-3 output");
+        }
+        let Ok(decoded_bytes) = std::fs::read(&out_path) else {
+            panic!("ffmpeg produced no decode output");
+        };
+        let _ = std::fs::remove_file(&out_path);
+        // Per-channel RMS diagnostic. ffmpeg may apply a different
+        // channel reorder (its native AC-3 order is L,R,C,LFE,Ls,Rs
+        // when decoding to PCM), so we just sanity-check that every
+        // channel in the PCM stream carries signal energy — proof
+        // that the encoder didn't drop any of the 5.1 inputs.
+        let nch = channels as usize;
+        let total = decoded_bytes.len() / 2;
+        let frames = total / nch;
+        assert!(frames > sr as usize / 4, "ffmpeg decoded too few samples");
+        let skip = 768usize.min(frames);
+        let usable = frames.saturating_sub(skip);
+        let samples: Vec<i16> = decoded_bytes
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let mut per_ch_rms = vec![0.0f64; nch];
+        for ch in 0..nch {
+            let sq: f64 = (skip..frames)
+                .map(|n| samples[n * nch + ch] as f64)
+                .map(|s| s * s)
+                .sum();
+            per_ch_rms[ch] = (sq / usable as f64).sqrt();
+        }
+        eprintln!("ffmpeg 5.1 decode per-ch RMS: {:?}", per_ch_rms);
+        for (ch, rms) in per_ch_rms.iter().enumerate() {
+            assert!(
+                *rms > 50.0,
+                "ffmpeg-decoded ch{ch} RMS too low: {rms} — channel was lost",
+            );
+        }
+
+        // ---------- Per-channel PSNR vs reference ----------
+        //
+        // Our source layout: L, C, R, Ls, Rs, LFE   (per A/52 §5.4.2.3
+        //                                            acmod=7 + LFE).
+        // ffmpeg's PCM out:  L, R, C, LFE, Ls, Rs   (Microsoft / WAVEEX
+        //                                            channel order, which
+        //                                            ffmpeg uses by default
+        //                                            for raw s16le output).
+        // Pair source ch ↔ ffmpeg-PCM ch via the table below, then
+        // compute per-channel PSNR with a small lag search to absorb
+        // the encoder's overlap-add prime (~256 samples of latency
+        // on the first frame).
+        let src_to_ffmpeg = [0usize, 2, 1, 4, 5, 3];
+        let (_nsamp_src, src_bytes) = build_multichan_pcm(channels, sr, 0.5, 220.0);
+        let src_samples: Vec<i16> = src_bytes
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        for src_ch in 0..nch {
+            let ff_ch = src_to_ffmpeg[src_ch];
+            let mut best_sse = f64::INFINITY;
+            let mut best_lag = 0i32;
+            for lag in -512i32..=512 {
+                let mut sse = 0.0f64;
+                let mut count = 0usize;
+                for i in 0..usable {
+                    let src_n = (skip + i) as i32 + lag;
+                    if src_n < 0 || (src_n as usize) >= src_samples.len() / nch {
+                        continue;
+                    }
+                    let dec = samples[(skip + i) * nch + ff_ch] as f64;
+                    let orig = src_samples[src_n as usize * nch + src_ch] as f64;
+                    let d = dec - orig;
+                    sse += d * d;
+                    count += 1;
+                }
+                if count > 0 {
+                    let mse = sse / count as f64;
+                    if mse < best_sse {
+                        best_sse = mse;
+                        best_lag = lag;
+                    }
+                }
+            }
+            let psnr = if best_sse > 0.0 {
+                10.0 * (32767.0f64.powi(2) / best_sse).log10()
+            } else {
+                f64::INFINITY
+            };
+            eprintln!(
+                "ffmpeg 5.1 src_ch={src_ch} (ffmpeg ch={ff_ch}) PSNR={psnr:.2} dB lag={best_lag}",
+            );
+            // PSNR floor — chosen well below typical 5.1 / 448 kbps
+            // performance (~25 dB for tonal stationary signals) so
+            // the gate doesn't trip on small lag-search residue.
+            // The measured per-channel numbers are printed in the
+            // log above for capacity diagnosis. A real failure
+            // (e.g. one channel encoded as silence or routed to the
+            // wrong slot) drops PSNR below 5 dB.
+            assert!(
+                psnr > 10.0,
+                "ffmpeg src_ch{src_ch} PSNR {psnr:.2} dB below 10 dB floor",
+            );
+        }
     }
 }
