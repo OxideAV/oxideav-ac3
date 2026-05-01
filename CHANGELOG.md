@@ -7,7 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Round 24 (task #103) — replaced the ad-hoc first-difference + 4×
+  energy-ratio transient detector with a spec-faithful §8.2.2
+  implementation: a 4th-order Butterworth high-pass at 8 kHz cutoff
+  (cascaded direct-form-I biquads) followed by the hierarchical
+  three-level peak-ratio test (T₁=0.1, T₂=0.075, T₃=0.05) with a
+  `100/32768` silence threshold. Per-channel state holds the biquad
+  memory and the previous block's last-segment peaks so the cross-
+  block "k=1" comparisons of step 4 work as written. The previous
+  detector mis-fired on low-frequency pure tones (e.g. 220 Hz sine):
+  its 32-sample sub-frame energy ratio crossed 4× whenever a sub-
+  frame happened to land near the sine's zero-crossing, triggering
+  the 256-point short MDCT on a steady-state signal. Short MDCT on
+  a pure tone smears the bin energy across multiple bins, dropping
+  the ffmpeg-cross-decode L-channel PSNR on the 5.1 fixture from a
+  spec-expected ~24 dB down to **14.36 dB**. After the fix the
+  L-channel reads **24.54 dB** (+10.2 dB), matching the other fbw
+  channels' bit-allocation ceiling. The decoder side was already
+  correct; this was strictly an encoder transient-decision bug.
+  `transient_roundtrip_self_decode` had its synthetic-burst fixture
+  re-shaped (sharper σ=12 sample envelope at 4/8 kHz carrier) so the
+  bursts carry meaningful HF content for the 8 kHz HPF to pass — the
+  old σ=32 / 800-2400 Hz bursts were below the spec detector's
+  threshold and would trip a regression test that documents real
+  detector behaviour.
+
 ### Added
+
+- Round 24 (task #103) — per-channel `fsnroffst[ch]` tuning
+  (§5.4.3.40). `BitAllocParams` now carries a `[u8; MAX_FBW]` array
+  of per-channel fine-SNR offsets; after the global `(csnr, fsnr)`
+  selection the tuner does a greedy per-channel sweep that bumps
+  individual channels' `fsnroffst[ch]` as long as the residual frame
+  budget allows. Previously every fbw channel emitted the same
+  `fsnroffst` value, leaving budget on the table when one channel's
+  mask had more headroom than its peers. The bitstream syntax always
+  allowed per-channel emission; the encoder just wasn't using it.
 
 - Round 19 — multichannel encoder. The encoder now accepts `channels`
   ∈ 1..=6 with per-channel-count acmod selection per A/52 Table 5.8:

@@ -143,6 +143,9 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         // Includes the LFE channel (last interleaved slot when lfeon=1).
         delay_line: vec![vec![0.0f32; SAMPLES_PER_BLOCK]; total_chans],
         pending_samples: vec![Vec::<f32>::new(); total_chans],
+        // Per-fbw-channel transient-detector state. LFE doesn't use
+        // blksw (§5.4.3.1) so we skip it; index 0..nfchans.
+        transient_state: (0..nfchans).map(|_| TransientDetector::default()).collect(),
         packet_queue: Vec::new(),
         pts: 0,
     }))
@@ -210,6 +213,12 @@ struct Ac3Encoder {
     /// consumed into a syncframe. Each inner `Vec` is per-channel
     /// (fbw 0..channels, then LFE when present).
     pending_samples: Vec<Vec<f32>>,
+    /// Per-fbw-channel state for the §8.2.2 spec-compliant transient
+    /// detector. Holds the cascaded biquad HPF state and the previous
+    /// 256-sample block's last-segment peak per hierarchy level so the
+    /// "P[j][0] = previous-tree last-segment peak" test of §8.2.2
+    /// step 4 has the right history.
+    transient_state: Vec<TransientDetector>,
     packet_queue: Vec<Packet>,
     /// Running sample PTS. Each produced syncframe carries SAMPLES_PER_FRAME.
     pts: i64,
@@ -361,26 +370,32 @@ impl Ac3Encoder {
                 in_buf[256..].copy_from_slice(
                     &drain[blk * SAMPLES_PER_BLOCK..(blk + 1) * SAMPLES_PER_BLOCK],
                 );
-                // Per-block transient decision. Compares the high-pass
-                // energy of consecutive 64-sample sub-frames within
-                // the *new* 256-sample input (the right half of the
-                // 512-sample window, where a transient that starts
-                // here will be smeared by a long MDCT but captured
-                // cleanly by the short-block pair). Threshold + HP
-                // filter chosen empirically against the burst fixture
-                // — see `detect_transient` for the rationale.
+                // Per-block transient decision. Implements §8.2.2 of
+                // ATSC A/52: a 4th-order Butterworth HPF at 8 kHz
+                // followed by a hierarchical peak-ratio test on three
+                // levels (256 / 128×2 / 64×4). The "second half" of
+                // the 512-sample MDCT window — i.e. the freshly drained
+                // 256 samples in `in_buf[256..]` — is what we test;
+                // a transient there is what the short-block pair
+                // localises so it doesn't smear across the prior 256
+                // samples of left-context.
+                //
+                // Spec uses very strict ratios (T[1]=0.1, T[2]=0.075,
+                // T[3]=0.05) → ~10×–20× peak rises required; pure tones
+                // (even at low frequency) sit nowhere near these
+                // thresholds because the 8 kHz HPF removes the carrier
+                // entirely.
                 //
                 // The `AC3_DISABLE_BLKSW=1` environment variable
                 // forces long blocks regardless of detector output —
                 // useful when bisecting whether a quality regression
-                // is short-block-related, and for the round-15 A/B
-                // PSNR measurement.
+                // is short-block-related.
                 // LFE never short-blocks (no blksw bit per §5.4.3.1).
                 let is_lfe_chan = self.lfeon && ch == lfe_idx;
                 let is_short = if is_lfe_chan || std::env::var("AC3_DISABLE_BLKSW").is_ok() {
                     false
                 } else {
-                    detect_transient(&in_buf[256..])
+                    self.transient_state[ch].process(&in_buf[256..])
                 };
                 if !is_lfe_chan {
                     blksw[ch][blk] = is_short;
@@ -869,6 +884,7 @@ impl Ac3Encoder {
             // bytes) rather than overshoots.
             csnroffst: 15,
             fsnroffst: 0,
+            fsnroffst_ch: [0u8; MAX_FBW],
             cplfsnroffst: 0,
             lfefsnroffst: 0,
             fgaincod: 4,
@@ -904,19 +920,22 @@ impl Ac3Encoder {
             self.acmod,
             self.lfeon,
         );
-
         // Compute bap arrays per channel per block using the tuned
         // params. Layout matches `exps`:
         //   0..nfchans → fbw, nfchans → cpl, nfchans+1 → LFE.
+        // Per-channel fsnroffst is read from `tuned_ba.fsnroffst_ch`
+        // so each channel uses its own bit-allocation refinement.
         let mut baps: Vec<Vec<[u8; N_COEFFS]>> =
             vec![vec![[0u8; N_COEFFS]; BLOCKS_PER_FRAME]; self.channels + 2];
         for ch in 0..self.channels {
+            let mut ch_ba = tuned_ba;
+            ch_ba.fsnroffst = tuned_ba.fsnroffst_ch[ch];
             for blk in 0..BLOCKS_PER_FRAME {
                 compute_bap(
                     &exps[ch][blk],
                     ch_end_mant,
                     self.fscod,
-                    &tuned_ba,
+                    &ch_ba,
                     &mut baps[ch][blk],
                     Some((&dba_plan, ch)),
                 );
@@ -1186,9 +1205,12 @@ impl Ac3Encoder {
                     bw.write_u32(tuned_ba.cplfgaincod as u32, 3);
                 }
                 // §5.4.3.40-41 fsnroffst[ch] (4 bits) + fgaincod[ch]
-                // (3 bits) per fbw channel.
-                for _ in 0..self.channels {
-                    bw.write_u32(tuned_ba.fsnroffst as u32, 4);
+                // (3 bits) per fbw channel. Per-channel fsnroffst
+                // values are populated by the per-channel refinement
+                // pass in `tune_snroffst`; channels with more masking
+                // headroom get bumped above the global base.
+                for ch in 0..self.channels {
+                    bw.write_u32(tuned_ba.fsnroffst_ch[ch] as u32, 4);
                     bw.write_u32(tuned_ba.fgaincod as u32, 3);
                 }
                 // §5.4.3.42 lfefsnroffst (4 bits) + §5.4.3.43 lfefgaincod (3 bits).
@@ -1438,50 +1460,175 @@ impl Ac3Encoder {
 /// independently — adjacent transients on different channels are
 /// allowed to flip blksw differently per spec §5.4.3.1).
 ///
-/// Threshold = 4.0 — corresponds to ~6 dB sub-frame-to-sub-frame
-/// energy jump. Smaller `THRESHOLD` over-triggers on a steady tone's
-/// natural amplitude variation; larger misses the trailing edge of
-/// short attacks. 4.0 picks up the burst onsets in the
-/// `transient_bursts_stereo` fixture's analogue without misfiring on
-/// the steady 440 Hz pre-burst region (verified by
-/// `transient_detector_sanity`).
-fn detect_transient(block: &[f32]) -> bool {
-    if block.len() < 32 {
-        return false;
-    }
-    const THRESHOLD: f32 = 4.0;
-    // 32-sample sub-frames give the detector ~150 µs resolution
-    // (32 samples / 48 kHz). Smaller would be more sensitive but
-    // also noisier; larger would miss sharp clicks.
-    const SUBFRAME: usize = 32;
-    // High-pass via first-difference. A first-order HP has a 6
-    // dB/oct slope, which is enough to suppress the dominant
-    // 440 Hz sine in the test fixture (rolled off ~10 dB at the
-    // first-difference's natural break-frequency of ~2400 Hz @
-    // 48 kHz) while passing the burst's sharp envelope edges.
-    let mut hp = vec![0.0f32; block.len()];
-    hp[0] = block[0];
-    for i in 1..block.len() {
-        hp[i] = block[i] - block[i - 1];
-    }
-    // Sub-frame energies.
-    let nsub = block.len() / SUBFRAME;
-    let mut energies = vec![0.0f32; nsub];
-    for sub in 0..nsub {
-        let lo = sub * SUBFRAME;
-        let hi = lo + SUBFRAME;
-        energies[sub] = hp[lo..hi].iter().map(|&v| v * v).sum::<f32>();
-    }
-    // Search for the largest sub-to-sub energy jump.
-    const FLOOR: f32 = 1e-8;
-    for w in energies.windows(2) {
-        let prev = w[0].max(FLOOR);
-        let cur = w[1];
-        if cur > THRESHOLD * prev {
-            return true;
+/// Spec-faithful (ATSC A/52 §8.2.2) per-channel transient detector.
+///
+/// Holds the cascaded biquad HPF state across 256-sample blocks plus
+/// the prior block's last-segment peak per hierarchy level so the
+/// "P[j][0] = previous tree's last segment peak" rule of step 4 has
+/// the right history.
+///
+/// The HPF is a 4th-order Butterworth high-pass at 8 kHz cutoff @
+/// 48 kHz sample rate, implemented as two cascaded direct-form-I
+/// biquads with Butterworth Q values (~0.541 and ~1.307) producing a
+/// 24 dB/oct rolloff below 8 kHz. Coefficients are pre-computed for
+/// (fc=8000, fs=48000) — the §8.2.2 spec doesn't bind the filter
+/// coefficients but does bind the topology and cutoff.
+#[derive(Clone, Default)]
+struct TransientDetector {
+    /// Direct-form-I biquad memory: [x[n-1], x[n-2], y[n-1], y[n-2]]
+    /// for stage 0 (low Q) and stage 1 (high Q).
+    biquad_state: [[f32; 4]; 2],
+    /// Last-segment peak per hierarchy level from the previous block,
+    /// representing P[1][0] / P[2][0] / P[3][0] in the §8.2.2
+    /// formulation (the "k=0" entry is the previous tree's last
+    /// segment).
+    prev_peak_l1: f32,
+    prev_peak_l2: f32,
+    prev_peak_l3: f32,
+    /// `false` until the first block has been processed. The very
+    /// first call sees zeroed biquad state, which means the HPF has a
+    /// startup transient over the first ~10 samples regardless of
+    /// input — that transient looks like a sharp onset to the
+    /// segment-1-vs-prior-block comparison and would over-trigger.
+    /// We therefore skip the k=1 (cross-block) parts of the §8.2.2
+    /// step-4 test on the first call only.
+    primed: bool,
+}
+
+/// Cascaded-biquad direct-form-I 4th-order Butterworth HPF at 8 kHz @
+/// 48 kHz. Coefficients computed via bilinear-transform RBJ HPF
+/// formulae with the two stage-Q values for a 4th-order Butterworth
+/// (Q₁ ≈ 0.5412, Q₂ ≈ 1.3066).
+///
+/// Each biquad: `y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2]
+///                    - a1*y[n-1] - a2*y[n-2]`.
+/// Indexing: `[b0, b1, b2, a1, a2]` (a0 normalised to 1).
+const HPF_8K_BIQUADS: [[f32; 5]; 2] = [
+    // Stage 0 — low Q (≈ 0.5412), more damped pole pair.
+    [
+        0.416_658_9,
+        -0.833_317_8,
+        0.416_658_9,
+        -0.555_545_6,
+        0.111_09,
+    ],
+    // Stage 1 — high Q (≈ 1.3066), peaking pole pair.
+    [
+        0.563_325_9,
+        -1.126_651_7,
+        0.563_325_9,
+        -0.751_113,
+        0.502_226_3,
+    ],
+];
+
+impl TransientDetector {
+    /// Run the 256-sample second-half through the HPF and the
+    /// hierarchical peak-ratio test. Returns `true` when a transient
+    /// is detected per §8.2.2 step 4.
+    fn process(&mut self, block: &[f32]) -> bool {
+        if block.len() < 256 {
+            // Pre-priming or partial input — never short-block.
+            return false;
         }
+        // 1) High-pass filter — cascaded biquad direct-form-I.
+        let mut hp = [0.0f32; 256];
+        for i in 0..256 {
+            let mut x = block[i];
+            for stage in 0..2 {
+                let s = &mut self.biquad_state[stage];
+                let c = &HPF_8K_BIQUADS[stage];
+                let y = c[0] * x + c[1] * s[0] + c[2] * s[1] - c[3] * s[2] - c[4] * s[3];
+                // Shift state.
+                s[1] = s[0]; // x[n-2] = x[n-1]
+                s[0] = x; // x[n-1] = x[n]
+                s[3] = s[2]; // y[n-2] = y[n-1]
+                s[2] = y; // y[n-1] = y[n]
+                x = y;
+            }
+            hp[i] = x;
+        }
+        // 4a) Silence threshold — if the overall block peak is below
+        // 100/32768 ≈ 0.003, force long block regardless of relative
+        // peaks.
+        let p11 = hp.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        const SILENCE_THRESHOLD: f32 = 100.0 / 32768.0;
+        if p11 < SILENCE_THRESHOLD {
+            // Persist last-segment peaks for the next block (use 0;
+            // silence has no carry-over significance).
+            self.prev_peak_l1 = p11;
+            self.prev_peak_l2 = peak(&hp[128..256]);
+            self.prev_peak_l3 = peak(&hp[192..256]);
+            return false;
+        }
+        // 2/3) Hierarchical peak detection.
+        // Level 1: P[1][1] = peak over [0,256) — already = p11.
+        // Level 2: P[2][1] = peak over [0,128); P[2][2] = peak over [128,256).
+        // Level 3: P[3][1..4] = peak over each 64-sample segment.
+        let p21 = peak(&hp[0..128]);
+        let p22 = peak(&hp[128..256]);
+        let p31 = peak(&hp[0..64]);
+        let p32 = peak(&hp[64..128]);
+        let p33 = peak(&hp[128..192]);
+        let p34 = peak(&hp[192..256]);
+        // Threshold ratios per §8.2.2 step 4: |P[j][k]| × T[j] > |P[j][k-1]|
+        // means the new peak is more than 1/T[j] times the previous —
+        // i.e. a sharp rise. For k=1 the previous-segment reference is
+        // the prior block's last-segment peak (P[j][0]).
+        const T1: f32 = 0.1;
+        const T2: f32 = 0.075;
+        const T3: f32 = 0.05;
+        // We also guard against division-by-zero when the previous
+        // segment was effectively silent. The spec test is multiplicative
+        // (no division), so silence → previous peak ≈ 0 → any positive
+        // current peak satisfies the inequality. The silence-threshold
+        // check above (step 4a) already short-circuits the
+        // "everything-quiet" block; here we just need a tiny epsilon to
+        // keep the comparison numerically sane for adjacent-segment
+        // pairs where one segment landed near a HPF zero-crossing.
+        // Setting this too high (e.g. 100/32768) suppresses real burst
+        // detection where a near-silent pre-burst segment is followed by
+        // a moderate-amplitude attack — the pure-tone case is already
+        // ruled out by the 8 kHz HPF's removal of the carrier.
+        const PREV_FLOOR: f32 = 1e-8;
+        // Cross-block (k=1) comparisons. Skip on the very first call
+        // because the un-primed biquad startup transient would always
+        // fire them.
+        let (trig_l1_x, trig_l2_x, trig_l3_x) = if self.primed {
+            (
+                p11 * T1 > self.prev_peak_l1.max(PREV_FLOOR),
+                p21 * T2 > self.prev_peak_l2.max(PREV_FLOOR),
+                p31 * T3 > self.prev_peak_l3.max(PREV_FLOOR),
+            )
+        } else {
+            (false, false, false)
+        };
+        let trig_l2 = trig_l2_x || (p22 * T2 > p21.max(PREV_FLOOR));
+        let trig_l3 = trig_l3_x
+            || (p32 * T3 > p31.max(PREV_FLOOR))
+            || (p33 * T3 > p32.max(PREV_FLOOR))
+            || (p34 * T3 > p33.max(PREV_FLOOR));
+        let triggered = trig_l1_x || trig_l2 || trig_l3;
+        // Persist this block's last-segment peaks for the next call.
+        self.prev_peak_l1 = p11;
+        self.prev_peak_l2 = p22;
+        self.prev_peak_l3 = p34;
+        self.primed = true;
+        triggered
     }
-    false
+}
+
+#[inline]
+fn peak(seg: &[f32]) -> f32 {
+    seg.iter().fold(0.0f32, |a, &v| a.max(v.abs()))
+}
+
+/// Stateless wrapper around [`TransientDetector::process`] for the
+/// existing `transient_detector_sanity` smoke test, which doesn't
+/// thread per-call state (single-shot inputs).
+#[cfg(test)]
+fn detect_transient(block: &[f32]) -> bool {
+    TransientDetector::default().process(block)
 }
 
 // ---------------------------------------------------------------------------
@@ -1634,7 +1781,17 @@ struct BitAllocParams {
     dbpbcod: u8,
     floorcod: u8,
     csnroffst: u8,
+    /// Base / "global" fsnroffst for fbw channels. After
+    /// `tune_snroffst` runs, the per-channel array `fsnroffst_ch`
+    /// carries the per-channel tuned values (each ≥ this base) and the
+    /// bitstream emitter writes the per-channel values. The base value
+    /// is also the one fed into `compute_bap_cpl` when its caller
+    /// substitutes `fsnroffst = cplfsnroffst`.
     fsnroffst: u8,
+    /// Per-fbw-channel fine SNR offset (§5.4.3.40). Bitstream-level
+    /// width is 4 bits / channel. Defaults to `[fsnroffst; MAX_FBW]`
+    /// when the per-channel tuner hasn't run yet.
+    fsnroffst_ch: [u8; MAX_FBW],
     cplfsnroffst: u8,
     lfefsnroffst: u8,
     fgaincod: u8,
@@ -2343,6 +2500,112 @@ fn tune_snroffst(
                     best = cand;
                 }
             }
+        }
+    }
+    // Seed per-channel array with the chosen global fsnr so the
+    // bitstream emitter has a populated `fsnroffst_ch` even when the
+    // per-channel refinement loop below is a no-op.
+    for ch in 0..MAX_FBW {
+        best.fsnroffst_ch[ch] = best.fsnroffst;
+    }
+    if nchan == 0 {
+        return best;
+    }
+
+    // -----------------------------------------------------------------
+    // Per-channel fsnroffst refinement (round-23/103, §5.4.3.40).
+    //
+    // After the global (csnr, fsnr) is chosen above, the budget is
+    // typically not exhausted — many channels only need fsnr=k while a
+    // few would benefit from fsnr=k+δ. The bitstream syntax allows a
+    // distinct fsnroffst per fbw channel (4 bits each); spending the
+    // residual budget per-channel turns leftover bits into per-channel
+    // PSNR.
+    //
+    // Greedy refinement: while at least one channel can have its
+    // fsnroffst incremented by 1 without overshooting `budget`, pick
+    // the channel that delivers the largest mantissa-bit increase per
+    // step (= the channel whose mask has the most low-bap bins to
+    // promote — the ones that benefit most). For simplicity we just
+    // pick the lowest-numbered channel that fits each round; the
+    // order matters only marginally because the bumps are 1-step and
+    // the total slack is usually 1-3 bumps per channel.
+    //
+    // We don't tune cplfsnroffst / lfefsnroffst per-channel here —
+    // they're singletons in the bitstream syntax and the cpl/lfe
+    // pseudo-channels don't need it for the current test inputs.
+    let recompute_used = |ba_in: &BitAllocParams| -> u32 {
+        let mut bps: Vec<Vec<[u8; N_COEFFS]>> =
+            vec![vec![[0u8; N_COEFFS]; exps[0].len()]; nchan + 2];
+        for ch in 0..nchan {
+            let mut ch_ba = *ba_in;
+            ch_ba.fsnroffst = ba_in.fsnroffst_ch[ch];
+            for blk in 0..exps[ch].len() {
+                compute_bap(
+                    &exps[ch][blk],
+                    end,
+                    fscod,
+                    &ch_ba,
+                    &mut bps[ch][blk],
+                    Some((dba, ch)),
+                );
+            }
+        }
+        if cpl.in_use {
+            let cpl_idx = nchan;
+            let begf_mant = cpl.begf_mant();
+            let endf_mant = cpl.endf_mant();
+            let mut cpl_ba = *ba_in;
+            cpl_ba.fsnroffst = ba_in.cplfsnroffst;
+            cpl_ba.fgaincod = ba_in.cplfgaincod;
+            for blk in 0..exps[cpl_idx].len() {
+                compute_bap_cpl(
+                    &exps[cpl_idx][blk],
+                    begf_mant,
+                    endf_mant,
+                    fscod,
+                    &cpl_ba,
+                    &mut bps[cpl_idx][blk],
+                    Some((dba, MAX_FBW)),
+                );
+            }
+        }
+        if lfeon {
+            let lfe_idx = nchan + 1;
+            let mut lfe_ba = *ba_in;
+            lfe_ba.fsnroffst = ba_in.lfefsnroffst;
+            lfe_ba.fgaincod = ba_in.lfefgaincod;
+            for blk in 0..exps[lfe_idx].len() {
+                compute_bap(
+                    &exps[lfe_idx][blk],
+                    LFE_END_MANT,
+                    fscod,
+                    &lfe_ba,
+                    &mut bps[lfe_idx][blk],
+                    None,
+                );
+            }
+        }
+        mantissa_bits_total(&bps, end, nchan, cpl, lfeon)
+    };
+    // Per-channel greedy bumps. Cap iterations at MAX_FBW * 16 (15 max
+    // bump per channel) to bound the worst-case work.
+    for _round in 0..(MAX_FBW * 16) {
+        let mut bumped = false;
+        for ch in 0..nchan {
+            if best.fsnroffst_ch[ch] >= 15 {
+                continue;
+            }
+            let mut trial = best;
+            trial.fsnroffst_ch[ch] += 1;
+            let trial_used = recompute_used(&trial);
+            if trial_used <= budget {
+                best = trial;
+                bumped = true;
+            }
+        }
+        if !bumped {
+            break;
         }
     }
     best
@@ -3248,32 +3511,41 @@ mod tests {
     }
 
     /// End-to-end transient encode + decode: build a stereo signal with
-    /// three sharp Gaussian bursts (matching the structure of the
-    /// `transient_bursts_stereo.ac3` decoder fixture), encode, then
-    /// decode through our own decoder. Verify (a) at least a handful
-    /// of audio blocks emit `blksw=1`, and (b) the round-trip RMS is
-    /// non-trivial. The encoder→decoder PSNR floor for transient
-    /// content with short blocks active is meaningfully above the
-    /// long-only baseline (~21 dB documented in the task brief).
+    /// three sharp clicks (matching the broadband content of real AC-3
+    /// transients), encode, then decode through our own decoder. Verify
+    /// (a) at least a handful of audio blocks emit `blksw=1`, and
+    /// (b) the round-trip RMS is non-trivial. The encoder→decoder PSNR
+    /// floor for transient content with short blocks active is
+    /// meaningfully above the long-only baseline (~21 dB documented in
+    /// the task brief).
+    ///
+    /// Click structure: a half-Hann-windowed broadband impulse (4 kHz +
+    /// 8 kHz components, σ ≈ 12 samples) at each click time. The 8 kHz
+    /// content is essential — the §8.2.2 transient detector applies a
+    /// 4th-order Butterworth HPF at 8 kHz cutoff, so a click whose
+    /// spectrum dies below 4 kHz produces no detectable post-HPF peak.
     #[test]
     fn transient_roundtrip_self_decode() {
         let sr = 48_000u32;
         let dur = 1.0f32;
         let nsamp = (sr as f32 * dur) as usize;
-        // Stereo signal: 440 Hz background + 3 wider bursts at
-        // 0.20 / 0.50 / 0.80 s. Burst envelope width = 32 samples
-        // (≈ 0.7 ms) — wide enough to break the long-block MDCT's
-        // pre/post-echo at the burst boundary, narrow enough for
-        // the short-block pair (256-sample MDCT) to localise.
         let mut pcm = vec![0i16; nsamp * 2];
         for n in 0..nsamp {
             let t = n as f32 / sr as f32;
             let base = 0.10 * (2.0 * std::f32::consts::PI * 440.0 * t).sin();
             let mut burst = 0.0f32;
-            for &(t_burst, freq) in &[(0.20, 1200.0), (0.50, 2400.0), (0.80, 800.0)] {
-                let dt = (t - t_burst) * sr as f32 / 32.0;
+            // Sharp clicks at 0.20 / 0.50 / 0.80 s. Each click is a
+            // narrow Gaussian-windowed sine pair (4 kHz + 8 kHz) at
+            // σ=12 samples (~0.25 ms wide). The HF content survives
+            // the 8 kHz HPF and produces a clean P[3] peak for the
+            // §8.2.2 detector to fire on.
+            for &t_burst in &[0.20f32, 0.50, 0.80] {
+                let dt = (t - t_burst) * sr as f32 / 12.0;
                 let env = (-(dt * dt)).exp();
-                burst += 0.7 * env * (2.0 * std::f32::consts::PI * freq * t).sin();
+                burst += 0.7
+                    * env
+                    * ((2.0 * std::f32::consts::PI * 4000.0 * t).sin() * 0.5
+                        + (2.0 * std::f32::consts::PI * 8000.0 * t).sin() * 0.5);
             }
             let s = (base + burst).clamp(-1.0, 1.0);
             let q = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
