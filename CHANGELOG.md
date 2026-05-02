@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 25 (task #155) — multichannel coupling: extended the encoder's
+  §7.4 channel-coupling path from the previous 2/0-only restriction to
+  every multichannel acmod (3/0, 2/2, 3/2, 5.1). All available fbw
+  channels join the coupling group (`chincpl[ch]=1` for every fbw,
+  matching the spec's 1..=5 limit; LFE is excluded by §7.4.1). The
+  coupling-channel coefficients become the mean of every coupled
+  channel's MDCT bin in `[37 + 12*cplbegf, 37 + 12*(cplendf+3))`, and
+  per-channel cplco coordinates restore each channel's HF envelope on
+  decode. With cplbegf=8 / cplendf=15 (the 2/0 baseline) the cpl region
+  spans ~6 kHz upward, and 5.1 frees ~5× the per-channel HF mantissa
+  budget — at 320 kbps for a 5-fbw HF-rich source this lifts the average
+  fbw-channel self-decode PSNR from **20.82 dB** to **23.94 dB**
+  (+3.12 dB at matched bitrate). The `AC3_DISABLE_CPL` env var still
+  suppresses coupling for A/B testing; `AC3_TRACE_CPL_ENC=1` now prints
+  the chincpl mask + per-channel mstr/cplco/cplcoexp/cplcomant arrays.
+  Test gates (1 new test + 1 fix, total = 56 active + 2 ignored):
+    - `five_one_coupling_beats_no_coupling_at_low_bitrate` (ignored —
+      mutates `AC3_DISABLE_CPL` so it must run alone) — encodes the same
+      5.1 HF-rich PCM with and without coupling at 320 kbps and
+      asserts the coupled path beats the no-coupling path by ≥1 dB.
+    - `five_one_ffmpeg_crossdecode` — already in the suite, now passes
+      cleanly through ffmpeg's reference decoder. The previous output
+      tripped libavcodec's "new coupling coordinates must be present in
+      block 0" + "expacc out-of-range" parsers; both were rooted in the
+      same bug below.
+  Bitstream fix needed to reach this acceptance:
+    - **§5.4.3.10 phsflginu gating** — the encoder used to emit the
+      1-bit `phsflginu` field unconditionally on block 0 of every cpl
+      strategy frame, but the spec defines the field only for `acmod ==
+      0x2` (2/0 stereo). For multichannel acmods the phantom bit
+      shifted every following block-0 cpl field by 1 bit, which
+      cascaded into ffmpeg parsing the cpl-coord side info as garbage
+      and then walking off into the cpl-exponent stream where it landed
+      on impossible D15 packed values (the "expacc 127 out-of-range"
+      messages). The encoder's own decoder masked the bug by reading
+      phsflginu conditionally — same logic on both sides means
+      self-decode round-tripped fine. Now `phsflginu` is written only
+      when `acmod == 0x2`, matching `audblk::parse_audblk_side_info`.
+    - **`overhead_bits_for`** correspondingly drops the 1-bit phsflginu
+      contribution for non-2/0 acmods so `tune_snroffst`'s mantissa
+      budget calculation matches the actual emitted bitstream length.
+    - **`write_exponents_cpl`** — clamped `cplabsexp` to ≤12 (was 15)
+      so the seed `(cplabsexp << 1)` cannot exceed 24. Pre-fix, the
+      decoder's running exp could land at 30 + small negative delta
+      = 28, breaching the §7.1.3 [0, 24] limit and tripping ffmpeg's
+      "expacc out-of-range" check on the very first cpl D15 group. Add
+      a debug_assert that catches any future regression of the same
+      shape inside the encoder rather than at the consumer end.
+
 - E-AC-3 (Enhanced AC-3) encoder per ATSC A/52:2018 Annex E, round-1
   scope: a single independent substream (`strmtyp=0`, `substreamid=0`,
   `bsid=16`) carrying mono (acmod=1) or stereo (acmod=2) audio at

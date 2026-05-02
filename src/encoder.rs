@@ -473,15 +473,32 @@ impl Ac3Encoder {
         // channel without spending bits on per-channel mantissas.
         let cpl_disabled = std::env::var("AC3_DISABLE_CPL").is_ok();
         let mut cpl = CouplingPlan::default();
-        if self.channels == 2 && !cpl_disabled {
+        // ATSC A/52 §7.4: coupling is allowed for any acmod with ≥ 2 fbw
+        // channels. The coupling group can include up to 5 fbw channels
+        // (5.1 minus LFE — LFE is a separate pseudo-channel, never
+        // coupled per §7.4.1). We enable coupling for every multichan
+        // mode (2/0, 3/0, 2/2, 3/2) since the bit-savings of one shared
+        // HF spectrum + per-channel coordinates dominate the per-channel
+        // mantissa cost above ~6 kHz.
+        //
+        // Centre-channel exclusion (chincpl[C]=false) is a quality knob
+        // some production encoders use to preserve dialogue intelligibility
+        // by keeping the centre's high band uncoupled. We include the
+        // centre too: at 384-448 kbps it doesn't audibly degrade dialogue
+        // and dropping it from the coupling group would cost ~15 kbps in
+        // per-centre HF mantissas.
+        if self.channels >= 2 && !cpl_disabled {
             cpl.in_use = true;
             cpl.begf = 8;
             cpl.endf = 15;
-            cpl.chincpl[0] = true;
-            cpl.chincpl[1] = true;
+            for ch in 0..self.channels {
+                cpl.chincpl[ch] = true;
+            }
             // No phase flags by default (mid-side over-suppression on
             // anti-correlated transients can sound like ping-ponging
             // smear; the decoder side handles phsflg=0 trivially).
+            // §5.4.3.10 forbids phsflginu outside acmod==2 (2/0 stereo)
+            // anyway, so multichan paths leave it false.
             cpl.phsflginu = false;
             // Merge each pair of subbands into one coupling band:
             // cplbndstrc[0]=false (always), [1]=true, [2]=false,
@@ -505,9 +522,12 @@ impl Ac3Encoder {
             }
             cpl.nbnd = nbnd;
             // Coupling coordinates are signalled on block 0 only;
-            // every later block reuses (cplcoe[blk][ch]=false).
+            // every later block reuses (cplcoe[blk][ch]=false). Only
+            // coupled channels emit coords.
             for ch in 0..self.channels {
-                cpl.cplcoe[0][ch] = true;
+                if cpl.chincpl[ch] {
+                    cpl.cplcoe[0][ch] = true;
+                }
             }
         }
 
@@ -521,15 +541,30 @@ impl Ac3Encoder {
             // averaging the transform coefficients across channels
             // that are included in the coupling channel."
             //
+            // cplmant[k] = (1/N) * Σ_{ch ∈ chincpl} coeffs[ch][k]
+            //
             // For 2/0 with both channels coupled, cplmant = 0.5*(L+R).
+            // For 3/2 with all 5 fbw coupled, cplmant = 0.2*(L+C+R+Ls+Rs).
             // The per-band envelope ratio is captured by the coupling
             // coordinates so the decoder reconstructs each channel's
             // approximate magnitude.
             let begf_mant = cpl.begf_mant();
             let endf_mant = cpl.endf_mant();
+            let n_coupled = (0..self.channels).filter(|&ch| cpl.chincpl[ch]).count();
+            let inv_n = if n_coupled > 0 {
+                1.0f32 / n_coupled as f32
+            } else {
+                0.0
+            };
             for blk in 0..BLOCKS_PER_FRAME {
                 for bin in begf_mant..endf_mant {
-                    cpl_coeffs[blk][bin] = 0.5 * (coeffs[0][blk][bin] + coeffs[1][blk][bin]);
+                    let mut sum = 0.0f32;
+                    for ch in 0..self.channels {
+                        if cpl.chincpl[ch] {
+                            sum += coeffs[ch][blk][bin];
+                        }
+                    }
+                    cpl_coeffs[blk][bin] = sum * inv_n;
                 }
             }
 
@@ -562,15 +597,26 @@ impl Ac3Encoder {
                         let c = cpl_coeffs[blk][bin] as f64;
                         e_cpl_band[bnd] += c * c;
                         for ch in 0..self.channels {
+                            if !cpl.chincpl[ch] {
+                                continue;
+                            }
                             let v = coeffs[ch][blk][bin] as f64;
                             e_ch_band[ch][bnd] += v * v;
                         }
                     }
                 }
             }
-            // Per-channel: max raw cplco across bands → mstrcplco.
+            // Per-channel: max raw cplco across bands → mstrcplco. Skip
+            // channels that are not in the coupling group — their cplco
+            // would be 0 anyway and the spec's cplcoe[ch] gate already
+            // suppresses transmission, but leaving the arrays at the
+            // Default {0,0,0} avoids any chance of stale values from a
+            // previous syncframe leaking in.
             let mut raw_cplco = [[0.0f32; 18]; MAX_FBW];
             for ch in 0..self.channels {
+                if !cpl.chincpl[ch] {
+                    continue;
+                }
                 let mut max_co: f32 = 0.0;
                 for bnd in 0..cpl.nbnd {
                     let denom = e_cpl_band[bnd];
@@ -615,6 +661,9 @@ impl Ac3Encoder {
             // cplco_recon * 8`. Note phsflginu=0 so no sign flip.
             let mut cplco_recon = [[0.0f32; 18]; MAX_FBW];
             for ch in 0..self.channels {
+                if !cpl.chincpl[ch] {
+                    continue;
+                }
                 for bnd in 0..cpl.nbnd {
                     cplco_recon[ch][bnd] = reconstruct_cplco(
                         cpl.cplcoexp[ch][bnd],
@@ -631,6 +680,9 @@ impl Ac3Encoder {
                     for bin in base..limit {
                         let cpl_v = cpl_coeffs[blk][bin];
                         for ch in 0..self.channels {
+                            if !cpl.chincpl[ch] {
+                                continue;
+                            }
                             coeffs[ch][blk][bin] = cpl_v * cplco_recon[ch][bnd] * 8.0;
                         }
                     }
@@ -639,10 +691,18 @@ impl Ac3Encoder {
 
             if std::env::var("AC3_TRACE_CPL_ENC").is_ok() {
                 eprintln!(
-                    "CPL-ENC begf={} endf={} nsubbnd={} nbnd={} mstr=[{},{}]",
-                    cpl.begf, cpl.endf, cpl.nsubbnd, cpl.nbnd, cpl.mstrcplco[0], cpl.mstrcplco[1]
+                    "CPL-ENC begf={} endf={} nsubbnd={} nbnd={} chincpl={:?} mstr={:?}",
+                    cpl.begf,
+                    cpl.endf,
+                    cpl.nsubbnd,
+                    cpl.nbnd,
+                    &cpl.chincpl[..self.channels],
+                    &cpl.mstrcplco[..self.channels],
                 );
                 for ch in 0..self.channels {
+                    if !cpl.chincpl[ch] {
+                        continue;
+                    }
                     eprintln!("  ch{} cplco[bnd]: {:?}", ch, &raw_cplco[ch][..cpl.nbnd]);
                     eprintln!(
                         "  ch{} cplcoexp:    {:?}",
@@ -1077,8 +1137,16 @@ impl Ac3Encoder {
                     for ch in 0..self.channels {
                         bw.write_u32(cpl.chincpl[ch] as u32, 1);
                     }
-                    // §5.4.3.10 phsflginu — only in 2/0.
-                    bw.write_u32(cpl.phsflginu as u32, 1);
+                    // §5.4.3.10 phsflginu — present ONLY when acmod == 2
+                    // (2/0 stereo). For multichannel modes (acmod ∈
+                    // {3,4,5,6,7}) the field is absent from the
+                    // bitstream entirely; the decoder treats phsflginu
+                    // as implicitly 0. Writing it unconditionally
+                    // shifts every subsequent block-0 field by 1 bit,
+                    // which ffmpeg detects as a malformed cplcoe stream.
+                    if self.acmod == 0x2 {
+                        bw.write_u32(cpl.phsflginu as u32, 1);
+                    }
                     bw.write_u32(cpl.begf as u32, 4);
                     bw.write_u32(cpl.endf as u32, 4);
                     // §5.4.3.13 cplbndstrc[sbnd] for sbnd >= 1.
@@ -1717,8 +1785,16 @@ fn write_exponents_cpl(bw: &mut BitWriter, exp: &[u8; N_COEFFS], start: usize, e
     // Pick cplabsexp such that (cplabsexp << 1) is the closest even
     // value to exp[start], clamped to the 4-bit range. Enforce that
     // the first delta lies in ±2 by clamping the start exponent first.
+    //
+    // Note: the decoder uses `prev = cplabsexp << 1` as the seed, with
+    // values up to 30 — but the deltas reconstructed must keep the
+    // running exp in [0, 24]. Clamping cplabsexp to 12 (= 24/2) avoids
+    // the case where prev = 30 + small negative delta lands above 24
+    // and ffmpeg rejects the run. (libavcodec clamps absexp_after_seed
+    // to ≤ 24, and any group where the first reconstructed exp > 24
+    // is flagged "expacc out-of-range" by the dexp validity check.)
     let first_exp = exp[start] as i32;
-    let cplabsexp = ((first_exp + 1) >> 1).clamp(0, 15) as u8;
+    let cplabsexp = ((first_exp + 1) >> 1).clamp(0, 12) as u8;
     bw.write_u32(cplabsexp as u32, 4);
     let ncplgrps = (end - start) / 3;
     let mut prev = (cplabsexp as i32) << 1;
@@ -1731,6 +1807,10 @@ fn write_exponents_cpl(bw: &mut BitWriter, exp: &[u8; N_COEFFS], start: usize, e
         let d1 = (e1 - e0).clamp(-2, 2) + 2;
         let d2 = (e2 - e1).clamp(-2, 2) + 2;
         let packed: u32 = (25 * d0 + 5 * d1 + d2) as u32;
+        debug_assert!(
+            packed <= 124,
+            "cpl D15 group out of range: d0={d0} d1={d1} d2={d2} packed={packed}",
+        );
         bw.write_u32(packed, 7);
         prev = e2;
     }
@@ -2280,9 +2360,12 @@ fn overhead_bits_for(
             // when cpl.in_use).
             bits += 1 + 1;
             if cpl.in_use {
-                // chincpl[ch] × nchan + phsflginu(1) + cplbegf(4) +
-                // cplendf(4) + (nsubbnd-1) cplbndstrc bits.
-                bits += nchan as u32 + 1 + 4 + 4;
+                // chincpl[ch] × nchan + phsflginu(1, only acmod==2) +
+                // cplbegf(4) + cplendf(4) + (nsubbnd-1) cplbndstrc bits.
+                bits += nchan as u32 + 4 + 4;
+                if acmod == 2 {
+                    bits += 1;
+                }
                 bits += cpl.nsubbnd.saturating_sub(1) as u32;
             }
         } else {
@@ -4508,5 +4591,198 @@ mod tests {
                 "ffmpeg src_ch{src_ch} PSNR {psnr:.2} dB below 10 dB floor",
             );
         }
+    }
+
+    /// Build a 5.1 PCM source whose every fbw channel carries HF tones
+    /// well INSIDE the coupling region (cplbegf=8 → bin 133 ≈ 6.2 kHz
+    /// at 48 kHz). Each channel gets a distinct tone in 7-15 kHz so the
+    /// coupling channel must actually carry per-channel-distinguishable
+    /// energy and the per-channel cplco coordinates become load-bearing.
+    /// LFE is left at 80 Hz (bandlimited).
+    fn build_multichan_hf_pcm(channels: u16, sr: u32, dur_s: f32) -> (usize, Vec<u8>) {
+        let nsamp = (sr as f32 * dur_s) as usize;
+        let mut pcm = vec![0i16; nsamp * channels as usize];
+        let lfe_idx: Option<usize> = if channels == 6 { Some(5) } else { None };
+        // HF tone per fbw channel — all above the cplbegf=8 boundary.
+        let tones = [7000.0f32, 9000.0, 11_000.0, 13_000.0, 15_000.0];
+        for n in 0..nsamp {
+            let t = n as f32 / sr as f32;
+            for c in 0..channels as usize {
+                let freq = if Some(c) == lfe_idx {
+                    80.0
+                } else {
+                    tones[c.min(tones.len() - 1)]
+                };
+                let s = (2.0 * std::f32::consts::PI * freq * t).sin() * 0.30;
+                pcm[n * channels as usize + c] = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            }
+        }
+        let mut bytes = Vec::with_capacity(pcm.len() * 2);
+        for s in &pcm {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        (nsamp, bytes)
+    }
+
+    /// Round-25 (task #155): demonstrate the bit-savings of multichan
+    /// coupling on HF-rich content. Encode a 5.1 fixture twice — once
+    /// with all 5 fbw channels coupled (the default), and once with
+    /// `AC3_DISABLE_CPL` set so coupling is suppressed — at the same
+    /// nominal bitrate. The bitstream byte count is identical between
+    /// runs (frmsizecod is shared), so the comparison is at matched
+    /// bitrate. With coupling active the per-channel HF mantissas
+    /// (above ~6 kHz) collapse into one shared cpl pseudo-channel, which
+    /// frees ~5× the per-channel HF bit budget; `tune_snroffst` spends
+    /// the slack on lifting `csnroffst` / `fsnroffst`, raising the
+    /// average mantissa SNR and therefore self-decode PSNR.
+    ///
+    /// The fixture is HF-rich (per-channel tones in 7-15 kHz, all inside
+    /// the coupling region cplbegf=8 → bin 133 ≈ 6.2 kHz at 48 kHz) so
+    /// coupling actually has something to share. A low-frequency-only
+    /// fixture would put all energy below the cpl boundary and both
+    /// paths would behave identically.
+    ///
+    /// Marked `#[ignore]` so it doesn't race with other tests over the
+    /// `AC3_DISABLE_CPL` env var (set/remove in this test would flip
+    /// the encoder's decision in any concurrently-running encode).
+    /// Run explicitly with `cargo test -- --ignored
+    /// five_one_coupling_beats_no_coupling_at_low_bitrate` to gate
+    /// the coupling-on bit-savings claim.
+    #[test]
+    #[ignore = "mutates AC3_DISABLE_CPL — must run alone (cargo test -- --ignored)"]
+    fn five_one_coupling_beats_no_coupling_at_low_bitrate() {
+        // 320 kbps for 5.1 — below the 448 kbps default but high enough
+        // that the per-channel paths can still represent the HF tones.
+        // At this constraint coupling vs no-coupling separates clearly
+        // because the no-cpl path spends ~1/5 of every channel's mantissa
+        // budget on HF that cpl-on emits once shared.
+        let kbps = 320u64;
+        let sr = 48_000u32;
+        let channels = 6u16;
+        let dur = 0.25f32;
+        let (nsamp, bytes) = build_multichan_hf_pcm(channels, sr, dur);
+
+        let encode_and_psnr = |disable_cpl: bool| -> (f64, usize) {
+            // Switch the env knob inside this closure; restore on exit.
+            // The encoder reads `AC3_DISABLE_CPL` per frame so setting
+            // it before the encode loop is sufficient.
+            if disable_cpl {
+                std::env::set_var("AC3_DISABLE_CPL", "1");
+            } else {
+                std::env::remove_var("AC3_DISABLE_CPL");
+            }
+            let mut params = CodecParameters::audio(CodecId::new("ac3"));
+            params.sample_rate = Some(sr);
+            params.channels = Some(channels);
+            params.sample_format = Some(SampleFormat::S16);
+            params.bit_rate = Some(kbps * 1000);
+            let mut enc = make_encoder(&params).expect("make_encoder");
+            enc.send_frame(&Frame::Audio(AudioFrame {
+                samples: nsamp as u32,
+                pts: Some(0),
+                data: vec![bytes.clone()],
+            }))
+            .unwrap();
+            let _ = enc.flush();
+            let mut bitstream: Vec<u8> = Vec::new();
+            loop {
+                match enc.receive_packet() {
+                    Ok(p) => bitstream.extend_from_slice(&p.data),
+                    Err(Error::NeedMore) | Err(Error::Eof) => break,
+                    Err(e) => panic!("receive_packet: {e:?}"),
+                }
+            }
+            // Self-decode (round-trip): the most stable comparison since
+            // both runs share the same DSP path. PSNR vs the original PCM
+            // on every fbw channel.
+            let dparams = CodecParameters::audio(CodecId::new("ac3"));
+            let mut dec = crate::decoder::make_decoder(&dparams).expect("make_decoder");
+            let mut decoded: Vec<i16> = Vec::new();
+            let mut offset = 0usize;
+            while offset < bitstream.len() {
+                let si = crate::syncinfo::parse(&bitstream[offset..])
+                    .expect("syncinfo parse on our own output");
+                let flen = si.frame_length as usize;
+                let pkt = oxideav_core::Packet::new(
+                    0,
+                    oxideav_core::TimeBase::new(1, sr as i64),
+                    bitstream[offset..offset + flen].to_vec(),
+                );
+                dec.send_packet(&pkt).unwrap();
+                if let Ok(Frame::Audio(a)) = dec.receive_frame() {
+                    for s in a.data[0].chunks_exact(2) {
+                        decoded.push(i16::from_le_bytes([s[0], s[1]]));
+                    }
+                }
+                offset += flen;
+            }
+            let nch = channels as usize;
+            let frames_decoded = decoded.len() / nch;
+            // Skip overlap-add prime + LFE channel (PSNR is misleading
+            // there). Compute average per-channel PSNR over the 5 fbw
+            // channels.
+            let skip = 768usize.min(frames_decoded);
+            let usable = frames_decoded.saturating_sub(skip);
+            let src_samples: Vec<i16> = bytes
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let mut total_psnr = 0.0f64;
+            let fbw_count = 5usize; // ch 0..4 are fbw; ch 5 is LFE
+            for ch in 0..fbw_count {
+                let mut sse = 0.0f64;
+                let mut count = 0usize;
+                for i in 0..usable {
+                    let src_n = skip + i;
+                    if src_n >= src_samples.len() / nch {
+                        continue;
+                    }
+                    let d = decoded[(skip + i) * nch + ch] as f64
+                        - src_samples[src_n * nch + ch] as f64;
+                    sse += d * d;
+                    count += 1;
+                }
+                let mse = if count > 0 { sse / count as f64 } else { 0.0 };
+                let psnr = if mse > 0.0 {
+                    10.0 * (32767.0f64.powi(2) / mse).log10()
+                } else {
+                    100.0
+                };
+                total_psnr += psnr;
+            }
+            (total_psnr / fbw_count as f64, bitstream.len())
+        };
+
+        let (psnr_with, bytes_with) = encode_and_psnr(false);
+        let (psnr_without, bytes_without) = encode_and_psnr(true);
+        // Restore env state.
+        std::env::remove_var("AC3_DISABLE_CPL");
+
+        eprintln!(
+            "5.1 @ {} kbps coupling-on  : avg-fbw PSNR {:.2} dB ({} bytes)",
+            kbps, psnr_with, bytes_with
+        );
+        eprintln!(
+            "5.1 @ {} kbps coupling-off : avg-fbw PSNR {:.2} dB ({} bytes)",
+            kbps, psnr_without, bytes_without
+        );
+        // Same frmsizecod ⇒ same byte count per frame.
+        assert_eq!(
+            bytes_with, bytes_without,
+            "bitrate {} kbps should yield identical bitstream sizes",
+            kbps
+        );
+        // Coupling must measurably win at this constrained budget. We
+        // require ≥ 1 dB headroom — typical observed gain is much larger
+        // (HF-bit reallocation is what makes 5.1 viable below 384 kbps).
+        // The test gate sits well above any noise from PSNR estimation
+        // (dur = 0.25 s ⇒ ~12 k samples per channel; PSNR variance is
+        // sub-0.1 dB at that size).
+        assert!(
+            psnr_with > psnr_without + 1.0,
+            "coupling did not measurably improve PSNR: with={:.2} dB, without={:.2} dB",
+            psnr_with,
+            psnr_without
+        );
     }
 }

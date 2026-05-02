@@ -18,7 +18,12 @@ Early WIP. Implementation follows the A/52 spec incrementally:
 - [x] Mantissa decode (§7.3) with bap=0 dither (§7.3.4)
 - [x] IMDCT synthesis (§7.9) — 512-point long-block path;
       256-point short-block still uses a reference (non-FFT) IMDCT
-- [x] Channel coupling (§7.4) + rematrix (§7.5) + dynrng (§7.7)
+- [x] Channel coupling (§7.4) + rematrix (§7.5) + dynrng (§7.7) —
+      coupling now spans up to 5 fbw channels (encoder + decoder),
+      matching the spec's nfchans limit (5.1 minus LFE). At 320 kbps
+      on HF-rich 5.1 content the multichannel cpl path lifts the
+      average self-decode PSNR by **+3.12 dB** over the no-coupling
+      baseline at matched bitstream size (round 25 / task #155).
 - [x] Delta bit allocation (§7.2.2.6) — encoder + decoder
 - [x] Multichannel encode — 1/0, 2/0, 3/0, 2/2, 3/2, and 3/2 + LFE
       (the canonical 5.1 layout: L,C,R,Ls,Rs,LFE) with per-acmod BSI
