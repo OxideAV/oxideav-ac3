@@ -51,13 +51,20 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       tight the pass is a no-op and the bitstream stays
       byte-identical to the previous encoder.
 - [ ] Downmix (§7.8) — 3/2 and 3/1 modes still pending
-- [x] E-AC-3 (bsid=16, Annex E) — encoder, round-1 scope: independent
-      substream (`strmtyp=0`, `substreamid=0`) only, mono / stereo,
-      6 blocks per syncframe (`numblkscod=3`), no coupling, no
-      spectral extension, no Adaptive Hybrid Transform. Cross-decodes
-      cleanly through ffmpeg at PSNR equivalent to the AC-3 baseline.
-      Multichannel + dependent substreams + SPX + AHT remain out of
-      scope. Codec id = `"eac3"`.
+- [x] E-AC-3 (bsid=16, Annex E) — encoder. Independent substream
+      (`strmtyp=0`, `substreamid=0`) for 1.0/2.0/5.1 layouts (acmod
+      ∈ {1, 2, 7}, with `lfeon=1` for 5.1). 7.1 input emits an
+      indep+dep substream pair (round 27 / task #187): the indep
+      substream carries the 5.1 program (acmod=7, lfeon=1); the
+      dep substream (`strmtyp=1`, `substreamid=0`, acmod=2) carries
+      the back-surround pair Lb/Rb with `chanmape=1` and `chanmap`
+      bit 6 (`Lrs/Rrs pair`, Table E2.5) set. Per ATSC A/52 §E.3.8.2
+      a reference 5.1 decoder ignores the dep substream and reads
+      only indep substream 0 — extended decoders that honour the
+      chanmap field reassemble all 8 channels. 6 blocks per
+      syncframe (`numblkscod=3`), no coupling, no spectral
+      extension, no Adaptive Hybrid Transform. Cross-decodes
+      cleanly through ffmpeg. Codec id = `"eac3"`.
 
 ## Installation
 

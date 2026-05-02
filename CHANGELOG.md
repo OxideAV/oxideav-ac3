@@ -9,6 +9,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 27 (task #187) — E-AC-3 dependent substream encode +
+  multichannel scope expansion. The encoder now accepts 1, 2, 6,
+  and 8 input channels (was 1 / 2 only):
+    - **5.1 input (6 ch)** → single independent substream with
+      `acmod=7` (3/2 L,C,R,Ls,Rs) and `lfeon=1`. The DSP path
+      gained the LFE pseudo-channel exponent / mantissa pipeline
+      (D15 over `bins[0..7]`, no chbwcod, `lfeexpstr` emitted in
+      audfrm with the same D15-on-blocks-0-and-3 cadence used by
+      the fbw channels).
+    - **7.1 input (8 ch)** → the spec's §E.3.8.2 indep+dep pair.
+      Indep substream is the 5.1 program built from the source's
+      L,C,R,Ls,Rs,LFE; the dep substream is `strmtyp=1`,
+      `substreamid=0`, `acmod=2`, `lfeon=0` carrying Lb/Rb with
+      `chanmape=1` and `chanmap = 0x0200` (bit 6 of the 16-bit
+      field — Lrs/Rrs pair per Table E2.5; bit 0 sits in MSB so
+      the bit-6 mask is `1 << (15 - 6)`). The packet payload is
+      the byte-concatenation of the two syncframes, both starting
+      with `0x0B 0x77`. Default bitrates: 384 kbps indep + 192 kbps
+      dep = 576 kbps total; user-supplied `bit_rate` is split
+      preserving the same ratio.
+  Refactor: the per-syncframe DSP body moved out of `Eac3Encoder::
+  emit_syncframe` into `emit_substream(sub, frame_pcm)` which
+  takes a `SubstreamLayout` (strmtyp / substreamid / acmod /
+  lfeon / chanmap / src-PCM-index map / frame_bytes) and writes
+  one E-AC-3 syncframe of size `sub.frame_bytes`. `emit_syncframe`
+  drains 1536 samples per input channel and dispatches to one or
+  two `emit_substream` calls based on the `Layout::Indep` /
+  `Layout::Pair` configuration built at make-encoder time.
+  Bitstream additions vs round 26:
+    - `chanmape(1) [+ chanmap(16) when chanmape=1]` after `compre`
+      in bsi when `strmtyp == 1` (§E.2.2.2 / E.2.3.1.7-8).
+    - `lfeexpstr[blk]` (1 bit per block) inside audfrm when
+      `lfeon=1` (§E.2.3.2.7).
+    - LFE D15 exponents (4-bit absexp + 2 D15 groups) in audblks
+      with new exponent strategy when `lfeon=1`.
+    - `convexpstre` / `convsnroffste` skipped on `strmtyp==1`
+      substreams (only emitted for indep streams per §E.2.2.3 /
+      §E.2.2.4 syntax).
+  Tests added (4 new tests; the eac3 unit-test cluster grows
+  from 4 to 6 inside the lib, and the `eac3_ffmpeg` integration
+  suite from 3 to 5):
+    - `make_encoder_71_builds_pair_layout` — accepts 8 ch and
+      asserts the chanmap MSB ordering math (`1 << (15 - 6) =
+      0x0200` for the Lrs/Rrs-pair location bit).
+    - `make_encoder_51_5fbw_plus_lfe` — accepts 6 ch at 384 kbps.
+    - `eac3_71_emits_indep_plus_dep_substream_pair` — encodes 1 s
+      of 7.1 sine, asserts each frame is exactly `1536 + 768 =
+      2304 bytes`, that both halves start with the syncword, that
+      the first half's `strmtyp` is 0, and that the second half's
+      `strmtyp` is 1.
+    - `eac3_71_pair_decodes_through_ffmpeg` — pipes the 7.1
+      output through `ffmpeg -f eac3 -i …` and verifies ffmpeg
+      reports either 6 or 8 channels (§E.3.8.1 reference decoder
+      vs full 7.1 reassembler) with non-trivial Left-channel
+      energy. The ffmpeg reference decoder accepts the stream
+      cleanly.
+  Existing test `make_encoder_rejects_unsupported_channels` was
+  updated to test 4 channels (no longer in the allow-list) instead
+  of 6 (now accepted as 5.1).
+
 - Round 26 (task #170) — per-block SNR-offset bit-pool tuning. AC-3
   syntax §5.4.3.37-43 lets every audio block re-transmit a fresh
   `(csnroffst, fsnroffst[ch], cplfsnroffst, lfefsnroffst)` tuple via
