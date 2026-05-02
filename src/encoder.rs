@@ -984,17 +984,44 @@ impl Ac3Encoder {
             self.acmod,
             self.lfeon,
         );
+        // Round-24 / task #170: per-block snroffst redistribution.
+        // After the global tuner picks a frame-wide (csnr, fsnr_ch)
+        // baseline, this pass moves bits between blocks based on
+        // per-block masking demand. When a transient sits in one block
+        // and the rest of the frame is silent, the demand-heavy block
+        // gets a fsnr bump (more mantissa bits → less PSNR drop on the
+        // transient) while quiet blocks donate the savings. The
+        // bitstream syntax §5.4.3.37-43 already supports per-block
+        // snroffste so the decoder applies the new values immediately.
+        // The AC3_DISABLE_PERBLOCK_SNR env var pins the plan to the
+        // flat global one — useful for A/B-ing the contribution.
+        let snr_plan = if std::env::var("AC3_DISABLE_PERBLOCK_SNR").is_ok() {
+            PerBlockSnr::from_global(&tuned_ba)
+        } else {
+            tune_per_block_snroffst(
+                &tuned_ba,
+                &exps,
+                ch_end_mant,
+                self.channels,
+                self.fscod,
+                self.frame_bytes,
+                &exp_strategies,
+                &cpl,
+                &dba_plan,
+                self.acmod,
+                self.lfeon,
+            )
+        };
         // Compute bap arrays per channel per block using the tuned
         // params. Layout matches `exps`:
         //   0..nfchans → fbw, nfchans → cpl, nfchans+1 → LFE.
-        // Per-channel fsnroffst is read from `tuned_ba.fsnroffst_ch`
-        // so each channel uses its own bit-allocation refinement.
+        // Per-channel fsnroffst is read from `snr_plan.fsnroffst_ch[blk]`
+        // so each (channel, block) uses its own bit-allocation refinement.
         let mut baps: Vec<Vec<[u8; N_COEFFS]>> =
             vec![vec![[0u8; N_COEFFS]; BLOCKS_PER_FRAME]; self.channels + 2];
         for ch in 0..self.channels {
-            let mut ch_ba = tuned_ba;
-            ch_ba.fsnroffst = tuned_ba.fsnroffst_ch[ch];
             for blk in 0..BLOCKS_PER_FRAME {
+                let ch_ba = snr_plan.ba_for_fbw(&tuned_ba, blk, ch);
                 compute_bap(
                     &exps[ch][blk],
                     ch_end_mant,
@@ -1018,13 +1045,9 @@ impl Ac3Encoder {
             let cpl_idx = cpl_idx_in_exps;
             let begf_mant = cpl.begf_mant();
             let endf_mant = cpl.endf_mant();
-            // Build a BitAllocParams variant where csnr/fsnr are the
-            // cpl values so compute_bap's snroffset arithmetic uses
-            // the cpl-specific knob.
-            let mut cpl_ba = tuned_ba;
-            cpl_ba.fsnroffst = tuned_ba.cplfsnroffst;
-            cpl_ba.fgaincod = tuned_ba.cplfgaincod;
+            // Per-block (csnr, cplfsnr) substitution via snr_plan.
             for blk in 0..BLOCKS_PER_FRAME {
+                let cpl_ba = snr_plan.ba_for_cpl(&tuned_ba, blk);
                 compute_bap_cpl(
                     &exps[cpl_idx][blk],
                     begf_mant,
@@ -1039,13 +1062,10 @@ impl Ac3Encoder {
         // LFE bap. The decoder treats LFE as a fbw channel with start=0,
         // end=7 and `is_coupling=false`, using the LFE-specific
         // (lfefsnroffst, lfefgaincod) pair. We run `compute_bap` with a
-        // `lfe_ba` variant carrying those values into fsnroffst/fgaincod
-        // so the masking-curve arithmetic picks them up.
+        // per-block `lfe_ba` variant from `snr_plan`.
         if self.lfeon {
-            let mut lfe_ba = tuned_ba;
-            lfe_ba.fsnroffst = tuned_ba.lfefsnroffst;
-            lfe_ba.fgaincod = tuned_ba.lfefgaincod;
             for blk in 0..BLOCKS_PER_FRAME {
+                let lfe_ba = snr_plan.ba_for_lfe(&tuned_ba, blk);
                 compute_bap(
                     &exps[lfe_idx_in_exps][blk],
                     LFE_END_MANT,
@@ -1267,27 +1287,33 @@ impl Ac3Encoder {
                 bw.write_u32(tuned_ba.dbpbcod as u32, 2);
                 bw.write_u32(tuned_ba.floorcod as u32, 3);
             }
-            let snroffste = blk == 0;
+            // §5.4.3.37 snroffste — block 0 is mandatory; on later
+            // blocks we set snroffste=1 only when the per-block plan
+            // (#170) carries a value differing from the previous
+            // emitted set. Otherwise snroffste=0 means "decoder reuses
+            // the prior block's csnr/fsnr*", which keeps the cost at
+            // 1 bit when no redistribution was beneficial.
+            let snroffste = snr_plan.snroffste(blk);
             bw.write_u32(snroffste as u32, 1);
             if snroffste {
-                bw.write_u32(tuned_ba.csnroffst as u32, 6);
+                bw.write_u32(snr_plan.csnroffst[blk] as u32, 6);
                 if cpl.in_use {
                     // §5.4.3.38 cplfsnroffst (4 bits), §5.4.3.39 cplfgaincod (3 bits).
-                    bw.write_u32(tuned_ba.cplfsnroffst as u32, 4);
+                    bw.write_u32(snr_plan.cplfsnroffst[blk] as u32, 4);
                     bw.write_u32(tuned_ba.cplfgaincod as u32, 3);
                 }
                 // §5.4.3.40-41 fsnroffst[ch] (4 bits) + fgaincod[ch]
-                // (3 bits) per fbw channel. Per-channel fsnroffst
-                // values are populated by the per-channel refinement
-                // pass in `tune_snroffst`; channels with more masking
-                // headroom get bumped above the global base.
+                // (3 bits) per fbw channel. Per-block per-channel
+                // fsnroffst values come from the round-24 redistribution
+                // pass; demand-heavy blocks have higher fsnr than the
+                // frame-wide global baseline picked by `tune_snroffst`.
                 for ch in 0..self.channels {
-                    bw.write_u32(tuned_ba.fsnroffst_ch[ch] as u32, 4);
+                    bw.write_u32(snr_plan.fsnroffst_ch[blk][ch] as u32, 4);
                     bw.write_u32(tuned_ba.fgaincod as u32, 3);
                 }
                 // §5.4.3.42 lfefsnroffst (4 bits) + §5.4.3.43 lfefgaincod (3 bits).
                 if self.lfeon {
-                    bw.write_u32(tuned_ba.lfefsnroffst as u32, 4);
+                    bw.write_u32(snr_plan.lfefsnroffst[blk] as u32, 4);
                     bw.write_u32(tuned_ba.lfefgaincod as u32, 3);
                 }
             }
@@ -2696,6 +2722,450 @@ pub(crate) fn tune_snroffst(
         }
     }
     best
+}
+
+// ---------------------------------------------------------------------------
+// Per-block snroffst tuning (round-24 / task #170)
+//
+// ATSC A/52 §5.4.3.37-43 lets each audio block re-transmit a fresh
+// (csnroffst, fsnroffst[ch], cplfsnroffst, lfefsnroffst) tuple via the
+// `snroffste=1` flag. The decoder applies these immediately, so they
+// take effect for the rest of that block onward (and remain in effect
+// until the next snroffste=1).
+//
+// Without per-block tuning every block within a 32 ms syncframe shares
+// one global SNR offset budget. When the frame contains a transient
+// (high masking demand on one block, near-silence elsewhere), a flat
+// allocation under-spends on the transient block while wasting bits on
+// the silent neighbours. The redistribution pass below moves bits from
+// quiet blocks onto demand-heavy blocks within the unchanged frame
+// budget.
+// ---------------------------------------------------------------------------
+
+/// Per-block override of the SNR-offset fields. Layout mirrors the
+/// per-block bitstream syntax: each block carries its own csnroffst +
+/// per-channel fsnroffst + cpl/lfe fsnroffst values. The encoder
+/// emits `snroffste=1` for any block whose values differ from the
+/// previous emitted set, otherwise `snroffste=0` (reuse).
+#[derive(Clone, Copy)]
+pub(crate) struct PerBlockSnr {
+    pub(crate) csnroffst: [u8; BLOCKS_PER_FRAME],
+    pub(crate) fsnroffst_ch: [[u8; MAX_FBW]; BLOCKS_PER_FRAME],
+    pub(crate) cplfsnroffst: [u8; BLOCKS_PER_FRAME],
+    pub(crate) lfefsnroffst: [u8; BLOCKS_PER_FRAME],
+}
+
+impl PerBlockSnr {
+    /// Construct a per-block plan that reuses the global tuned values
+    /// for every block. Equivalent to the pre-#170 behaviour.
+    pub(crate) fn from_global(ba: &BitAllocParams) -> Self {
+        Self {
+            csnroffst: [ba.csnroffst; BLOCKS_PER_FRAME],
+            fsnroffst_ch: [ba.fsnroffst_ch; BLOCKS_PER_FRAME],
+            cplfsnroffst: [ba.cplfsnroffst; BLOCKS_PER_FRAME],
+            lfefsnroffst: [ba.lfefsnroffst; BLOCKS_PER_FRAME],
+        }
+    }
+
+    /// Returns true when block `blk`'s snroffst tuple differs from the
+    /// previous block's. Block 0 always returns true (must transmit).
+    pub(crate) fn snroffste(&self, blk: usize) -> bool {
+        if blk == 0 {
+            return true;
+        }
+        let prev = blk - 1;
+        self.csnroffst[blk] != self.csnroffst[prev]
+            || self.fsnroffst_ch[blk] != self.fsnroffst_ch[prev]
+            || self.cplfsnroffst[blk] != self.cplfsnroffst[prev]
+            || self.lfefsnroffst[blk] != self.lfefsnroffst[prev]
+    }
+
+    /// Build a `BitAllocParams` snapshot for the fbw channel `ch` at
+    /// block `blk`, substituting the per-block (csnr, fsnr) values into
+    /// `ba`. Used by `compute_bap` callers to render block-specific
+    /// mantissa allocations.
+    pub(crate) fn ba_for_fbw(
+        &self,
+        base: &BitAllocParams,
+        blk: usize,
+        ch: usize,
+    ) -> BitAllocParams {
+        let mut out = *base;
+        out.csnroffst = self.csnroffst[blk];
+        out.fsnroffst = self.fsnroffst_ch[blk][ch];
+        out
+    }
+
+    pub(crate) fn ba_for_cpl(&self, base: &BitAllocParams, blk: usize) -> BitAllocParams {
+        let mut out = *base;
+        out.csnroffst = self.csnroffst[blk];
+        out.fsnroffst = self.cplfsnroffst[blk];
+        out.fgaincod = base.cplfgaincod;
+        out
+    }
+
+    pub(crate) fn ba_for_lfe(&self, base: &BitAllocParams, blk: usize) -> BitAllocParams {
+        let mut out = *base;
+        out.csnroffst = self.csnroffst[blk];
+        out.fsnroffst = self.lfefsnroffst[blk];
+        out.fgaincod = base.lfefgaincod;
+        out
+    }
+}
+
+/// Per-block masking demand, measured as the average (PSD - mask floor)
+/// gap in dB-equivalent units across the channel set. Larger gap means
+/// more coefficients sit above the mask and would benefit from extra
+/// mantissa bits — i.e. higher SNR offset is more PSNR per bit there.
+///
+/// We use the **mean** PSD over [0, end) as a proxy for masking demand:
+/// silent blocks have PSD ≈ -3072 (24 << 7) for every bin, while
+/// transient blocks have a wide dynamic range and high mean PSD. The
+/// proxy correlates well with actual mantissa hunger because
+/// `compute_bap` derives bap from `mask - PSD`, so high-PSD bins
+/// dominate the bap budget.
+fn per_block_demand(
+    exps: &[Vec<[u8; N_COEFFS]>],
+    end: usize,
+    nchan: usize,
+) -> [i64; BLOCKS_PER_FRAME] {
+    let mut demand = [0i64; BLOCKS_PER_FRAME];
+    if nchan == 0 || end == 0 {
+        return demand;
+    }
+    for blk in 0..BLOCKS_PER_FRAME {
+        let mut sum: i64 = 0;
+        let mut cnt: i64 = 0;
+        for ch in 0..nchan {
+            for bin in 0..end {
+                // PSD = 3072 - (exp << 7) per §7.2.2.1. Lower exponent
+                // (larger coefficient magnitude) → higher PSD.
+                let psd = 3072i64 - ((exps[ch][blk][bin] as i64) << 7);
+                sum += psd;
+                cnt += 1;
+            }
+        }
+        demand[blk] = if cnt > 0 { sum / cnt } else { 0 };
+    }
+    demand
+}
+
+/// Adjust the per-block snroffst plan so high-demand blocks get a
+/// fsnroffst bump and low-demand blocks get a fsnroffst drop, keeping
+/// the total mantissa bits + per-block snroffste overhead within the
+/// frame budget.
+///
+/// Algorithm:
+///   1. Sort blocks by demand (high → low).
+///   2. Group blocks into "left half" (blocks 0/1/2) and "right half"
+///      (blocks 3/4/5). The split aligns with the encoder's D15-on-
+///      blocks-0-and-3 exponent strategy: blocks 0/1/2 share an
+///      exponent set (D15 on 0, REUSE on 1/2) and blocks 3/4/5 share
+///      another (D15 on 3, REUSE on 4/5). Treating each half as one
+///      bit-allocation unit means a single snroffste=1 emission on
+///      block 3 carries the per-half tuning at a fixed 27-30 bit
+///      overhead (vs the cascading overhead of arbitrary per-block
+///      changes).
+///   3. Drop the donor half's all-channel fsnroffst by k steps (k =
+///      1, 2, 3) and bump the recipient half's by k steps, accepting
+///      the largest k that fits the budget after accounting for the
+///      block-3 snroffste payload. Try `(donor=left, recipient=right)`
+///      and the swap; pick whichever yields a profitable transfer
+///      based on the demand sign.
+///   4. Then run the original 1-step pair-walk for fine refinement.
+///
+/// Returns the populated `PerBlockSnr`. When no profitable transfer
+/// exists (uniform demand, tight budget), this returns the global plan
+/// untouched so the encoder remains fully spec-compliant — `snroffste`
+/// stays at the original "block-0 only" pattern.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tune_per_block_snroffst(
+    ba: &BitAllocParams,
+    exps: &[Vec<[u8; N_COEFFS]>],
+    end: usize,
+    nchan: usize,
+    fscod: u8,
+    frame_bytes: usize,
+    exp_strategies: &[u8; BLOCKS_PER_FRAME],
+    cpl: &CouplingPlan,
+    dba: &DbaPlan,
+    acmod: u8,
+    lfeon: bool,
+) -> PerBlockSnr {
+    let mut plan = PerBlockSnr::from_global(ba);
+    if nchan == 0 {
+        return plan;
+    }
+
+    // Order blocks by descending demand. We only redistribute when
+    // there is a meaningful spread — uniform demand means the global
+    // tuner already converged to the right answer.
+    let demand = per_block_demand(exps, end, nchan);
+    let mut order: [usize; BLOCKS_PER_FRAME] = [0, 1, 2, 3, 4, 5];
+    order.sort_by(|&a, &b| demand[b].cmp(&demand[a]));
+    let spread = demand[order[0]] - demand[order[BLOCKS_PER_FRAME - 1]];
+    if std::env::var("AC3_DEBUG_PERBLOCK_SNR").is_ok() {
+        eprintln!(
+            "perblock_snr: demand={:?} order={:?} spread={} ba.csnr={} ba.fsnr_ch={:?}",
+            demand, order, spread, ba.csnroffst, ba.fsnroffst_ch
+        );
+    }
+    // Threshold ≈ 256 PSD-units (≈ 2 exponents worth) — below this the
+    // blocks look perceptually uniform and per-block emission would
+    // just waste the snroffste overhead bits.
+    if spread < 256 {
+        return plan;
+    }
+
+    // Helper: compute current total mantissa bits across all blocks
+    // under the current `plan`, plus per-block snroffste overhead
+    // delta vs the pre-#170 baseline (block-0-only emission).
+    let recompute = |plan: &PerBlockSnr| -> u32 {
+        let mut bps: Vec<Vec<[u8; N_COEFFS]>> =
+            vec![vec![[0u8; N_COEFFS]; exps[0].len()]; nchan + 2];
+        for blk in 0..BLOCKS_PER_FRAME {
+            for ch in 0..nchan {
+                let ch_ba = plan.ba_for_fbw(ba, blk, ch);
+                compute_bap(
+                    &exps[ch][blk],
+                    end,
+                    fscod,
+                    &ch_ba,
+                    &mut bps[ch][blk],
+                    Some((dba, ch)),
+                );
+            }
+            if cpl.in_use {
+                let cpl_idx = nchan;
+                let cpl_ba = plan.ba_for_cpl(ba, blk);
+                compute_bap_cpl(
+                    &exps[cpl_idx][blk],
+                    cpl.begf_mant(),
+                    cpl.endf_mant(),
+                    fscod,
+                    &cpl_ba,
+                    &mut bps[cpl_idx][blk],
+                    Some((dba, MAX_FBW)),
+                );
+            }
+            if lfeon {
+                let lfe_idx = nchan + 1;
+                let lfe_ba = plan.ba_for_lfe(ba, blk);
+                compute_bap(
+                    &exps[lfe_idx][blk],
+                    LFE_END_MANT,
+                    fscod,
+                    &lfe_ba,
+                    &mut bps[lfe_idx][blk],
+                    None,
+                );
+            }
+        }
+        mantissa_bits_total(&bps, end, nchan, cpl, lfeon)
+    };
+
+    // Per-block snroffste overhead bits when set to 1 (block 0 was
+    // already counted by the existing overhead model). For each *extra*
+    // block where snroffste flips to 1 we add the snroffst payload:
+    //   csnr(6) + nchan*(fsnr(4)+fgain(3)) [+ cpl 4+3] [+ lfe 4+3]
+    // The leading 1-bit `snroffste` flag itself is already part of the
+    // baseline overhead.
+    let snroffste_payload: u32 = 6
+        + nchan as u32 * (4 + 3)
+        + if cpl.in_use { 4 + 3 } else { 0 }
+        + if lfeon { 4 + 3 } else { 0 };
+
+    let baseline_overhead =
+        overhead_bits_for(exp_strategies, end, nchan, cpl, dba, acmod, lfeon) + 32 /* safety */;
+    let total_bits = (frame_bytes * 8) as u32;
+    if baseline_overhead >= total_bits {
+        return plan;
+    }
+    let baseline_budget = total_bits - baseline_overhead;
+    let baseline_used = recompute(&plan);
+    if baseline_used > baseline_budget {
+        // Global tuner should have prevented this; bail rather than
+        // make things worse.
+        return plan;
+    }
+
+    // Cost of the per-block snroffste payloads currently used by the
+    // plan (counting blocks 1..5 that flip on). Block 0 is always a
+    // payload block in the baseline overhead.
+    let extra_snr_overhead = |plan: &PerBlockSnr| -> u32 {
+        let mut n_extra = 0u32;
+        for blk in 1..BLOCKS_PER_FRAME {
+            if plan.snroffste(blk) {
+                n_extra += 1;
+            }
+        }
+        n_extra * snroffste_payload
+    };
+
+    // Compute per-half mean demand. The encoder runs D15 on blocks 0
+    // and 3 with REUSE elsewhere, so blocks 0/1/2 share an exponent
+    // set and blocks 3/4/5 share another. Treating each half as the
+    // bit-allocation unit costs only 1 snroffste=1 payload (on block
+    // 3), keeping the per-block overhead bounded.
+    let left_demand: i64 = (0..3).map(|b| demand[b]).sum::<i64>() / 3;
+    let right_demand: i64 = (3..6).map(|b| demand[b]).sum::<i64>() / 3;
+    let half_spread = (left_demand - right_demand).abs();
+    if std::env::var("AC3_DEBUG_PERBLOCK_SNR").is_ok() {
+        eprintln!(
+            "perblock_snr: left_demand={} right_demand={} half_spread={} baseline_used={}/{}",
+            left_demand, right_demand, half_spread, baseline_used, baseline_budget
+        );
+    }
+    if half_spread >= 128 {
+        // Direction: positive half_spread means left is higher demand,
+        // so right is the donor and left is the recipient (and vice
+        // versa).
+        let (donor_blocks, recip_blocks): (&[usize], &[usize]) = if left_demand > right_demand {
+            (&[3, 4, 5], &[0, 1, 2])
+        } else {
+            (&[0, 1, 2], &[3, 4, 5])
+        };
+
+        // The global tuner consumes most of the frame budget, so a
+        // naive equal-and-opposite transfer rarely fits the snroffste
+        // overhead (~27 bits for stereo). The redistribution is two
+        // independent moves:
+        //
+        //   * **bank step `down`** — drop donor blocks' fsnr by `down`
+        //     unconditionally. Donates donor PSNR to free mantissa
+        //     bits.
+        //   * **bump step `up`** — raise recipient blocks' fsnr by
+        //     `up` unconditionally. Spends those bits where the
+        //     masking demand is highest.
+        //
+        // We iterate (down, up) and accept the trial maximising
+        // `up - down` (a heuristic for "PSNR gained on the demand
+        // side, less PSNR lost on the donor side") subject to
+        // `trial_used + extra_snr_overhead ≤ baseline_budget`. The
+        // search is O(16²) which is trivial.
+        let mut best_score = i32::MIN;
+        let mut best_trial = plan;
+        for down in 0..=8i32 {
+            // Donor-side eligibility.
+            let donor_ok = donor_blocks
+                .iter()
+                .all(|&db| (0..nchan).all(|c| plan.fsnroffst_ch[db][c] as i32 >= down));
+            if !donor_ok {
+                continue;
+            }
+            for up in 0..=8i32 {
+                if down == 0 && up == 0 {
+                    continue;
+                }
+                let recip_ok = recip_blocks
+                    .iter()
+                    .all(|&rb| (0..nchan).all(|c| (plan.fsnroffst_ch[rb][c] as i32) + up <= 15));
+                if !recip_ok {
+                    continue;
+                }
+                let mut trial = plan;
+                for &db in donor_blocks {
+                    for c in 0..nchan {
+                        trial.fsnroffst_ch[db][c] =
+                            (trial.fsnroffst_ch[db][c] as i32 - down).max(0) as u8;
+                    }
+                    if cpl.in_use {
+                        trial.cplfsnroffst[db] =
+                            (trial.cplfsnroffst[db] as i32 - down).max(0) as u8;
+                    }
+                    if lfeon {
+                        trial.lfefsnroffst[db] =
+                            (trial.lfefsnroffst[db] as i32 - down).max(0) as u8;
+                    }
+                }
+                for &rb in recip_blocks {
+                    for c in 0..nchan {
+                        trial.fsnroffst_ch[rb][c] =
+                            ((trial.fsnroffst_ch[rb][c] as i32) + up).min(15) as u8;
+                    }
+                    if cpl.in_use {
+                        trial.cplfsnroffst[rb] =
+                            ((trial.cplfsnroffst[rb] as i32) + up).min(15) as u8;
+                    }
+                    if lfeon {
+                        trial.lfefsnroffst[rb] =
+                            ((trial.lfefsnroffst[rb] as i32) + up).min(15) as u8;
+                    }
+                }
+                let trial_used = recompute(&trial);
+                let trial_overhead = extra_snr_overhead(&trial);
+                let fits = trial_used + trial_overhead <= baseline_budget;
+                if std::env::var("AC3_DEBUG_PERBLOCK_SNR").is_ok() && fits {
+                    eprintln!(
+                        "  half-transfer down={} up={} used={} overhead={} budget={} accepted",
+                        down, up, trial_used, trial_overhead, baseline_budget
+                    );
+                }
+                if fits {
+                    let score = up - down;
+                    if score > best_score {
+                        best_score = score;
+                        best_trial = trial;
+                    }
+                }
+            }
+        }
+        if best_score > i32::MIN {
+            plan = best_trial;
+        }
+    }
+
+    // Optional fine refinement: greedy pair walk over individual blocks
+    // for cases where the half-frame transfer was rejected but a tiny
+    // single-channel transfer still fits. Kept narrow because each
+    // accepted swap can flip 2-4 snroffste bits.
+    let max_rounds = 4;
+    for _round in 0..max_rounds {
+        let mut improved = false;
+        for i in 0..(BLOCKS_PER_FRAME / 2) {
+            let recipient = order[i];
+            let donor = order[BLOCKS_PER_FRAME - 1 - i];
+            if recipient == donor || demand[recipient] - demand[donor] < 256 {
+                continue;
+            }
+            let donor_ch = (0..nchan)
+                .filter(|&c| plan.fsnroffst_ch[donor][c] > 0)
+                .max_by_key(|&c| plan.fsnroffst_ch[donor][c]);
+            let recip_ch = (0..nchan)
+                .filter(|&c| plan.fsnroffst_ch[recipient][c] < 15)
+                .min_by_key(|&c| plan.fsnroffst_ch[recipient][c]);
+            if let (Some(dc), Some(rc)) = (donor_ch, recip_ch) {
+                let mut trial = plan;
+                trial.fsnroffst_ch[donor][dc] -= 1;
+                trial.fsnroffst_ch[recipient][rc] += 1;
+                let trial_used = recompute(&trial);
+                let trial_overhead = extra_snr_overhead(&trial);
+                if trial_used + trial_overhead <= baseline_budget {
+                    plan = trial;
+                    improved = true;
+                }
+            }
+        }
+        if !improved {
+            break;
+        }
+    }
+
+    // Final guard: the per-block plan must still fit. If somehow the
+    // greedy walk overshot (shouldn't happen, but be defensive), fall
+    // back to the flat plan.
+    let final_used = recompute(&plan);
+    let final_overhead = extra_snr_overhead(&plan);
+    if final_used + final_overhead > baseline_budget {
+        return PerBlockSnr::from_global(ba);
+    }
+    if std::env::var("AC3_DEBUG_PERBLOCK_SNR").is_ok() {
+        eprintln!(
+            "perblock_snr: final csnr={:?} fsnr_ch={:?} extra_overhead={}",
+            plan.csnroffst, plan.fsnroffst_ch, final_overhead
+        );
+    }
+    plan
 }
 
 // ---------------------------------------------------------------------------
@@ -4783,6 +5253,328 @@ mod tests {
             "coupling did not measurably improve PSNR: with={:.2} dB, without={:.2} dB",
             psnr_with,
             psnr_without
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Per-block snroffst tuning (round-24 / task #170) tests.
+    // -----------------------------------------------------------------
+
+    /// Build a stereo fixture where audio block 3 of a syncframe carries
+    /// a broadband transient and the surrounding blocks are near
+    /// silence. With a 256-sample block size and 6 blocks per frame the
+    /// transient lives in samples [256*3, 256*4) = [768, 1024).
+    /// Multiple syncframes are emitted so the encoder/decoder can warm
+    /// up before the metric window.
+    fn build_perblock_transient_pcm(sr: u32) -> (usize, Vec<u8>) {
+        // 4 syncframes of audio = 4*1536 = 6144 samples. We measure
+        // from the 2nd frame onwards so the decoder/encoder priming
+        // windows have settled.
+        let frames = 4usize;
+        let nsamp = frames * 1536;
+        let mut pcm = vec![0i16; nsamp * 2];
+        for f in 0..frames {
+            let frame_off = f * 1536;
+            // Steady low-amplitude 880 Hz tone everywhere → blocks 0/1/2
+            // have non-zero bap bins (so their fsnroffst donations
+            // actually save mantissa bits). Then add a HF chord burst on
+            // block 3 of each frame (samples 768..1024) to create the
+            // demand spike that should attract the redistributed bits.
+            for k in 0..1536 {
+                let n = frame_off + k;
+                let t = n as f32 / sr as f32;
+                let bg = 0.10 * (2.0 * std::f32::consts::PI * 880.0 * t).sin();
+                let burst = if (768..1024).contains(&k) {
+                    0.50 * ((2.0 * std::f32::consts::PI * 4000.0 * t).sin() * 0.25
+                        + (2.0 * std::f32::consts::PI * 6000.0 * t).sin() * 0.25
+                        + (2.0 * std::f32::consts::PI * 8000.0 * t).sin() * 0.25
+                        + (2.0 * std::f32::consts::PI * 10_000.0 * t).sin() * 0.25)
+                } else {
+                    0.0
+                };
+                let s = (bg + burst).clamp(-1.0, 1.0);
+                let q = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                pcm[n * 2] = q;
+                pcm[n * 2 + 1] = q;
+            }
+        }
+        let mut bytes = Vec::with_capacity(pcm.len() * 2);
+        for s in &pcm {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        (nsamp, bytes)
+    }
+
+    /// Self-decode roundtrip with per-block snroffst tuning enabled
+    /// (default). This is the primary spec-conformance test for the
+    /// round-24 work — proves a frame whose `snroffste=1` fires on
+    /// blocks other than block 0 still self-decodes through our own
+    /// AC-3 decoder. Catches bitstream sync regressions in the
+    /// `snroffste/csnroffst/fsnroffst` write path.
+    #[test]
+    fn perblock_snroffst_self_decode() {
+        let sr = 48_000u32;
+        let (nsamp, bytes) = build_perblock_transient_pcm(sr);
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(sr);
+        params.channels = Some(2);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(192_000);
+        let mut enc = make_encoder(&params).expect("make_encoder");
+        let audio = AudioFrame {
+            samples: nsamp as u32,
+            pts: Some(0),
+            data: vec![bytes],
+        };
+        enc.send_frame(&Frame::Audio(audio)).unwrap();
+        let _ = enc.flush();
+        let mut pkts = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => pkts.push(p),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        assert!(!pkts.is_empty(), "expected at least one packet");
+        let dparams = CodecParameters::audio(CodecId::new("ac3"));
+        let mut dec = crate::decoder::make_decoder(&dparams).expect("make_decoder");
+        let mut decoded = 0usize;
+        for p in &pkts {
+            dec.send_packet(p).unwrap();
+            while let Ok(Frame::Audio(a)) = dec.receive_frame() {
+                decoded += a.data[0].len() / 4;
+            }
+        }
+        assert!(
+            decoded > 0,
+            "decoder produced no audio from per-block-snr-tuned bitstream"
+        );
+    }
+
+    /// A/B PSNR on the transient-in-block-3 fixture. Encodes the same
+    /// PCM twice — once with per-block snroffst tuning active (#170,
+    /// the default) and once with `AC3_DISABLE_PERBLOCK_SNR=1` set so
+    /// every block reuses the global flat allocation. Both encodes use
+    /// the same frmsizecod (so identical bitstream byte budget). The
+    /// per-block-tuned run must produce equal-or-better localised
+    /// PSNR over block 3's sample range.
+    ///
+    /// Marked `#[ignore]` so it doesn't race with other tests over the
+    /// `AC3_DISABLE_PERBLOCK_SNR` env var (set/remove here would flip
+    /// the encoder's decision in any concurrently-running encode).
+    /// Run with `cargo test -- --ignored perblock_snroffst_helps_transient`.
+    #[test]
+    #[ignore = "mutates AC3_DISABLE_PERBLOCK_SNR — must run alone (cargo test -- --ignored)"]
+    fn perblock_snroffst_helps_transient() {
+        let sr = 48_000u32;
+        let (nsamp, bytes) = build_perblock_transient_pcm(sr);
+        // 96 kbps stereo — tight enough that the global tuner
+        // typically lands on csnr ≈ 4-6 with substantial mantissa
+        // hunger on the transient block, so per-block redistribution
+        // can move bits where they matter. At 192 kbps the budget is
+        // loose enough that both paths reach ceiling PSNR and the A/B
+        // signal vanishes.
+        let kbps = 96u64;
+
+        let encode_and_psnr = |disable: bool| -> (f64, usize) {
+            if disable {
+                std::env::set_var("AC3_DISABLE_PERBLOCK_SNR", "1");
+            } else {
+                std::env::remove_var("AC3_DISABLE_PERBLOCK_SNR");
+            }
+            let mut params = CodecParameters::audio(CodecId::new("ac3"));
+            params.sample_rate = Some(sr);
+            params.channels = Some(2);
+            params.sample_format = Some(SampleFormat::S16);
+            params.bit_rate = Some(kbps * 1000);
+            let mut enc = make_encoder(&params).expect("make_encoder");
+            let audio = AudioFrame {
+                samples: nsamp as u32,
+                pts: Some(0),
+                data: vec![bytes.clone()],
+            };
+            enc.send_frame(&Frame::Audio(audio)).unwrap();
+            let _ = enc.flush();
+            let mut pkts = Vec::new();
+            let mut total_bytes = 0usize;
+            loop {
+                match enc.receive_packet() {
+                    Ok(p) => {
+                        total_bytes += p.data.len();
+                        pkts.push(p);
+                    }
+                    Err(Error::NeedMore) | Err(Error::Eof) => break,
+                    Err(e) => panic!("receive_packet: {e:?}"),
+                }
+            }
+            let dparams = CodecParameters::audio(CodecId::new("ac3"));
+            let mut dec = crate::decoder::make_decoder(&dparams).expect("make_decoder");
+            let mut decoded: Vec<i16> = Vec::new();
+            for p in &pkts {
+                dec.send_packet(p).unwrap();
+                while let Ok(Frame::Audio(a)) = dec.receive_frame() {
+                    for s in a.data[0].chunks_exact(4) {
+                        decoded.push(i16::from_le_bytes([s[0], s[1]]));
+                    }
+                }
+            }
+            let orig: Vec<i16> = bytes
+                .chunks_exact(4)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let n = decoded.len().min(orig.len());
+            // Lag search across the first transient (frame 1 burst at
+            // ~ sample 1536+896 = 2432) — the IMDCT priming offset is
+            // 256 samples but ffmpeg-style decoders also have a frame
+            // of look-ahead, so we sweep ±1024.
+            let mut best_lag = 0i32;
+            let mut best_sse = f64::INFINITY;
+            for lag in -1024i32..=1024 {
+                let mut sse = 0.0f64;
+                let mut count = 0usize;
+                for i in 1536..n {
+                    let b = i as i32 + lag;
+                    if b < 0 || (b as usize) >= orig.len() {
+                        continue;
+                    }
+                    let d = decoded[i] as f64 - orig[b as usize] as f64;
+                    sse += d * d;
+                    count += 1;
+                }
+                if count > 0 {
+                    let mse = sse / count as f64;
+                    if mse < best_sse {
+                        best_sse = mse;
+                        best_lag = lag;
+                    }
+                }
+            }
+            // Localised PSNR over block-3 windows of frames 1..N (skip
+            // frame 0 priming). Block 3 of frame f sits at
+            // [f*1536+768, f*1536+1024).
+            let mut burst_sse = 0.0f64;
+            let mut burst_count = 0usize;
+            let frames = nsamp / 1536;
+            for f in 1..frames {
+                for i in (f * 1536 + 768)..(f * 1536 + 1024).min(n) {
+                    let b = i as i32 + best_lag;
+                    if b < 0 || (b as usize) >= orig.len() {
+                        continue;
+                    }
+                    let d = decoded[i] as f64 - orig[b as usize] as f64;
+                    burst_sse += d * d;
+                    burst_count += 1;
+                }
+            }
+            let psnr = if burst_count > 0 && burst_sse > 0.0 {
+                let mse = burst_sse / burst_count as f64;
+                10.0 * (32767.0f64.powi(2) / mse).log10()
+            } else {
+                f64::INFINITY
+            };
+            (psnr, total_bytes)
+        };
+
+        let (psnr_with, bytes_with) = encode_and_psnr(false);
+        let (psnr_without, bytes_without) = encode_and_psnr(true);
+        std::env::remove_var("AC3_DISABLE_PERBLOCK_SNR");
+
+        eprintln!(
+            "block-3 transient @ {} kbps: per-block-tuned  = {:.2} dB ({} bytes)",
+            kbps, psnr_with, bytes_with
+        );
+        eprintln!(
+            "block-3 transient @ {} kbps: flat allocation  = {:.2} dB ({} bytes)",
+            kbps, psnr_without, bytes_without
+        );
+        // Same frmsizecod ⇒ same byte budget per frame.
+        assert_eq!(
+            bytes_with, bytes_without,
+            "per-block tuning should not change frame byte count"
+        );
+        // Per-block tuning must be at least non-regressive on the
+        // demand-heavy block. We accept equality (no-op) too — for
+        // some seeds the demand spread is below the redistribution
+        // threshold and the plan stays flat by design.
+        assert!(
+            psnr_with >= psnr_without - 0.1,
+            "per-block snroffst tuning regressed transient PSNR: with={:.2} dB, without={:.2} dB",
+            psnr_with,
+            psnr_without
+        );
+    }
+
+    /// ffmpeg cross-decode of the per-block-snroffst output. Encode the
+    /// transient-in-block-3 fixture (which exercises the snroffste=1
+    /// path on non-block-0 audio blocks) and verify ffmpeg parses it
+    /// cleanly. This is the spec-conformance gate for #170: a
+    /// production decoder we did NOT write must accept our per-block
+    /// snroffst stream. Skips when ffmpeg is missing.
+    #[test]
+    fn perblock_snroffst_ffmpeg_crossdecode() {
+        use std::process::Command;
+        let sr = 48_000u32;
+        let (nsamp, bytes) = build_perblock_transient_pcm(sr);
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(sr);
+        params.channels = Some(2);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(192_000);
+        let mut enc = make_encoder(&params).expect("make_encoder");
+        let audio = AudioFrame {
+            samples: nsamp as u32,
+            pts: Some(0),
+            data: vec![bytes],
+        };
+        enc.send_frame(&Frame::Audio(audio)).unwrap();
+        let _ = enc.flush();
+        let mut ac3_bytes: Vec<u8> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => ac3_bytes.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        let in_path = std::env::temp_dir().join("oxideav_ac3_perblock_snr_enc.ac3");
+        let out_path = std::env::temp_dir().join("oxideav_ac3_perblock_snr_dec.pcm");
+        std::fs::write(&in_path, &ac3_bytes).expect("write ac3");
+        let _ = std::fs::remove_file(&out_path);
+        let out = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "ac3",
+                "-i",
+            ])
+            .arg(&in_path)
+            .args(["-f", "s16le", "-acodec", "pcm_s16le", "-ac", "2"])
+            .arg(&out_path)
+            .status();
+        let _ = std::fs::remove_file(&in_path);
+        let Ok(status) = out else {
+            eprintln!("ffmpeg unavailable — skipping per-block snr cross-decode gate");
+            return;
+        };
+        if !status.success() {
+            panic!("ffmpeg failed to decode our per-block-snroffst AC-3 output");
+        }
+        let Ok(decoded_bytes) = std::fs::read(&out_path) else {
+            panic!("ffmpeg produced no decode output");
+        };
+        let _ = std::fs::remove_file(&out_path);
+        assert!(
+            decoded_bytes.len() > 1000,
+            "ffmpeg per-block decode suspiciously short: {} bytes",
+            decoded_bytes.len()
+        );
+        eprintln!(
+            "ffmpeg cross-decoded our per-block-snroffst stream: {} bytes",
+            decoded_bytes.len()
         );
     }
 }

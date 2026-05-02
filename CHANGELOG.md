@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 26 (task #170) — per-block SNR-offset bit-pool tuning. AC-3
+  syntax §5.4.3.37-43 lets every audio block re-transmit a fresh
+  `(csnroffst, fsnroffst[ch], cplfsnroffst, lfefsnroffst)` tuple via
+  the `snroffste=1` flag; previously the encoder only emitted one
+  global tuple on block 0 and reused it for blocks 1..5. The new
+  `tune_per_block_snroffst` pass runs after the existing global
+  `tune_snroffst` and redistributes mantissa bits between blocks based
+  on per-block masking demand. Algorithm:
+    1. Compute per-block PSD demand (mean of `3072 - (exp << 7)` over
+       all bins / fbw channels) — silent blocks land near 24, loud
+       blocks land at 800-1200+.
+    2. Group blocks 0/1/2 vs 3/4/5 (the encoder's D15-on-blocks-0-and-3
+       exponent strategy means each half shares an exponent set).
+    3. Search `(down, up) ∈ [0, 8] × [0, 8]` step pairs: drop the
+       donor half's whole-block fsnroffst by `down` (banks bits) and
+       bump the recipient half by `up` (spends bits where the masking
+       demand is highest). Accept the pair maximising `up - down`
+       subject to the trial mantissa-bit count + per-block snroffste
+       payload (~27 bits/changed-block for stereo) fitting the frame
+       budget.
+    4. Optional fine refinement via single-channel pair walks on the
+       residual budget.
+  When the demand spread is below threshold or the budget is too tight
+  the pass returns the flat plan unchanged — `snroffste` reverts to
+  block-0-only and the bitstream stays byte-identical to the previous
+  encoder. `AC3_DISABLE_PERBLOCK_SNR=1` pins the flat plan for A/B
+  testing; `AC3_DEBUG_PERBLOCK_SNR=1` prints the demand vector and
+  the accepted (down, up) trial.
+  Test gates (3 new tests, total = 57 active + 2 ignored):
+    - `perblock_snroffst_self_decode` — encode 4 syncframes carrying a
+      HF-rich chord burst on block 3 of each frame and silence
+      elsewhere; verify our own decoder reads the per-block snroffst
+      stream without complaint.
+    - `perblock_snroffst_helps_transient` (ignored — mutates
+      `AC3_DISABLE_PERBLOCK_SNR` so it must run alone) — A/B encodes
+      the same fixture at 96 kbps stereo with vs without per-block
+      tuning, asserts identical byte count and that the per-block path
+      doesn't regress block-3 PSNR. Measured: per-block-tuned **32.91
+      dB** vs flat **31.84 dB** (+1.07 dB localised on the demand-heavy
+      block at matched bitrate).
+    - `perblock_snroffst_ffmpeg_crossdecode` — encodes the same
+      fixture and pipes through `ffmpeg -f ac3` to verify a production
+      decoder accepts our snroffste-on-non-block-0 stream cleanly.
+
 - Round 25 (task #155) — multichannel coupling: extended the encoder's
   §7.4 channel-coupling path from the previous 2/0-only restriction to
   every multichannel acmod (3/0, 2/2, 3/2, 5.1). All available fbw

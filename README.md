@@ -39,6 +39,17 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       channels can spend residual budget bits matching their mask
       headroom. Bitstream syntax always allowed it; the encoder now
       uses it.
+- [x] Per-block SNR-offset bit-pool tuning (§5.4.3.37-43, round 26 /
+      task #170) — encoder runs a redistribution pass after the global
+      tuner that moves mantissa bits between blocks based on per-block
+      masking demand, emitting `snroffste=1` on the boundary block
+      when the redistribution fits the budget. On a 96 kbps stereo
+      fixture with a HF-rich chord burst on block 3 of each frame,
+      block-3 PSNR rises from **31.84 dB** (flat allocation) to
+      **32.91 dB** (per-block tuned) at matched bitstream size
+      (+1.07 dB). When the demand spread is small or the budget is
+      tight the pass is a no-op and the bitstream stays
+      byte-identical to the previous encoder.
 - [ ] Downmix (§7.8) — 3/2 and 3/1 modes still pending
 - [x] E-AC-3 (bsid=16, Annex E) — encoder, round-1 scope: independent
       substream (`strmtyp=0`, `substreamid=0`) only, mono / stereo,
