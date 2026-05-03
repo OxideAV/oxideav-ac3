@@ -366,8 +366,8 @@ fn decode_stream(input: &[u8]) -> DecodedPcm {
                 if channels == 0 && af.samples > 0 {
                     // Channels = total samples / per-channel samples.
                     let per_ch = af.samples as usize;
-                    if per_ch > 0 {
-                        channels = (n / per_ch) as u16;
+                    if let Some(c) = n.checked_div(per_ch) {
+                        channels = c as u16;
                     }
                     sample_rate = 48_000; // AC-3 max; we don't have a per-frame field
                 }
