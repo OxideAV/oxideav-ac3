@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.3...v0.0.4) - 2026-05-03
+
+### Other
+
+- clippy follow-ups (div_ceil + vec_init_then_push)
+- drop redundant u32 cast on bsi.frame_bytes
+- add Annex E decoder dispatch + BSI/audfrm parsers (round 1)
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.2...v0.0.3) - 2026-05-03
 
 ### Other
