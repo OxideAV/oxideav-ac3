@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.2...v0.0.3) - 2026-05-03
+
+### Other
+
+- use checked_div for per-channel sample math
+- rustfmt docs_corpus.rs
+- wire docs/audio/ac3/fixtures/ corpus into tests/docs_corpus.rs
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- round 27/task #187 — E-AC-3 dependent substream encode (7.1)
+- round 26/task #170 — per-block SNR-offset bit-pool tuning
+- round 25/task #155 — multichannel coupling (>2 fbw)
+- round 25 — E-AC-3 (Annex E) encoder, round-1 scope
+- round 24 - spec-faithful transient detector + per-channel fsnroffst
+- round 19 — multichannel encoder (1/0, 3/0, 2/2, 3/2, 5.1)
+- round 18 — encoder-side §7.2.2.6 delta bit allocation
+- adopt slim AudioFrame shape
+- round 16 — encoder-side §7.4 channel coupling
+- round 15 — encoder-side short-block emission + transient detection
+- round 14 — transient PSNR was a TEST BUG, not a decoder bug
+- round 13 — verify FBW step C clean; add encoder rematrix (§7.5.3)
+- round 12 - fix parse_frame_side_info double-consume; rule out cpl/snroffset/phsflg
+- round 11 - hand-trace bndpsd/excite/mask/bap, add diagnostic probes
+- round 7 — apply §7.2.2.6 dba + cap §7.5 rematrix at coupling boundary
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - Round 27 (task #187) — E-AC-3 dependent substream encode +
