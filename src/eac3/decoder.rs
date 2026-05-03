@@ -1,4 +1,4 @@
-//! E-AC-3 syncframe decoder — rounds 1 + 2.
+//! E-AC-3 syncframe decoder — rounds 1 + 2 + 3.
 //!
 //! Round-1 path:
 //!
@@ -9,7 +9,7 @@
 //!    flags only (no DSP yet).
 //! 4. Emit `bsi.num_blocks × 256 × nchans` interleaved S16 zeros.
 //!
-//! Round-2 path (this commit):
+//! Round-2 path:
 //!
 //! 5. Hand the BitReader to [`super::dsp::decode_indep_audblks`],
 //!    which walks per-block side-info, runs §7 bit allocation +
@@ -18,12 +18,19 @@
 //!    (coupling, SPX, AHT, transient processing, …) the decoder
 //!    falls back to silent emit so the corpus driver keeps decoding.
 //!
-//! The dependent-substream recombination case
-//! (`eac3-from-ac3-bitstream-recombination`) is detected and noted
-//! but only the independent substream is emitted. Dependent
-//! substreams are still parsed (BSI + audfrm) so the decoder's
-//! output PCM is the right length — round 3 will add the per-channel
-//! `chanmap`-driven recombination into the indep program.
+//! Round-3 path (this commit):
+//!
+//! 6. Walk dependent substreams in the same packet, decode each via
+//!    the round-2 DSP, and **splice** the resulting channels into
+//!    [`Eac3DecoderState::indep_pcm_f32`] so the final emitted PCM
+//!    is `(indep_nchans + Σ dep_nchans) × samples`. The chanmap
+//!    field (Table E2.5) is parsed but not used to reorder — round
+//!    3 simply appends dep channels at the end of the indep program.
+//!    None of the corpus fixtures actually exercise dep substreams
+//!    (FFmpeg's eac3 encoder doesn't emit them per
+//!    `eac3-5.1-side-768kbps/notes.md`); the plumbing is in place so
+//!    a future custom-built fixture (or interop with a real DD+
+//!    7.1 stream) works end-to-end.
 
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
@@ -52,16 +59,22 @@ pub struct Eac3DecoderState {
     /// substream. Carries exponent reuse + 256-sample IMDCT delay line
     /// across blocks and frames.
     indep_state: Ac3State,
-    /// Per-channel persistent DSP state for the **dependent** substream
-    /// (round 3 hookup). Held separately so a dep-substream block's
-    /// reuse-exponent path doesn't read indep exponents.
-    #[allow(dead_code)]
+    /// Per-channel persistent DSP state for the **dependent** substream.
+    /// Held separately so a dep-substream block's reuse-exponent path
+    /// doesn't read indep exponents.
     dep_state: Ac3State,
-    /// Round-3 PCM scratch — the f32 PCM of the indep substream's
-    /// channels in their native layout, populated by round 2 and
-    /// awaiting dep-substream channels (chanmap-spliced) in round 3.
-    #[allow(dead_code)]
+    /// Per-frame f32 PCM scratch — the indep substream's PCM in its
+    /// native layout immediately after [`decode_indep_substream`]; if
+    /// any dep substreams follow in the same packet, their channels
+    /// are spliced in by [`decode_dep_substream`], growing this slot
+    /// to `indep_nchans + dep_nchans`.
     indep_pcm_f32: Vec<f32>,
+    /// Current channel count of [`Self::indep_pcm_f32`] — starts at
+    /// the indep BSI's `nchans` and grows as dep substreams splice
+    /// their channels in.
+    indep_nchans: u16,
+    /// Samples-per-frame (per channel) of [`Self::indep_pcm_f32`].
+    indep_samples_per_frame: u32,
     /// Per-frame error string (last seen). Diagnostic only.
     pub last_error: Option<String>,
 }
@@ -156,9 +169,9 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
                 indep_pcm = Some(pcm);
             }
             StreamType::Dependent => {
-                // Round 1+2: parsed but skipped. Round 3 will fold the
-                // dep substream's `chanmap` channels into the indep
-                // PCM when one exists in `state.last_indep`.
+                // Round 3: decode + splice into indep_pcm_f32. On
+                // failure (Unsupported / parse error) we keep the
+                // indep PCM as-is so output is still meaningful.
                 let _ = decode_dep_substream(state, &bsi, &audfrm, &mut br);
             }
             StreamType::Reserved => {
@@ -169,11 +182,22 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
         off += frame_bytes;
     }
 
-    indep_pcm.ok_or_else(|| {
+    let mut pcm = indep_pcm.ok_or_else(|| {
         Error::invalid(
             "eac3: packet contains no independent substream (only dependent or ac3-convert frames)",
         )
-    })
+    })?;
+
+    // Rebuild the final S16 buffer from the (possibly extended)
+    // [`indep_pcm_f32`] scratch. When no dep substream was seen, this
+    // is the indep PCM unchanged; when one or more dep substreams
+    // contributed, the scratch has grown to `indep_nchans + Σ
+    // dep_nchans` channels.
+    if state.indep_nchans != pcm.channels {
+        pcm.channels = state.indep_nchans;
+        pcm.pcm_s16le = pack_f32_to_s16le(&state.indep_pcm_f32);
+    }
+    Ok(pcm)
 }
 
 /// Decode one independent substream's audblks. Tries the round-2 DSP
@@ -192,31 +216,28 @@ fn decode_indep_substream(
 
     let dsp_result =
         dsp::decode_indep_audblks(bsi, audfrm, br, &mut state.indep_state, &mut floats);
-    let pcm_s16le = match dsp_result {
-        Ok(()) => {
-            // Pack f32 → S16 interleaved.
-            let mut out = vec![0u8; floats.len() * 2];
-            for (i, s) in floats.iter().enumerate() {
-                let clamped = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                let le = clamped.to_le_bytes();
-                out[i * 2] = le[0];
-                out[i * 2 + 1] = le[1];
-            }
-            out
+    if let Err(e) = &dsp_result {
+        // Silent fallback. Reset the per-channel exponent reuse state
+        // so the next frame's reuse-strategy blocks don't pick up
+        // garbage from a half-decoded prior frame.
+        state.last_error = Some(format!("{e}"));
+        state.indep_state = Ac3State::new();
+        for v in floats.iter_mut() {
+            *v = 0.0;
         }
-        Err(e) => {
-            // Silent fallback. Reset the per-channel exponent reuse
-            // state so the next frame's reuse-strategy blocks don't
-            // pick up garbage from a half-decoded prior frame.
-            state.last_error = Some(format!("{e}"));
-            state.indep_state = Ac3State::new();
-            vec![0u8; floats.len() * 2]
-        }
-    };
+    }
 
-    // Cache the f32 slot for round 3 even on silent fallback (keeps
-    // sizes consistent for dep-substream splice).
+    // Cache the indep f32 PCM in its native (acmod, lfeon) layout
+    // so any subsequent dep substream in the same packet can append
+    // its chanmap-routed channels (round 3).
     state.indep_pcm_f32 = floats;
+    state.indep_nchans = nchans as u16;
+    state.indep_samples_per_frame = samples;
+
+    // Pack indep PCM only. If a dep substream follows, the packet-
+    // level driver will rebuild the final S16 buffer in
+    // `decode_eac3_packet` after all substreams are walked.
+    let pcm_s16le = pack_f32_to_s16le(&state.indep_pcm_f32);
 
     Ok(DecodedFrame {
         sample_rate: bsi.sample_rate,
@@ -226,15 +247,108 @@ fn decode_indep_substream(
     })
 }
 
-/// Decode (currently: skip) a dependent substream. Round 3 wires the
-/// chanmap-driven splice into [`Eac3DecoderState::indep_pcm_f32`].
+/// Decode one dependent substream and splice its `chanmap`-routed
+/// channels into the indep substream's PCM scratch
+/// [`Eac3DecoderState::indep_pcm_f32`].
+///
+/// Returns `Ok(extended_channel_count)` on success; `Err(...)` if
+/// the dep substream uses a feature we can't decode (round-2-style
+/// silent-fallback applied to the dep audio, leaving the indep PCM
+/// untouched).
 fn decode_dep_substream(
-    _state: &mut Eac3DecoderState,
-    _bsi: &Eac3Bsi,
-    _audfrm: &AudFrm,
-    _br: &mut BitReader<'_>,
-) -> Result<()> {
-    Ok(())
+    state: &mut Eac3DecoderState,
+    bsi: &Eac3Bsi,
+    audfrm: &AudFrm,
+    br: &mut BitReader<'_>,
+) -> Result<u16> {
+    let samples = bsi.num_blocks as u32 * SAMPLES_PER_BLOCK as u32;
+    let dep_nchans = bsi.nchans as usize;
+
+    // Without an indep substream in the same packet there is nothing
+    // to extend. Per §E.2.3.1.1 a dep substream must follow an
+    // indep substream; flag it but don't error.
+    if state.last_indep.is_none() {
+        return Err(Error::invalid(
+            "eac3 dep: dependent substream with no preceding independent substream",
+        ));
+    }
+    if state.indep_samples_per_frame != samples {
+        return Err(Error::invalid(format!(
+            "eac3 dep: dep substream sample-count {samples} differs from indep {}",
+            state.indep_samples_per_frame
+        )));
+    }
+
+    // Decode the dep substream into its own f32 buffer. Round 3 reuses
+    // the indep DSP path; the dep substream's audblks have the same
+    // syntax (Table E1.4 doesn't branch on strmtyp).
+    let mut dep_floats = vec![0.0f32; samples as usize * dep_nchans];
+    if let Err(e) =
+        dsp::decode_indep_audblks(bsi, audfrm, br, &mut state.dep_state, &mut dep_floats)
+    {
+        // Silent fallback for the dep substream — leave indep PCM
+        // untouched so the indep program is still audible.
+        state.last_error = Some(format!("{e}"));
+        state.dep_state = Ac3State::new();
+        return Err(e);
+    }
+
+    // Splice channels per chanmap (Table E2.5).
+    splice_dep_into_indep(state, bsi, &dep_floats);
+    Ok(state.indep_nchans)
+}
+
+/// Pack interleaved f32 PCM (range -1..1) into S16LE bytes.
+fn pack_f32_to_s16le(floats: &[f32]) -> Vec<u8> {
+    let mut out = vec![0u8; floats.len() * 2];
+    for (i, s) in floats.iter().enumerate() {
+        let clamped = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        let le = clamped.to_le_bytes();
+        out[i * 2] = le[0];
+        out[i * 2 + 1] = le[1];
+    }
+    out
+}
+
+/// Splice the dep substream's `nfchans` channels into the indep PCM
+/// scratch per the chanmap field (Table E2.5). Grows the scratch's
+/// channel count + reinterleaves on the fly.
+///
+/// Round 3 implementation strategy: simply **append** the dep
+/// substream's channels at the end of the indep program (i.e. for an
+/// indep 5.1 + dep [Lc Rc], the output becomes 8 channels [L C R Ls
+/// Rs LFE Lc Rc]). The chanmap bits aren't currently used to
+/// reorder — Table E2.5 specifies where each channel sits in a 16-
+/// channel reference grid, but downstream consumers (the corpus
+/// driver and the `Downmix` engine) work in acmod-native layouts
+/// only. A future round can route per-bit if/when a fixture exercises
+/// a non-trivial chanmap.
+fn splice_dep_into_indep(state: &mut Eac3DecoderState, bsi: &Eac3Bsi, dep_floats: &[f32]) {
+    let dep_nchans = bsi.nchans as usize;
+    let samples = state.indep_samples_per_frame as usize;
+    let indep_nchans = state.indep_nchans as usize;
+    let new_nchans = indep_nchans + dep_nchans;
+
+    let mut grown = vec![0.0f32; samples * new_nchans];
+    for n in 0..samples {
+        for ch in 0..indep_nchans {
+            grown[n * new_nchans + ch] = state.indep_pcm_f32[n * indep_nchans + ch];
+        }
+        for ch in 0..dep_nchans {
+            grown[n * new_nchans + indep_nchans + ch] = dep_floats[n * dep_nchans + ch];
+        }
+    }
+    state.indep_pcm_f32 = grown;
+    state.indep_nchans = new_nchans as u16;
+
+    // Diagnostic: log the chanmap for any future bug hunts.
+    if let Some(map) = bsi.chanmap {
+        if std::env::var("EAC3_TRACE_CHANMAP").is_ok() {
+            eprintln!(
+                "TRACE-CHANMAP dep substream: chanmap=0x{map:04X} dep_nchans={dep_nchans} → indep grown to {new_nchans} channels",
+            );
+        }
+    }
 }
 
 /// Build a silent S16 PCM buffer of the right shape for one
