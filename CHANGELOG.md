@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — round 6 (task #324) — Adaptive Hybrid Transform (AHT)
+
+- **VQ codebooks E4.1..E4.7** — 956 entries × 6 i16 transcribed
+  verbatim from ATSC A/52:2018 (= ETSI TS 102 366 v1.4.1) Annex E §4
+  into `src/eac3/tables/aht_codebooks.rs`. Spec values, not
+  implementation source.
+- **`src/eac3/aht.rs`** — AHT decode helpers:
+    - `HEBAPTAB` — Table E3.1 high-efficiency bit-allocation pointer
+      lookup (64 entries).
+    - `HEBAP_MANT_BITS` — Table E3.2 mantissa bits per `hebap` for the
+      scalar/GAQ regime (`hebap >= 8`).
+    - `VQ_BITS` — codeword widths for VQ tables E4.1..E4.7
+      (2/3/4/5/7/8/9 bits).
+    - `vq_lookup(hebap, index)` — per-bin 6-tuple VQ lookup,
+      Q15-normalised to (-1, 1).
+    - `read_scalar_aht_mantissas` + Table E3.5 GAQ small/large
+      quantiser with the §3.4.4.2 large-mantissa remap.
+    - `idct_ii_6` — §3.4.5 inverse DCT-II that recovers per-block
+      MDCT coefficients from the 6 AHT-domain values per bin.
+    - `fill_gaqbin` / `gaq_sections` / `read_gaq_gains` — per
+      §3.4.2 helper-variable derivation and per-channel gain-word
+      bit-stream parsing.
+- **`audfrm` two-phase parse** — `parse_with` now stops at the AHT
+  anchor when `ahte == 1`, surfacing `AudFrm::aht_anchor_bits` +
+  `aht_phase_b_pending`; a new `parse_phase_b(br, audfrm, bsi,
+  hints)` consumes `chahtinu[ch]` / `cplahtinu` / `lfeahtinu`
+  followed by the SNR / transient / SPX-attenuation / blkstrtinfo
+  tail. Hints (`AhtRegsHints`) carry `nchregs[ch]` / `ncplregs` /
+  `nlferegs` derived from the per-block exponent strategies.
+- **dsp AHT path** — `decode_indep_audblks` keeps a per-channel AHT
+  coefficient cache and dispatches AHT-active channels to a
+  GAQ + VQ + IDCT mantissa decoder on the FIRST audblk where the
+  channel emits exponents. Subsequent audblks pull pre-computed
+  coefficients from the cache.
+- **Round-6 scope is mono-only**: `nfchans == 1 && !lfeon &&
+  ncplblks == 0`. Multichannel / coupled / LFE AHT mutes via an
+  `Unsupported` early return — the iterative `nchregs` probe
+  (§3.4.2) lands in round 7. The `eac3-low-bitrate-32kbps` corpus
+  fixture is the only AHT-active fixture and matches the mono
+  scope; round 6 unblocks its 14 of 17 AHT-on frames.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.3...v0.0.4) - 2026-05-03
 
 ### Other

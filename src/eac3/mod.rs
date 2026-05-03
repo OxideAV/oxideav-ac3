@@ -40,32 +40,56 @@
 //!   1.0 / 2.0 / 5.1 indep substreams + 7.1 indep+dep pair. Untouched
 //!   by this commit.
 //!
-//! ## Deferred to round 2 and beyond
+//! ## Round 6 (this commit) — Adaptive Hybrid Transform (AHT)
 //!
-//! * Real DSP (exponent decode, parametric bit allocation, mantissa
-//!   dequantization, decoupling, IMDCT, overlap-add) for an indep
-//!   substream — most of the AC-3 helpers in [`crate::audblk`] can
-//!   be reused once the BSI/audfrm fields are translated into the
-//!   shape `Ac3State`/`run_bit_allocation`/`unpack_mantissas` expect.
-//! * Dependent substream recombination (the `eac3-from-ac3-bitstream-
-//!   recombination` fixture and the `eac3-5.1-side-768kbps` 5.1+side
-//!   case) — needs a multi-substream syncframe assembler that
-//!   threads `chanmap` channels into the indep substream's output
-//!   PCM matrix.
-//! * Adaptive Hybrid Transform (AHT) and Spectral Extension (SPX) —
-//!   conditional on `ahte` / `spxinu` flags surfaced by the audfrm /
-//!   audblk parsers. Both are §E features the round-1 parser will
-//!   correctly skip past on streams that opt out.
-//! * 256-coeff-block-per-syncframe variants (`numblkscod < 3`).
-//!   The `eac3-256-coeff-block` fixture uses `numblkscod=0` (1 block
-//!   per syncframe = 256 samples) — the parser handles it, but the
-//!   silent-PCM path produces an output of the right length only.
+//! * **VQ codebooks E4.1..E4.7** — 956 entries × 6 i16 transcribed
+//!   from A/52:2018 Annex E §4 into [`tables::aht_codebooks`]. Plus
+//!   the `hebap` pointer table (E3.1) and quantiser-bit table (E3.2)
+//!   in [`aht`].
+//! * **Phase-B audfrm parse** — [`audfrm::parse_with`] now stops at
+//!   the AHT anchor when `ahte == 1`, leaving the variable-width
+//!   `chahtinu` / `cplahtinu` / `lfeahtinu` bits for [`audfrm::parse_phase_b`]
+//!   once the dsp pre-walk has produced `nchregs[ch]` / `ncplregs` /
+//!   `nlferegs` from the per-block exponent strategies.
+//! * **AHT mantissa decode** ([`aht::vq_lookup`] /
+//!   [`aht::read_scalar_aht_mantissas`]) + **§3.4.5 inverse DCT-II**
+//!   ([`aht::idct_ii_6`]) routed through a per-frame coefficient
+//!   cache in [`dsp::decode_indep_audblks`]. AHT-active channels read
+//!   their full 6×nmant mantissa block in audblk[0]'s mantissa step;
+//!   audblks 1..5 pull pre-computed coefficients from the cache.
+//! * **Round-6 scope is mono-only** — multichannel / LFE / coupled AHT
+//!   needs the 2-pass nchregs probe (round 7). The
+//!   `eac3-low-bitrate-32kbps` fixture is the only AHT-active fixture
+//!   in the corpus.
+//!
+//! ## Deferred to round 7 and beyond
+//!
+//! * Multichannel / coupled / LFE AHT — needs the iterative nchregs
+//!   probe described in §3.4.2 (or a deferred audfrm parse with full
+//!   audblk pre-walk). The `cplahtinu` / `lfeahtinu` bit streams
+//!   themselves are already wired through [`audfrm::AudFrm`].
+//! * **Spectral Extension (SPX)** — `spxinu == 1` still mutes per
+//!   §E.2.2.5.4. SPX needs the `spxcoexp`/`spxcomant` coordinate
+//!   decoder + the noise-blend / amplitude-fold reconstruction
+//!   pipeline. No corpus fixture exercises SPX yet.
+//! * **Frame-level exponent strategy** (`expstre == 0`) — the
+//!   `frmchexpstr` 5-bit codeword expansion via Table E2.10. None of
+//!   the FFmpeg-encoded corpus fixtures use it.
+//! * **Per-block SNR-offset** (`snroffststr != 0`) — needs the
+//!   audblk-level `snroffste` parser. Same situation as above.
+//! * **Transient pre-noise processing** (`transproce == 1`) — the
+//!   `transprocloc` / `transproclen` per-channel attenuation envelope.
+//! * **256-coeff-block-per-syncframe variants** (`numblkscod < 3`).
+//!   The parser handles them; the silent-PCM path produces an output
+//!   of the right length only.
 
+pub mod aht;
 pub mod audfrm;
 pub mod bsi;
 pub mod decoder;
 pub mod dsp;
 pub mod encoder;
+pub mod tables;
 
 // Re-exports — keep the public surface identical to the old single-
 // file `eac3.rs` so external callers (the encoder integration test in

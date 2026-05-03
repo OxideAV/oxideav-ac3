@@ -28,7 +28,7 @@
 //! "frame-level value reused".
 
 use oxideav_core::bits::BitReader;
-use oxideav_core::{Error, Result};
+use oxideav_core::Result;
 
 use super::bsi::{Bsi, StreamType};
 
@@ -114,6 +114,27 @@ pub struct AudFrm {
     /// Number of blocks with `cplinu[blk] == 1`. Convenient summary
     /// for the round-2 DSP path which rejects any non-zero value.
     pub ncplblks: u32,
+    /// Bit position immediately before the AHT block in audfrm. Set
+    /// by `parse_with` regardless of whether `ahte` was true. The
+    /// dsp module uses this anchor to reseek into audfrm after a
+    /// pre-walk of audblks has produced `nchregs[ch]`/`ncplregs`/
+    /// `nlferegs` — see [`super::dsp::decode_indep_audblks`].
+    pub aht_anchor_bits: u64,
+    /// `true` when `parse_with` returned with `ahte == 1` BEFORE
+    /// consuming the AHT bits or the SNR/transient/SPX/blkstrtinfo
+    /// tail. The caller must invoke [`parse_phase_b`] with the
+    /// computed nchregs hints to finish parsing audfrm.
+    pub aht_phase_b_pending: bool,
+    /// Per-fbw-channel `chahtinu[ch]` flag from §3.4.2 / Table E1.3.
+    /// `true` means channel `ch` is AHT-coded for this syncframe.
+    /// Populated by [`parse_phase_b`].
+    pub chahtinu: [bool; MAX_FBW],
+    /// `cplahtinu` flag (single coupling channel). Populated by
+    /// [`parse_phase_b`] when `ncplregs == 1 && ncplblks == 6`.
+    pub cplahtinu: bool,
+    /// `lfeahtinu` flag (single LFE channel). Populated by
+    /// [`parse_phase_b`] when `nlferegs == 1` and `lfeon == true`.
+    pub lfeahtinu: bool,
 }
 
 impl AudFrm {
@@ -139,8 +160,25 @@ impl AudFrm {
             cplinu_blk: [false; MAX_BLOCKS_PER_FRAME],
             cplstre_blk: [false; MAX_BLOCKS_PER_FRAME],
             ncplblks: 0,
+            aht_anchor_bits: 0,
+            aht_phase_b_pending: false,
+            chahtinu: [false; MAX_FBW],
+            cplahtinu: false,
+            lfeahtinu: false,
         }
     }
+}
+
+/// Per-channel hint set produced by the dsp pre-walk before invoking
+/// [`parse_phase_b`]. Each `nchregs[ch]` value is the number of
+/// non-`REUSE` exponent strategies emitted across the 6 audblks for
+/// that channel; `chahtinu[ch]` is present in the bitstream only when
+/// `nchregs[ch] == 1` (and likewise for `ncplregs` / `nlferegs`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AhtRegsHints {
+    pub nchregs: [u8; MAX_FBW],
+    pub ncplregs: u8,
+    pub nlferegs: u8,
 }
 
 /// Parse `audfrm()` per Table E1.3.
@@ -263,32 +301,49 @@ pub fn parse_with(br: &mut BitReader<'_>, bsi: &Bsi) -> Result<AudFrm> {
     // Per §E.2.3.5 / Table E1.3, `ahte` is in scope only when
     // `expstre == 1`. When `ahte == 1`, audfrm carries `ahtinu[ch]`
     // (1 bit) for every fbw channel whose 6-block exponent
-    // strategies are all REUSE, and one `ahtinu_lfe`. The per-
-    // channel "all-REUSE" determination requires reading the audblk
-    // strategy bits **before** we get to the AHT block — but those
-    // bits live in audblk[0]..audblk[5], past the audfrm boundary.
+    // strategies are all REUSE (`nchregs[ch] == 1`), and one
+    // `ahtinu_lfe`. The per-channel `nchregs[ch]` determination
+    // requires reading the audblk strategy bits **before** we get to
+    // the AHT block — but those bits live in audblk[0]..audblk[5],
+    // past the audfrm boundary.
     //
-    // Round 4 stub: we surface `ahte == true` to the DSP path (which
-    // bails with `Unsupported`) without attempting to consume the
-    // variable-length `ahtinu[ch]` bits. The bit cursor will land in
-    // the wrong place for any subsequent fields the dsp path reads,
-    // but the caller treats the whole frame as silent on Unsupported
-    // so cursor drift is contained.
+    // Round 6 (this commit) splits audfrm parsing into two phases:
     //
-    // The `eac3-low-bitrate-32kbps` fixture (which uses AHT at low
-    // bit budgets per its `notes.md`) will mute. A real round-4
-    // implementation requires a 2-pass decode (scan audblks for
-    // chexpstr first, then re-walk audfrm + audblks for AHT) plus
-    // the §E.2.2.4 Karhunen-Loeve VQ codebooks — substantial work
-    // deferred to a follow-up.
+    // * `parse_with` (this entry point) walks fields 0..AHT and
+    //   captures `aht_anchor_bits` = the bit position immediately
+    //   before the AHT block. When `ahte == 0`, the parser proceeds
+    //   straight to the SNR/transient/SPX/blkstrtinfo tail (the
+    //   classic round-1 path). When `ahte == 1`, it RETURNS HERE
+    //   without consuming the variable-length AHT bits OR the tail
+    //   fields; the dsp module then pre-walks audblks for chexpstr,
+    //   computes nchregs, and calls `parse_phase_b` with the hint
+    //   to finish the parse.
+    //
+    // The `aht_anchor_bits` field is set in both branches so the
+    // dsp module can reseek the bit cursor to here before invoking
+    // `parse_phase_b`.
+    a.aht_anchor_bits = br.bit_position();
     if a.ahte {
-        return Err(Error::Unsupported(
-            "eac3 audfrm: ahte == 1 (AHT in use) — round 4 stub mutes; \
-             real AHT decode (Karhunen-Loeve VQ codebooks per §E.2.2.4) \
-             is a follow-up"
-                .to_string(),
-        ));
+        // Phase A only — AHT bits + remaining tail are read by
+        // `parse_phase_b` once the dsp pre-walk has produced
+        // nchregs[ch] / ncplregs / nlferegs.
+        a.bits_consumed = br.bit_position() - start_bits;
+        a.aht_phase_b_pending = true;
+        return Ok(a);
     }
+
+    parse_tail(br, &mut a, bsi)?;
+
+    a.bits_consumed = br.bit_position() - start_bits;
+    Ok(a)
+}
+
+/// Parse the SNR-offset / transient / SPX-attenuation / blkstrtinfo
+/// tail of `audfrm()`. Shared between `parse_with` (the AHT-off fast
+/// path) and [`parse_phase_b`] (the AHT-on staged path).
+fn parse_tail(br: &mut BitReader<'_>, a: &mut AudFrm, bsi: &Bsi) -> Result<()> {
+    let nfchans = bsi.nfchans as usize;
+    let num_blocks = bsi.num_blocks as usize;
 
     // ---- audio frame SNR offset data ----
     if a.snroffststr == 0 {
@@ -323,15 +378,13 @@ pub fn parse_with(br: &mut BitReader<'_>, bsi: &Bsi) -> Result<AudFrm> {
     // Only present for frames with > 1 block (numblkscod != 0); flagged
     // by `blkstrtinfoe`. When set, `blkstrtinfo` follows with
     // `nblkstrtbits` bits. nblkstrtbits is derived from frmsiz per
-    // §2.3.2.27. Round-1 parser simply consumes the byte-aligned-up
-    // budget when the flag is set; for fixtures we care about
-    // (numblkscod=3 → 6 blocks), we follow the spec formula.
+    // §2.3.2.27.
     if num_blocks != 1 {
         let blkstrtinfoe = br.read_u32(1)? != 0;
         if blkstrtinfoe {
             // nblkstrtbits = (numblks - 1) * (4 + ceil(log2(frmsiz_bits)))
             // For numblks=6 and frmsiz_bits ≤ 16, log2 ≤ 4 → 8 bits per
-            // entry → 5*8 = 40 bits. We use the spec-correct formula.
+            // entry → 5*8 = 40 bits. Spec-correct formula per §2.3.2.27.
             let frame_bits = bsi.frame_bytes * 8;
             let log2 = 32 - frame_bits.leading_zeros();
             let bits_per = 4 + log2;
@@ -345,10 +398,56 @@ pub fn parse_with(br: &mut BitReader<'_>, bsi: &Bsi) -> Result<AudFrm> {
     // The spec requires the syntax-state init for every channel in the
     // syncframe (firstspxcos[ch] = 1, firstcplcos[ch] = 1, firstcplleak
     // = 1) — these are stateful initialisers, not bit-field reads.
-    // Nothing to consume here.
+    Ok(())
+}
 
-    a.bits_consumed = br.bit_position() - start_bits;
-    Ok(a)
+/// Phase-B audfrm parse — consumes the AHT block (using the
+/// pre-walked `nchregs` hints to know which channels emit `chahtinu`
+/// bits) and the SNR/transient/SPX-attenuation/blkstrtinfo tail.
+///
+/// Caller must:
+///
+/// 1. Have called [`parse_with`] which returned `aht_phase_b_pending == true`.
+/// 2. Reseek the bit reader to `audfrm.aht_anchor_bits` (the
+///    bit position immediately before the AHT block).
+/// 3. Pass `hints` produced by walking all 6 audblks for chexpstr.
+///
+/// Updates `audfrm.chahtinu`/`cplahtinu`/`lfeahtinu` and clears
+/// `aht_phase_b_pending`. The bit reader lands at the start of
+/// `audblk[0]` on success.
+pub fn parse_phase_b(
+    br: &mut BitReader<'_>,
+    audfrm: &mut AudFrm,
+    bsi: &Bsi,
+    hints: &AhtRegsHints,
+) -> Result<()> {
+    if !audfrm.aht_phase_b_pending {
+        return Ok(());
+    }
+    let nfchans = bsi.nfchans as usize;
+    let lfeon = bsi.lfeon;
+
+    // §3.4.2 AHT bit stream syntax (Table E1.3 chunk gated by `ahte`):
+    //
+    //   if (ncplblks == 6 && ncplregs == 1) cplahtinu  (1 bit)
+    //   for ch in 0..nfchans:
+    //       if nchregs[ch] == 1               chahtinu[ch]  (1 bit)
+    //   if (lfeon && nlferegs == 1)           lfeahtinu  (1 bit)
+    if audfrm.ncplblks == 6 && hints.ncplregs == 1 {
+        audfrm.cplahtinu = br.read_u32(1)? != 0;
+    }
+    for ch in 0..nfchans {
+        if hints.nchregs[ch] == 1 {
+            audfrm.chahtinu[ch] = br.read_u32(1)? != 0;
+        }
+    }
+    if lfeon && hints.nlferegs == 1 {
+        audfrm.lfeahtinu = br.read_u32(1)? != 0;
+    }
+
+    parse_tail(br, audfrm, bsi)?;
+    audfrm.aht_phase_b_pending = false;
+    Ok(())
 }
 
 /// Convenience parser that creates a fresh [`BitReader`] over `data`.
