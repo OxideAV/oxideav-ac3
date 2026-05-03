@@ -1,9 +1,33 @@
-//! E-AC-3 audio-block DSP pipeline — round 2.
+//! E-AC-3 audio-block DSP pipeline — rounds 2 + 4 stub.
 //!
 //! Translates the parsed [`super::bsi::Bsi`] + [`super::audfrm::AudFrm`]
 //! into the existing AC-3 [`crate::audblk::Ac3State`] shape so the §7
 //! DSP helpers (`decode_exponents`, `run_bit_allocation`,
 //! `unpack_mantissas`, `dsp_block`) can be reused without modification.
+//!
+//! ## Round 4 (this commit)
+//!
+//! AHT and SPX are E-AC-3-specific psychoacoustic features that gate
+//! decode for any fixture using them. The round-4 **stub** in this
+//! commit:
+//!
+//! * Surfaces `ahte == 1` as a clear `Error::Unsupported` from the
+//!   audfrm parser instead of silently skipping bits (round 1
+//!   incorrectly consumed AHT bits as if they were always-emitted).
+//! * Tightens the `spxinu == 1` rejection in the audblk parser with
+//!   a spec citation (§E.2.2.5.4).
+//! * Documents the path forward: a real round-4-bis lands the §E.2.2.4
+//!   Karhunen-Loeve VQ codebooks (AHT) and the §E.2.2.5.4 SBR-style
+//!   parametric high-frequency reconstruction (SPX). Both are
+//!   substantial: AHT requires a 2-pass audblk decode (scan
+//!   chexpstr, then re-walk for AHT in-use bits) plus the VQ
+//!   codebook tables themselves; SPX needs the spxcoexp/spxcomant
+//!   coordinate decoding + the noise-blend / amplitude-fold
+//!   reconstruction pipeline.
+//!
+//! Fixtures unblocked by round 4-bis: `eac3-low-bitrate-32kbps` (AHT
+//! at low bit budgets per its `notes.md`). No corpus fixture
+//! exercises SPX (FFmpeg's eac3 encoder doesn't emit it).
 //!
 //! ## Scope (round 2)
 //!
@@ -166,22 +190,29 @@ pub fn decode_indep_audblks(
             }
         }
 
-        // ---- spectral extension strategy block ----
-        // E-AC-3 emits `spxstre` here. Round 2 forces SPX off:
-        // `spxstre[0]` is implicit 1 with `spxinu[0] = 0`; subsequent
-        // blocks emit only `spxstre[blk]` (1 bit each) + nothing else.
-        // We have already verified `spxinu` is never set in
-        // reject_unsupported by checking the per-block spxinu would have
-        // been emitted — but the simple-encoder fixtures we target have
-        // spxstre=0 for all blocks except blk 0 (and spxinu=0 there).
-        // Per §E.1.3.5.1: if (blk == 0) { spxstre = 1; spxinu (1) }
-        //                 else         { spxstre (1); if (spxstre) spxinu (1) }
+        // ---- spectral extension strategy block (§E.1.3.5.1) ----
+        //
+        // Per Table E1.4, blk 0 has implicit `spxstre = 1` with the
+        // 1-bit `spxinu[0]` emitted directly; subsequent blocks emit
+        // `spxstre[blk]` (1 bit) + (only if spxstre[blk]) `spxinu[blk]`.
+        //
+        // Round 4 stub: SPX-active frames mute. The spec (§E.1.3.5.1
+        // / §E.2.2.5.4) describes a parametric high-frequency
+        // reconstruction (similar to AAC's SBR): bins in the SPX
+        // region [spxbegf .. spxendf] are derived from low-frequency
+        // bins via per-band amplitude (`spxbndcoeff`) + blending
+        // (`spxblnd`) coefficients, plus a coupling-style coordinate
+        // table (`mstrspxco`/`spxcoexp`/`spxcomant`). FFmpeg's eac3
+        // encoder doesn't emit SPX (per `eac3-low-rate-stereo-64kbps/
+        // notes.md` "gap"), so no corpus fixture currently exercises
+        // this path.
         let spxstre = if blk == 0 { true } else { br.read_u32(1)? != 0 };
         if spxstre {
             let spxinu = br.read_u32(1)? != 0;
             if spxinu {
                 return Err(Error::unsupported(
-                    "eac3 audblk: spectral extension in use — round 2 mutes",
+                    "eac3 audblk: spxinu == 1 (spectral extension active) — \
+                     round 4 stub mutes; full §E.2.2.5.4 SPX decode is a follow-up",
                 ));
             }
         }
@@ -473,8 +504,12 @@ fn reject_unsupported(bsi: &Eac3Bsi, audfrm: &AudFrm) -> Result<()> {
         ));
     }
     if audfrm.ahte {
+        // Defensive — the audfrm parser bails before returning a
+        // valid `AudFrm` when ahte == 1, so we should never see this
+        // case. Kept as a safety net for any future audfrm path that
+        // surfaces ahte without bailing.
         return Err(Error::unsupported(
-            "eac3 dsp: AHT in use — round 2 mutes (round 4 lands AHT)",
+            "eac3 dsp: AHT in use — round 4 stub mutes",
         ));
     }
     if audfrm.ncplblks > 0 {

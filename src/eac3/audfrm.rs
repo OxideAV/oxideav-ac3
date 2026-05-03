@@ -249,23 +249,33 @@ pub fn parse_with(br: &mut BitReader<'_>, bsi: &Bsi) -> Result<AudFrm> {
 
     // ---- AHT data ----
     //
-    // ahte is in scope only when expstre == 1 (Annex E §E.2.2.3 puts
-    // the AHT block under `if (ahte)` after the exponent-strategy
-    // block). We mirror the spec's grammar: AHT carries per-channel
-    // and LFE in-use flags whose existence depends on whether the
-    // block-run of exponents is "all reuse" for that channel.
+    // Per §E.2.3.5 / Table E1.3, `ahte` is in scope only when
+    // `expstre == 1`. When `ahte == 1`, audfrm carries `ahtinu[ch]`
+    // (1 bit) for every fbw channel whose 6-block exponent
+    // strategies are all REUSE, and one `ahtinu_lfe`. The per-
+    // channel "all-REUSE" determination requires reading the audblk
+    // strategy bits **before** we get to the AHT block — but those
+    // bits live in audblk[0]..audblk[5], past the audfrm boundary.
     //
-    // Round-1 assumption: when ahte == 1 the encoder uses AHT for
-    // every channel that has 6 reuse blocks. We don't track per-
-    // channel reuse-block counts here — instead we conservatively
-    // consume one in-use bit per fbw channel and one for LFE iff the
-    // ahte flag is set. This is sufficient for fixtures that don't
-    // turn AHT on; fixtures that do (none in the round-1 corpus
-    // shortlist) will hit a downstream "unsupported" error in the
-    // audblk parser.
+    // Round 4 stub: we surface `ahte == true` to the DSP path (which
+    // bails with `Unsupported`) without attempting to consume the
+    // variable-length `ahtinu[ch]` bits. The bit cursor will land in
+    // the wrong place for any subsequent fields the dsp path reads,
+    // but the caller treats the whole frame as silent on Unsupported
+    // so cursor drift is contained.
+    //
+    // The `eac3-low-bitrate-32kbps` fixture (which uses AHT at low
+    // bit budgets per its `notes.md`) will mute. A real round-4
+    // implementation requires a 2-pass decode (scan audblks for
+    // chexpstr first, then re-walk audfrm + audblks for AHT) plus
+    // the §E.2.2.4 Karhunen-Loeve VQ codebooks — substantial work
+    // deferred to a follow-up.
     if a.ahte {
-        return Err(Error::unsupported(
-            "eac3 audfrm: AHT in use (ahte==1) — round-1 decoder mutes",
+        return Err(Error::Unsupported(
+            "eac3 audfrm: ahte == 1 (AHT in use) — round 4 stub mutes; \
+             real AHT decode (Karhunen-Loeve VQ codebooks per §E.2.2.4) \
+             is a follow-up"
+                .to_string(),
         ));
     }
 
