@@ -301,7 +301,7 @@ pub fn parse_with(br: &mut BitReader<'_>, bsi: &Bsi) -> Result<AudFrm> {
             // nblkstrtbits = (numblks - 1) * (4 + ceil(log2(frmsiz_bits)))
             // For numblks=6 and frmsiz_bits ≤ 16, log2 ≤ 4 → 8 bits per
             // entry → 5*8 = 40 bits. We use the spec-correct formula.
-            let frame_bits = (bsi.frame_bytes as u32) * 8;
+            let frame_bits = bsi.frame_bytes * 8;
             let log2 = 32 - frame_bits.leading_zeros();
             let bits_per = 4 + log2;
             let total = (num_blocks as u32 - 1) * bits_per;
