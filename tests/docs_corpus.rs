@@ -42,9 +42,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use oxideav_ac3::syncinfo;
-use oxideav_core::{
-    CodecId, CodecParameters, CodecRegistry, Decoder, Frame, Packet, TimeBase,
-};
+use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Decoder, Frame, Packet, TimeBase};
 
 // ---------------------------------------------------------------------------
 // Fixture path resolution
@@ -353,10 +351,7 @@ fn decode_stream(input: &[u8]) -> DecodedPcm {
         let pkt = Packet::new(0, TimeBase::new(1, 48_000), payload).with_pts(i as i64 * 1536);
         if let Err(e) = dec.send_packet(&pkt) {
             if first_error.is_none() {
-                first_error = Some(format!(
-                    "send_packet@frame{i} (bsid={}): {e:?}",
-                    f.bsid
-                ));
+                first_error = Some(format!("send_packet@frame{i} (bsid={}): {e:?}", f.bsid));
             }
             // Reset state so the next frame's send_packet doesn't see
             // a stale `pending` slot.
@@ -384,17 +379,13 @@ fn decode_stream(input: &[u8]) -> DecodedPcm {
             }
             Ok(other) => {
                 if first_error.is_none() {
-                    first_error =
-                        Some(format!("frame{i}: unexpected non-audio frame: {other:?}"));
+                    first_error = Some(format!("frame{i}: unexpected non-audio frame: {other:?}"));
                 }
                 let _ = dec.reset();
             }
             Err(e) => {
                 if first_error.is_none() {
-                    first_error = Some(format!(
-                        "receive_frame@frame{i} (bsid={}): {e:?}",
-                        f.bsid
-                    ));
+                    first_error = Some(format!("receive_frame@frame{i} (bsid={}): {e:?}", f.bsid));
                 }
                 let _ = dec.reset();
             }
@@ -482,11 +473,7 @@ fn evaluate(case: &CorpusCase) {
     let input_bytes = match fs::read(&input_path) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!(
-                "skip {}: missing {} ({e})",
-                case.name,
-                input_path.display()
-            );
+            eprintln!("skip {}: missing {} ({e})", case.name, input_path.display());
             return;
         }
     };
@@ -929,4 +916,3 @@ fn syncframe_iter_handles_eac3_frmsiz_field() {
         bytes.len(),
     );
 }
-
