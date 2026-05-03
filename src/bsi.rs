@@ -13,6 +13,17 @@ use oxideav_core::{Error, Result};
 
 use crate::tables::acmod_nfchans;
 
+/// Largest `bsid` value accepted by the base AC-3 BSI parser. Streams
+/// at higher `bsid` values use the Annex E (E-AC-3) syntax — the
+/// top-level decoder dispatches them to [`crate::eac3::decoder`].
+///
+/// The spec mandates muting for `bsid > 8` in pure AC-3 decoders
+/// (§5.4.2.7) but accepts up to 10 as a small safety margin for
+/// near-compatible streams (legacy bsid=9..=10 variants of base AC-3
+/// that still parse the same syntax). bsid 11..=16 is canonical
+/// E-AC-3 territory.
+pub const MAX_BSID_BASE: u8 = 10;
+
 /// Parsed BSI — just the fields a decoder actually needs. Optional
 /// service-metadata (compression gain, language code, timecodes,
 /// `addbsi`) is consumed but not surfaced since the decoder doesn't

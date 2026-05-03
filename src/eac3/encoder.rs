@@ -53,9 +53,11 @@ use crate::tables::WINDOW;
 /// the AC-3 decoder/encoder in [`crate::register`]).
 pub const CODEC_ID_STR: &str = "eac3";
 
-/// `bsid` value for E-AC-3 streams compliant with ATSC A/52 Annex E
-/// (§E.2.3.1.6: bsid = 16 = '10000').
-pub const EAC3_BSID: u8 = 16;
+// `EAC3_BSID` is the canonical bsid value for E-AC-3 streams (= 16).
+// It lives in [`super::bsi`] now and is re-exported through
+// `eac3::EAC3_BSID` in `mod.rs`. Re-import locally for the bit
+// writer call-site below.
+use super::bsi::EAC3_BSID;
 
 /// Build an E-AC-3 encoder.
 ///

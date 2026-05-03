@@ -15,6 +15,7 @@ use oxideav_core::{
 use crate::audblk::{self, Ac3State, BLOCKS_PER_FRAME, SAMPLES_PER_BLOCK};
 use crate::bsi::{self, Bsi};
 use crate::downmix::{Downmix, DownmixMode};
+use crate::eac3;
 use crate::syncinfo::{self, SyncInfo};
 
 /// Samples produced per AC-3 syncframe, per channel: 6 blocks × 256
@@ -29,6 +30,23 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         pending: None,
         eof: false,
         state: Ac3State::new(),
+        eac3_state: eac3::Eac3DecoderState::default(),
+        requested_channels: params.channels,
+    }))
+}
+
+/// Dedicated E-AC-3 decoder factory. Identical to [`make_decoder`] —
+/// the same `Ac3Decoder` struct dispatches on the per-packet bsid —
+/// but registered with the `eac3` codec id so the registry's
+/// container-tag lookup hits it for `A_EAC3` / `0xA7` / etc.
+pub fn make_eac3_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    Ok(Box::new(Ac3Decoder {
+        codec_id: params.codec_id.clone(),
+        time_base: TimeBase::new(1, 48_000),
+        pending: None,
+        eof: false,
+        state: Ac3State::new(),
+        eac3_state: eac3::Eac3DecoderState::default(),
         requested_channels: params.channels,
     }))
 }
@@ -39,6 +57,11 @@ struct Ac3Decoder {
     pending: Option<Packet>,
     eof: bool,
     state: Ac3State,
+    /// Per-decoder E-AC-3 state — empty in round 1 (no overlap-add
+    /// delay yet), present so round 2 can park dependent-substream
+    /// recombination scratch + per-channel IMDCT history without
+    /// changing this struct's layout.
+    eac3_state: eac3::Eac3DecoderState,
     /// Downmix target channel count — `Some(1)` = mono, `Some(2)` =
     /// stereo, `None` = passthrough of whatever the bitstream carries.
     /// Drives the §7.8 matrix in [`Ac3Decoder::process_frame`].
@@ -83,6 +106,7 @@ impl Decoder for Ac3Decoder {
         self.pending = None;
         self.eof = false;
         self.state = Ac3State::new();
+        self.eac3_state = eac3::Eac3DecoderState::default();
         Ok(())
     }
 }
@@ -93,7 +117,77 @@ impl Ac3Decoder {
         if data.len() < 5 {
             return Err(Error::invalid("ac3: packet too short for syncinfo"));
         }
-        let si: SyncInfo = syncinfo::parse(data)?;
+        // Top-level dispatch: peek at the bsid byte to choose AC-3
+        // vs E-AC-3. The 5-bit `bsid` field sits at byte 5 (top 5
+        // bits) in BOTH syntaxes:
+        //
+        //   AC-3:    syncword(2B) + crc1(2B) + fscod+frmsizecod(1B)
+        //            ⇒ BSI starts at byte 5; bsid is the first 5
+        //            bits = byte 5 top 5 bits.
+        //   E-AC-3:  syncword(2B) + strmtyp+substreamid+frmsiz(2B) +
+        //            fscod+(numblkscod|fscod2)+acmod+lfeon(1B) ⇒ bsid
+        //            starts at byte 5 bit 0 = byte 5 top 5 bits.
+        //
+        // So `data[5] >> 3` is bsid in either layout. Per §E.2.3.1.6,
+        // bsid 0..8 is base AC-3, 9/10 are reserved (we tolerate them
+        // via the same AC-3 path), and 11..16 routes to Annex E.
+        let try_ac3 = syncinfo::parse(data);
+        if let Ok(si) = try_ac3 {
+            // bsid lives in BSI byte 0 (= packet byte 5), top 5 bits.
+            // The first BSI byte sits at exactly the same place in
+            // both AC-3 (after 5 bytes of syncinfo) and E-AC-3 (after
+            // 16-bit syncword + 16-bit strmtyp/substreamid/frmsiz +
+            // 8-bit fscod/numblkscod/acmod/lfeon = 5 bytes). Whether
+            // the value at byte 5's top 5 bits parses as bsid in BOTH
+            // syntaxes is a documented spec property — see §E.2.3.1.
+            if data.len() > 5 {
+                let bsi_byte0 = data[5];
+                let bsid = bsi_byte0 >> 3;
+                if bsid <= bsi::MAX_BSID_BASE {
+                    return self.process_ac3_frame(pkt, si);
+                }
+            }
+        }
+        // E-AC-3 path. The AC-3 syncinfo path may have rejected the
+        // packet entirely (frmsizecod past Table 5.18) — that's still
+        // a valid E-AC-3 syncframe. Hand the whole packet to the
+        // Annex E decoder.
+        self.process_eac3_frame(pkt)
+    }
+
+    fn process_eac3_frame(&mut self, pkt: &Packet) -> Result<Frame> {
+        let data = &pkt.data[..];
+        let decoded = eac3::decode_eac3_packet(&mut self.eac3_state, data)?;
+        // Apply downmix request only if the decoded program has more
+        // channels than requested. Round 1 emits silence so the
+        // downmix is a no-op anyway, but threading the request
+        // through keeps round-2 work minimal.
+        let channels = decoded.channels;
+        let mut pcm = decoded.pcm_s16le;
+        if let Some(req) = self.requested_channels {
+            if req < channels {
+                let bytes_per_sample = 2usize;
+                let in_stride = channels as usize * bytes_per_sample;
+                let out_stride = req as usize * bytes_per_sample;
+                let n_frames = decoded.samples as usize;
+                let mut out = vec![0u8; n_frames * out_stride];
+                for i in 0..n_frames {
+                    let src = &pcm[i * in_stride..i * in_stride + out_stride];
+                    out[i * out_stride..i * out_stride + out_stride].copy_from_slice(src);
+                }
+                pcm = out;
+            }
+        }
+        self.time_base = TimeBase::new(1, decoded.sample_rate as i64);
+        Ok(Frame::Audio(AudioFrame {
+            samples: decoded.samples,
+            pts: pkt.pts,
+            data: vec![pcm],
+        }))
+    }
+
+    fn process_ac3_frame(&mut self, pkt: &Packet, si: SyncInfo) -> Result<Frame> {
+        let data = &pkt.data[..];
         if (si.frame_length as usize) > data.len() {
             return Err(Error::invalid(format!(
                 "ac3: packet short: frame_length={} pkt_len={}",

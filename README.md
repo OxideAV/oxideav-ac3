@@ -65,6 +65,20 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       syncframe (`numblkscod=3`), no coupling, no spectral
       extension, no Adaptive Hybrid Transform. Cross-decodes
       cleanly through ffmpeg. Codec id = `"eac3"`.
+- [x] E-AC-3 decoder — **round 1** (task #285): full BSI parser
+      (Table E1.2) covering strmtyp / substreamid / frmsiz / fscod
+      / fscod2 / numblkscod / acmod / lfeon / bsid / dialnorm /
+      chanmape+chanmap / mixmdate / infomdate / addbsi; full audfrm
+      parser (Table E1.3) covering the 11 strategy flags +
+      coupling-block run + frame-level exponent strategies +
+      converter exponents + frame SNR offsets + transient pre-noise
+      params + spectral-extension attenuation + per-block-start
+      info. Top-level dispatch in the AC-3 decoder routes packets
+      with `bsid > 10` to the Annex E path. Round-1 PCM output is
+      silent (zero S16) of the correct shape (`num_blocks × 256 ×
+      nchans`); real DSP (decouple + IMDCT + overlap-add) is
+      deferred to round 2 along with dependent-substream
+      recombination, AHT, and spectral extension.
 
 ## Installation
 
@@ -77,7 +91,8 @@ oxideav-ac3 = "0.0"
 
 ## Codec ID
 
-- Codec: `"ac3"`; output sample format `S16` interleaved.
+- Codec: `"ac3"` (decoder + encoder) and `"eac3"` (decoder + encoder);
+  output sample format `S16` interleaved.
 
 ## License
 

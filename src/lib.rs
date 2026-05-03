@@ -80,18 +80,49 @@ pub fn register(reg: &mut CodecRegistry) {
             .encoder(make_encoder),
     );
 
-    // E-AC-3 encoder (Annex E). Accepts mono, stereo, and 7.1 input.
-    // 7.1 (8 ch) emits an independent substream pair: indep substream
-    // carries a 5.1 downmix (acmod=7, lfeon=1) and dep substream 0
-    // carries Lb/Rb back surrounds with chanmap bit 6 set (Lrs/Rrs
-    // pair) per ATSC A/52 Annex E §E.2.3.1.7-8 / §E.3.8.2. SPX / AHT
-    // are out of scope. No decoder yet.
+    // E-AC-3 (Annex E). Accepts mono, stereo, and 7.1 input on the
+    // encoder side. 7.1 (8 ch) emits an independent substream pair:
+    // indep substream carries a 5.1 downmix (acmod=7, lfeon=1) and
+    // dep substream 0 carries Lb/Rb back surrounds with chanmap bit
+    // 6 set (Lrs/Rrs pair) per ATSC A/52 Annex E §E.2.3.1.7-8 /
+    // §E.3.8.2. SPX / AHT are out of scope.
+    //
+    // Decoder side: round-1 path parses the BSI + audfrm bit-
+    // accurately and emits silent PCM of the correct shape. Real DSP
+    // (decouple + IMDCT) lands in round 2.
     let eac3_cid = CodecId::new(CODEC_ID_STR_EAC3);
+    let eac3_dec_caps = CodecCapabilities::audio("eac3_sw_dec")
+        .with_lossy(true)
+        .with_intra_only(true)
+        .with_max_channels(8)
+        .with_max_sample_rate(48_000);
     let eac3_enc_caps = CodecCapabilities::audio("eac3_sw_enc")
         .with_lossy(true)
         .with_intra_only(true)
         .with_max_channels(8)
         .with_max_sample_rate(48_000);
+    // Container tag claims for E-AC-3:
+    //   - WAVEFORMATEX::wFormatTag = 0xA7 (DD+ in WAV/AVI)
+    //   - MP4 ObjectTypeIndication 0xA6 (ISOBMFF carriage)
+    //   - Matroska CodecID "A_EAC3"
+    reg.register(
+        CodecInfo::new(eac3_cid.clone())
+            .capabilities(eac3_dec_caps.clone())
+            .decoder(make_eac3_decoder)
+            .tag(CodecTag::wave_format(0xA7)),
+    );
+    reg.register(
+        CodecInfo::new(eac3_cid.clone())
+            .capabilities(eac3_dec_caps.clone())
+            .decoder(make_eac3_decoder)
+            .tag(CodecTag::mp4_object_type(0xA6)),
+    );
+    reg.register(
+        CodecInfo::new(eac3_cid.clone())
+            .capabilities(eac3_dec_caps)
+            .decoder(make_eac3_decoder)
+            .tag(CodecTag::matroska("A_EAC3")),
+    );
     reg.register(
         CodecInfo::new(eac3_cid)
             .capabilities(eac3_enc_caps)
@@ -109,4 +140,8 @@ fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 
 fn make_eac3_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     eac3::make_encoder(params)
+}
+
+fn make_eac3_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    decoder::make_eac3_decoder(params)
 }
