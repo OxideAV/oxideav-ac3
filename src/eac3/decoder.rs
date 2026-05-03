@@ -55,10 +55,12 @@ pub struct Eac3DecoderState {
     /// Per-channel persistent DSP state for the **dependent** substream
     /// (round 3 hookup). Held separately so a dep-substream block's
     /// reuse-exponent path doesn't read indep exponents.
+    #[allow(dead_code)]
     dep_state: Ac3State,
     /// Round-3 PCM scratch — the f32 PCM of the indep substream's
     /// channels in their native layout, populated by round 2 and
     /// awaiting dep-substream channels (chanmap-spliced) in round 3.
+    #[allow(dead_code)]
     indep_pcm_f32: Vec<f32>,
     /// Per-frame error string (last seen). Diagnostic only.
     pub last_error: Option<String>,
