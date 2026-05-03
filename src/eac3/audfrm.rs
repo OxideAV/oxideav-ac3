@@ -354,7 +354,7 @@ mod tests {
 
     fn pack_msb(bits: &[(u32, u32)]) -> Vec<u8> {
         let total: u32 = bits.iter().map(|(n, _)| *n).sum();
-        let nbytes = (total + 7) / 8;
+        let nbytes = total.div_ceil(8);
         let mut out = vec![0u8; nbytes as usize];
         let mut bitpos = 0u32;
         for &(n, v) in bits {
@@ -377,9 +377,8 @@ mod tests {
     #[test]
     fn parses_minimal_indep_stereo_audfrm() {
         let bsi = make_bsi(2, false, 6, StreamType::Independent);
-        let mut bits: Vec<(u32, u32)> = Vec::new();
         // Strategy flags (numblkscod==3 → 6 blocks)
-        bits.push((1, 1)); // expstre
+        let mut bits: Vec<(u32, u32)> = vec![(1, 1)]; // expstre
         bits.push((1, 0)); // ahte
         bits.push((2, 0)); // snroffststr
         bits.push((1, 0)); // transproce

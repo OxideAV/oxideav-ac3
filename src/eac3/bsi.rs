@@ -590,7 +590,7 @@ mod tests {
     /// boundary.
     fn pack_msb(bits: &[(u32, u32)]) -> (Vec<u8>, u64) {
         let total: u32 = bits.iter().map(|(n, _)| *n).sum();
-        let nbytes = (total + 7) / 8;
+        let nbytes = total.div_ceil(8);
         let mut out = vec![0u8; nbytes as usize];
         let mut bitpos = 0u32;
         for &(n, v) in bits {
