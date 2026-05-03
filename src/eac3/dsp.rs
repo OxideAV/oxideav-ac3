@@ -281,9 +281,7 @@ pub fn decode_indep_audblks(
     let mut aht_pending: [bool; MAX_FBW] = [false; MAX_FBW];
     let mut aht_filled: [bool; MAX_FBW] = [false; MAX_FBW];
     if audfrm.ahte {
-        for ch in 0..nfchans {
-            aht_pending[ch] = audfrm.chahtinu[ch];
-        }
+        aht_pending[..nfchans].copy_from_slice(&audfrm.chahtinu[..nfchans]);
     }
 
     for blk in 0..num_blocks {

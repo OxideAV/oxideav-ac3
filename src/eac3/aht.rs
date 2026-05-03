@@ -202,7 +202,7 @@ pub fn read_gaq_gains(
                 written += 1;
             }
             3 => {
-                let grp = br.read_u32(5)? as u32;
+                let grp = br.read_u32(5)?;
                 // Triplet decode per §3.4.4.2 pseudo-code.
                 let m1 = (grp / 9) as u8;
                 let m2 = ((grp % 9) / 3) as u8;
@@ -317,7 +317,7 @@ pub fn read_scalar_aht_mantissas(
                 // Conventional symmetric quantiser: read m bits, sign-
                 // extend, divide by 2^(m-1).
                 let raw = br.read_u32(m)? as i32;
-                let signed = ((raw as i32) << (32 - m)) >> (32 - m);
+                let signed = (raw << (32 - m)) >> (32 - m);
                 *sample = signed as f32 * scale_full;
             }
             2 => {
@@ -325,12 +325,12 @@ pub fn read_scalar_aht_mantissas(
                 // for full-scale-negative tag → m-bit large value.
                 let small_bits = m - 1;
                 let raw_s = br.read_u32(small_bits)? as i32;
-                let small_signed = ((raw_s as i32) << (32 - small_bits)) >> (32 - small_bits);
+                let small_signed = (raw_s << (32 - small_bits)) >> (32 - small_bits);
                 let small_min = -(1i32 << (small_bits - 1));
                 if small_signed == small_min {
                     // Tag detected — large mantissa follows (m bits).
                     let raw_l = br.read_u32(m)? as i32;
-                    let large_signed = ((raw_l as i32) << (32 - m)) >> (32 - m);
+                    let large_signed = (raw_l << (32 - m)) >> (32 - m);
                     *sample = remap_large_mantissa(hebap, gk, large_signed, m);
                 } else {
                     // Small mantissa: divide by 2^(m-2) per Table E3.5
@@ -350,16 +350,16 @@ pub fn read_scalar_aht_mantissas(
                     // Edge case: m=2 → no small-value bits; treat as
                     // full-scale-negative every time.
                     let raw_l = br.read_u32(m)? as i32;
-                    let large_signed = ((raw_l as i32) << (32 - m)) >> (32 - m);
+                    let large_signed = (raw_l << (32 - m)) >> (32 - m);
                     *sample = remap_large_mantissa(hebap, gk, large_signed, m);
                     continue;
                 }
                 let raw_s = br.read_u32(small_bits)? as i32;
-                let small_signed = ((raw_s as i32) << (32 - small_bits)) >> (32 - small_bits);
+                let small_signed = (raw_s << (32 - small_bits)) >> (32 - small_bits);
                 let small_min = -(1i32 << (small_bits - 1));
                 if small_signed == small_min {
                     let raw_l = br.read_u32(m)? as i32;
-                    let large_signed = ((raw_l as i32) << (32 - m)) >> (32 - m);
+                    let large_signed = (raw_l << (32 - m)) >> (32 - m);
                     *sample = remap_large_mantissa(hebap, gk, large_signed, m);
                 } else {
                     let small_scale = 1.0f32 / ((1u32 << (small_bits - 1)) as f32);
