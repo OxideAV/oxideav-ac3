@@ -669,17 +669,9 @@ impl Eac3Encoder {
                 bw.write_u32(0, 1); // cplstre[blk] = 0
             }
         }
-        for blk in 0..BLOCKS_PER_FRAME {
-            for _ch in 0..nfchans {
-                bw.write_u32(exp_strategies[blk] as u32, 2);
-            }
-        }
-        // expstre==1 + lfeon=1 → per-block lfeexpstr (1 bit each).
-        if sub.lfeon {
-            for blk in 0..BLOCKS_PER_FRAME {
-                bw.write_u32(exp_strategies[blk] as u32, 1);
-            }
-        }
+        // expstre==1 → per-block per-channel chexpstr (and per-block
+        // lfeexpstr) live in audblk(), NOT audfrm. Round 2 fix: round
+        // 1 over-emitted these bits in audfrm.
         // strmtyp == 0x0 ⇒ convexpstre. With numblkscod==0x3 this is
         // implicit = 1 → emit per-channel convexpstr (5 bits each).
         if sub.strmtyp == 0 {
@@ -728,6 +720,16 @@ impl Eac3Encoder {
             }
 
             let exp_strategy = exp_strategies[blk];
+            // §E.1.3.4 — per-block per-channel chexpstr (2 bits each)
+            // when expstre == 1. Always emitted (encoder forces
+            // expstre = 1).
+            for _ in 0..nfchans {
+                bw.write_u32(exp_strategy as u32, 2);
+            }
+            // LFE strategy — 1 bit when lfeon.
+            if sub.lfeon {
+                bw.write_u32(exp_strategy as u32, 1);
+            }
             if exp_strategy != 0 {
                 for _ in 0..nfchans {
                     bw.write_u32(chbwcod as u32, 6);
@@ -736,7 +738,8 @@ impl Eac3Encoder {
             if exp_strategy == 1 {
                 for ch in 0..nfchans {
                     write_exponents_d15(&mut bw, &exps[ch][blk], ch_end_mant);
-                    bw.write_u32(0, 2); // gainrng = 0
+                    // E-AC-3 audblk does NOT emit gainrng (base-AC-3
+                    // §5.4.3 carries it; Annex E §E.1.3.4 dropped it).
                 }
             }
             // LFE exponents — D15 only, no chbwcod (LFE has fixed bw).
@@ -754,11 +757,15 @@ impl Eac3Encoder {
                 bw.write_u32(tuned_ba.floorcod as u32, 3);
             }
 
-            bw.write_u32(0, 1); // fgaincode = 0
+            // §E.1.3.5.4 frmfgaincode==1 ⇒ per-block `fgaincode` flag.
+            bw.write_u32(0, 1); // fgaincode = 0 (no per-channel override)
 
-            if sub.strmtyp == 0 {
-                bw.write_u32(0, 1); // convsnroffste = 0
-            }
+            // §E.1.3.5.5 — convsnroffste lives inside `if (snroffste)`,
+            // which is only emitted when snroffststr != 0. With our
+            // encoder forcing snroffststr == 0 there is NO snroffst
+            // field in audblk; the previous `bw.write_u32(0, 1)` here
+            // emitted a stray bit that the spec doesn't define. Round
+            // 2 fix.
 
             let any_fbw_dba = (0..nfchans).any(|c| dba_plan.nseg[c] > 0);
             if blk == 0 && any_fbw_dba {

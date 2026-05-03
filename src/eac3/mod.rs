@@ -64,6 +64,7 @@
 pub mod audfrm;
 pub mod bsi;
 pub mod decoder;
+pub mod dsp;
 pub mod encoder;
 
 // Re-exports — keep the public surface identical to the old single-

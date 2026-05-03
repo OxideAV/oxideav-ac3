@@ -98,6 +98,14 @@ pub struct AudFrm {
     /// Total bits the parser consumed (handy for callers that share
     /// a bit cursor and want to seek to the start of `audblk[0]`).
     pub bits_consumed: u64,
+    /// Per-block `cplinu[blk]` — surfaced from audfrm so the audblk
+    /// parser knows whether to read the coupling-coordinate block.
+    /// `false` for blocks with no coupling. Always `false` when
+    /// `acmod ≤ 1` (no coupling possible).
+    pub cplinu_blk: [bool; MAX_BLOCKS_PER_FRAME],
+    /// Number of blocks with `cplinu[blk] == 1`. Convenient summary
+    /// for the round-2 DSP path which rejects any non-zero value.
+    pub ncplblks: u32,
 }
 
 impl AudFrm {
@@ -120,6 +128,8 @@ impl AudFrm {
             frmcsnroffst: 0,
             frmfsnroffst: 0,
             bits_consumed: 0,
+            cplinu_blk: [false; MAX_BLOCKS_PER_FRAME],
+            ncplblks: 0,
         }
     }
 }
@@ -171,50 +181,50 @@ pub fn parse_with(br: &mut BitReader<'_>, bsi: &Bsi) -> Result<AudFrm> {
         // bit.
         let cplinu0 = br.read_u32(1)?;
         ncplblks += cplinu0;
+        a.cplinu_blk[0] = cplinu0 != 0;
         let mut last_cplinu = cplinu0;
-        for _blk in 1..num_blocks {
+        for blk in 1..num_blocks {
             let cplstre = br.read_u32(1)? != 0;
             if cplstre {
                 let v = br.read_u32(1)?;
                 last_cplinu = v;
             }
             ncplblks += last_cplinu;
+            a.cplinu_blk[blk] = last_cplinu != 0;
         }
     }
+    a.ncplblks = ncplblks;
 
     // ---- exponent strategy data ----
-    if a.expstre {
-        // Per-block per-channel strategy codes. cplexpstr only when
-        // coupling is actually in use for that block — but we don't
-        // remember per-block cplinu. Spec handles this by gating each
-        // block's cplexpstr on cplinu[blk]. Round-1 simplification:
-        // when ncplblks > 0 we conservatively assume all blocks coded
-        // a cplexpstr; when ncplblks == 0 we skip them entirely.
-        // For the round-1 parser this is OK because we don't apply
-        // the values — but the audblk parser needs to know per-block
-        // cplinu, which means we need to re-compute it there. We do
-        // not return per-block cplinu from audfrm; instead the audblk
-        // parser maintains its own state.
-        for _blk in 0..num_blocks {
-            if ncplblks > 0 {
-                let _cplexpstr = br.read_u32(2)?;
-            }
-            for _ch in 0..nfchans {
-                let _chexpstr = br.read_u32(2)?;
-            }
-        }
-    } else {
-        // Frame-level strategies.
+    //
+    // §E.1.2.2 / Table E1.3 — when expstre == 1, per-block per-channel
+    // strategy codes live in **audblk()**, NOT audfrm. We consume
+    // exactly zero bits from audfrm in that branch.
+    //
+    // When expstre == 0 (frame-level strategies), audfrm carries the
+    // 5-bit `frmcplexpstr` (only if coupling is in use somewhere) +
+    // 5-bit `frmchexpstr[ch]` per fbw channel. The 5-bit codeword
+    // expands per Table E2.10 to a 6-block strategy run via the
+    // chexpstr_run table.
+    //
+    // `lfeexpstr[blk]` — same rule: when expstre == 1, lfe strategies
+    // live per-block in audblk(); they only appear in audfrm when
+    // expstre == 0 (one bit per block). The previous round-1 parser
+    // unconditionally walked these bits — which over-consumed the
+    // audfrm by 12 + lfe×6 bits whenever expstre==1, sliding every
+    // subsequent field (frmcsnroffst, dba, skip, audblk header) into
+    // the wrong bit slots. Round 2 corrects this.
+    if !a.expstre {
         if bsi.acmod > 0x1 && ncplblks > 0 {
             a.frmcplexpstr = br.read_u32(5)? as u8;
         }
         for ch in 0..nfchans {
             a.frmchexpstr[ch] = br.read_u32(5)? as u8;
         }
-    }
-    if lfeon {
-        for blk in 0..num_blocks {
-            a.lfeexpstr[blk] = br.read_u32(1)? as u8;
+        if lfeon {
+            for blk in 0..num_blocks {
+                a.lfeexpstr[blk] = br.read_u32(1)? as u8;
+            }
         }
     }
 
@@ -394,14 +404,9 @@ mod tests {
         for _ in 1..6 {
             bits.push((1, 0)); // cplstre[blk] = 0
         }
-        // expstre=1 → per-block per-channel chexpstr (no cplexpstr since
-        // ncplblks=0). 6 blocks * 2 chans * 2 bits = 24 bits, code 1
-        // (D15) for blocks 0+3, REUSE for the rest.
-        for _ in 0..6 {
-            for _ in 0..2 {
-                bits.push((2, 0));
-            }
-        }
+        // expstre==1 → per-block per-channel chexpstr lives in audblk(),
+        // not audfrm. (Round-2 bug fix: round 1 over-consumed 24 bits
+        // here.)
         // strmtyp == 0 + numblkscod == 0x3 → convexpstre implicit = 1,
         // followed by per-channel convexpstr (5 bits each).
         for _ in 0..2 {

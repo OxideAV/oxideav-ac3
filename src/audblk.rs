@@ -1047,7 +1047,7 @@ pub(crate) fn remat_band_count(cplinu: bool, cplbegf: u8) -> usize {
 }
 
 /// Decode a grouped exponent run (§7.1.3).
-fn decode_exponents(
+pub(crate) fn decode_exponents(
     br: &mut BitReader,
     absexp: i32,
     ngrps: usize,
@@ -1085,7 +1085,7 @@ fn decode_exponents(
 /// Parametric bit allocation (§7.2.2) for a single channel range.
 /// `start`..`end` is the mantissa-bin range.
 #[allow(clippy::too_many_arguments)]
-fn run_bit_allocation(
+pub(crate) fn run_bit_allocation(
     state: &mut Ac3State,
     ch: usize,
     start: usize,
@@ -1422,7 +1422,7 @@ fn dither_lfsr(state: &mut u32) -> f32 {
 
 /// Unpack + dequantize mantissas for all channels (§7.3).
 /// Populates ChannelState.coeffs with dequantized transform coefficients.
-fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitReader) -> Result<()> {
+pub(crate) fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitReader) -> Result<()> {
     let nfchans = bsi.nfchans as usize;
     // Zero any leftover coefficient slots so stale data from prior blocks
     // can never bleed into the IMDCT input. Unpacked mantissas overwrite
@@ -1656,7 +1656,7 @@ fn fetch_mantissa(
 /// Apply DSP stages to the current block: decouple, rematrix, dynrng,
 /// IMDCT, window + overlap-add. Populates `channels[ch].coeffs[0..256]`
 /// with time-domain PCM samples ready for emission.
-fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
+pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
     let nfchans = bsi.nfchans as usize;
     let acmod = bsi.acmod;
 
