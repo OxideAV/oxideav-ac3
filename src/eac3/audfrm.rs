@@ -103,6 +103,14 @@ pub struct AudFrm {
     /// `false` for blocks with no coupling. Always `false` when
     /// `acmod ≤ 1` (no coupling possible).
     pub cplinu_blk: [bool; MAX_BLOCKS_PER_FRAME],
+    /// Per-block `cplstre[blk]` — coupling-strategy-exists flag per
+    /// block. Block 0 is always implicit `1` per §E.1.2.2 / Table E1.3
+    /// (the spec only transmits `cplinu[0]`); subsequent blocks
+    /// transmit `cplstre[blk]` explicitly. Surfaced so the round-5
+    /// audblk DSP path knows when to expect the coupling-strategy
+    /// fields (chincpl[], cplbegf, …) versus reusing the prior block's
+    /// strategy with fresh coordinates.
+    pub cplstre_blk: [bool; MAX_BLOCKS_PER_FRAME],
     /// Number of blocks with `cplinu[blk] == 1`. Convenient summary
     /// for the round-2 DSP path which rejects any non-zero value.
     pub ncplblks: u32,
@@ -129,6 +137,7 @@ impl AudFrm {
             frmfsnroffst: 0,
             bits_consumed: 0,
             cplinu_blk: [false; MAX_BLOCKS_PER_FRAME],
+            cplstre_blk: [false; MAX_BLOCKS_PER_FRAME],
             ncplblks: 0,
         }
     }
@@ -182,9 +191,11 @@ pub fn parse_with(br: &mut BitReader<'_>, bsi: &Bsi) -> Result<AudFrm> {
         let cplinu0 = br.read_u32(1)?;
         ncplblks += cplinu0;
         a.cplinu_blk[0] = cplinu0 != 0;
+        a.cplstre_blk[0] = true;
         let mut last_cplinu = cplinu0;
         for blk in 1..num_blocks {
             let cplstre = br.read_u32(1)? != 0;
+            a.cplstre_blk[blk] = cplstre;
             if cplstre {
                 let v = br.read_u32(1)?;
                 last_cplinu = v;
