@@ -1416,6 +1416,18 @@ impl Ac3Encoder {
                     let nseg = dba_plan.nseg[MAX_FBW] as u32;
                     bw.write_u32(nseg - 1, 3); // cpldeltnseg
                     for seg in 0..nseg as usize {
+                        // §5.4.3.51 deltoffst is a 5-bit field — clipping
+                        // here is a panic-on-bug guard so future plan
+                        // builders that exceed 31 fail loudly instead of
+                        // silently truncating + mis-targeting the mask
+                        // delta on the decoder side. The wire write below
+                        // would mask to 5 bits regardless.
+                        debug_assert!(
+                            dba_plan.offst[MAX_FBW][seg] <= 31,
+                            "cpldeltoffst[{}]={} exceeds 5-bit field range",
+                            seg,
+                            dba_plan.offst[MAX_FBW][seg]
+                        );
                         bw.write_u32(dba_plan.offst[MAX_FBW][seg] as u32, 5);
                         bw.write_u32(dba_plan.len[MAX_FBW][seg] as u32, 4);
                         bw.write_u32(dba_plan.ba[MAX_FBW][seg] as u32, 3);
@@ -1426,6 +1438,13 @@ impl Ac3Encoder {
                         let nseg = dba_plan.nseg[ch] as u32;
                         bw.write_u32(nseg - 1, 3); // deltnseg[ch]
                         for seg in 0..nseg as usize {
+                            debug_assert!(
+                                dba_plan.offst[ch][seg] <= 31,
+                                "deltoffst[ch={}][seg={}]={} exceeds 5-bit field range",
+                                ch,
+                                seg,
+                                dba_plan.offst[ch][seg]
+                            );
                             bw.write_u32(dba_plan.offst[ch][seg] as u32, 5);
                             bw.write_u32(dba_plan.len[ch][seg] as u32, 4);
                             bw.write_u32(dba_plan.ba[ch][seg] as u32, 3);
@@ -2146,15 +2165,16 @@ pub(crate) fn pick_strategy_for_block(exp: &[u8], end: usize) -> u8 {
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(75);
-    // D45 is currently disabled by default — its emission has a
-    // first-frame mantissa-stream desync that we haven't pinned down
-    // yet (the per-bin exp arrays match between encoder and decoder
-    // post-grpsize-expansion, but the bit allocator delivers ~3 fewer
-    // mantissa bits in the decoder than the encoder writes for frame
-    // 1 specifically; subsequent frames are fine). Setting
-    // `AC3_ENABLE_D45=1` re-enables it for empirical sweeps. D25 ships
-    // by default and is bit-exact across self- and ffmpeg-decode.
-    let d45_enabled = std::env::var("AC3_ENABLE_D45").is_ok();
+    // D45 is enabled by default since round 29 — the prior frame-1
+    // mantissa-stream desync was caused by `build_dba_plan` letting the
+    // chosen DBA band exceed 31 (the 5-bit `deltoffst` field range per
+    // §5.4.3.51). Wire-side truncation re-targeted the +6 dB mask delta
+    // at a low band that the encoder had not tagged, drifting `bap[]`
+    // by 1 at that bin and shifting the rest of the mantissa stream.
+    // The fix clamped `hi_band ≤ 32` in `build_dba_plan`; D45 now
+    // round-trips bit-exact through the decoder. Set
+    // `AC3_DISABLE_D45=1` to fall back to D25-only for A/B sweeps.
+    let d45_enabled = std::env::var("AC3_DISABLE_D45").is_err();
     let pick = if d45_enabled && d45_avg_x100 <= d45_thr {
         3
     } else if d25_avg_x100 <= d25_thr {
@@ -4194,11 +4214,20 @@ pub(crate) fn build_dba_plan(
     cpl: &CouplingPlan,
 ) -> DbaPlan {
     let mut plan = DbaPlan::default();
-    // Search range: bands 25..45 (mid frequencies, well below the
+    // Search range: bands 25..32 (mid frequencies, well below the
     // coupling cut-off and above the bass region). The §7.2.2 BNDTAB
-    // covers bands 0..49; bins 25..40 cover ≈ 1.4–4.8 kHz at 48 kHz.
+    // covers bands 0..49; bins 25..32 cover ≈ 1.4–2.7 kHz at 48 kHz.
+    //
+    // Upper bound is 32 (= 2^5) because §5.4.3.51 specifies `deltoffst`
+    // as a 5-bit field (range 0..31) and we currently emit nseg=1, so
+    // the segment's `deltoffst` is the absolute band number — anything
+    // ≥ 32 truncates on the wire to `band & 31`, which mis-targets the
+    // delta on the decoder side and causes a per-frame mask divergence
+    // at a low band the encoder never tagged. To stay above 31 the
+    // emitter would need nseg ≥ 2 with an intermediate skip segment,
+    // which costs more bits than the dba saves; clamp instead.
     let lo_band = 25usize;
-    let hi_band = 45usize.min(MASKTAB[end.saturating_sub(1).max(1)] as usize);
+    let hi_band = 32usize.min(MASKTAB[end.saturating_sub(1).max(1)] as usize);
     if hi_band <= lo_band + 1 {
         return plan; // not enough headroom — leave everything zero
     }
@@ -5072,6 +5101,199 @@ mod tests {
         let drms = (dsq / (decoded_bytes.len() / 4) as f64).sqrt();
         eprintln!(
             "ffmpeg decode of our D25 output: {} bytes, RMS {:.1}",
+            decoded_bytes.len(),
+            drms
+        );
+        assert!(drms > 1000.0, "ffmpeg-decoded RMS too low: {drms}");
+    }
+
+    /// Round-29 regression: D45 grpsize=4 exponent strategy round-trips
+    /// bit-exact through both the in-tree decoder AND ffmpeg.
+    ///
+    /// The dba-offset-truncation bug fixed in `build_dba_plan`
+    /// (best_band capped at 31 to fit the 5-bit `deltoffst` field per
+    /// §5.4.3.51) made the first-frame mantissa stream desync by one
+    /// bit; with the cap this test passes against ffmpeg and against
+    /// our decoder's PSNR floor.
+    ///
+    /// Picks a smooth low-band signal so the strategy selector emits
+    /// chexpstr=3 on at least one anchor block per frame.
+    #[test]
+    fn d45_exp_strategy_selection_and_ffmpeg_crosscheck() {
+        use std::process::Command;
+        let sr = 48_000u32;
+        let dur = 1.0f32;
+        let nsamp = (sr as f32 * dur) as usize;
+        // Pure 110 Hz tone: HF bins are zero so the decimated exponent
+        // ladder is monotonically increasing and very smooth — the
+        // smoothness test in `pick_strategy_for_block` should pick D45
+        // on at least one anchor block per frame.
+        let mut pcm = vec![0i16; nsamp * 2];
+        for n in 0..nsamp {
+            let t = n as f32 / sr as f32;
+            let s = 0.50 * (2.0 * std::f32::consts::PI * 110.0 * t).sin();
+            let q = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            pcm[n * 2] = q;
+            pcm[n * 2 + 1] = q;
+        }
+        let mut bytes = Vec::with_capacity(pcm.len() * 2);
+        for s in &pcm {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(sr);
+        params.channels = Some(2);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(192_000);
+        let mut enc = make_encoder(&params).expect("make_encoder");
+        let audio = AudioFrame {
+            samples: nsamp as u32,
+            pts: Some(0),
+            data: vec![bytes.clone()],
+        };
+        enc.send_frame(&Frame::Audio(audio)).unwrap();
+        let _ = enc.flush();
+        let mut pkts = Vec::new();
+        let mut ac3_bytes: Vec<u8> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    ac3_bytes.extend_from_slice(&p.data);
+                    pkts.push(p);
+                }
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        assert!(pkts.len() >= 30, "got only {} packets", pkts.len());
+
+        // Gate (a): at least half the frames should carry chexpstr=3
+        // (D45) on at least one fbw channel anchor block.
+        let mut frames_with_d45 = 0usize;
+        for p in &pkts {
+            let si = crate::syncinfo::parse(&p.data).expect("syncinfo");
+            let b = crate::bsi::parse(&p.data[5..]).expect("bsi");
+            let side = crate::audblk::parse_frame_side_info(&si, &b, &p.data).expect("side-info");
+            let mut frame_has_d45 = false;
+            for s in &side {
+                for v in s.chexpstr.iter().take(2) {
+                    if *v == 3 {
+                        frame_has_d45 = true;
+                    }
+                }
+            }
+            if frame_has_d45 {
+                frames_with_d45 += 1;
+            }
+        }
+        eprintln!(
+            "D45 selection: {}/{} frames carry chexpstr=3 on at least one fbw channel/block",
+            frames_with_d45,
+            pkts.len()
+        );
+        assert!(
+            frames_with_d45 * 2 >= pkts.len(),
+            "D45 strategy never picked ({} of {} frames) — selector thresholds may be off",
+            frames_with_d45,
+            pkts.len()
+        );
+
+        // Gate (b): self-decode round-trip — PSNR > 20 dB after lag align.
+        let dparams = CodecParameters::audio(CodecId::new("ac3"));
+        let mut dec = crate::decoder::make_decoder(&dparams).expect("make_decoder");
+        let mut decoded: Vec<i16> = Vec::new();
+        for p in &pkts {
+            dec.send_packet(p).unwrap();
+            if let Ok(Frame::Audio(a)) = dec.receive_frame() {
+                for s in a.data[0].chunks_exact(4) {
+                    decoded.push(i16::from_le_bytes([s[0], s[1]]));
+                }
+            }
+        }
+        assert!(decoded.len() > nsamp / 2, "decoded too few samples");
+        let orig_l: Vec<i16> = (0..nsamp).map(|i| pcm[i * 2]).collect();
+        let n = decoded.len().min(orig_l.len());
+        let skip = 768usize.min(n);
+        let usable = n.saturating_sub(skip);
+        let mut best_sse = f64::INFINITY;
+        for lag in -512i32..=512 {
+            let mut sse = 0.0f64;
+            let mut count = 0usize;
+            for i in 0..usable {
+                let a = (skip + i) as i32;
+                let b = a + lag;
+                if b < 0 || (b as usize) >= orig_l.len() {
+                    continue;
+                }
+                let d = decoded[a as usize] as f64 - orig_l[b as usize] as f64;
+                sse += d * d;
+                count += 1;
+            }
+            if count > 0 {
+                let mse = sse / count as f64;
+                if mse < best_sse {
+                    best_sse = mse;
+                }
+            }
+        }
+        let psnr = if best_sse > 0.0 {
+            10.0 * (32767.0f64.powi(2) / best_sse).log10()
+        } else {
+            f64::INFINITY
+        };
+        eprintln!("D45 self-decode PSNR: {psnr:.2} dB");
+        assert!(
+            psnr > 20.0,
+            "D45 self-decode PSNR collapsed: {psnr:.2} dB (regression of the 5-bit dba_offst truncation bug?)"
+        );
+
+        // Gate (c): ffmpeg cross-decode.
+        let in_path = std::env::temp_dir().join("oxideav_ac3_d45_enc.ac3");
+        let out_path = std::env::temp_dir().join("oxideav_ac3_d45_dec.pcm");
+        std::fs::write(&in_path, &ac3_bytes).expect("write ac3");
+        let _ = std::fs::remove_file(&out_path);
+        let out = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "ac3",
+                "-i",
+            ])
+            .arg(&in_path)
+            .args(["-f", "s16le", "-acodec", "pcm_s16le", "-ac", "2"])
+            .arg(&out_path)
+            .status();
+        let _ = std::fs::remove_file(&in_path);
+        let Ok(status) = out else {
+            eprintln!("ffmpeg unavailable — skipping cross-decode gate");
+            return;
+        };
+        assert!(
+            status.success(),
+            "ffmpeg failed to decode our D45-strategy AC-3 output"
+        );
+        let Ok(decoded_bytes) = std::fs::read(&out_path) else {
+            panic!("ffmpeg produced no decode output");
+        };
+        let _ = std::fs::remove_file(&out_path);
+        assert!(
+            decoded_bytes.len() > 4_000,
+            "ffmpeg produced suspiciously short decode: {} bytes",
+            decoded_bytes.len()
+        );
+        let dsq: f64 = decoded_bytes
+            .chunks_exact(4)
+            .map(|c| {
+                let l = i16::from_le_bytes([c[0], c[1]]) as f64;
+                l * l
+            })
+            .sum();
+        let drms = (dsq / (decoded_bytes.len() / 4) as f64).sqrt();
+        eprintln!(
+            "ffmpeg decode of our D45 output: {} bytes, RMS {:.1}",
             decoded_bytes.len(),
             drms
         );

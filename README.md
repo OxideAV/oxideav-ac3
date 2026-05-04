@@ -40,18 +40,20 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       headroom. Bitstream syntax always allowed it; the encoder now
       uses it.
 - [x] Per-channel exponent strategy selection (§7.1.3 / §5.4.3.22,
-      round 28) — encoder anchor blocks (block 0 / 3) now pick
-      D15 (grpsize=1) or D25 (grpsize=2) per channel based on the
-      smoothness of the exponent envelope. Smooth-spectrum bass /
-      mid-band channels emit D25 instead of D15, halving the per-channel
-      exponent payload (`4 + 7 × ((end-1+3)/6)` bits vs `4 + 7 × ((end-1)/3)`).
-      With end_mant=253 the saving is **~290 bits/channel/anchor block**
-      that the snr-offset tuner reinvests in mantissa precision. The
-      decoder side already supported all three "new" strategies; this
-      round wires the encoder to actually emit them when the spectrum
-      allows. ffmpeg cross-decodes the D25-bearing stream cleanly. D45
-      (grpsize=4) emission is gated behind `AC3_ENABLE_D45=1` —
-      first-frame mantissa-stream desync follow-up.
+      round 28 + 29) — encoder anchor blocks (block 0 / 3) pick
+      D15 (grpsize=1), D25 (grpsize=2), or D45 (grpsize=4) per channel
+      based on the smoothness of the exponent envelope. Smooth-spectrum
+      bass / mid-band channels emit D25 or D45 instead of D15, shrinking
+      the per-channel exponent payload (D45 = `4 + 7 × ((end-1+9)/12)`
+      vs D15 = `4 + 7 × ((end-1)/3)`). With end_mant=253 D45 saves
+      **~430 bits/channel/anchor block** over D15 that the snr-offset
+      tuner reinvests in mantissa precision. Round 29 unblocked D45 by
+      capping the dba-segment search at band 31 (the 5-bit `deltoffst`
+      field range per §5.4.3.51) — previously the search reached up to
+      band 44 and the wire write silently truncated, mis-targeting the
+      mask delta on the decoder side. `AC3_DISABLE_D45=1` falls back to
+      D25-only for A/B sweeps. ffmpeg cross-decodes both D25 and D45
+      streams cleanly.
 - [x] Per-block SNR-offset bit-pool tuning (§5.4.3.37-43, round 26 /
       task #170) — encoder runs a redistribution pass after the global
       tuner that moves mantissa bits between blocks based on per-block

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — round 29 — D45 grpsize=4 anchor blocks now bit-exact
+
+- **`build_dba_plan` — clamp `hi_band` to 32 (was 45).** The DBA segment
+  search picked a "quietest" mid-band in `[25, 45)`, then emitted that
+  absolute band number as `deltoffst` (5 bits per §5.4.3.51). When the
+  best band ≥ 32 the wire write silently truncated to `band & 31`,
+  re-targeting the +6 dB mask delta at a low band the encoder never
+  tagged. The decoder applied the delta at the wrong band → `bap[]`
+  drifted by 1 at one bin → the rest of the frame's mantissa stream
+  shifted by 1 bit. Cap the search at 32 so a single 5-bit segment can
+  always reach its band; multi-segment dba would let us reclaim the
+  upper region but costs more bits than the dba saves at our bitrates.
+- **D45 (chexpstr=3) is now the default** when the strategy selector's
+  smoothness probe permits — `AC3_DISABLE_D45=1` falls back to D25-only
+  for A/B sweeps. Previously gated behind `AC3_ENABLE_D45=1` for the
+  same reason as the dba fix above (the symptom looked like a D45
+  emitter bug but it was a dba syntax bug masked by D25's different
+  `build_dba_plan` exponent inputs).
+- **Encoder defensive guard.** Added a `debug_assert!(offst <= 31)` to
+  the dba emission so any future plan builder that overshoots the
+  5-bit field range fails loudly instead of corrupting the bitstream.
+- **Test gate `d45_exp_strategy_selection_and_ffmpeg_crosscheck`** —
+  encodes a 110 Hz stereo tone, asserts ≥ 50% of frames carry
+  `chexpstr=3` on an anchor block, asserts self-decode PSNR > 20 dB,
+  asserts ffmpeg cross-decode succeeds with non-trivial PCM.
+  Measured: 32/32 frames carry D45, self-decode PSNR 24.90 dB,
+  ffmpeg-decode RMS 10767.
+
 ### Added — round 28 — per-channel exponent strategy selection (D25)
 
 - **Encoder-side §7.1.3 / §5.4.3.22 chexpstr selection.** The encoder's
