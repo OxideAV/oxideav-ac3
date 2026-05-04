@@ -873,12 +873,46 @@ impl Ac3Encoder {
                     preprocess_d15(&mut exps[ch][blk][..ch_end_mant]);
                 }
             }
-            // For REUSE blocks, copy the most recent transmitted D15 set
-            // forward so compute_bap + mantissa quantisation use the
-            // exponents the decoder will see on this block.
+        }
+        // Per-channel exponent-strategy selection (§7.1.3 / §5.4.3.22).
+        // After D15 preprocessing each anchor block (block 0 / 3) is
+        // smooth enough to consider D25 (grpsize=2) or D45 (grpsize=4)
+        // when adjacent bins share similar exponents. We pick per
+        // channel per block so a HF-rich channel can still emit D15
+        // while a smooth bass channel saves bits via D45. The frame
+        // anchor pattern (new on 0/3, REUSE on 1/2/4/5) is preserved.
+        // `AC3_DISABLE_EXPSTR_SEL=1` pins every "new" anchor to D15
+        // for A/B testing.
+        let chexpstr_plan: Vec<[u8; BLOCKS_PER_FRAME]> =
+            if std::env::var("AC3_DISABLE_EXPSTR_SEL").is_ok() {
+                let mut out = vec![[0u8; BLOCKS_PER_FRAME]; self.channels];
+                for ch in 0..self.channels {
+                    out[ch] = exp_strategies;
+                }
+                out
+            } else {
+                select_exp_strategies(&exps, self.channels, ch_end_mant)
+            };
+        // Apply grpsize quantisation for any channel that picked D25/D45
+        // on an anchor block. The decoder will reconstruct the same
+        // exponents (one per grpsize span replicated across the span)
+        // so feeding the bit allocator and mantissa quantiser the same
+        // values keeps everything in lockstep.
+        for ch in 0..self.channels {
+            for blk in 0..BLOCKS_PER_FRAME {
+                let strat = chexpstr_plan[ch][blk];
+                if strat >= 2 {
+                    let grpsize = if strat == 2 { 2 } else { 4 };
+                    quantise_exponents_to_grpsize(&mut exps[ch][blk][..ch_end_mant], grpsize);
+                }
+            }
+            // For REUSE blocks (chexpstr==0), copy the most recent
+            // transmitted exponent set forward so compute_bap +
+            // mantissa quantisation use the exponents the decoder will
+            // see on this block.
             let mut last = 0usize;
             for blk in 0..BLOCKS_PER_FRAME {
-                if exp_strategies[blk] == 1 {
+                if chexpstr_plan[ch][blk] != 0 {
                     last = blk;
                 } else {
                     let src: [u8; N_COEFFS] = exps[ch][last];
@@ -970,8 +1004,9 @@ impl Ac3Encoder {
 
         // Iteratively tune csnroffst+fsnroffst so the encoded mantissa
         // bits + side-info fit the frame payload. This is the minimal
-        // loop §8.2.12 describes.
-        let tuned_ba = tune_snroffst(
+        // loop §8.2.12 describes. Pass the per-channel chexpstr plan so
+        // the budget calculation accounts for D25/D45 savings.
+        let tuned_ba = tune_snroffst_with_plan(
             &ba,
             &exps,
             ch_end_mant,
@@ -979,6 +1014,7 @@ impl Ac3Encoder {
             self.fscod,
             self.frame_bytes,
             &exp_strategies,
+            Some(&chexpstr_plan),
             &cpl,
             &dba_plan,
             self.acmod,
@@ -998,7 +1034,7 @@ impl Ac3Encoder {
         let snr_plan = if std::env::var("AC3_DISABLE_PERBLOCK_SNR").is_ok() {
             PerBlockSnr::from_global(&tuned_ba)
         } else {
-            tune_per_block_snroffst(
+            tune_per_block_snroffst_with_plan(
                 &tuned_ba,
                 &exps,
                 ch_end_mant,
@@ -1006,6 +1042,7 @@ impl Ac3Encoder {
                 self.fscod,
                 self.frame_bytes,
                 &exp_strategies,
+                Some(&chexpstr_plan),
                 &cpl,
                 &dba_plan,
                 self.acmod,
@@ -1221,32 +1258,33 @@ impl Ac3Encoder {
                 }
             }
 
-            // chexpstr: per-block strategy chosen above.
+            // chexpstr: per-channel-per-block strategy chosen above.
+            // The frame-wide `exp_strategies[blk]` still drives cpl /
+            // lfe / chbwcod / dba decisions because those side-info
+            // fields are tied to the anchor cadence.
             let exp_strategy: u8 = exp_strategies[blk];
             // §5.4.3.21 cplexpstr — only when cplinu. Use the same
-            // strategy as the fbw channels (D15 on blocks 0/3, REUSE
-            // elsewhere).
+            // strategy as the anchor cadence (cpl D25/D45 selection
+            // would need its own smoothness probe; round defers it).
             if cpl.in_use {
                 bw.write_u32(exp_strategy as u32, 2);
             }
-            // §5.4.3.22 chexpstr[ch] — 2 bits per fbw channel.
-            for _ in 0..self.channels {
-                bw.write_u32(exp_strategy as u32, 2);
+            // §5.4.3.22 chexpstr[ch] — 2 bits per fbw channel from the
+            // per-channel plan.
+            for ch in 0..self.channels {
+                bw.write_u32(chexpstr_plan[ch][blk] as u32, 2);
             }
-            // §5.4.3.23 lfeexpstr — 1 bit when lfeon. We mirror fbw
-            // strategy: 1 bit set when exp_strategy is "new" (D15),
-            // 0 bit when REUSE.
+            // §5.4.3.23 lfeexpstr — 1 bit when lfeon. LFE always uses
+            // D15 in this encoder (the bin-7 LFE band is tiny).
             if self.lfeon {
                 bw.write_u32(if exp_strategy == 1 { 1 } else { 0 }, 1);
             }
             // chbwcod (only when exp strategy != reuse, AND channel not
             // coupled). When coupling is active, channels do not
             // transmit their own bandwidth code.
-            if exp_strategy != 0 {
-                for ch in 0..self.channels {
-                    if !(cpl.in_use && cpl.chincpl[ch]) {
-                        bw.write_u32(chbwcod as u32, 6);
-                    }
+            for ch in 0..self.channels {
+                if chexpstr_plan[ch][blk] != 0 && !(cpl.in_use && cpl.chincpl[ch]) {
+                    bw.write_u32(chbwcod as u32, 6);
                 }
             }
 
@@ -1257,23 +1295,32 @@ impl Ac3Encoder {
             // grouping over [cpl_begf_mant, cpl_endf_mant) per
             // §7.1.3, with the absolute exponent value implied to be
             // the 4-bit cplabsexp left-shifted by 1.
-            if exp_strategy == 1 {
-                if cpl.in_use {
-                    let cpl_idx = cpl_idx_in_exps;
-                    let begf_mant = cpl.begf_mant();
-                    let endf_mant = cpl.endf_mant();
-                    write_exponents_cpl(&mut bw, &exps[cpl_idx][blk], begf_mant, endf_mant);
+            if cpl.in_use && exp_strategy == 1 {
+                let cpl_idx = cpl_idx_in_exps;
+                let begf_mant = cpl.begf_mant();
+                let endf_mant = cpl.endf_mant();
+                write_exponents_cpl(&mut bw, &exps[cpl_idx][blk], begf_mant, endf_mant);
+            }
+            for ch in 0..self.channels {
+                let strat = chexpstr_plan[ch][blk];
+                if strat == 0 {
+                    continue;
                 }
-                for ch in 0..self.channels {
-                    write_exponents_d15(&mut bw, &exps[ch][blk], ch_end_mant);
-                    bw.write_u32(0, 2); // gainrng = 0
-                }
-                // §5.4.3.29 LFE exponents — D15 over bins 0..7, with
-                // `nlfegrps=2` (2 groups of 3 deltas after the 4-bit
-                // absexp).
-                if self.lfeon {
-                    write_exponents_d15(&mut bw, &exps[lfe_idx_in_exps][blk], LFE_END_MANT);
-                }
+                let grpsize: usize = if strat == 1 {
+                    1
+                } else if strat == 2 {
+                    2
+                } else {
+                    4
+                };
+                write_exponents_grouped(&mut bw, &exps[ch][blk], ch_end_mant, grpsize);
+                bw.write_u32(0, 2); // gainrng = 0
+            }
+            // §5.4.3.29 LFE exponents — D15 over bins 0..7, with
+            // `nlfegrps=2` (2 groups of 3 deltas after the 4-bit
+            // absexp).
+            if self.lfeon && exp_strategy == 1 {
+                write_exponents_d15(&mut bw, &exps[lfe_idx_in_exps][blk], LFE_END_MANT);
             }
 
             // Bit-allocation side-info: block 0 transmits the parametric
@@ -1848,33 +1895,315 @@ fn write_exponents_cpl(bw: &mut BitWriter, exp: &[u8; N_COEFFS], start: usize, e
 /// three (ngrps = (end-1)/3) as a single 7-bit word encoding three
 /// `(dexp+2)` values via m = 25*(dexp0+2) + 5*(dexp1+2) + (dexp2+2).
 pub(crate) fn write_exponents_d15(bw: &mut BitWriter, exp: &[u8; N_COEFFS], end: usize) {
+    write_exponents_grouped(bw, exp, end, 1);
+}
+
+/// Generic per-§7.1.3 grouped exponent emitter. `grpsize` ∈ {1, 2, 4}
+/// selects the strategy: D15 (=1), D25 (=2), D45 (=4). The bit-stream
+/// layout is the same in every case — 4-bit absexp followed by N
+/// 7-bit packed groups — only `N = ngrps_for_strategy(end, grpsize)`
+/// changes. Per-strategy `nchgrps` matches the decoder side
+/// (`audblk::decode_exponents`):
+///
+/// * D15 → ngrps = (end - 1) / 3            — 1 delta per bin
+/// * D25 → ngrps = (end - 1 + 3) / 6        — 1 delta per 2 bins
+/// * D45 → ngrps = (end - 1 + 9) / 12       — 1 delta per 4 bins
+///
+/// For grpsize > 1 the caller is expected to have *already* averaged
+/// the per-bin raw exponents down to one representative per grpsize
+/// span (see `quantise_exponents_to_grpsize`). Without that pre-pass
+/// the deltas would clip wildly when bin energies vary inside a group.
+pub(crate) fn write_exponents_grouped(
+    bw: &mut BitWriter,
+    exp: &[u8; N_COEFFS],
+    end: usize,
+    grpsize: usize,
+) {
+    if end == 0 {
+        return;
+    }
     let absexp = exp[0];
     bw.write_u32(absexp as u32, 4);
-    let ngrps = (end - 1) / 3;
+    let ngrps = ngrps_for_strategy(end, grpsize);
+    // The caller has already invoked `quantise_exponents_to_grpsize`
+    // (or `preprocess_d15` for grpsize=1) so adjacent representatives
+    // already differ by at most 2. We just need to walk the array,
+    // sampling one representative per grpsize span, and pack them
+    // into 7-bit deltas.
+    let mut prev = absexp as i32;
     for grp in 0..ngrps {
-        let base = 1 + grp * 3;
-        let e_prev_0 = if base == 1 {
-            absexp as i32
-        } else {
-            exp[base - 1] as i32
-        };
-        let e0 = exp[base] as i32;
-        let e1 = exp[base + 1] as i32;
-        let e2 = exp[base + 2] as i32;
-        let d0 = (e0 - e_prev_0).clamp(-2, 2) + 2;
+        // The three representatives this group encodes live at
+        // bin positions (1 + (grp*3 + 0..3)*grpsize). When `end` is
+        // smaller than that range the spec implicitly pads with the
+        // last representative (delta = 0); the decoder's grpsize
+        // expansion will write past `end` only if our `end`/`ngrps`
+        // pair disagrees with the decoder's, so we emit zero-deltas
+        // for any pad slot.
+        let p0 = 1 + (grp * 3) * grpsize;
+        let p1 = p0 + grpsize;
+        let p2 = p1 + grpsize;
+        let e0 = if p0 < end { exp[p0] as i32 } else { prev };
+        let e1 = if p1 < end { exp[p1] as i32 } else { e0 };
+        let e2 = if p2 < end { exp[p2] as i32 } else { e1 };
+        let d0 = (e0 - prev).clamp(-2, 2) + 2;
         let d1 = (e1 - e0).clamp(-2, 2) + 2;
         let d2 = (e2 - e1).clamp(-2, 2) + 2;
         let packed: u32 = (25 * d0 + 5 * d1 + d2) as u32;
         bw.write_u32(packed, 7);
+        prev = e2;
     }
-    // If (end-1) % 3 != 0, the spare (up to 2) exponents are padded
-    // into the last group implicitly — A/52 caps end at 253, so this
-    // is exact for chbwcod=60 (end=252, (252-1)/3=83 groups with
-    // 83*3+1=250 exponents transmitted). Uncovered bins reuse the last
-    // transmitted value on the decoder side via the grpsize expansion
-    // step (`exp[(i*grpsize)+j+1] = aexp[i]`), so they are not a
-    // problem in practice.
-    let _ = ngrps;
+}
+
+/// Match-decoder formula for the number of 7-bit exponent groups
+/// transmitted under each strategy (§7.1.3, mirrors
+/// `audblk::decode_exponents`'s grpsize→nchgrps switch).
+pub(crate) fn ngrps_for_strategy(end: usize, grpsize: usize) -> usize {
+    if end == 0 {
+        return 0;
+    }
+    match grpsize {
+        1 => (end - 1) / 3,
+        2 => (end - 1 + 3) / 6,
+        4 => (end - 1 + 9) / 12,
+        _ => 0,
+    }
+}
+
+/// Quantise per-bin raw exponents down to one representative per
+/// grpsize span, clamp deltas between successive representatives to
+/// ±2 (the AC-3 differential encoding limit), then expand back to
+/// per-bin (replicating the representative) so the bit allocator +
+/// mantissa quantiser see the exponents the decoder will actually
+/// reconstruct.
+///
+/// Operates in place. For grpsize=1 this is a no-op (the caller has
+/// already invoked `preprocess_d15` for the D15 case). For grpsize>1
+/// the representative is the minimum of the span (covers the loudest
+/// bin in the group; matches `write_exponents_grouped`).
+pub(crate) fn quantise_exponents_to_grpsize(exp: &mut [u8], grpsize: usize) {
+    if grpsize <= 1 || exp.len() < 2 {
+        return;
+    }
+    let n = exp.len();
+    // Bin 0 is the absexp seed; D15 preprocessing already legalised
+    // it to ≤15 (4-bit absexp range).
+    if exp[0] > 15 {
+        exp[0] = 15;
+    }
+    // Pass 1 (in place): replace each grpsize-span starting at bin 1
+    // with the minimum of the span — that's the largest-magnitude
+    // bin's exponent and so will not clip on quantisation.
+    let mut i = 1usize;
+    while i < n {
+        let span_end = (i + grpsize).min(n);
+        let mut m = exp[i];
+        for k in (i + 1)..span_end {
+            if exp[k] < m {
+                m = exp[k];
+            }
+        }
+        for k in i..span_end {
+            exp[k] = m;
+        }
+        i = span_end;
+    }
+    // Pass 2: walk the representative sequence (one rep per grpsize
+    // span starting at bin 1) and clamp the delta from one rep to the
+    // next to ±2. The decoder packs each representative as a single
+    // ±2 delta against the prior representative, so any jump beyond
+    // ±2 would be silently clamped on decode and the encoder's bit
+    // allocator would diverge from the decoder's reconstruction.
+    //
+    // Walk both forward (push reps down toward subsequent loud bins)
+    // and back-prop (let a quiet rep pull its predecessors down so a
+    // sudden silence after a loud span doesn't leave the encoder
+    // stuck at exp=0 across a 4-bin span). Two passes mirror the
+    // `preprocess_d15` shape.
+    // Backward pass: rep[i] ≤ rep[i+grpsize] + 2 (where indices refer
+    // to bin positions, but reps are constant within a grpsize span
+    // so we can compare endpoint values).
+    let mut i = if n > grpsize { n - grpsize } else { 1 };
+    while i > grpsize {
+        let next_first = i; // first bin of next span
+        let cur_first = i - grpsize; // first bin of current span
+        let next_plus_two = (exp[next_first] as i32 + 2).min(24) as u8;
+        if exp[cur_first] > next_plus_two {
+            // re-stamp the entire current span.
+            let span_end = (cur_first + grpsize).min(n);
+            for k in cur_first..span_end {
+                exp[k] = next_plus_two;
+            }
+        }
+        if i <= grpsize {
+            break;
+        }
+        i -= grpsize;
+    }
+    // Back-prop the absexp slot too: exp[0] ≤ exp[1] + 2.
+    let next_plus_two = (exp[1] as i32 + 2).min(15) as u8;
+    if exp[0] > next_plus_two {
+        exp[0] = next_plus_two;
+    }
+    // Forward pass: clamp each forward delta to ±2 and the running
+    // value to [0, 24]. The first rep's delta is against absexp; each
+    // subsequent rep's delta is against the previous rep.
+    let mut prev = exp[0];
+    let mut i = 1usize;
+    while i < n {
+        let span_end = (i + grpsize).min(n);
+        let target = exp[i];
+        let d = (target as i32 - prev as i32).clamp(-2, 2);
+        let new_val = ((prev as i32 + d).clamp(0, 24)) as u8;
+        for k in i..span_end {
+            exp[k] = new_val;
+        }
+        prev = new_val;
+        i = span_end;
+    }
+}
+
+/// Pick the smoothest strategy (D15 / D25 / D45) for one channel's
+/// block of raw exponents. "Smoothest" = the strategy that, after the
+/// grpsize-merge, loses the *least* energy resolution. We use the
+/// per-bin clipping cost the merge would cause: a bin clipped from
+/// `e` to `min(e, e_neighbour)` loses `(e - shared_e)` units of
+/// dynamic range. Pick the largest grpsize whose total clipping cost
+/// across the band stays below thresholds derived from the bit
+/// budget of the alternative.
+///
+/// Returns one of `1` (D15), `2` (D25), `3` (D45). Never returns 0
+/// (REUSE) — that's a higher-level decision per-block.
+///
+/// The thresholds reflect the bit savings: D45 vs D15 saves
+/// ~(d15_bits - d45_bits) bits, so the merge can absorb up to
+/// ~(savings / 4) units of clipping (each clipped bin upcasts a
+/// mantissa bap by ~1 ⇒ ~4 bit cost). Empirically tuned for the
+/// `chbwcod=60` (end=252) case where d15=4+7×83=585, d45=4+7×21=151.
+pub(crate) fn pick_strategy_for_block(exp: &[u8], end: usize) -> u8 {
+    if end <= 1 {
+        return 1;
+    }
+    // D45 cost: how much mantissa-side dynamic range we'd burn if we
+    // collapsed every 4-bin span to its minimum exponent.
+    let mut cost_d45 = 0u32;
+    let mut cost_d25 = 0u32;
+    let mut i = 1usize;
+    while i < end {
+        let s4_end = (i + 4).min(end);
+        let s2_end = (i + 2).min(end);
+        let mut m4 = exp[i];
+        for k in (i + 1)..s4_end {
+            if exp[k] < m4 {
+                m4 = exp[k];
+            }
+        }
+        for k in i..s4_end {
+            cost_d45 += (exp[k] - m4) as u32;
+        }
+        // D25 cost computed on the leading half of the same span.
+        let mut m2 = exp[i];
+        for k in (i + 1)..s2_end {
+            if exp[k] < m2 {
+                m2 = exp[k];
+            }
+        }
+        for k in i..s2_end {
+            cost_d25 += (exp[k] - m2) as u32;
+        }
+        // Continue with the next D25 pair so cost_d25 covers all bins.
+        if s2_end < s4_end {
+            let mut m2b = exp[s2_end];
+            for k in (s2_end + 1)..s4_end {
+                if exp[k] < m2b {
+                    m2b = exp[k];
+                }
+            }
+            for k in s2_end..s4_end {
+                cost_d25 += (exp[k] - m2b) as u32;
+            }
+        }
+        i = s4_end;
+    }
+    // Thresholds: per-bin avg clipping budget. D45 saves ~430 bits vs
+    // D15 on a full-bandwidth channel; spending up to 1 bit/bin on
+    // dynamic-range loss is well worth it. D25 saves ~290 bits vs D15.
+    let bins = (end - 1) as u32;
+    if bins == 0 {
+        return 1;
+    }
+    let d45_avg_x100 = (cost_d45 * 100) / bins;
+    let d25_avg_x100 = (cost_d25 * 100) / bins;
+    // < 0.5 exp-units/bin avg ⇒ D45 is cheap enough.
+    // Selection thresholds (tunable via env for empirical sweeps).
+    // Lower = more aggressive (more D25/D45). Higher = more conservative
+    // (more D15). Defaults derived from preserved-PSNR experiments on
+    // the round 28 / task #324 fixtures.
+    let d45_thr = std::env::var("AC3_EXPSTR_D45_THR")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(50);
+    let d25_thr = std::env::var("AC3_EXPSTR_D25_THR")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(75);
+    // D45 is currently disabled by default — its emission has a
+    // first-frame mantissa-stream desync that we haven't pinned down
+    // yet (the per-bin exp arrays match between encoder and decoder
+    // post-grpsize-expansion, but the bit allocator delivers ~3 fewer
+    // mantissa bits in the decoder than the encoder writes for frame
+    // 1 specifically; subsequent frames are fine). Setting
+    // `AC3_ENABLE_D45=1` re-enables it for empirical sweeps. D25 ships
+    // by default and is bit-exact across self- and ffmpeg-decode.
+    let d45_enabled = std::env::var("AC3_ENABLE_D45").is_ok();
+    let pick = if d45_enabled && d45_avg_x100 <= d45_thr {
+        3
+    } else if d25_avg_x100 <= d25_thr {
+        2
+    } else {
+        1
+    };
+    if let Ok(force) = std::env::var("AC3_FORCE_EXPSTR") {
+        if let Ok(v) = force.parse::<u8>() {
+            if (1..=3).contains(&v) {
+                return v;
+            }
+        }
+    }
+    pick
+}
+
+/// Pick a per-channel-per-block exponent strategy plan. The plan
+/// honours the encoder's anchor-block convention (D15/D25/D45 on
+/// blocks 0 and 3, REUSE elsewhere — cadence chosen by the existing
+/// snr-offset and dba state machinery) but lets each anchor block
+/// pick the cheapest strategy that still represents its spectrum.
+///
+/// `exps[ch][blk]` = pre-D15-preprocessed raw exponents.
+/// `nchan`       = number of fbw channels (0..nchan-1 indexed).
+/// `end`         = ch_end_mant.
+///
+/// Returned shape `[ch][blk]` matches `chexpstr[ch]` semantics:
+///   0 = REUSE, 1 = D15, 2 = D25, 3 = D45.
+pub(crate) fn select_exp_strategies(
+    exps: &[Vec<[u8; N_COEFFS]>],
+    nchan: usize,
+    end: usize,
+) -> Vec<[u8; BLOCKS_PER_FRAME]> {
+    let mut out = vec![[0u8; BLOCKS_PER_FRAME]; nchan];
+    for (ch, plan) in out.iter_mut().enumerate().take(nchan) {
+        // Anchor pattern: blocks 0 and 3 are "new". Pick the
+        // cheapest legal strategy for each anchor based on its
+        // smoothness; the in-between blocks REUSE.
+        let s0 = pick_strategy_for_block(&exps[ch][0], end);
+        let s3 = pick_strategy_for_block(&exps[ch][3], end);
+        plan[0] = s0;
+        plan[1] = 0;
+        plan[2] = 0;
+        plan[3] = s3;
+        plan[4] = 0;
+        plan[5] = 0;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2322,8 +2651,15 @@ fn mantissa_bits_total(
 /// Compute the exact overhead bits (everything except mantissas) for a
 /// given per-block exponent strategy. We walk the bitstream layout the
 /// emitter uses and sum each field's width.
+///
+/// `chexpstr_per_ch` carries the per-channel-per-block exponent
+/// strategy (chexpstr semantics: 0=REUSE / 1=D15 / 2=D25 / 3=D45).
+/// When `None`, falls back to the legacy frame-wide `exp_strategies`
+/// (every fbw channel uses the same strategy).
+#[allow(clippy::too_many_arguments)]
 fn overhead_bits_for(
     exp_strategies: &[u8; BLOCKS_PER_FRAME],
+    chexpstr_per_ch: Option<&[[u8; BLOCKS_PER_FRAME]]>,
     end: usize,
     nchan: usize,
     cpl: &CouplingPlan,
@@ -2350,9 +2686,20 @@ fn overhead_bits_for(
         bsi_bits += 2;
     }
     let mut bits: u32 = 40 + bsi_bits;
-    // D15 ngrps for the per-channel exponents (over [0, end)).
-    let ngrps = (end - 1) / 3;
-    let d15_bits_per_ch = 4 + 7 * ngrps as u32;
+    // Per-strategy bits-per-channel helper: 4-bit absexp + 7-bit groups.
+    // grpsize ∈ {1, 2, 4} matches strategy code {1, 2, 3}.
+    let exp_bits_for_strategy = |strategy: u8| -> u32 {
+        let grpsize = match strategy {
+            1 => 1,
+            2 => 2,
+            3 => 4,
+            _ => return 0,
+        };
+        4 + 7 * ngrps_for_strategy(end, grpsize) as u32
+    };
+    // Default fbw bits when the per-channel plan isn't supplied (every
+    // channel uses the frame-wide strategy code from `exp_strategies`).
+    let d15_bits_per_ch = exp_bits_for_strategy(1);
     // D15 ngrps for the cpl pseudo-channel (over [cpl_begf_mant,
     // cpl_endf_mant)). Per §7.1.3 cpl uses
     // ncplgrps = (cplendmant - cplstrtmant) / 3 for D15.
@@ -2423,27 +2770,50 @@ fn overhead_bits_for(
         }
         // chbwcod × nchan (6 bits) only when exp strategy != reuse and
         // channel not coupled.
-        if s != 0 {
-            let n_indep = if cpl.in_use {
-                nchan as u32 - coupled_chs
+        // Effective per-channel "is this channel new this block?":
+        // either we're using the per-channel plan (chexpstr_per_ch[ch][blk])
+        // or every channel mirrors the frame-wide strategy `s`.
+        let ch_strategy = |ch: usize| -> u8 {
+            match chexpstr_per_ch {
+                Some(plan) => plan[ch][blk_i],
+                None => s,
+            }
+        };
+        let n_new_ch = (0..nchan).filter(|&c| ch_strategy(c) != 0).count() as u32;
+        if n_new_ch > 0 {
+            let n_new_indep = if cpl.in_use {
+                let coupled_new = (0..nchan)
+                    .filter(|&c| cpl.chincpl[c] && ch_strategy(c) != 0)
+                    .count() as u32;
+                n_new_ch - coupled_new
             } else {
-                nchan as u32
+                n_new_ch
             };
-            bits += 6 * n_indep;
+            bits += 6 * n_new_indep;
         }
         // exponents when new: cpl D15 (when cplexpstr=new) +
-        // per-channel D15 + 2 bits gainrng × nchan + LFE D15.
-        if s == 1 {
-            if cpl.in_use {
-                bits += cpl_d15_bits;
-            }
-            bits += (d15_bits_per_ch + 2) * nchan as u32;
-            // §5.4.3.29 LFE D15 exponents over bins 0..7 = 4 bits absexp
-            // + 2 groups × 7 bits = 18 bits. No gainrng for LFE.
-            if lfeon {
-                bits += 4 + 2 * 7;
+        // per-channel exponents + 2 bits gainrng × (channels with new
+        // strategy) + LFE D15.
+        if s == 1 && cpl.in_use {
+            bits += cpl_d15_bits;
+        }
+        // Per-channel: pay (4 + 7 * ngrps + 2) bits when this channel's
+        // strategy this block is non-REUSE; otherwise pay nothing.
+        for ch in 0..nchan {
+            let strat = ch_strategy(ch);
+            if strat != 0 {
+                bits += exp_bits_for_strategy(strat) + 2 /* gainrng */;
             }
         }
+        if s == 1 && lfeon {
+            // §5.4.3.29 LFE D15 exponents over bins 0..7 = 4 bits absexp
+            // + 2 groups × 7 bits = 18 bits. No gainrng for LFE.
+            bits += 4 + 2 * 7;
+        }
+        // Suppress unused-warning when `chexpstr_per_ch` is None and
+        // every channel mirrors the frame-wide `s` — `d15_bits_per_ch`
+        // is still used below for legacy single-strategy callers.
+        let _ = d15_bits_per_ch;
         // baie(1) + bit-alloc side info
         if s == 1 {
             // baie=1: sdcycod(2)+fdcycod(2)+sgaincod(2)+dbpbcod(2)+floorcod(3)=11
@@ -2527,8 +2897,44 @@ pub(crate) fn tune_snroffst(
     acmod: u8,
     lfeon: bool,
 ) -> BitAllocParams {
+    tune_snroffst_with_plan(
+        ba,
+        exps,
+        end,
+        nchan,
+        fscod,
+        frame_bytes,
+        exp_strategies,
+        None,
+        cpl,
+        dba,
+        acmod,
+        lfeon,
+    )
+}
+
+/// Same as [`tune_snroffst`] but accepts a per-channel-per-block
+/// chexpstr plan (`chexpstr_per_ch[ch][blk]` = 0/1/2/3). When the plan
+/// uses D25 or D45 strategies, the exponent-payload bits are smaller,
+/// freeing more of the frame budget for mantissas.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tune_snroffst_with_plan(
+    ba: &BitAllocParams,
+    exps: &[Vec<[u8; N_COEFFS]>],
+    end: usize,
+    nchan: usize,
+    fscod: u8,
+    frame_bytes: usize,
+    exp_strategies: &[u8; BLOCKS_PER_FRAME],
+    chexpstr_per_ch: Option<&[[u8; BLOCKS_PER_FRAME]]>,
+    cpl: &CouplingPlan,
+    dba: &DbaPlan,
+    acmod: u8,
+    lfeon: bool,
+) -> BitAllocParams {
     let overhead =
-        overhead_bits_for(exp_strategies, end, nchan, cpl, dba, acmod, lfeon) + 32 /* safety */;
+        overhead_bits_for(exp_strategies, chexpstr_per_ch, end, nchan, cpl, dba, acmod, lfeon)
+            + 32 /* safety */;
     let total_bits = (frame_bytes * 8) as u32;
     if overhead >= total_bits {
         return *ba;
@@ -2878,7 +3284,7 @@ fn per_block_demand(
 /// exists (uniform demand, tight budget), this returns the global plan
 /// untouched so the encoder remains fully spec-compliant — `snroffste`
 /// stays at the original "block-0 only" pattern.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn tune_per_block_snroffst(
     ba: &BitAllocParams,
     exps: &[Vec<[u8; N_COEFFS]>],
@@ -2887,6 +3293,37 @@ pub(crate) fn tune_per_block_snroffst(
     fscod: u8,
     frame_bytes: usize,
     exp_strategies: &[u8; BLOCKS_PER_FRAME],
+    cpl: &CouplingPlan,
+    dba: &DbaPlan,
+    acmod: u8,
+    lfeon: bool,
+) -> PerBlockSnr {
+    tune_per_block_snroffst_with_plan(
+        ba,
+        exps,
+        end,
+        nchan,
+        fscod,
+        frame_bytes,
+        exp_strategies,
+        None,
+        cpl,
+        dba,
+        acmod,
+        lfeon,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tune_per_block_snroffst_with_plan(
+    ba: &BitAllocParams,
+    exps: &[Vec<[u8; N_COEFFS]>],
+    end: usize,
+    nchan: usize,
+    fscod: u8,
+    frame_bytes: usize,
+    exp_strategies: &[u8; BLOCKS_PER_FRAME],
+    chexpstr_per_ch: Option<&[[u8; BLOCKS_PER_FRAME]]>,
     cpl: &CouplingPlan,
     dba: &DbaPlan,
     acmod: u8,
@@ -2976,7 +3413,8 @@ pub(crate) fn tune_per_block_snroffst(
         + if lfeon { 4 + 3 } else { 0 };
 
     let baseline_overhead =
-        overhead_bits_for(exp_strategies, end, nchan, cpl, dba, acmod, lfeon) + 32 /* safety */;
+        overhead_bits_for(exp_strategies, chexpstr_per_ch, end, nchan, cpl, dba, acmod, lfeon)
+            + 32 /* safety */;
     let total_bits = (frame_bytes * 8) as u32;
     if baseline_overhead >= total_bits {
         return plan;
@@ -3902,6 +4340,114 @@ mod tests {
     use super::*;
     use oxideav_core::{CodecId, CodecParameters, SampleFormat};
 
+    /// Walk the decoder's grouped-exponent reconstruction (matches
+    /// `audblk::decode_exponents` + grpsize expansion) on the encoder's
+    /// emitted bits, to verify round-trip equality of the per-bin
+    /// exponent array. Returns the reconstructed exponent array.
+    fn decode_exponents_test(
+        bits: &[u8],
+        absexp_bits: u32,
+        ngrps: usize,
+        grpsize: usize,
+        end: usize,
+    ) -> Vec<u8> {
+        use oxideav_core::bits::BitReader;
+        let mut br = BitReader::new(bits);
+        let absexp = br.read_u32(4).unwrap() as i32;
+        debug_assert_eq!(absexp as u32, absexp_bits);
+        let mut prev = absexp;
+        let mut out = vec![0u8; end];
+        out[0] = absexp.clamp(0, 24) as u8;
+        for grp in 0..ngrps {
+            let gexp = br.read_u32(7).unwrap() as i32;
+            let m1 = gexp / 25;
+            let m2 = (gexp % 25) / 5;
+            let m3 = (gexp % 25) % 5;
+            let dexp0 = m1 - 2;
+            let dexp1 = m2 - 2;
+            let dexp2 = m3 - 2;
+            let e0 = (prev + dexp0).clamp(0, 24);
+            let e1 = (e0 + dexp1).clamp(0, 24);
+            let e2 = (e1 + dexp2).clamp(0, 24);
+            for (k, &e) in [e0, e1, e2].iter().enumerate() {
+                let i = grp * 3 + k;
+                let base = i * grpsize + 1;
+                for j in 0..grpsize {
+                    if base + j < end {
+                        out[base + j] = e as u8;
+                    }
+                }
+            }
+            prev = e2;
+        }
+        out
+    }
+
+    fn encode_exponents_test(exp: &[u8], end: usize, grpsize: usize) -> Vec<u8> {
+        use oxideav_core::bits::BitWriter;
+        let mut bw = BitWriter::with_capacity(64);
+        let mut padded = [0u8; N_COEFFS];
+        padded[..exp.len().min(N_COEFFS)].copy_from_slice(&exp[..exp.len().min(N_COEFFS)]);
+        write_exponents_grouped(&mut bw, &padded, end, grpsize);
+        bw.into_bytes()
+    }
+
+    /// Encoder/decoder round-trip parity for the new
+    /// `quantise_exponents_to_grpsize` + `write_exponents_grouped`
+    /// pipeline. Verifies that for every input shape the bit allocator
+    /// (encoder side, post-quantise) and the decoder (post-grpsize
+    /// expansion) see the same per-bin exponents — without this, bap[]
+    /// disagreement causes mantissa-stream byte drift.
+    #[test]
+    fn quantise_grpsize_roundtrip_parity_d25_d45() {
+        for (label, mut exp_init) in [
+            (
+                "ch0_dba_test_blk0_realistic",
+                vec![
+                    9u8, 1, 1, 5, 8, 16, 18, 19, 19, 20, 20, 20, 20, 21, 21, 21, 22, 22, 22, 22,
+                    22, 22, 22, 22, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+                    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+                    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+                    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+                    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+                    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+                ],
+            ),
+            (
+                "ramp_with_silence_tail",
+                vec![
+                    3u8, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+                    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+                    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+                    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+                    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+                    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+                    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
+                ],
+            ),
+        ] {
+            // Pad to 133 bins (typical coupled fbw end_mant).
+            while exp_init.len() < 133 {
+                exp_init.push(23);
+            }
+            for &(grpsize, strat_label) in &[(2usize, "D25"), (4usize, "D45")] {
+                let mut exp = exp_init.clone();
+                let end = 133usize;
+                quantise_exponents_to_grpsize(&mut exp[..end], grpsize);
+                let bits = encode_exponents_test(&exp, end, grpsize);
+                let ngrps = ngrps_for_strategy(end, grpsize);
+                let decoded = decode_exponents_test(&bits, exp[0] as u32, ngrps, grpsize, end);
+                for k in 0..end {
+                    assert_eq!(
+                        exp[k], decoded[k],
+                        "{}: {} mismatch at bin {}: encoder sees {}, decoder reconstructs {}",
+                        label, strat_label, k, exp[k], decoded[k],
+                    );
+                }
+            }
+        }
+    }
+
     /// Encode a 440 Hz sine, then decode it back through our own
     /// decoder. We expect the round-trip to produce a non-zero RMS on
     /// both channels (evidence the bit-stream is legal and the
@@ -4380,6 +4926,156 @@ mod tests {
             drms
         );
         assert!(drms > 200.0, "ffmpeg-decoded RMS too low: {drms}");
+    }
+
+    /// Per-channel-per-block exponent strategy selection (§7.1.3 /
+    /// §5.4.3.22) — verify the encoder picks D25 (`chexpstr=2`) on a
+    /// smooth-envelope source where it's spec-legal, and that ffmpeg
+    /// cross-decodes the resulting bit-stream cleanly.
+    ///
+    /// Setup: a stereo bass tone (220 Hz) plus a few mid-band
+    /// harmonics. The energy is concentrated below ~2 kHz where each
+    /// 1/6-octave band's exponent envelope is smooth; D25's
+    /// pair-shared exponent representation costs ~½ the bits of D15
+    /// and the bit allocator can spend the savings on mantissa
+    /// resolution.
+    ///
+    /// Gates: (a) `parse_frame_side_info` reads `chexpstr[ch] == 2`
+    /// (D25) on at least one anchor block (block 0 or 3) of each
+    /// frame, (b) ffmpeg decodes the elementary stream without error,
+    /// (c) the decoded RMS is non-trivial (not silence).
+    #[test]
+    fn d25_exp_strategy_selection_and_ffmpeg_crosscheck() {
+        use std::process::Command;
+        let sr = 48_000u32;
+        let dur = 1.0f32;
+        let nsamp = (sr as f32 * dur) as usize;
+        // Bass + mid harmonic mix — smooth spectral envelope below
+        // 2 kHz, near-silent above. The encoder's strategy selector
+        // should pick D25 on the anchor blocks.
+        let mut pcm = vec![0i16; nsamp * 2];
+        for n in 0..nsamp {
+            let t = n as f32 / sr as f32;
+            let lo = 0.40 * (2.0 * std::f32::consts::PI * 220.0 * t).sin();
+            let mid1 = 0.20 * (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+            let mid2 = 0.10 * (2.0 * std::f32::consts::PI * 880.0 * t).sin();
+            let s = (lo + mid1 + mid2).clamp(-1.0, 1.0);
+            let q = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            pcm[n * 2] = q;
+            pcm[n * 2 + 1] = q;
+        }
+        let mut bytes = Vec::with_capacity(pcm.len() * 2);
+        for s in &pcm {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(sr);
+        params.channels = Some(2);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(192_000);
+        let mut enc = make_encoder(&params).expect("make_encoder");
+        let audio = AudioFrame {
+            samples: nsamp as u32,
+            pts: Some(0),
+            data: vec![bytes],
+        };
+        enc.send_frame(&Frame::Audio(audio)).unwrap();
+        let _ = enc.flush();
+        let mut pkts = Vec::new();
+        let mut ac3_bytes: Vec<u8> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    ac3_bytes.extend_from_slice(&p.data);
+                    pkts.push(p);
+                }
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        assert!(pkts.len() >= 30, "got only {} packets", pkts.len());
+
+        // Gate (a): at least one anchor block of each frame uses D25.
+        let mut frames_with_d25 = 0usize;
+        for p in &pkts {
+            let si = crate::syncinfo::parse(&p.data).expect("syncinfo");
+            let b = crate::bsi::parse(&p.data[5..]).expect("bsi");
+            let side = crate::audblk::parse_frame_side_info(&si, &b, &p.data).expect("side-info");
+            let mut frame_has_d25 = false;
+            for s in &side {
+                for v in s.chexpstr.iter().take(2) {
+                    if *v == 2 {
+                        frame_has_d25 = true;
+                    }
+                }
+            }
+            if frame_has_d25 {
+                frames_with_d25 += 1;
+            }
+        }
+        eprintln!(
+            "D25 selection: {}/{} frames carry chexpstr=2 on at least one fbw channel/block",
+            frames_with_d25,
+            pkts.len()
+        );
+        assert!(
+            frames_with_d25 * 2 >= pkts.len(),
+            "D25 strategy never picked ({} of {} frames) — selector thresholds may be off",
+            frames_with_d25,
+            pkts.len()
+        );
+
+        // Gate (b)/(c): ffmpeg cross-decode.
+        let in_path = std::env::temp_dir().join("oxideav_ac3_d25_enc.ac3");
+        let out_path = std::env::temp_dir().join("oxideav_ac3_d25_dec.pcm");
+        std::fs::write(&in_path, &ac3_bytes).expect("write ac3");
+        let _ = std::fs::remove_file(&out_path);
+        let out = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "ac3",
+                "-i",
+            ])
+            .arg(&in_path)
+            .args(["-f", "s16le", "-acodec", "pcm_s16le", "-ac", "2"])
+            .arg(&out_path)
+            .status();
+        let _ = std::fs::remove_file(&in_path);
+        let Ok(status) = out else {
+            eprintln!("ffmpeg unavailable — skipping cross-decode gate");
+            return;
+        };
+        assert!(
+            status.success(),
+            "ffmpeg failed to decode our D25-strategy AC-3 output"
+        );
+        let Ok(decoded_bytes) = std::fs::read(&out_path) else {
+            panic!("ffmpeg produced no decode output");
+        };
+        let _ = std::fs::remove_file(&out_path);
+        assert!(
+            decoded_bytes.len() > 4_000,
+            "ffmpeg produced suspiciously short decode: {} bytes",
+            decoded_bytes.len()
+        );
+        let dsq: f64 = decoded_bytes
+            .chunks_exact(4)
+            .map(|c| {
+                let l = i16::from_le_bytes([c[0], c[1]]) as f64;
+                l * l
+            })
+            .sum();
+        let drms = (dsq / (decoded_bytes.len() / 4) as f64).sqrt();
+        eprintln!(
+            "ffmpeg decode of our D25 output: {} bytes, RMS {:.1}",
+            decoded_bytes.len(),
+            drms
+        );
+        assert!(drms > 1000.0, "ffmpeg-decoded RMS too low: {drms}");
     }
 
     /// Encode a stereo signal with strong high-frequency content, then

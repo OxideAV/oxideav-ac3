@@ -721,11 +721,20 @@ pub(crate) fn parse_audblk_into(
                 3 => 4,
                 _ => 1,
             };
-            let nchgrps = match chexpstr[ch] {
-                1 => (end - 1) / 3,
-                2 => (end - 1 + 3) / 6,
-                3 => (end - 1 + 9) / 12,
-                _ => 0,
+            // Guard against `end == 0` (rare: a fully-coupled channel
+            // whose cpl_begf_mant lands at 0 has no independent
+            // exponents). Without this guard the `(end - 1) / k` term
+            // would underflow under debug arithmetic and panic the
+            // decoder mid-frame.
+            let nchgrps = if end == 0 {
+                0usize
+            } else {
+                match chexpstr[ch] {
+                    1 => (end - 1) / 3,
+                    2 => (end - 1 + 3) / 6,
+                    3 => (end - 1 + 9) / 12,
+                    _ => 0,
+                }
             };
             let mut raw_exp = vec![0i32; nchgrps * 3];
             decode_exponents(br, absexp, nchgrps, chexpstr[ch] as usize, &mut raw_exp)?;

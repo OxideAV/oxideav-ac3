@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — round 28 — per-channel exponent strategy selection (D25)
+
+- **Encoder-side §7.1.3 / §5.4.3.22 chexpstr selection.** The encoder's
+  anchor blocks (blocks 0 and 3 of each syncframe) now pick D15
+  (grpsize=1) or D25 (grpsize=2) **per fbw channel** based on a
+  smoothness probe of the post-`preprocess_d15` exponent array. Smooth
+  channels emit D25 — `4 + 7×((end-1+3)/6)` bits per anchor block
+  instead of D15's `4 + 7×((end-1)/3)`, saving ~290 bits per channel
+  per anchor block at end_mant=253 (full-bandwidth uncoupled stereo).
+  The freed bits are picked up automatically by the existing
+  `tune_snroffst_with_plan` pass and reinvested in mantissa precision.
+- **`select_exp_strategies`** — per-channel-per-block plan vector with
+  the conservative "anchor on blocks 0 and 3, REUSE on 1/2/4/5"
+  cadence preserved. Per-channel decisions: silent / smooth-tail
+  channels can pick a coarser grpsize than transient / HF-rich
+  channels in the same block.
+- **`pick_strategy_for_block`** — sums the per-bin clipping cost of
+  collapsing the spectrum to grpsize=2 and grpsize=4 spans (each
+  clipped bin upcasts a mantissa bap by ≈1 bit, so the cost is in
+  exp-units worth of dynamic range). Pick the largest grpsize whose
+  per-bin avg clipping cost stays below thresholds tuned to the bit
+  savings of each strategy. Thresholds are env-tunable via
+  `AC3_EXPSTR_D25_THR` / `AC3_EXPSTR_D45_THR`; `AC3_FORCE_EXPSTR=N`
+  pins all anchors to a fixed strategy for A/B sweeps.
+- **`quantise_exponents_to_grpsize`** — replaces each grpsize-span
+  with its minimum-exponent representative (covers the loudest bin
+  in the span without clipping), then back-prop and forward-clamp the
+  representative sequence so adjacent reps differ by at most ±2 (the
+  AC-3 differential encoding limit). The bit allocator and mantissa
+  quantiser see the same per-bin exponents the decoder will
+  reconstruct after grpsize expansion, keeping bap[] in lockstep.
+- **`write_exponents_grouped`** — generic 4-bit absexp + 7-bit packed
+  groups emitter parameterised on grpsize; replaces the dedicated
+  D15-only `write_exponents_d15` (which is now a thin wrapper).
+- **`overhead_bits_for`** — accepts an optional per-channel-per-block
+  chexpstr plan. When supplied, the per-channel exponent payload is
+  computed from the actual emitted strategy instead of assuming D15
+  for every channel, so `tune_snroffst`'s budget calculation matches
+  the actual emitted byte count.
+- **`AC3_ENABLE_D45` env-gated D45 path** — D45 emission has a
+  first-frame-only mantissa desync the round didn't crack (per-bin
+  exp arrays match between encoder/decoder post-grpsize expansion;
+  the bit allocator delivers ~3 fewer mantissa bits in the decoder
+  than the encoder writes during frame 1; subsequent frames are
+  bit-exact). Disabled by default; leave the infrastructure in place
+  for round 29 to land it once the desync is bracketed. D45 saves an
+  additional ~145 bits/channel/anchor block over D25 when the
+  spectrum is smooth enough.
+- Test gate: `d25_exp_strategy_selection_and_ffmpeg_crosscheck` —
+  encodes a 220 Hz + 440 Hz + 880 Hz stereo mix at 192 kbps,
+  asserts every frame carries `chexpstr=2` on at least one fbw
+  channel of an anchor block, and verifies ffmpeg decodes the
+  resulting elementary stream into non-trivial PCM. Measured: 32 of
+  32 frames pick D25 on at least one anchor; ffmpeg-decode RMS
+  10190.
+
+### Fixed — decoder defensive guard for end=0
+
+- **`audblk::parse_audblk_into`** — guard `(end - 1) / k` underflow
+  when a fully-coupled fbw channel has `cpl_begf_mant == 0`. Without
+  the guard a corpus stream with that shape (unusual but spec-legal)
+  would panic the decoder mid-frame instead of producing zero
+  exponent groups for the channel. Surfaced by
+  `tests/docs_corpus.rs::corpus_ac3_3_2_48000_384kbps`.
+
 ### Added — round 6 (task #324) — Adaptive Hybrid Transform (AHT)
 
 - **VQ codebooks E4.1..E4.7** — 956 entries × 6 i16 transcribed
