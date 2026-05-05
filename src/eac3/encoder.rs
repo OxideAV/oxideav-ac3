@@ -669,14 +669,44 @@ impl Eac3Encoder {
                 bw.write_u32(0, 1); // cplstre[blk] = 0
             }
         }
-        // expstre==1 → per-block per-channel chexpstr (and per-block
-        // lfeexpstr) live in audblk(), NOT audfrm. Round 2 fix: round
-        // 1 over-emitted these bits in audfrm.
-        // strmtyp == 0x0 ⇒ convexpstre. With numblkscod==0x3 this is
-        // implicit = 1 → emit per-channel convexpstr (5 bits each).
+        // §E.1.2.3 / Table E1.3 — exponent strategy data.
+        //
+        // When `expstre == 1`, the per-block per-channel `chexpstr`
+        // codes (2 bits each) AND any per-block `cplexpstr` (when
+        // coupling is in use) live HERE in audfrm — NOT in audblk.
+        // The previous "round 2 fix" inverted this: it moved the bits
+        // into audblk because the spec text for §E.2.3.2.1 (`expstre`)
+        // says "the fields for the full exponent strategy shall be
+        // present in each audio block" — but Table E1.3 makes clear
+        // those fields are still emitted in audfrm, just indexed by
+        // block. ffmpeg's parser consumes them in audfrm and rejects
+        // any frame that doesn't supply them, surfacing as the
+        // "new bit allocation info must be present in block 0" /
+        // "delta bit allocation strategy reserved" / "error in bit
+        // allocation" cascade once the parser misaligns.
+        //
+        // Coupling: cplinu==0 for every block of every substream we
+        // emit, so the `if (cplinu[blk] == 1) {cplexpstr[blk]}` branch
+        // never fires. We only emit per-channel chexpstr.
+        for blk in 0..BLOCKS_PER_FRAME {
+            for _ch in 0..nfchans {
+                bw.write_u32(exp_strategies[blk] as u32, 2);
+            }
+        }
+        // §E.1.2.3 — `lfeexpstr[blk]` (1 bit) per block when lfeon,
+        // OUTSIDE the `if (expstre)` gate (always present when LFE is
+        // on, regardless of expstre).
+        if sub.lfeon {
+            for blk in 0..BLOCKS_PER_FRAME {
+                bw.write_u32(exp_strategies[blk] as u32, 1);
+            }
+        }
+        // §E.1.2.3 — converter exponent strategy data. strmtyp == 0x0
+        // (independent substream) and numblkscod == 0x3 ⇒ convexpstre
+        // implicit = 1, followed by per-channel convexpstr (5 bits each).
         if sub.strmtyp == 0 {
             for _ in 0..nfchans {
-                bw.write_u32(0, 5); // convexpstr = 0 (REUSE)
+                bw.write_u32(0, 5); // convexpstr = 0 (REUSE codeword)
             }
         }
         // ahte == 0 ⇒ no AHT block.
@@ -720,29 +750,36 @@ impl Eac3Encoder {
             }
 
             let exp_strategy = exp_strategies[blk];
-            // §E.1.3.4 — per-block per-channel chexpstr (2 bits each)
-            // when expstre == 1. Always emitted (encoder forces
-            // expstre = 1).
-            for _ in 0..nfchans {
-                bw.write_u32(exp_strategy as u32, 2);
-            }
-            // LFE strategy — 1 bit when lfeon.
-            if sub.lfeon {
-                bw.write_u32(exp_strategy as u32, 1);
-            }
+            // §E.1.2.4 / Table E1.4 — `chexpstr[blk][ch]` and
+            // `lfeexpstr[blk]` were already emitted in audfrm above.
+            // audblk only carries the **bandwidth code + exponent
+            // payload** that follows from those strategies, gated by
+            // the `chexpstr[blk][ch] != reuse` test.
+            //
+            // §E.1.2.4 chbwcod[ch] — 6 bits per fbw channel whose
+            // strategy this block is non-REUSE AND that channel is
+            // neither in coupling nor in spectral extension. Our
+            // encoder runs cplinu=0 + spxinu=0 so the chincpl /
+            // chinspx checks both pass.
             if exp_strategy != 0 {
                 for _ in 0..nfchans {
                     bw.write_u32(chbwcod as u32, 6);
                 }
             }
+            // §E.1.2.4 fbw exponents (cplexps section is skipped:
+            // cplinu=0). After each channel's grouped exponents, the
+            // spec emits `gainrng[ch]` (2 bits) — same as base AC-3
+            // §5.4.2.20. The previous "round 2 fix" comment claimed
+            // Annex E dropped gainrng but Table E1.4 lists it
+            // explicitly inside the per-channel exponent block.
             if exp_strategy == 1 {
                 for ch in 0..nfchans {
                     write_exponents_d15(&mut bw, &exps[ch][blk], ch_end_mant);
-                    // E-AC-3 audblk does NOT emit gainrng (base-AC-3
-                    // §5.4.3 carries it; Annex E §E.1.3.4 dropped it).
+                    bw.write_u32(0, 2); // gainrng[ch] = 0
                 }
             }
-            // LFE exponents — D15 only, no chbwcod (LFE has fixed bw).
+            // LFE exponents — D15 only, no chbwcod (LFE has fixed bw),
+            // and no gainrng (only fbw channels carry gainrng).
             if sub.lfeon && exp_strategy == 1 {
                 write_exponents_d15(&mut bw, &exps[lfe_idx_in_exps][blk], LFE_END_MANT);
             }
@@ -760,12 +797,17 @@ impl Eac3Encoder {
             // §E.1.3.5.4 frmfgaincode==1 ⇒ per-block `fgaincode` flag.
             bw.write_u32(0, 1); // fgaincode = 0 (no per-channel override)
 
-            // §E.1.3.5.5 — convsnroffste lives inside `if (snroffste)`,
-            // which is only emitted when snroffststr != 0. With our
-            // encoder forcing snroffststr == 0 there is NO snroffst
-            // field in audblk; the previous `bw.write_u32(0, 1)` here
-            // emitted a stray bit that the spec doesn't define. Round
-            // 2 fix.
+            // §E.1.2.4 convsnroffste — UNCONDITIONAL when strmtyp == 0
+            // (independent substream). Per Table E1.4 line 7965, this
+            // sits between the fgaincode block and the cplleak block,
+            // gated only by `if (strmtyp == 0x0)` — NOT inside the
+            // `if (snroffste)` branch as the previous comment claimed.
+            // We never emit `convsnroffst`, so write the gating bit at
+            // 0.
+            if sub.strmtyp == 0 {
+                bw.write_u32(0, 1); // convsnroffste = 0
+            }
+            // cplleak block skipped: cplinu=0 for every block.
 
             let any_fbw_dba = (0..nfchans).any(|c| dba_plan.nseg[c] > 0);
             if blk == 0 && any_fbw_dba {

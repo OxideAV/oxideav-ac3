@@ -78,8 +78,15 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       only indep substream 0 — extended decoders that honour the
       chanmap field reassemble all 8 channels. 6 blocks per
       syncframe (`numblkscod=3`), no coupling, no spectral
-      extension, no Adaptive Hybrid Transform. Cross-decodes
-      cleanly through ffmpeg. Codec id = `"eac3"`.
+      extension, no Adaptive Hybrid Transform. Task #467 corrected
+      the audfrm-vs-audblk placement of `chexpstr[blk][ch]` /
+      `cplexpstr[blk]` / `lfeexpstr[blk]` (audfrm per ETSI §E.1.2.3
+      / Table E.1.3, gated by `expstre`), restored the per-channel
+      `gainrng` (2 bits) emit in audblk, and added the unconditional
+      `convsnroffste` bit when `strmtyp == 0` — ffmpeg now decodes
+      every output cleanly at PSNR **20.21 dB** (mono 96k / stereo
+      192k) and reconstructs the full 8-channel program for the 7.1
+      indep+dep pair. Codec id = `"eac3"`.
 - [x] E-AC-3 decoder — **round 1** (task #285): full BSI parser
       (Table E1.2) covering strmtyp / substreamid / frmsiz / fscod
       / fscod2 / numblkscod / acmod / lfeon / bsid / dialnorm /

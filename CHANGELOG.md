@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — task #467 — E-AC-3 audfrm vs audblk exponent strategy bit placement
+
+- **`chexpstr[blk][ch]`, `cplexpstr[blk]`, and `lfeexpstr[blk]` now live in
+  `audfrm()` per ETSI TS 102 366 V1.4.1 §E.1.2.3 / Table E.1.3 (= ATSC
+  A/52:2018 Annex E Table E1.3).** Earlier rounds put these per-block
+  strategy codes inside `audblk()` (with a "round 2 fix" comment doubling
+  down on the inversion). The spec text in §E.1.3.2.1 — "If the expstre
+  bit is set to '1', the fields that carry the full exponent strategy
+  syntax shall be present in **each audio block**" — refers to the
+  per-block-indexed fields enumerated by the syntax table; those fields
+  LIVE in audfrm, indexed by `[blk]`. Audblk (Table E.1.4) does NOT
+  re-emit chexpstr/cplexpstr/lfeexpstr; it merely consumes them as state
+  via `if(chexpstr[blk][ch] != reuse) {chbwcod[ch]; ...}` gates.
+  ffmpeg follows the table verbatim; our streams misaligned by 12 bits
+  per block (2 × nfchans), surfacing as the cascade
+  `new bit allocation info must be present in block 0`,
+  `delta bit allocation strategy reserved`, `error in bit allocation`.
+- **`lfeexpstr[blk]` is now emitted unconditionally of `expstre`.** The
+  `if(lfeon)` lfeexpstr loop sits OUTSIDE the `if(expstre)` branch in
+  Table E.1.3. Previously we only emitted it when `expstre == 0`, which
+  silently dropped 6 bits per LFE-on substream per syncframe.
+- **`gainrng[ch]` (2 bits) restored after each per-channel exponent
+  payload in audblk.** Table E.1.4 line: `gainrng[ch] 2`, immediately
+  after the `nchgrps[ch]` group emit. The earlier "Annex E dropped
+  gainrng" comment was wrong; gainrng is per-fbw-channel-only (LFE has
+  no gainrng) and the bit MUST be consumed or every subsequent field
+  in the audblk slides by 2 bits per non-REUSE channel.
+- **`convsnroffste` (1 bit) emitted by encoder when `strmtyp == 0`.**
+  Per Table E.1.4, the `if(strmtyp == 0x0) { convsnroffste; if(set)
+  convsnroffst(10) }` block sits between fgaincode and cplleak,
+  UNCONDITIONAL on snroffste. The encoder previously skipped it
+  entirely; the dsp parser was already reading it (round 5 fix), so
+  the asymmetry desync'd the wire stream.
+- **Audfrm parser** now reads per-block per-channel `chexpstr` and
+  per-block `cplexpstr` when `expstre==1`, and the per-block
+  `lfeexpstr` array unconditionally of expstre. Two new fields on
+  `AudFrm`: `chexpstr_blk_ch[6][5]` and `cplexpstr_blk[6]`. The
+  test `parses_minimal_indep_stereo_audfrm` was updated to pack the
+  6×2 chexpstr bits in the right slot.
+- **Dsp module** now looks up chexpstr/cplexpstr/lfeexpstr from the
+  parsed audfrm instead of re-reading them from the audblk byte
+  stream. Added `let _gainrng = br.read_u32(2)?` after each per-channel
+  exponent decode to consume the now-emitted bit.
+- **Verification:** all three pre-existing E-AC-3 ffmpeg cross-decode
+  tests pass: `eac3_stereo_192k_decodes_through_ffmpeg` →
+  PSNR **20.21 dB** (above the 18 dB floor); `eac3_mono_96k_decodes_through_ffmpeg`
+  → PSNR **20.21 dB**; `eac3_71_pair_decodes_through_ffmpeg` → ffmpeg
+  reconstructs the full 8-channel program (chanmap honored) with
+  L-energy 2844 across 49 152 samples. Full test run: 98 passed,
+  0 failed across the lib + 5 integration suites.
+
 ### Fixed — round 29 — D45 grpsize=4 anchor blocks now bit-exact
 
 - **`build_dba_plan` — clamp `hi_band` to 32 (was 45).** The DBA segment

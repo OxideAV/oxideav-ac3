@@ -87,8 +87,24 @@ pub struct AudFrm {
     /// 5 bits each). 0xFF when not applicable.
     pub frmchexpstr: [u8; MAX_FBW],
     /// `lfeexpstr[blk]` — LFE exponent strategy per block (1 bit each).
-    /// Only valid when `lfeon == true`.
+    /// Only valid when `lfeon == true`. Per Table E.1.3 / §E.1.2.3 the
+    /// LFE per-block strategy is emitted in audfrm UNCONDITIONALLY of
+    /// `expstre` (the `if(lfeon)` block sits OUTSIDE the
+    /// `if(expstre)` branch).
     pub lfeexpstr: [u8; MAX_BLOCKS_PER_FRAME],
+    /// Per-block per-channel exponent strategy code (`chexpstr[blk][ch]`,
+    /// 2 bits each). Populated when `expstre == 1` (the per-block path,
+    /// which is what every reasonable encoder picks). Each value is
+    /// the AC-3 strategy code: 0 = REUSE, 1 = D15, 2 = D25, 3 = D45.
+    /// When `expstre == 0`, this field stays zeroed and the audblk
+    /// path must derive per-block strategies from `frmchexpstr` via
+    /// Table E2.10.
+    pub chexpstr_blk_ch: [[u8; MAX_FBW]; MAX_BLOCKS_PER_FRAME],
+    /// Per-block coupling-channel exponent strategy code
+    /// (`cplexpstr[blk]`, 2 bits each), populated when `expstre == 1`
+    /// AND `cplinu[blk] == 1` for that block. 0 = REUSE, 1 = D15,
+    /// 2 = D25, 3 = D45.
+    pub cplexpstr_blk: [u8; MAX_BLOCKS_PER_FRAME],
     /// Frame-level coarse SNR offset (`frmcsnroffst`, 6 bits). Only
     /// when `snroffststr == 0`.
     pub frmcsnroffst: u8,
@@ -154,6 +170,8 @@ impl AudFrm {
             frmcplexpstr: 0xFF,
             frmchexpstr: [0xFF; MAX_FBW],
             lfeexpstr: [0; MAX_BLOCKS_PER_FRAME],
+            chexpstr_blk_ch: [[0; MAX_FBW]; MAX_BLOCKS_PER_FRAME],
+            cplexpstr_blk: [0; MAX_BLOCKS_PER_FRAME],
             frmcsnroffst: 0,
             frmfsnroffst: 0,
             bits_consumed: 0,
@@ -246,34 +264,59 @@ pub fn parse_with(br: &mut BitReader<'_>, bsi: &Bsi) -> Result<AudFrm> {
 
     // ---- exponent strategy data ----
     //
-    // §E.1.2.2 / Table E1.3 — when expstre == 1, per-block per-channel
-    // strategy codes live in **audblk()**, NOT audfrm. We consume
-    // exactly zero bits from audfrm in that branch.
+    // §E.1.2.3 / Table E.1.3 (ETSI TS 102 366 V1.4.1):
     //
-    // When expstre == 0 (frame-level strategies), audfrm carries the
-    // 5-bit `frmcplexpstr` (only if coupling is in use somewhere) +
-    // 5-bit `frmchexpstr[ch]` per fbw channel. The 5-bit codeword
-    // expands per Table E2.10 to a 6-block strategy run via the
-    // chexpstr_run table.
+    //   if(expstre) {
+    //       for(blk = 0..6) {
+    //           if(cplinu[blk] == 1) cplexpstr[blk]   2 bits
+    //           for(ch = 0..nfchans) chexpstr[blk][ch] 2 bits
+    //       }
+    //   } else {
+    //       if((acmod>1) && (ncplblks>0)) frmcplexpstr 5 bits
+    //       for(ch = 0..nfchans) frmchexpstr[ch]      5 bits
+    //   }
+    //   if(lfeon) {
+    //       for(blk = 0..6) lfeexpstr[blk]            1 bit each
+    //   }
     //
-    // `lfeexpstr[blk]` — same rule: when expstre == 1, lfe strategies
-    // live per-block in audblk(); they only appear in audfrm when
-    // expstre == 0 (one bit per block). The previous round-1 parser
-    // unconditionally walked these bits — which over-consumed the
-    // audfrm by 12 + lfe×6 bits whenever expstre==1, sliding every
-    // subsequent field (frmcsnroffst, dba, skip, audblk header) into
-    // the wrong bit slots. Round 2 corrects this.
-    if !a.expstre {
+    // The `if(lfeon)` block sits OUTSIDE the `if(expstre)` branch —
+    // per-block lfeexpstr is emitted unconditionally of expstre.
+    //
+    // ETSI §E.1.3.2.1 / ATSC §E.2.3.2.1 text: "If the expstre bit is
+    // set to '1', the fields that carry the full exponent strategy
+    // syntax shall be present in **each audio block**." This wording
+    // refers to the per-block-indexed fields enumerated by the
+    // syntax table — they LIVE in audfrm, indexed by `[blk]`. Audblk
+    // (Table E.1.4) does NOT re-emit chexpstr/cplexpstr/lfeexpstr; it
+    // merely consumes them as state via gates like
+    // `if(chexpstr[blk][ch] != reuse) {chbwcod[ch]; ...}`.
+    //
+    // Earlier rounds inverted this — moving the bits into audblk —
+    // and the round-2 comment doubled down. ffmpeg follows the table
+    // verbatim and rejects every frame our encoder emitted, surfacing
+    // as the cascade "new bit allocation info must be present in
+    // block 0" / "delta bit allocation strategy reserved" / "error in
+    // bit allocation".
+    if a.expstre {
+        for blk in 0..num_blocks {
+            if a.cplinu_blk[blk] {
+                a.cplexpstr_blk[blk] = br.read_u32(2)? as u8;
+            }
+            for ch in 0..nfchans {
+                a.chexpstr_blk_ch[blk][ch] = br.read_u32(2)? as u8;
+            }
+        }
+    } else {
         if bsi.acmod > 0x1 && ncplblks > 0 {
             a.frmcplexpstr = br.read_u32(5)? as u8;
         }
         for ch in 0..nfchans {
             a.frmchexpstr[ch] = br.read_u32(5)? as u8;
         }
-        if lfeon {
-            for blk in 0..num_blocks {
-                a.lfeexpstr[blk] = br.read_u32(1)? as u8;
-            }
+    }
+    if lfeon {
+        for blk in 0..num_blocks {
+            a.lfeexpstr[blk] = br.read_u32(1)? as u8;
         }
     }
 
@@ -524,9 +567,13 @@ mod tests {
         for _ in 1..6 {
             bits.push((1, 0)); // cplstre[blk] = 0
         }
-        // expstre==1 → per-block per-channel chexpstr lives in audblk(),
-        // not audfrm. (Round-2 bug fix: round 1 over-consumed 24 bits
-        // here.)
+        // expstre==1 + cplinu[blk]=0 for every block → per-block
+        // per-channel chexpstr (2 bits each) for 6 blocks × 2 channels
+        // = 24 bits live HERE in audfrm (Table E.1.3 / §E.1.2.3).
+        // No cplexpstr (no coupling). No lfeexpstr (lfeon=false).
+        for _ in 0..(6 * 2) {
+            bits.push((2, 0)); // chexpstr[blk][ch] = REUSE
+        }
         // strmtyp == 0 + numblkscod == 0x3 → convexpstre implicit = 1,
         // followed by per-channel convexpstr (5 bits each).
         for _ in 0..2 {

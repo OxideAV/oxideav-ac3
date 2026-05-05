@@ -118,7 +118,15 @@
 //! [`oxideav_core::Error::Unsupported`] and the caller (the decoder
 //! in [`super::decoder`]) falls back to silent emit for that frame.
 //!
-//! ## Bit syntax — Table E1.4 (audblk()) verbatim, simplified
+//! ## Bit syntax — Table E.1.4 (audblk()) verbatim, simplified
+//!
+//! Per ETSI TS 102 366 V1.4.1 §E.1.2.4 / ATSC A/52:2018 Table E1.4 the
+//! per-block-per-channel `chexpstr`, per-block `cplexpstr`, and
+//! per-block `lfeexpstr` strategy codes are emitted in **audfrm**
+//! (Table E.1.3, gated by `expstre`), NOT in audblk. Audblk merely
+//! consumes them as state via the `chexpstr[blk][ch] != reuse` /
+//! `cplexpstr[blk] != reuse` / `lfeexpstr[blk] != reuse` gates that
+//! decide whether the bandwidth code + exponent payload follow.
 //!
 //! ```text
 //!   if (blkswe)   for (ch=0..nfchans) blksw[ch]    1
@@ -129,20 +137,23 @@
 //!     dynrng2e                                       1
 //!     if (dynrng2e) dynrng2                          8
 //!   }
-//!   if (cplstre[blk])      cplinu[blk]               (parsed in audfrm)
-//!   /* coupling block — skipped: cplinu = 0 */
+//!   if (blk == 0) spxstre = 1
+//!   else          spxstre                            1
+//!   if (spxstre)  spxinu (+ spx fields when set)     1+
+//!   if (cplstre[blk])  ... coupling strategy fields ...   (cplstre/cplinu in audfrm)
+//!   if (cplinu[blk])   ... coupling coordinates ...
 //!   if (acmod==2) {
-//!     rematstr                                       1
-//!     if (rematstr) rematflg[0..n]                   1 each
+//!     if (blk == 0) rematstr = 1                       (implicit)
+//!     else          rematstr                          1
+//!     if (rematstr) rematflg[0..n]                    1 each
 //!   }
-//!   /* exponent strategies */
-//!   if (cplinu[blk]) cplexpstr                       2
-//!   for (ch=0..nfchans) chexpstr[ch]                 2  (when expstre==1)
-//!   if (lfeon)        lfeexpstr                      1
+//!   /* §E.1.2.4 chbwcod — gated by audfrm-supplied chexpstr */
+//!   for (ch) if (chexpstr[blk][ch] != reuse && !chincpl && !chinspx)
+//!                       chbwcod[ch]                  6
 //!   /* exponents */
-//!   if (cplinu[blk] && cplexpstr!=0) — coupling exponents
-//!   for (ch) if (chexpstr[ch]!=0)    — chbwcod[ch] (6) + grouped exponents
-//!   if (lfeon && lfeexpstr!=0)        — LFE exponents
+//!   if (cplinu[blk] && cplexpstr[blk] != reuse) — coupling exponents (cplabsexp + groups)
+//!   for (ch) if (chexpstr[blk][ch] != reuse)    — exps[ch][0] + groups + gainrng[ch] (2)
+//!   if (lfeon && lfeexpstr[blk] != reuse)       — LFE exponents (no gainrng)
 //!   /* bit-allocation parametric */
 //!   if (bamode) {
 //!     baie                                            1
@@ -150,7 +161,9 @@
 //!   }
 //!   if (snroffststr==0) — uses frame-level (csnroffst, fsnroffst).
 //!   else                — per-block snroffste etc. (NOT IN ROUND 2)
-//!   if (frmfgaincode)   — fgaincode per block. (We treat as no extra bits.)
+//!   if (frmfgaincode)   — fgaincode (1 bit) per block, then 3 bits per channel if set.
+//!   if (strmtyp == 0)   — convsnroffste (1 bit) [+10-bit convsnroffst when set]
+//!   if (cplinu[blk]) — cplleak block (cplleake + cplfleak/cplsleak).
 //!   /* dba */
 //!   if (dbaflde) {
 //!     deltbaie                                        1
@@ -537,22 +550,23 @@ pub fn decode_indep_audblks(
             }
         }
 
-        // ---- §E.1.3.4 exponent strategy ----
-        // Round 2 requires expstre == 1 (per-block strategies live here).
-        // Round 5 adds cplexpstr (2 bits) when cplinu[blk]; chexpstr
-        // per fbw channel (2 bits each); lfeexpstr (1 bit) when lfeon.
-        let mut cplexpstr = 0u8;
-        if cplinu {
-            cplexpstr = br.read_u32(2)? as u8;
-        }
+        // ---- §E.1.2.4 exponent strategy lookup ----
+        //
+        // §E.1.2.3 / Table E.1.3 emit `chexpstr[blk][ch]` (2 bits),
+        // `cplexpstr[blk]` (2 bits when cplinu[blk]), and per-block
+        // `lfeexpstr[blk]` (1 bit, when lfeon) IN audfrm — NOT in
+        // audblk. The audblk only carries the bandwidth code +
+        // exponent payload that those strategies gate. Round-29.5
+        // moves the strategy reads back to where the spec puts them
+        // (audfrm); audblk just looks them up.
+        let cplexpstr = if cplinu {
+            audfrm.cplexpstr_blk[blk]
+        } else {
+            0u8
+        };
         let mut chexpstr = [0u8; MAX_FBW];
-        for ch in 0..nfchans {
-            chexpstr[ch] = br.read_u32(2)? as u8;
-        }
-        let mut lfeexpstr = 0u8;
-        if lfeon {
-            lfeexpstr = br.read_u32(1)? as u8;
-        }
+        chexpstr[..nfchans].copy_from_slice(&audfrm.chexpstr_blk_ch[blk][..nfchans]);
+        let lfeexpstr = if lfeon { audfrm.lfeexpstr[blk] } else { 0u8 };
 
         // §E.1.3.4.5 chbwcod — only when chexpstr != REUSE AND the
         // channel is not in coupling AND not in spectral extension
@@ -643,8 +657,16 @@ pub fn decode_indep_audblks(
                         }
                     }
                 }
-                // E-AC-3 audblk does NOT carry gainrng (that field is
-                // base-AC-3 only). Skip.
+                // §E.1.2.4 / Table E.1.4 — `gainrng[ch]` (2 bits)
+                // immediately after the per-channel exponent payload.
+                // We don't currently use it in the DSP path (the round-2
+                // bit-allocation reuses base-AC-3 sgain logic that
+                // doesn't consult gainrng), but the bit MUST be
+                // consumed or every subsequent field slides. The
+                // earlier "Annex E dropped gainrng" comment was wrong;
+                // Table E.1.4 emits it for every fbw channel whose
+                // strategy this block is non-REUSE.
+                let _gainrng = br.read_u32(2)?;
             } else if blk == 0 {
                 return Err(Error::invalid(
                     "eac3 audblk: chexpstr == 0 in block 0 (no prior exponents to reuse)",
