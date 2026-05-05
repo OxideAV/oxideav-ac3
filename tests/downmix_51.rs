@@ -36,7 +36,7 @@ fn decode_ac3_fully(data: &[u8], target_channels: Option<u16>) -> (u16, Vec<i16>
     oxideav_ac3::register_codecs(&mut reg);
     let mut params = CodecParameters::audio(CodecId::new("ac3"));
     params.channels = target_channels;
-    let mut dec = reg.make_decoder(&params).expect("make_decoder");
+    let mut dec = reg.first_decoder(&params).expect("make_decoder");
 
     let mut offset = 0;
     let mut pcm: Vec<i16> = Vec::new();

@@ -39,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut reg = CodecRegistry::new();
     oxideav_ac3::register_codecs(&mut reg);
     let params = CodecParameters::audio(CodecId::new("ac3"));
-    let mut dec = reg.make_decoder(&params).expect("make_decoder");
+    let mut dec = reg.first_decoder(&params).expect("make_decoder");
     let mut our_pcm: Vec<u8> = Vec::new();
     let mut offset = 0;
     let mut frame_idx: i64 = 0;

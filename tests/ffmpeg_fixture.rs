@@ -57,7 +57,7 @@ fn decoder_produces_frames_of_correct_shape() {
     let mut reg = CodecRegistry::new();
     oxideav_ac3::register_codecs(&mut reg);
     let params = CodecParameters::audio(CodecId::new("ac3"));
-    let mut dec = reg.make_decoder(&params).expect("make_decoder");
+    let mut dec = reg.first_decoder(&params).expect("make_decoder");
 
     let mut offset = 0;
     let mut produced = 0;
@@ -162,7 +162,7 @@ fn decoder_sine_fixture_has_nonzero_rms() {
     let mut reg = CodecRegistry::new();
     oxideav_ac3::register_codecs(&mut reg);
     let params = CodecParameters::audio(CodecId::new("ac3"));
-    let mut dec = reg.make_decoder(&params).expect("make_decoder");
+    let mut dec = reg.first_decoder(&params).expect("make_decoder");
 
     let mut offset = 0;
     let mut frame_idx = 0i64;
@@ -261,7 +261,7 @@ fn decoder_matches_ffmpeg_within_psnr_floor() {
     let mut reg = CodecRegistry::new();
     oxideav_ac3::register_codecs(&mut reg);
     let params = CodecParameters::audio(CodecId::new("ac3"));
-    let mut dec = reg.make_decoder(&params).expect("make_decoder");
+    let mut dec = reg.first_decoder(&params).expect("make_decoder");
     let mut our_pcm: Vec<u8> = Vec::with_capacity(ref_pcm.len());
     let mut offset = 0;
     let mut frame_idx: i64 = 0;
@@ -438,7 +438,7 @@ fn decoder_matches_ffmpeg_on_transient_fixture() {
     let mut reg = CodecRegistry::new();
     oxideav_ac3::register_codecs(&mut reg);
     let params = CodecParameters::audio(CodecId::new("ac3"));
-    let mut dec = reg.make_decoder(&params).expect("make_decoder");
+    let mut dec = reg.first_decoder(&params).expect("make_decoder");
     let mut our_pcm: Vec<u8> = Vec::with_capacity(ref_pcm.len());
     let mut offset = 0;
     let mut frame_idx: i64 = 0;

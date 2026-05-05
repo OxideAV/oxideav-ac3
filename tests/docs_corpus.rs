@@ -325,7 +325,7 @@ fn decode_stream(input: &[u8]) -> DecodedPcm {
     let mut reg = CodecRegistry::new();
     oxideav_ac3::register_codecs(&mut reg);
     let params = CodecParameters::audio(CodecId::new("ac3"));
-    let mut dec: Box<dyn Decoder> = match reg.make_decoder(&params) {
+    let mut dec: Box<dyn Decoder> = match reg.first_decoder(&params) {
         Ok(d) => d,
         Err(e) => {
             return DecodedPcm {
