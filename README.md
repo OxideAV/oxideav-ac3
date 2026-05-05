@@ -24,11 +24,18 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       on HF-rich 5.1 content the multichannel cpl path lifts the
       average self-decode PSNR by **+3.12 dB** over the no-coupling
       baseline at matched bitstream size (round 25 / task #155).
-- [x] Delta bit allocation (§7.2.2.6) — encoder + decoder
+- [x] Delta bit allocation (§7.2.2.6) — encoder + decoder, with
+      tonal-vs-noise psy classification (round 30): `band_is_tonal` measures
+      exponent spread (min vs. mean) per band across 6 blocks; DBA band
+      picker steers toward spectrally flat (noise-like) bands, avoiding
+      bands containing a dominant tone where raising the mask costs quality
 - [x] Multichannel encode — 1/0, 2/0, 3/0, 2/2, 3/2, and 3/2 + LFE
       (the canonical 5.1 layout: L,C,R,Ls,Rs,LFE) with per-acmod BSI
       emission, LFE exponent + bap + mantissa pipeline (§5.4.3.23
-      / §5.4.3.29 / §5.4.3.42-43), and ffmpeg cross-decode validation
+      / §5.4.3.29 / §5.4.3.42-43), and ffmpeg cross-decode validation.
+      LFE spectrally constrained to 0–120 Hz per §7.1.3 (round 30):
+      MDCT bins ≥ 2 are zeroed before exponent extraction; `LFE_END_MANT=7`
+      is unchanged for bitstream compatibility
 - [x] Spec-§8.2.2 transient detector — 4th-order Butterworth 8 kHz
       cascaded-biquad HPF + hierarchical 3-level peak-ratio test
       (T₁=0.1 / T₂=0.075 / T₃=0.05); per-channel state. Replaces the
@@ -87,6 +94,13 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       every output cleanly at PSNR **20.21 dB** (mono 96k / stereo
       192k) and reconstructs the full 8-channel program for the 7.1
       indep+dep pair. Codec id = `"eac3"`.
+- [x] E-AC-3 adaptive exponent strategy (round 30) — encoder now calls
+      `select_exp_strategies` per-channel on each anchor block (0/3),
+      replacing the static D15-only pattern with D15/D25/D45 chosen from
+      spectral smoothness, matching the AC-3 encoder's strategy. D45
+      saves ~430 bits/channel/anchor-block that the SNR-offset tuner
+      redirects to mantissa precision. `EAC3_DISABLE_EXPSTR_SEL=1`
+      reverts to static D15 for A/B testing.
 - [x] E-AC-3 decoder — **round 1** (task #285): full BSI parser
       (Table E1.2) covering strmtyp / substreamid / frmsiz / fscod
       / fscod2 / numblkscod / acmod / lfeon / bsid / dialnorm /

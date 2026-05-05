@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Tonal-vs-noise psy classification in DBA band selection** (round 30).
+  Added `band_is_tonal` helper that measures the exponent spread
+  (min vs. mean) within a frequency band across all 6 blocks. The
+  `build_dba_plan` band picker now tracks per-band tonal votes and
+  applies a large penalty (1 000 000) to mostly-tonal bands, steering
+  the DBA target toward spectrally flat (noise-like) bands instead of
+  bands that contain a dominant tone. This avoids raising the masking
+  threshold at frequencies where the tone is perceptually salient.
+
+- **Adaptive D15/D25/D45 exponent-strategy selection for E-AC-3**
+  (round 30). The E-AC-3 encoder previously used a static
+  `[1, 0, 0, 1, 0, 0]` pattern (always D15 on anchor blocks, REUSE
+  elsewhere). It now calls `select_exp_strategies` — the same adaptive
+  per-channel smoothness test already used by the AC-3 encoder — to
+  pick D15/D25/D45 per channel per anchor block. Smooth-spectrum
+  channels emit D25 or D45, freeing ~430 bits/channel/anchor-block for
+  mantissa precision. `EAC3_DISABLE_EXPSTR_SEL=1` reverts to static
+  D15-only for A/B sweeps. `tune_snroffst_with_plan` receives the
+  `chexpstr_plan` so the mantissa budget accounts for the exponent savings.
+
+- **LFE spectral constraint (0–120 Hz)** (round 30). Both the AC-3 and
+  E-AC-3 encoders now zero MDCT coefficients at bin ≥ 2 before exponent
+  extraction, enforcing the spec §7.1.3 0–120 Hz LFE bandwidth limit
+  (at 48 kHz, bin 0 ≈ 47 Hz; bin 1 ≈ 141 Hz). Bins 2..6 carry
+  `exp=24 → bap=0 → no mantissa bits`, so `LFE_END_MANT=7` is
+  unchanged for bitstream compatibility.
+
 ### Changed
 
 - **`register` entry point unified on `RuntimeContext`** (task #502).

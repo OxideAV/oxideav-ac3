@@ -43,8 +43,9 @@ use crate::audblk::{BLOCKS_PER_FRAME, N_COEFFS, SAMPLES_PER_BLOCK};
 use crate::decoder::SAMPLES_PER_FRAME;
 use crate::encoder::{
     ac3_crc_update, build_dba_plan, compute_bap, decode_input_samples, extract_exponent,
-    preprocess_d15, quantise_mantissa, tune_snroffst, write_exponents_d15, write_mantissa_stream,
-    BitAllocParams, CouplingPlan, TransientDetector, LFE_END_MANT,
+    preprocess_d15, quantise_exponents_to_grpsize, quantise_mantissa, select_exp_strategies,
+    tune_snroffst_with_plan, write_exponents_grouped, write_mantissa_stream, BitAllocParams,
+    CouplingPlan, TransientDetector, LFE_END_MANT,
 };
 use crate::mdct::{mdct_256_pair, mdct_512};
 use crate::tables::WINDOW;
@@ -498,23 +499,69 @@ impl Eac3Encoder {
             }
         }
         if sub.lfeon {
+            // §7.1.3: LFE is spectrally constrained to 0-120 Hz per the
+            // AC-3 / E-AC-3 specification. At 48 kHz with a 512-point
+            // MDCT, bin k ≈ (2k+1)×48000/1024 Hz; bin 0 ≈ 47 Hz,
+            // bin 1 ≈ 141 Hz. We zero coefficients at bin ≥ 2 to enforce
+            // the 0–120 Hz constraint before exponent extraction, keeping
+            // only the sub-120 Hz content in the coded LFE signal. The
+            // LFE_END_MANT bitstream limit remains 7 (decoder expects it),
+            // but bins 2..7 are set to silence so they don't consume bits.
+            let lfe_cutoff = match self.sample_rate {
+                48_000 => 2usize, // bin 0 ≈ 47 Hz, bin 1 ≈ 141 Hz → keep 0..2
+                44_100 => 2usize,
+                32_000 => 2usize,
+                _ => 2usize,
+            };
             for blk in 0..BLOCKS_PER_FRAME {
+                for k in lfe_cutoff..LFE_END_MANT {
+                    coeffs[nfchans][blk][k] = 0.0;
+                }
                 for k in 0..LFE_END_MANT {
                     exps[lfe_idx_in_exps][blk][k] = extract_exponent(coeffs[nfchans][blk][k]);
                 }
             }
         }
-        // Exponent strategy: D15 on blocks 0 and 3, REUSE elsewhere.
+        // Exponent-strategy selection: adaptive D15/D25/D45 per-channel
+        // per-anchor-block (§7.1.3 / §5.4.3.22). The frame-wide anchor
+        // pattern [1,0,0,1,0,0] is preserved; for each anchor block
+        // (block 0 and block 3) we pick the smoothest legal strategy
+        // (D15/D25/D45) per channel. Blocks 1/2/4/5 always REUSE.
+        // EAC3_DISABLE_EXPSTR_SEL=1 pins every anchor to D15 (same as
+        // old static behaviour) for A/B testing.
         let exp_strategies: [u8; BLOCKS_PER_FRAME] = [1, 0, 0, 1, 0, 0];
+        // D15-preprocess every anchor block first so the strategy picker
+        // sees legalised exponents.
         for ch in 0..nfchans {
             for blk in 0..BLOCKS_PER_FRAME {
                 if exp_strategies[blk] == 1 {
                     preprocess_d15(&mut exps[ch][blk][..ch_end_mant]);
                 }
             }
+        }
+        let chexpstr_plan: Vec<[u8; BLOCKS_PER_FRAME]> =
+            if std::env::var("EAC3_DISABLE_EXPSTR_SEL").is_ok() {
+                let mut out = vec![[0u8; BLOCKS_PER_FRAME]; nfchans];
+                for ch in 0..nfchans {
+                    out[ch] = exp_strategies;
+                }
+                out
+            } else {
+                select_exp_strategies(&exps, nfchans, ch_end_mant)
+            };
+        // Apply grpsize quantisation for D25/D45 anchor blocks.
+        for ch in 0..nfchans {
+            for blk in 0..BLOCKS_PER_FRAME {
+                let strat = chexpstr_plan[ch][blk];
+                if strat >= 2 {
+                    let grpsize = if strat == 2 { 2 } else { 4 };
+                    quantise_exponents_to_grpsize(&mut exps[ch][blk][..ch_end_mant], grpsize);
+                }
+            }
+            // REUSE blocks get the most-recent anchor's exponents.
             let mut last = 0usize;
             for blk in 0..BLOCKS_PER_FRAME {
-                if exp_strategies[blk] == 1 {
+                if chexpstr_plan[ch][blk] != 0 {
                     last = blk;
                 } else {
                     let src: [u8; N_COEFFS] = exps[ch][last];
@@ -523,9 +570,9 @@ impl Eac3Encoder {
             }
         }
         if sub.lfeon {
-            // LFE strategy: reuse same D15 cadence; LFE has no chexpstr
-            // — we still preprocess each block with D15 grouping for
-            // the bins we actually code.
+            // LFE strategy: D15 on anchor blocks, REUSE elsewhere. The
+            // 1-bit lfeexpstr field only supports D15 or REUSE (§5.4.3.23
+            // / §E.1.2.3).
             for blk in 0..BLOCKS_PER_FRAME {
                 if exp_strategies[blk] == 1 {
                     preprocess_d15(&mut exps[lfe_idx_in_exps][blk][..LFE_END_MANT]);
@@ -566,7 +613,9 @@ impl Eac3Encoder {
         } else {
             build_dba_plan(&exps, nfchans, ch_end_mant, &cpl)
         };
-        let tuned_ba = tune_snroffst(
+        // Pass chexpstr_plan so the overhead calculator accounts for
+        // D25/D45 exponent savings when sizing the mantissa budget.
+        let tuned_ba = tune_snroffst_with_plan(
             &ba,
             &exps,
             ch_end_mant,
@@ -574,6 +623,7 @@ impl Eac3Encoder {
             self.fscod,
             sub.frame_bytes,
             &exp_strategies,
+            Some(&chexpstr_plan),
             &cpl,
             &dba_plan,
             sub.acmod,
@@ -687,15 +737,16 @@ impl Eac3Encoder {
         //
         // Coupling: cplinu==0 for every block of every substream we
         // emit, so the `if (cplinu[blk] == 1) {cplexpstr[blk]}` branch
-        // never fires. We only emit per-channel chexpstr.
+        // never fires. We emit per-channel chexpstr from the adaptive
+        // D15/D25/D45 plan selected above (chexpstr_plan[ch][blk]).
         for blk in 0..BLOCKS_PER_FRAME {
-            for _ch in 0..nfchans {
-                bw.write_u32(exp_strategies[blk] as u32, 2);
+            for ch in 0..nfchans {
+                bw.write_u32(chexpstr_plan[ch][blk] as u32, 2);
             }
         }
         // §E.1.2.3 — `lfeexpstr[blk]` (1 bit) per block when lfeon,
         // OUTSIDE the `if (expstre)` gate (always present when LFE is
-        // on, regardless of expstre).
+        // on, regardless of expstre). LFE always D15 or REUSE.
         if sub.lfeon {
             for blk in 0..BLOCKS_PER_FRAME {
                 bw.write_u32(exp_strategies[blk] as u32, 1);
@@ -759,29 +810,34 @@ impl Eac3Encoder {
             // §E.1.2.4 chbwcod[ch] — 6 bits per fbw channel whose
             // strategy this block is non-REUSE AND that channel is
             // neither in coupling nor in spectral extension. Our
-            // encoder runs cplinu=0 + spxinu=0 so the chincpl /
-            // chinspx checks both pass.
-            if exp_strategy != 0 {
-                for _ in 0..nfchans {
+            // encoder runs cplinu=0 + spxinu=0 so we emit chbwcod for
+            // every channel with a non-REUSE (chexpstr != 0) strategy.
+            for ch in 0..nfchans {
+                if chexpstr_plan[ch][blk] != 0 {
                     bw.write_u32(chbwcod as u32, 6);
                 }
             }
             // §E.1.2.4 fbw exponents (cplexps section is skipped:
             // cplinu=0). After each channel's grouped exponents, the
             // spec emits `gainrng[ch]` (2 bits) — same as base AC-3
-            // §5.4.2.20. The previous "round 2 fix" comment claimed
-            // Annex E dropped gainrng but Table E1.4 lists it
-            // explicitly inside the per-channel exponent block.
-            if exp_strategy == 1 {
-                for ch in 0..nfchans {
-                    write_exponents_d15(&mut bw, &exps[ch][blk], ch_end_mant);
+            // §5.4.2.20. Emit exponents using the per-channel strategy
+            // (D15/D25/D45 from chexpstr_plan).
+            for ch in 0..nfchans {
+                let strat = chexpstr_plan[ch][blk];
+                if strat != 0 {
+                    let grpsize = match strat {
+                        1 => 1usize,
+                        2 => 2usize,
+                        _ => 4usize,
+                    };
+                    write_exponents_grouped(&mut bw, &exps[ch][blk], ch_end_mant, grpsize);
                     bw.write_u32(0, 2); // gainrng[ch] = 0
                 }
             }
             // LFE exponents — D15 only, no chbwcod (LFE has fixed bw),
             // and no gainrng (only fbw channels carry gainrng).
             if sub.lfeon && exp_strategy == 1 {
-                write_exponents_d15(&mut bw, &exps[lfe_idx_in_exps][blk], LFE_END_MANT);
+                write_exponents_grouped(&mut bw, &exps[lfe_idx_in_exps][blk], LFE_END_MANT, 1);
             }
 
             let baie = blk == 0;

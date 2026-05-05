@@ -844,8 +844,25 @@ impl Ac3Encoder {
         // limited to end_mant=7 with `nlfegrps=2` (i.e. 6 D15 deltas
         // covering bins 1..7). Encoder mirrors that: extract on each
         // block, with the same D15-on-blocks-0/3 strategy.
+        //
+        // §7.1.3 / A/52 §5.5.5 — LFE is spectrally constrained to
+        // 0–120 Hz. At 48 kHz with a 512-point MDCT, bin k has centre
+        // frequency (2k+1)×48000/1024 Hz: bin 0 ≈ 47 Hz, bin 1 ≈ 141 Hz.
+        // We zero coefficients from bin 2 onward so only sub-120 Hz
+        // content is coded in the LFE channel. LFE_END_MANT stays at 7
+        // (decoder expects it), but bins 2..7 carry exp=24 → bap=0 →
+        // no mantissa bits allocated.
         if self.lfeon {
+            let lfe_cutoff = match self.sample_rate {
+                48_000 => 2usize,
+                44_100 => 2usize,
+                32_000 => 2usize, // 32k: bin 1 ≈ 125 Hz — still close enough
+                _ => 2usize,
+            };
             for blk in 0..BLOCKS_PER_FRAME {
+                for k in lfe_cutoff..LFE_END_MANT {
+                    coeffs[lfe_idx][blk][k] = 0.0;
+                }
                 for k in 0..LFE_END_MANT {
                     exps[lfe_idx_in_exps][blk][k] = extract_exponent(coeffs[lfe_idx][blk][k]);
                 }
@@ -2903,7 +2920,7 @@ fn overhead_bits_for(
 /// Adjust `csnroffst`/`fsnroffst` so the total mantissa bit count fits
 /// the frame payload, minus the exact overhead cost. The sub-optimal
 /// sweep is O(16*16) which is trivial given 6 blocks × 253 bins.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn tune_snroffst(
     ba: &BitAllocParams,
     exps: &[Vec<[u8; N_COEFFS]>],
@@ -4193,18 +4210,45 @@ fn apply_dba_segments(plan: &DbaPlan, idx: usize, mask: &mut [i32; 50]) {
     }
 }
 
-/// Build a per-frame DBA plan. For each fbw channel we pick a single
-/// mid/high frequency band (band 30..45 region) whose summed PSD over
-/// the frame is the lowest in that range — i.e. perceptually quietest
-/// relative to its neighbours — and tag it with `+6 dB` to raise the
-/// masking floor. This frees ~3 mantissas per block (one band ≈ 3 bins
-/// in this range) to be reallocated by the snroffst tuner without
-/// changing the overall sound character.
+/// Classify a band as tonal (1) or noise-like (0) using a simple
+/// Spectral Flatness Measure (SFM) on the per-bin exponent values.
 ///
-/// Always conservative: only one band per channel, with the smallest
-/// possible segment count (nseg=1). This guarantees the dba syntax cost
-/// per channel per frame is `2 (deltbae) + 3 (nseg) + 5 (offst) + 4
-/// (len) + 3 (ba) = 17 bits` — under 1% of a 192 kbps frame.
+/// Tonal bands have one or a few dominant bins (low exponent = high
+/// energy) surrounded by silent bins (high exponent). Noise-like bands
+/// have more uniform energy distribution.
+///
+/// `bins` is the slice of exponent values covering the band. Returns
+/// `true` when the band is tonal (peak exponent much smaller than mean).
+fn band_is_tonal(bins: &[u8]) -> bool {
+    if bins.is_empty() {
+        return false;
+    }
+    // Measure: min exponent (loudest bin) vs mean exponent.
+    // A tonal band has min << mean (one peak dominates).
+    // A noise band has min ≈ mean (energy spread uniformly).
+    let min_exp = bins.iter().cloned().min().unwrap_or(24);
+    let mean_exp_x8: u32 = bins.iter().map(|&e| e as u32).sum::<u32>() * 8
+        / bins.len().max(1) as u32;
+    let min_exp_x8: u32 = min_exp as u32 * 8;
+    // Tonal if mean is > 3 exponent units (= 3/8 * 8 = 3 in x8 scale)
+    // above the peak — i.e. the loudest bin is at least 3 exponent
+    // steps (≈ 9 dB) quieter than the average implies. In practice this
+    // fires when there's a pure tone (single dominant bin) in the band.
+    mean_exp_x8 > min_exp_x8 + 24 // 24 = 3 exponent units × 8
+}
+
+/// Build a per-frame DBA plan. For each fbw channel we pick a single
+/// mid/high frequency band in [lo_band, hi_band) that is:
+///   a) noise-like (not tonal, per SFM) — raising the mask on a tonal
+///      band would cost more in perceivable quality than on a noise band;
+///   b) relatively quiet (low summed PSD over the frame).
+///
+/// This avoids raising the masking threshold on bands where a pure tone
+/// is present, instead preferring psychoacoustically expendable bands.
+///
+/// Always conservative: nseg=1 per channel, `deltoffst` ≤ 31 (5-bit
+/// limit per §5.4.3.51). Guarantees the dba syntax cost per channel is
+/// ≤ 17 bits — under 1% of a 192 kbps frame.
 ///
 /// Cpl-channel dba is left empty (cpldeltbae=2 on block 0).
 pub(crate) fn build_dba_plan(
@@ -4234,8 +4278,12 @@ pub(crate) fn build_dba_plan(
     for ch in 0..nchan {
         // Sum the PSD over all 6 blocks to get a stable per-band
         // estimate. PSD = 3072 - 128*exp; bigger PSD = louder bin.
+        // Also accumulate a per-band tonal vote (how many blocks see a
+        // tonal distribution in this band).
         let mut band_score = [0i64; 50];
-        for blk in 0..exps[ch].len() {
+        let mut band_tonal_votes = [0u32; 50];
+        let nblks = exps[ch].len();
+        for blk in 0..nblks {
             for bin in 0..end {
                 let psd = 3072 - ((exps[ch][blk][bin] as i32) << 7);
                 let band = MASKTAB[bin] as usize;
@@ -4243,13 +4291,31 @@ pub(crate) fn build_dba_plan(
                     band_score[band] += psd as i64;
                 }
             }
+            // Per-band tonal vote: check the exponents in each target band.
+            for b in lo_band..hi_band {
+                // Collect exponents of bins in this band.
+                let band_bins: Vec<u8> = (0..end)
+                    .filter(|&k| MASKTAB[k] as usize == b)
+                    .map(|k| exps[ch][blk][k])
+                    .collect();
+                if band_is_tonal(&band_bins) {
+                    band_tonal_votes[b] += 1;
+                }
+            }
         }
-        // Pick the band with the smallest score in [lo_band, hi_band).
+        // Build a composite score: prefer bands that are
+        //   1. not predominantly tonal (tonal_votes < nblks/2);
+        //   2. quiet (low band_score).
+        // Bands that are mostly tonal get a large penalty so the picker
+        // skips them and looks for a noisier alternative.
+        let tonal_penalty: i64 = 1_000_000; // large enough to always prefer non-tonal
         let mut best_band = lo_band;
         let mut best_score = i64::MAX;
         for b in lo_band..hi_band {
-            if band_score[b] < best_score {
-                best_score = band_score[b];
+            let is_mostly_tonal = band_tonal_votes[b] as usize > nblks / 2;
+            let adj_score = band_score[b] + if is_mostly_tonal { tonal_penalty } else { 0 };
+            if adj_score < best_score {
+                best_score = adj_score;
                 best_band = b;
             }
         }
