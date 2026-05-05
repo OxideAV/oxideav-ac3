@@ -38,7 +38,7 @@ pub const CODEC_ID_STR_EAC3: &str = "eac3";
 
 /// Register the AC-3 + E-AC-3 decoder + encoder with the supplied codec
 /// registry.
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let cid = CodecId::new(CODEC_ID_STR);
     let dec_caps = CodecCapabilities::audio("ac3_sw_dec")
         .with_lossy(true)
@@ -130,6 +130,12 @@ pub fn register(reg: &mut CodecRegistry) {
     );
 }
 
+/// Unified registration entry point — installs AC-3 + E-AC-3 into the
+/// codec sub-registry of the supplied [`oxideav_core::RuntimeContext`].
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+}
+
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     decoder::make_decoder(params)
 }
@@ -144,4 +150,33 @@ fn make_eac3_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 
 fn make_eac3_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     decoder::make_eac3_decoder(params)
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        register(&mut ctx);
+        let ac3 = CodecId::new(CODEC_ID_STR);
+        let eac3 = CodecId::new(CODEC_ID_STR_EAC3);
+        assert!(
+            ctx.codecs.has_decoder(&ac3),
+            "AC-3 decoder factory not installed via RuntimeContext"
+        );
+        assert!(
+            ctx.codecs.has_encoder(&ac3),
+            "AC-3 encoder factory not installed via RuntimeContext"
+        );
+        assert!(
+            ctx.codecs.has_decoder(&eac3),
+            "E-AC-3 decoder factory not installed via RuntimeContext"
+        );
+        assert!(
+            ctx.codecs.has_encoder(&eac3),
+            "E-AC-3 encoder factory not installed via RuntimeContext"
+        );
+    }
 }

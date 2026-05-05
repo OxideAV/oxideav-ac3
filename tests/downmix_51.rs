@@ -33,7 +33,7 @@ fn ffmpeg_available() -> bool {
 
 fn decode_ac3_fully(data: &[u8], target_channels: Option<u16>) -> (u16, Vec<i16>) {
     let mut reg = CodecRegistry::new();
-    oxideav_ac3::register(&mut reg);
+    oxideav_ac3::register_codecs(&mut reg);
     let mut params = CodecParameters::audio(CodecId::new("ac3"));
     params.channels = target_channels;
     let mut dec = reg.make_decoder(&params).expect("make_decoder");

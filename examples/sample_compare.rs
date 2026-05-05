@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = fs::remove_file(&tmp);
 
     let mut reg = CodecRegistry::new();
-    oxideav_ac3::register(&mut reg);
+    oxideav_ac3::register_codecs(&mut reg);
     let params = CodecParameters::audio(CodecId::new("ac3"));
     let mut dec = reg.make_decoder(&params).expect("make_decoder");
     let mut our_pcm: Vec<u8> = Vec::new();
