@@ -4227,8 +4227,8 @@ fn band_is_tonal(bins: &[u8]) -> bool {
     // A tonal band has min << mean (one peak dominates).
     // A noise band has min ≈ mean (energy spread uniformly).
     let min_exp = bins.iter().cloned().min().unwrap_or(24);
-    let mean_exp_x8: u32 =
-        bins.iter().map(|&e| e as u32).sum::<u32>() * 8 / bins.len().max(1) as u32;
+    let mean_exp_x8: u32 = bins.iter().map(|&e| e as u32).sum::<u32>() * 8
+        / bins.len().max(1) as u32;
     let min_exp_x8: u32 = min_exp as u32 * 8;
     // Tonal if mean is > 3 exponent units (= 3/8 * 8 = 3 in x8 scale)
     // above the peak — i.e. the loudest bin is at least 3 exponent
