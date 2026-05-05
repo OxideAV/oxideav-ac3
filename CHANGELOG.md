@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.4...v0.0.5) - 2026-05-05
+
+### Fixed
+
+- *(clippy)* drop unnecessary i32→i32 casts + manual_memcpy in EAC-3 AHT
+
+### Other
+
+- task #467 — move chexpstr/cplexpstr/lfeexpstr from audblk to audfrm
+- round 29 — D45 grpsize=4 anchor blocks now bit-exact
+- round 28 — per-channel exponent strategy selection (D15/D25)
+- round 6 (task #324) — Adaptive Hybrid Transform (AHT) decode
+- round 5 — standard coupling decode for 5.1 + low-rate stereo
+- round 4 stub — clarify AHT + SPX unsupported paths
+- round 3 — dependent substream channel splice
+- silence dead-code warning on round-3-only fields
+- round 2 — per-block DSP via Ac3State translation
+
 ### Fixed — task #467 — E-AC-3 audfrm vs audblk exponent strategy bit placement
 
 - **`chexpstr[blk][ch]`, `cplexpstr[blk]`, and `lfeexpstr[blk]` now live in
