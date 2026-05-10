@@ -509,18 +509,23 @@ pub(crate) fn parse_audblk_into(
             state.cpl_endf = br.read_u32(4)? as u8;
             side.cplbegf = state.cpl_begf;
             side.cplendf = state.cpl_endf;
-            // ncplsubnd = 3 + cplendf - cplbegf (spec comment in Table 5.3).
-            // Guard against pathological streams where cplbegf > cplendf
-            // — the spec requires cplbegf <= cplendf but we don't want a
-            // panic if the stream is malformed or our bit cursor has
-            // slipped in a later block. Fall back to an obviously-bogus
-            // value and let the caller detect via Err further on.
-            if (state.cpl_endf as usize) < state.cpl_begf as usize {
+            // Per A/52 §5.4.3.12 the upper sub-band index is `cplendf+2`,
+            // so the spec's validity envelope is `cplbegf <= cplendf+2`
+            // (equivalently `ncplsubnd = 3 + cplendf - cplbegf >= 1`).
+            // The earlier strict `cplendf < cplbegf` rejection bombed out
+            // of valid 5.0 (acmod=7 lfeon=0) frames where ffmpeg picks
+            // narrow-coupling configs like (cplbegf=11, cplendf=10), which
+            // place coupling on sub-bands 11..=12 (tc bins 169..193) — a
+            // perfectly legal 2-sub-band coupling channel. Using signed
+            // arithmetic also dodges the usize underflow that the previous
+            // branch would have hit before the explicit check.
+            let nsub = 3i32 + state.cpl_endf as i32 - state.cpl_begf as i32;
+            if nsub < 1 {
                 return Err(Error::invalid(
-                    "ac3: §5.4.3.11/12 cplbegf > cplendf — malformed coupling range",
+                    "ac3: §5.4.3.11/12 cplbegf > cplendf+2 — malformed coupling range",
                 ));
             }
-            state.cpl_nsubbnd = 3 + state.cpl_endf as usize - state.cpl_begf as usize;
+            state.cpl_nsubbnd = nsub as usize;
             // §5.4.3.13 cplbndstrc[sbnd] — 1 bit per subband for sbnd >= 1.
             state.cpl_bndstrc[0] = false;
             for bnd in 1..state.cpl_nsubbnd {

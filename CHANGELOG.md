@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Coupling-range validity check too strict for narrow-coupling streams**
+  (round 7 / r7). The audblk parser rejected any frame whose `cplbegf >
+  cplendf` with the message `§5.4.3.11/12 cplbegf > cplendf — malformed
+  coupling range`. Per A/52:2018 §5.4.3.12, the upper sub-band index is
+  `cplendf+2`, so the spec's actual envelope is `ncplsubnd = 3 + cplendf
+  - cplbegf >= 1`, equivalently `cplbegf <= cplendf+2`. ffmpeg's
+  encoder picks narrow `(cplbegf=11, cplendf=10)` configs on 5.0
+  (acmod=7, lfeon=0) frames — placing coupling on sub-bands 11..=12
+  (transform-coefficient bins 169..193, ~16-19 kHz at fs=48k) — and our
+  too-strict check bombed every block 0 of every frame. The catch in
+  `decode_frame` zeroed the coefficients on Err, then the next block
+  inherited a corrupt bit cursor (the cpl-begf/-endf reads are AFTER
+  cplinu / chincpl so the rejection was past the no-cpl path). PSNR on
+  `ac3-3-2-48000-384kbps` (5.0): **6.49 dB → 88.85 dB** (+82.36 dB).
+  Also moves to signed arithmetic for `ncplsubnd` so the `3 + cplendf
+  - cplbegf` term can't underflow `usize` before the check fires.
+
 - **Multichannel decoder output now in WAV-mask order** (round 6 / r6).
   AC-3 transmits multichannel layouts in `acmod` slot order
   (Table 5.8): 3/0 = `(L, C, R)`, 3/1 = `(L, C, R, S)`, 3/2 = `(L, C,

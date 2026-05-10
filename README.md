@@ -83,6 +83,18 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       in standard order. Boost on `ac3-3-0-48000`: **10.56 dB → 88.99 dB**
       PSNR vs FFmpeg `pcm_s16le`. Boost on `ac3-3-2-lfe-48000-448kbps`
       (5.1): **11.97 dB → 90.42 dB**.
+- [x] **Narrow-coupling validity envelope per §5.4.3.12** (round 7 / r7).
+      The audblk parser used to reject any block whose `cplbegf > cplendf`
+      with `malformed coupling range`. The spec's actual envelope is
+      `cplbegf <= cplendf+2` (since the upper sub-band index is
+      `cplendf+2` per §5.4.3.12) — equivalently `ncplsubnd = 3 + cplendf -
+      cplbegf >= 1`. ffmpeg picks narrow configs like
+      `(cplbegf=11, cplendf=10)` (sub-bands 11..=12, transform-coefficient
+      bins 169..193) on 5.0 (acmod=7, lfeon=0) frames; the strict check
+      bombed every block-0 of every frame, the catch in `decode_frame`
+      zeroed the coefficients, and the bit cursor drifted from there.
+      Boost on `ac3-3-2-48000-384kbps` (5.0): **6.49 dB → 88.85 dB**
+      PSNR (+82.36 dB).
 - [ ] Downmix (§7.8) — 3/2 and 3/1 modes still pending
 - [x] E-AC-3 (bsid=16, Annex E) — encoder. Independent substream
       (`strmtyp=0`, `substreamid=0`) for 1.0/2.0/5.1 layouts (acmod
