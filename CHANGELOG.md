@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.5...v0.0.6) - 2026-05-06
+
+### Other
+
+- drop dead `linkme` dep
+- registry calls: rename make_decoder/make_encoder → first_decoder/first_encoder
+- restore split-after-= form from 1de0dc2 (undo mistaken reformat)
+- apply cargo fmt (rustfmt CI fix for round 30)
+- rustfmt fix for band_is_tonal mean_exp_x8 line break
+- ac3/eac3 encoder round 30: adaptive expstr + LFE spectral constraint + tonal DBA
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-ac3/pull/502))
+
 ### Added
 
 - **Tonal-vs-noise psy classification in DBA band selection** (round 30).
