@@ -97,6 +97,17 @@ pub struct DecodedFrame {
     pub samples: u32,
     /// Interleaved S16LE bytes — `samples * channels * 2` total.
     pub pcm_s16le: Vec<u8>,
+    /// Independent substream's `acmod` field (Table E1.2 §E.1.2.1).
+    /// Surfaced so callers that need to reorder bitstream-order
+    /// multichannel layouts into WAV-mask order can pick the right
+    /// permutation via [`crate::wave_order`]. For dep-substream-extended
+    /// programs (e.g. 7.1 emitted as indep 5.1 + dep [Lb,Rb]) this
+    /// reflects the **indep** acmod only — the additional dep channels
+    /// are appended at the end of the PCM buffer per
+    /// `splice_dep_into_indep` and are not covered by Table 5.8.
+    pub acmod: u8,
+    /// Independent substream's `lfeon` flag (1 bit, §E.1.2.1).
+    pub lfeon: bool,
 }
 
 /// Decode one or more concatenated E-AC-3 syncframes contained in a
@@ -244,6 +255,8 @@ fn decode_indep_substream(
         channels: bsi.nchans as u16,
         samples,
         pcm_s16le,
+        acmod: bsi.acmod,
+        lfeon: bsi.lfeon,
     })
 }
 
@@ -366,6 +379,8 @@ fn build_silent_indep(bsi: &Eac3Bsi) -> Result<DecodedFrame> {
         channels: bsi.nchans as u16,
         samples,
         pcm_s16le,
+        acmod: bsi.acmod,
+        lfeon: bsi.lfeon,
     })
 }
 

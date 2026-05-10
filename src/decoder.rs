@@ -17,6 +17,7 @@ use crate::bsi::{self, Bsi};
 use crate::downmix::{Downmix, DownmixMode};
 use crate::eac3;
 use crate::syncinfo::{self, SyncInfo};
+use crate::wave_order;
 
 /// Samples produced per AC-3 syncframe, per channel: 6 blocks × 256
 /// new samples each (each audio block is a 512-point TDAC transform
@@ -158,12 +159,27 @@ impl Ac3Decoder {
     fn process_eac3_frame(&mut self, pkt: &Packet) -> Result<Frame> {
         let data = &pkt.data[..];
         let decoded = eac3::decode_eac3_packet(&mut self.eac3_state, data)?;
+        let channels = decoded.channels;
+        let mut pcm = decoded.pcm_s16le;
+        // Reorder bitstream-order multichannel layouts into WAV-mask
+        // order for the indep substream. The indep `acmod`/`lfeon`
+        // are surfaced on `DecodedFrame`; when there's a dep substream
+        // the buffer's channel count exceeds `output_channels(acmod,
+        // lfeon)` and `reorder_s16le_in_place` no-ops via its
+        // channel-count guard. Round 6 leaves the dep-substream-extended
+        // 7.1 case (indep 5.1 + dep [Lb,Rb]) in pure bitstream order;
+        // routing the chanmap-tagged dep channels into the WAV 7.1
+        // slots requires a bigger refactor and no fixture exercises it.
+        wave_order::reorder_s16le_in_place(
+            &mut pcm,
+            decoded.acmod,
+            decoded.lfeon,
+            channels as usize,
+        );
         // Apply downmix request only if the decoded program has more
         // channels than requested. Round 1 emits silence so the
         // downmix is a no-op anyway, but threading the request
         // through keeps round-2 work minimal.
-        let channels = decoded.channels;
-        let mut pcm = decoded.pcm_s16le;
         if let Some(req) = self.requested_channels {
             if req < channels {
                 let bytes_per_sample = 2usize;
@@ -261,6 +277,25 @@ impl Ac3Decoder {
             let le = clamped.to_le_bytes();
             out_bytes[i * 2] = le[0];
             out_bytes[i * 2 + 1] = le[1];
+        }
+
+        // 4) Reorder bitstream-order channels into WAV-mask order so
+        //    consumers that interpret the PCM as a WAVE file (or any
+        //    `WAVE_FORMAT_EXTENSIBLE`-compliant sink — `pcm_s16le`,
+        //    foobar2000, miniaudio, …) see (FL, FR, FC, LFE, BL, BR)
+        //    instead of AC-3's bitstream (L, C, R, Ls, Rs, LFE).
+        //    Mono / stereo / 2/1 / 2/2 layouts are no-ops; only
+        //    acmod ∈ {3, 5, 7} (the front-center-bearing modes) get
+        //    permuted. When downmix is active the output is already
+        //    in standard order — `out_channels < src_channels` skips
+        //    the reorder via [`wave_order::output_channels`] check.
+        if matches!(dmx_mode, DownmixMode::Passthrough) {
+            wave_order::reorder_s16le_in_place(
+                &mut out_bytes,
+                bsi.acmod,
+                bsi.lfeon,
+                out_channels as usize,
+            );
         }
 
         Ok(Frame::Audio(AudioFrame {

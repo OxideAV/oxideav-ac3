@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Multichannel decoder output now in WAV-mask order** (round 6 / r6).
+  AC-3 transmits multichannel layouts in `acmod` slot order
+  (Table 5.8): 3/0 = `(L, C, R)`, 3/1 = `(L, C, R, S)`, 3/2 = `(L, C,
+  R, Ls, Rs)`, with LFE appended as the last bitstream slot. Consumers
+  that interpret the decoded PCM as a WAVE file (or any
+  `WAVE_FORMAT_EXTENSIBLE`-compliant sink such as `pcm_s16le`,
+  foobar2000, or miniaudio) expect samples in `dwChannelMask` order:
+  `(FL, FR, FC, LFE, BL, BR)`. Stereo, mono, 2/1, 2/2, and 1+1 dual-mono
+  paths already match WAV order; only `acmod ∈ {3, 5, 7}` (the
+  front-center-bearing layouts) require permutation. The new
+  `wave_order` module exposes `wave_to_bitstream_map(acmod, lfeon)` and
+  `reorder_s16le_in_place(...)`, called once per syncframe in the
+  passthrough decode path of both AC-3 (`decoder::process_ac3_frame`)
+  and E-AC-3 (`decoder::process_eac3_frame`). Downmixed outputs
+  (mono / stereo via `Downmix`) skip the reorder because the matrix
+  emits in standard order. Verified against the docs corpus:
+  `ac3-3-0-48000` jumps from 10.56 dB to **88.99 dB** PSNR vs FFmpeg;
+  `ac3-3-2-lfe-48000-448kbps` (5.1) jumps from 11.97 dB to
+  **90.42 dB**. The dep-substream-extended 7.1 case (indep 5.1 + dep
+  `[Lb, Rb]`) keeps the trailing dep channels in append order — the
+  bigger refactor needed to route them through the WAV 7.1 slot map
+  is deferred (no fixture exercises it).
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.5...v0.0.6) - 2026-05-06
 
 ### Other

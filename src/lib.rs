@@ -29,6 +29,7 @@ pub mod imdct;
 pub mod mdct;
 pub mod syncinfo;
 pub mod tables;
+pub mod wave_order;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};

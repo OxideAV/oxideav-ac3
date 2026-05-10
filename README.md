@@ -72,6 +72,17 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       (+1.07 dB). When the demand spread is small or the budget is
       tight the pass is a no-op and the bitstream stays
       byte-identical to the previous encoder.
+- [x] **Bitstream → WAV channel reorder** (round 6 / r6) — multichannel
+      decoder output now lands in `WAVE_FORMAT_EXTENSIBLE` `dwChannelMask`
+      order `(FL, FR, FC, LFE, BL, BR)` instead of the bitstream's
+      `acmod` slot order `(L, C, R, Ls, Rs, LFE)`. Only the
+      front-center-bearing layouts (`acmod ∈ {3, 5, 7}`) need the
+      permutation; mono / stereo / 2/1 / 2/2 paths short-circuit.
+      Applied on the passthrough path of both AC-3 and E-AC-3 decoders;
+      downmix outputs skip the reorder because the matrix already emits
+      in standard order. Boost on `ac3-3-0-48000`: **10.56 dB → 88.99 dB**
+      PSNR vs FFmpeg `pcm_s16le`. Boost on `ac3-3-2-lfe-48000-448kbps`
+      (5.1): **11.97 dB → 90.42 dB**.
 - [ ] Downmix (§7.8) — 3/2 and 3/1 modes still pending
 - [x] E-AC-3 (bsid=16, Annex E) — encoder. Independent substream
       (`strmtyp=0`, `substreamid=0`) for 1.0/2.0/5.1 layouts (acmod
