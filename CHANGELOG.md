@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.6...v0.0.7) - 2026-05-17
+
+### Other
+
+- eac3 round 72 (r72): Table E2.10 frame-based exponent strategy decode
+- ac3 round 7 (r7): widen coupling-range check to spec envelope
+- ac3/eac3 round 6 (r6): emit decoder PCM in WAV-mask channel order
+
 ### Added
 
 - **E-AC-3 frame-based exponent strategy (`expstre == 0`)** — Table E2.10
