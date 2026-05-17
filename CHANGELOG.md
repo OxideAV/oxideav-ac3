@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **E-AC-3 frame-based exponent strategy (`expstre == 0`)** — Table E2.10
+  expansion (round 72). When the audfrm header carries `expstre == 0`,
+  the per-block per-channel strategy codes are emitted as 32 spec-defined
+  6-block runs indexed by a single 5-bit `frmcplexpstr` (when coupling
+  is in use anywhere in the frame) and one 5-bit `frmchexpstr[ch]` per
+  fbw channel (per A/52:2018 §E.2.3.2.12 / §E.2.3.2.13). The audfrm
+  parser now expands these codewords via `FRAME_EXP_STRAT_TABLE[32][6]`
+  (transcribed verbatim from ATSC A/52:2018 Annex E Table E2.10) into
+  `cplexpstr_blk[]` and `chexpstr_blk_ch[][]`, so the audblk DSP
+  consumes the same per-block shape it already does for the
+  `expstre == 1` path. Every FFmpeg-encoded E-AC-3 fixture in the
+  corpus picks `expstre == 0` — round 6's silent fallback hid this from
+  the round-2 DSP path. Corpus deltas (E-AC-3 fixtures, prior baseline
+  = 13.57 dB / silent):
+  * `eac3-5.1-48000-384kbps` → **90.01 dB** (+76.4 dB)
+  * `eac3-low-rate-stereo-64kbps` → **71.74 dB** (+58.2 dB)
+  * `eac3-low-bitrate-32kbps` → **66.32 dB** (+52.7 dB)
+  * `eac3-5.1-side-768kbps` → **21.32 dB** (+7.7 dB; SPX-blocked frames
+    still mute and bleed into the overlap-add delay line)
+  Remaining 3 fixtures (`eac3-stereo-48000-192kbps`,
+  `eac3-256-coeff-block`, `eac3-from-ac3-bitstream-recombination`)
+  exercise `spxinu == 1` blocks where the round-4 stub mutes — they
+  decode block-0/block-1 cleanly then drop to silent on the first SPX
+  frame. Implementing §E.2.2.5.4 spectral extension is the next E-AC-3
+  blocker.
+
+### Fixed
+
+- **E-AC-3 coupling validity envelope widened to §5.4.3.12** (round 72).
+  The audblk parser used to reject any block whose `cplbegf > cplendf`
+  with `malformed coupling range`. Mirroring the round-7 AC-3 fix
+  (commit `97d112f`), the spec's actual envelope is `ncplsubnd =
+  3 + cplendf - cplbegf >= 1` — equivalently `cplbegf <= cplendf+2`
+  — because §5.4.3.12 defines the upper sub-band index as `cplendf+2`.
+  FFmpeg picks narrow configs like `(cplbegf=11, cplendf=10)` on
+  high-bitrate 5.x frames; the strict check tripped on
+  `eac3-5.1-48000-384kbps` frame 0 every syncframe and crashed the
+  rest of the frame. Signed arithmetic prevents the `3 + cplendf -
+  cplbegf` term from underflowing `usize` before the check fires.
+
 ### Fixed
 
 - **Coupling-range validity check too strict for narrow-coupling streams**

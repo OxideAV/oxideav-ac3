@@ -124,6 +124,30 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       saves ~430 bits/channel/anchor-block that the SNR-offset tuner
       redirects to mantissa precision. `EAC3_DISABLE_EXPSTR_SEL=1`
       reverts to static D15 for A/B testing.
+- [x] **E-AC-3 frame-based exponent strategy** (`expstre == 0`,
+      round 72). The audfrm parser now expands the 5-bit
+      `frmcplexpstr` + per-channel `frmchexpstr[ch]` codewords (and
+      `convexpstr[ch]` on indep substreams) via **Table E2.10** into the
+      32 spec-defined `[D15/D25/D45/REUSE] × 6` per-block strategy
+      runs. The audblk dsp consumes the expanded `chexpstr_blk_ch[blk][ch]`
+      / `cplexpstr_blk[blk]` arrays unchanged from the `expstre == 1`
+      path — Table E2.10 also stocks `cplexpstr_blk[]` on blocks where
+      coupling is in use; entries for non-cplinu blocks are harmlessly
+      left at the lookup value (the dsp gates them on `cplinu_blk[blk]`).
+      Also widens the E-AC-3 coupling validity check to the §5.4.3.12
+      envelope (`cplbegf <= cplendf+2`, equivalently `ncplsubnd >= 1`)
+      so FFmpeg's narrow-coupling configs (e.g. `(cplbegf=11,
+      cplendf=10)` on 5.0 frames) no longer trip `malformed coupling
+      range`. Corpus deltas vs round-6 baseline (all FFmpeg-encoded
+      fixtures use `expstre == 0` so were silent before):
+      `eac3-5.1-48000-384kbps` **13.57 → 90.01 dB** (+76.4 dB),
+      `eac3-low-rate-stereo-64kbps` **13.57 → 71.74 dB** (+58.2 dB),
+      `eac3-low-bitrate-32kbps` **13.57 → 66.32 dB** (+52.7 dB),
+      `eac3-5.1-side-768kbps` **13.57 → 21.32 dB** (+7.7 dB; remaining
+      ceiling is SPX-blocked frames muting and bleeding into the
+      overlap-add delay line). Stereo-192k / 256-coeff-block / from-ac3
+      fixtures hit SPX-active blocks in mid-frame and stay near the
+      silent floor (SPX decode is the next blocker).
 - [x] E-AC-3 decoder — **round 1** (task #285): full BSI parser
       (Table E1.2) covering strmtyp / substreamid / frmsiz / fscod
       / fscod2 / numblkscod / acmod / lfeon / bsid / dialnorm /

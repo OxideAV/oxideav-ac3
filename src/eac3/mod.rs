@@ -72,9 +72,14 @@
 //!   §E.2.2.5.4. SPX needs the `spxcoexp`/`spxcomant` coordinate
 //!   decoder + the noise-blend / amplitude-fold reconstruction
 //!   pipeline. No corpus fixture exercises SPX yet.
-//! * **Frame-level exponent strategy** (`expstre == 0`) — the
-//!   `frmchexpstr` 5-bit codeword expansion via Table E2.10. None of
-//!   the FFmpeg-encoded corpus fixtures use it.
+//! * **Spectral Extension (SPX)** decode — `spxinu == 1` blocks still
+//!   mute. The corpus fixtures `eac3-stereo-48000-192kbps`,
+//!   `eac3-256-coeff-block`, and `eac3-from-ac3-bitstream-recombination`
+//!   spend most blocks in SPX-active state; until SPX decode lands they
+//!   self-decode to ~8-14 dB PSNR (silent fallback bleed). The
+//!   non-SPX fixtures decode cleanly: `eac3-5.1-48000-384kbps` at
+//!   **90 dB**, `eac3-low-rate-stereo-64kbps` at **72 dB**,
+//!   `eac3-low-bitrate-32kbps` at **66 dB**.
 //! * **Per-block SNR-offset** (`snroffststr != 0`) — needs the
 //!   audblk-level `snroffste` parser. Same situation as above.
 //! * **Transient pre-noise processing** (`transproce == 1`) — the

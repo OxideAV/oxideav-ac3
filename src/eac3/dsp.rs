@@ -419,12 +419,22 @@ pub fn decode_indep_audblks(
                 // §E.1.3.3.10 cplendf (4 bits when SPX is off; we
                 // already required spxinu == 0 above).
                 state.cpl_endf = br.read_u32(4)? as u8;
-                if (state.cpl_endf as usize) < state.cpl_begf as usize {
+                // §5.4.3.12 spec envelope: the upper sub-band index is
+                // `cplendf + 2`, so `ncplsubnd = 3 + cplendf - cplbegf
+                // >= 1` is the actual validity test (equivalently
+                // `cplbegf <= cplendf + 2`). The earlier "cplbegf >
+                // cplendf" rejection mirrored the AC-3 round-7 bug —
+                // FFmpeg's E-AC-3 encoder picks narrow configs like
+                // `(cplbegf=11, cplendf=10)` for high-bandwidth
+                // multichannel frames. Use signed arithmetic so the
+                // `3 + cplendf - cplbegf` term can't underflow.
+                let ncplsubnd_signed = 3i32 + state.cpl_endf as i32 - state.cpl_begf as i32;
+                if ncplsubnd_signed < 1 {
                     return Err(Error::invalid(
-                        "eac3 audblk: cplbegf > cplendf — malformed coupling range",
+                        "eac3 audblk: cplbegf > cplendf+2 — malformed coupling range",
                     ));
                 }
-                state.cpl_nsubbnd = 3 + state.cpl_endf as usize - state.cpl_begf as usize;
+                state.cpl_nsubbnd = ncplsubnd_signed as usize;
                 // §E.1.3.3.11 cplbndstrce — gates the cplbndstrc[]
                 // array. When 0, all subbands stay un-merged (i.e.
                 // cplbndstrc[bnd] = 0 for every band).
@@ -1242,11 +1252,14 @@ fn decode_aht_channel_mantissas(
 
 /// Decide whether the round-2 DSP path can handle this frame.
 fn reject_unsupported(bsi: &Eac3Bsi, audfrm: &AudFrm) -> Result<()> {
-    if !audfrm.expstre {
-        return Err(Error::unsupported(
-            "eac3 dsp: frame-level exponent strategy (expstre==0) — round 2 only does per-block",
-        ));
-    }
+    // expstre handling — both per-block (expstre==1) and frame-based
+    // (expstre==0) strategies are supported. Round 72 (this commit)
+    // landed the frame-based path: `audfrm::parse_with` expands the
+    // 5-bit `frmcplexpstr` + per-channel `frmchexpstr[ch]` codewords
+    // via Table E2.10 into `cplexpstr_blk[]` + `chexpstr_blk_ch[]` so
+    // the dsp body sees the same per-block-per-channel shape it
+    // already consumes for the expstre==1 case. Every FFmpeg-produced
+    // E-AC-3 fixture in the corpus picks expstre==0.
     if audfrm.snroffststr != 0 {
         return Err(Error::unsupported(format!(
             "eac3 dsp: snroffststr={} — round 2 only handles 0 (single frame value)",

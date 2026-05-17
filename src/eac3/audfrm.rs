@@ -39,6 +39,56 @@ const MAX_FBW: usize = 5;
 /// Maximum blocks per syncframe (Annex E).
 pub const MAX_BLOCKS_PER_FRAME: usize = 6;
 
+/// Strategy codes: 0 = REUSE, 1 = D15, 2 = D25, 3 = D45 (matching the
+/// AC-3 `chexpstr` 2-bit encoding so the audblk-side gates can be
+/// reused unchanged for the `expstre == 0` path).
+const R: u8 = 0;
+const D15: u8 = 1;
+const D25: u8 = 2;
+const D45: u8 = 3;
+
+/// **Table E2.10** — Frame Exponent Strategy Combinations (ATSC
+/// A/52:2018 Annex E §2.3.2.12 / §2.3.2.13). 32 rows × 6 blocks. Each
+/// row is the 6-block strategy run encoded by one 5-bit
+/// `frmcplexpstr` / `frmchexpstr[ch]` / `convexpstr[ch]` value.
+/// Position 0 (block 0) is never `REUSE` — every row begins with a
+/// concrete D15 / D25 / D45 strategy so the decoder always has fresh
+/// exponents to reuse from.
+pub(crate) const FRAME_EXP_STRAT_TABLE: [[u8; MAX_BLOCKS_PER_FRAME]; 32] = [
+    [D15, R, R, R, R, R],           // 0
+    [D15, R, R, R, R, D45],         // 1
+    [D15, R, R, R, D25, R],         // 2
+    [D15, R, R, R, D45, D45],       // 3
+    [D25, R, R, D25, R, R],         // 4
+    [D25, R, R, D25, R, D45],       // 5
+    [D25, R, R, D45, D25, R],       // 6
+    [D25, R, R, D45, D45, D45],     // 7
+    [D25, R, D15, R, R, R],         // 8
+    [D25, R, D25, R, R, D45],       // 9
+    [D25, R, D25, R, D25, R],       // 10
+    [D25, R, D25, R, D45, D45],     // 11
+    [D25, R, D45, D25, R, R],       // 12
+    [D25, R, D45, D25, R, D45],     // 13
+    [D25, R, D45, D45, D25, R],     // 14
+    [D25, R, D45, D45, D45, D45],   // 15
+    [D45, D15, R, R, R, R],         // 16
+    [D45, D15, R, R, R, D45],       // 17
+    [D45, D25, R, R, D25, R],       // 18
+    [D45, D25, R, R, D45, D45],     // 19
+    [D45, D25, R, D25, R, R],       // 20
+    [D45, D25, R, D25, R, D45],     // 21
+    [D45, D25, R, D45, D25, R],     // 22
+    [D45, D25, R, D45, D45, D45],   // 23
+    [D45, D45, D15, R, R, R],       // 24
+    [D45, D45, D25, R, R, D45],     // 25
+    [D45, D45, D25, R, D25, R],     // 26
+    [D45, D45, D25, R, D45, D45],   // 27
+    [D45, D45, D45, D25, R, R],     // 28
+    [D45, D45, D45, D25, R, D45],   // 29
+    [D45, D45, D45, D45, D25, R],   // 30
+    [D45, D45, D45, D45, D45, D45], // 31
+];
+
 /// Parsed `audfrm()` snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudFrm {
@@ -307,11 +357,28 @@ pub fn parse_with(br: &mut BitReader<'_>, bsi: &Bsi) -> Result<AudFrm> {
             }
         }
     } else {
+        // §E.2.3.2.12 / §E.2.3.2.13 — frame-based exponent strategy. A
+        // 5-bit `frmcplexpstr` (when coupling is in use anywhere in the
+        // frame) and one 5-bit `frmchexpstr[ch]` per fbw channel index
+        // into Table E2.10 to expand into 6 per-block strategies (each
+        // value is REUSE / D15 / D25 / D45). The 6-block expansion is
+        // also used to populate `cplexpstr_blk[]` on blocks where
+        // coupling is in use; entries for non-cplinu blocks are
+        // harmlessly left at the lookup value (the dsp module only
+        // consults `cplexpstr_blk[blk]` when `cplinu_blk[blk]` is true).
         if bsi.acmod > 0x1 && ncplblks > 0 {
             a.frmcplexpstr = br.read_u32(5)? as u8;
+            let row = FRAME_EXP_STRAT_TABLE[a.frmcplexpstr as usize];
+            a.cplexpstr_blk[..num_blocks].copy_from_slice(&row[..num_blocks]);
         }
         for ch in 0..nfchans {
             a.frmchexpstr[ch] = br.read_u32(5)? as u8;
+            let row = FRAME_EXP_STRAT_TABLE[a.frmchexpstr[ch] as usize];
+            // chexpstr_blk_ch is `[blk][ch]` so we can't use a single
+            // copy_from_slice — walk the blocks for this channel.
+            for blk in 0..num_blocks {
+                a.chexpstr_blk_ch[blk][ch] = row[blk];
+            }
         }
     }
     if lfeon {
@@ -601,5 +668,84 @@ mod tests {
         assert_eq!(af.snroffststr, 0);
         assert_eq!(af.frmcsnroffst, 15);
         assert_eq!(af.frmfsnroffst, 0);
+    }
+
+    /// Table E2.10 row sanity — the table is the contract between the
+    /// audfrm parser (which expands `frmchexpstr` / `frmcplexpstr`)
+    /// and the audblk DSP (which consumes per-block strategy codes via
+    /// `chexpstr_blk_ch[blk][ch]` / `cplexpstr_blk[blk]`).
+    #[test]
+    fn frame_exp_strat_table_spot_check_e2_10() {
+        // Row 0: D15 R R R R R
+        assert_eq!(FRAME_EXP_STRAT_TABLE[0], [D15, R, R, R, R, R]);
+        // Row 16: D45 D15 R R R R (the canonical FFmpeg pattern — every
+        // corpus FFmpeg-encoded fixture picks row 16 for fbw channels).
+        assert_eq!(FRAME_EXP_STRAT_TABLE[16], [D45, D15, R, R, R, R]);
+        // Row 28: D45 D45 D45 D25 R R (used by the 64kbps low-rate
+        // stereo fixture's frmcplexpstr).
+        assert_eq!(FRAME_EXP_STRAT_TABLE[28], [D45, D45, D45, D25, R, R]);
+        // Row 31: D45 across every block — fully refreshed exponents
+        // each block, the most-bits / least-temporal-correlation choice.
+        assert_eq!(FRAME_EXP_STRAT_TABLE[31], [D45, D45, D45, D45, D45, D45]);
+        // Block 0 column shall never be REUSE per spec design (the decoder
+        // needs concrete exponents on every syncframe's first block).
+        for row in &FRAME_EXP_STRAT_TABLE {
+            assert_ne!(row[0], R, "Table E2.10: block 0 must not be REUSE");
+        }
+    }
+
+    /// `expstre == 0` path: the parser expands `frmchexpstr` /
+    /// `frmcplexpstr` codewords into the per-block-per-channel strategy
+    /// arrays via Table E2.10 — the audblk DSP needs them shaped the
+    /// same as the `expstre == 1` path.
+    #[test]
+    fn parses_minimal_indep_stereo_audfrm_with_frame_exp_strat() {
+        let bsi = make_bsi(2, false, 6, StreamType::Independent);
+        let mut bits: Vec<(u32, u32)> = vec![(1, 0)]; // expstre = 0
+        bits.push((1, 0)); // ahte
+        bits.push((2, 0)); // snroffststr
+        bits.push((1, 0)); // transproce
+        bits.push((1, 1)); // blkswe
+        bits.push((1, 1)); // dithflage
+        bits.push((1, 1)); // bamode
+        bits.push((1, 0)); // frmfgaincode
+        bits.push((1, 1)); // dbaflde
+        bits.push((1, 1)); // skipflde
+        bits.push((1, 0)); // spxattene
+                           // acmod>1 → cplinu[0]=1, then cplstre[1..5]=0 (sticky reuse keeps cplinu=1)
+        bits.push((1, 1));
+        for _ in 1..6 {
+            bits.push((1, 0));
+        }
+        // expstre==0 + acmod>1 + ncplblks>0 → frmcplexpstr (5 bits).
+        // Pick row 16 to match the FFmpeg-canonical pattern.
+        bits.push((5, 16));
+        // 2 fbw channels × frmchexpstr (5 bits each).
+        bits.push((5, 16));
+        bits.push((5, 28));
+        // strmtyp==0 + numblkscod==3 → convexpstre implicit, 2 × 5 bits.
+        bits.push((5, 0));
+        bits.push((5, 0));
+        // snroffststr=0 → frmcsnroffst + frmfsnroffst.
+        bits.push((6, 15));
+        bits.push((4, 0));
+        // num_blocks > 1 → blkstrtinfoe (1 bit, 0).
+        bits.push((1, 0));
+
+        let buf = pack_msb(&bits);
+        let af = parse(&buf, &bsi).unwrap();
+        assert!(!af.expstre);
+        assert_eq!(af.ncplblks, 6);
+        assert_eq!(af.frmcplexpstr, 16);
+        assert_eq!(af.frmchexpstr[0], 16);
+        assert_eq!(af.frmchexpstr[1], 28);
+        // Expansion: row 16 = [D45, D15, R, R, R, R]; row 28 = [D45, D45, D45, D25, R, R].
+        let exp16 = FRAME_EXP_STRAT_TABLE[16];
+        let exp28 = FRAME_EXP_STRAT_TABLE[28];
+        for blk in 0..6 {
+            assert_eq!(af.cplexpstr_blk[blk], exp16[blk], "cpl[{blk}]");
+            assert_eq!(af.chexpstr_blk_ch[blk][0], exp16[blk], "ch0[{blk}]");
+            assert_eq!(af.chexpstr_blk_ch[blk][1], exp28[blk], "ch1[{blk}]");
+        }
     }
 }
