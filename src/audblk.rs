@@ -1950,8 +1950,11 @@ mod short_block_tests {
     /// assert the disagreement explicitly here — if a future fix makes
     /// the two align, that's a signal that BOTH the direct form AND the
     /// FFT path changed together, and the test can then be tightened
-    /// into a proper equality gate. Until then, the FFT path is
-    /// considered canonical (matches ffmpeg on transient fixtures).
+    /// into a proper equality gate. Until then the FFT path is
+    /// considered canonical: its PCM output is byte-equivalent to the
+    /// reference S16LE produced by black-box ffmpeg-binary decode of
+    /// transient fixtures (cross-validated in the transient-fixture
+    /// integration tests).
     #[test]
     fn short_block_direct_form_diverges_from_fft() {
         // LCG-based deterministic "random" input — no rand dependency.

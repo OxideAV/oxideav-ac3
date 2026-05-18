@@ -40,12 +40,16 @@
 //! `(L, C, R, Ls, Rs, LFE)` versus WAV `(L, R, C, LFE, Ls, Rs)`.
 //!
 //! Round 6 of `oxideav-ac3` adds this conversion so the decoder's S16
-//! output matches FFmpeg's `pcm_s16le` reference byte-for-byte (modulo
-//! IMDCT rounding) on multichannel fixtures. Mono and stereo paths are
-//! a no-op.
+//! output is byte-for-byte identical (modulo IMDCT rounding) to the
+//! reference S16LE PCM produced by black-box ffmpeg-binary decode of
+//! the same fixtures; validated in the multichannel reorder integration
+//! tests in `tests/`. Mono and stereo paths are a no-op.
 //!
-//! The same WAVE order applies to E-AC-3 (Annex E) since FFmpeg's eac3
-//! decoder shares the AC-3 channel-routing code.
+//! The same WAVE order applies to E-AC-3 (Annex E): A/52 Annex E
+//! reuses the same `acmod` / `lfeon` channel-layout fields with the
+//! same per-mode bitstream order as the AC-3 base layer (Annex E does
+//! not redefine them), so the AC-3 reorder LUTs are correct for
+//! E-AC-3 substreams without modification.
 
 /// Bitstream-slot index for each WAV-order output position.
 ///
