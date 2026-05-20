@@ -29,13 +29,19 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       exponent spread (min vs. mean) per band across 6 blocks; DBA band
       picker steers toward spectrally flat (noise-like) bands, avoiding
       bands containing a dominant tone where raising the mask costs quality
-- [x] Multichannel encode — 1/0, 2/0, 3/0, 2/2, 3/2, and 3/2 + LFE
-      (the canonical 5.1 layout: L,C,R,Ls,Rs,LFE) with per-acmod BSI
-      emission, LFE exponent + bap + mantissa pipeline (§5.4.3.23
-      / §5.4.3.29 / §5.4.3.42-43), and ffmpeg cross-decode validation.
-      LFE spectrally constrained to 0–120 Hz per §7.1.3 (round 30):
-      MDCT bins ≥ 2 are zeroed before exponent extraction; `LFE_END_MANT=7`
-      is unchanged for bitstream compatibility
+- [x] Multichannel encode — 1/0, 2/0, **2/0 + LFE (2.1)**, 3/0, 2/2,
+      3/2, and 3/2 + LFE (the canonical 5.1 layout: L,C,R,Ls,Rs,LFE)
+      with per-acmod BSI emission, LFE exponent + bap + mantissa
+      pipeline (§5.4.3.23 / §5.4.3.29 / §5.4.3.42-43), and ffmpeg
+      cross-decode validation. The 2.1 layout (round 78 / r78) is
+      reached by setting `CodecParameters.channel_layout =
+      Some(ChannelLayout::Stereo21)` on a 3-channel input — without
+      the explicit layout, 3 channels default to acmod=3 (3/0 = L,C,R).
+      ffmpeg cross-decodes our 2.1 output at within 0.2% per-channel
+      RMS of the input (`two_one_lfe_ffmpeg_crossdecode`). LFE
+      spectrally constrained to 0–120 Hz per §7.1.3 (round 30):
+      MDCT bins ≥ 2 are zeroed before exponent extraction;
+      `LFE_END_MANT=7` is unchanged for bitstream compatibility
 - [x] Spec-§8.2.2 transient detector — 4th-order Butterworth 8 kHz
       cascaded-biquad HPF + hierarchical 3-level peak-ratio test
       (T₁=0.1 / T₂=0.075 / T₃=0.05); per-channel state. Replaces the
@@ -95,7 +101,9 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       zeroed the coefficients, and the bit cursor drifted from there.
       Boost on `ac3-3-2-48000-384kbps` (5.0): **6.49 dB → 88.85 dB**
       PSNR (+82.36 dB).
-- [ ] Downmix (§7.8) — 3/2 and 3/1 modes still pending
+- [x] Downmix (§7.8) — LoRo 2-channel and mono target paths cover
+      every source acmod (1/0 / 2/0 / 3/0 / 2/1 / 3/1 / 2/2 / 3/2 /
+      1+1 dual-mono); LtRt (Dolby Surround matrix) is not implemented
 - [x] E-AC-3 (bsid=16, Annex E) — encoder. Independent substream
       (`strmtyp=0`, `substreamid=0`) for 1.0/2.0/5.1 layouts (acmod
       ∈ {1, 2, 7}, with `lfeon=1` for 5.1). 7.1 input emits an

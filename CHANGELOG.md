@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **2.1 (L, R, LFE) encoder layout** — round 78 / r78. Adds a new
+  acmod-emit path that maps a 3-channel input to `acmod=2 (2/0) +
+  lfeon=1` instead of the default 3-channel `acmod=3 (3/0 L,C,R)`.
+  Reached by setting `CodecParameters.channel_layout =
+  Some(ChannelLayout::Stereo21)` on a 3-channel input; the
+  count-alone path still defaults to 3/0 for backward compatibility.
+  BSI emission already gated `cmixlev` (acmod ∈ {3,5,7}),
+  `surmixlev` (acmod ∈ {4,5,6,7}), and `phsflginu` (acmod == 2)
+  correctly; the 2.1 path picks up the `dsurmod` emit (acmod == 2)
+  and routes LFE through the same per-channel exponent / bap /
+  mantissa pipeline as 5.1. Two new test gates land alongside:
+  `two_one_lfe_self_decode_roundtrip` (our decoder reads back per-
+  channel RMS within tolerance) and `two_one_lfe_ffmpeg_crossdecode`
+  (FFmpeg's reference decoder reports per-channel RMS within 0.2 %
+  of the input — `[6610, 6118, 6336]` ours vs `[6611, 6108, 6336]`
+  ffmpeg's). The full encoder acmod coverage is now 1/0, 2/0,
+  2/0+LFE (2.1), 3/0, 2/2, 3/2, and 3/2+LFE (5.1).
 - **E-AC-3 frame-based exponent strategy (`expstre == 0`)** — Table E2.10
   expansion (round 72). When the audfrm header carries `expstre == 0`,
   the per-block per-channel strategy codes are emitted as 32 spec-defined

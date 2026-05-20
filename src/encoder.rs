@@ -26,7 +26,8 @@
 use oxideav_core::bits::BitWriter;
 use oxideav_core::Encoder;
 use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
+    AudioFrame, ChannelLayout, CodecId, CodecParameters, Error, Frame, Packet, Result,
+    SampleFormat, TimeBase,
 };
 
 use crate::audblk::{remat_band_count, BLOCKS_PER_FRAME, MAX_FBW, N_COEFFS, SAMPLES_PER_BLOCK};
@@ -48,10 +49,14 @@ use crate::tables::{
 /// [`CodecParameters::audio`]):
 ///
 /// * `sample_rate` — 48 000, 44 100, or 32 000 Hz
-/// * `channels`    — 1..=6. Mapping to AC-3 acmod (Table 5.8):
+/// * `channels`    — 1..=6. Mapping to AC-3 acmod (Table 5.8) is driven
+///   by `channels` alone unless `channel_layout` resolves the
+///   ambiguity at a given channel count:
 ///   - `1` → acmod=1 (1/0 mono)
 ///   - `2` → acmod=2 (2/0 L,R)
-///   - `3` → acmod=3 (3/0 L,C,R)
+///   - `3` → acmod=3 (3/0 L,C,R) — DEFAULT for 3 channels
+///   - `3` + `channel_layout=Stereo21` → acmod=2 + lfeon=1
+///     (2/0 + LFE, "2.1": L,R,LFE)
 ///   - `4` → acmod=6 (2/2 L,R,Ls,Rs)
 ///   - `5` → acmod=7 (3/2 L,C,R,Ls,Rs)
 ///   - `6` → acmod=7 + lfeon=1 (3/2 + LFE — the canonical "5.1" layout
@@ -68,13 +73,26 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let channels = params
         .channels
         .ok_or_else(|| Error::invalid("ac3 encoder: channels is required"))?;
-    let (acmod, lfeon, nfchans) = match channels {
-        1 => (1u8, false, 1usize), // 1/0 mono
-        2 => (2u8, false, 2usize), // 2/0 L,R
-        3 => (3u8, false, 3usize), // 3/0 L,C,R
-        4 => (6u8, false, 4usize), // 2/2 L,R,Ls,Rs
-        5 => (7u8, false, 5usize), // 3/2 L,C,R,Ls,Rs
-        6 => (7u8, true, 5usize),  // 3/2 + LFE (5.1: L,C,R,Ls,Rs,LFE)
+    // §5.4.2.3 acmod mapping (Table 5.8) is mostly determined by the
+    // channel count alone, but at 3ch the count is ambiguous between
+    // 3/0 (L,C,R, acmod=3) and 2/0+LFE (L,R,LFE, acmod=2+lfeon=1). When
+    // `channel_layout` is supplied we honour it; otherwise we default to
+    // 3/0 for backward compatibility with callers that only set
+    // `channels`.
+    let (acmod, lfeon, nfchans) = match (channels, params.channel_layout) {
+        (1, _) => (1u8, false, 1usize), // 1/0 mono
+        (2, _) => (2u8, false, 2usize), // 2/0 L,R
+        (3, Some(ChannelLayout::Stereo21)) => {
+            // 2.1 = L,R,LFE — acmod=2 (2/0) + lfeon=1. Spec §5.4.2.3
+            // lists the LFE channel as orthogonal to acmod, so any
+            // acmod can carry an LFE; the canonical 2.1 layout pairs
+            // it with acmod=2. Input PCM order: (L, R, LFE).
+            (2u8, true, 2usize)
+        }
+        (3, _) => (3u8, false, 3usize), // 3/0 L,C,R (default for 3ch)
+        (4, _) => (6u8, false, 4usize), // 2/2 L,R,Ls,Rs
+        (5, _) => (7u8, false, 5usize), // 3/2 L,C,R,Ls,Rs
+        (6, _) => (7u8, true, 5usize),  // 3/2 + LFE (5.1: L,C,R,Ls,Rs,LFE)
         _ => {
             return Err(Error::Unsupported(format!(
                 "ac3 encoder: unsupported channel count {channels} (must be 1..=6)"
@@ -5875,6 +5893,231 @@ mod tests {
     #[test]
     fn five_one_self_decode_roundtrip() {
         encode_decode_multichan(6, 7, true);
+    }
+
+    /// Round-78: 2.1 (L, R, LFE) encode + self-decode roundtrip.
+    /// Exercises the new `channel_layout=Stereo21` path that maps a
+    /// 3-channel input to acmod=2 + lfeon=1 instead of the default
+    /// 3-channel acmod=3 (3/0 L,C,R). The bitstream-side LFE slot
+    /// reuses the same per-channel exponent / mantissa pipeline as 5.1;
+    /// nothing else changes — both the BSI emit and the audblk loop
+    /// already gate LFE on `self.lfeon` alone, not on `self.acmod`.
+    #[test]
+    fn two_one_lfe_self_decode_roundtrip() {
+        let sr = 48_000u32;
+        let channels: u16 = 3;
+        let dur = 0.5f32;
+        // Custom PCM builder so slot 2 carries an 80 Hz tone (inside
+        // the LFE band-limit) instead of build_multichan_pcm's default
+        // 3 × 220 Hz = 660 Hz which sits above LFE's ~656 Hz upper
+        // edge (LFE_END_MANT=7).
+        let nsamp = (sr as f32 * dur) as usize;
+        let mut pcm = vec![0i16; nsamp * channels as usize];
+        for n in 0..nsamp {
+            let t = n as f32 / sr as f32;
+            // Slot 0 = L (220 Hz), 1 = R (440 Hz), 2 = LFE (80 Hz).
+            for (c, freq) in [220.0f32, 440.0, 80.0].iter().enumerate() {
+                let s = (2.0 * std::f32::consts::PI * freq * t).sin() * 0.30;
+                let q = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                pcm[n * channels as usize + c] = q;
+            }
+        }
+        let mut bytes = Vec::with_capacity(pcm.len() * 2);
+        for s in &pcm {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(sr);
+        params.channels = Some(channels);
+        params.sample_format = Some(SampleFormat::S16);
+        params.channel_layout = Some(ChannelLayout::Stereo21);
+        let mut enc = make_encoder(&params).expect("make_encoder");
+        let audio = AudioFrame {
+            samples: nsamp as u32,
+            pts: Some(0),
+            data: vec![bytes.clone()],
+        };
+        enc.send_frame(&Frame::Audio(audio)).unwrap();
+        let _ = enc.flush();
+        let mut pkts = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => pkts.push(p),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        assert!(pkts.len() >= 10, "got only {} packets", pkts.len());
+
+        // Every syncframe must carry acmod=2 (2/0) + lfeon=1 — the
+        // distinguishing wire-level marker of the new 2.1 path.
+        for p in &pkts {
+            assert_eq!(p.data[0], 0x0B);
+            assert_eq!(p.data[1], 0x77);
+            let bsi = crate::bsi::parse(&p.data[5..]).expect("bsi");
+            assert_eq!(bsi.acmod, 2, "expected acmod=2 (2/0 stereo)");
+            assert!(bsi.lfeon, "expected lfeon=1 (2.1 carries LFE)");
+            assert_eq!(bsi.nchans, 3, "expected nchans=3 (2 fbw + LFE)");
+            // §5.4.2.6 dsurmod is present only when acmod == 2 — make
+            // sure the BSI parser saw a syntactically valid 2.1 header
+            // (a wrongly-emitted phsflginu or missing dsurmod would
+            // mis-align the bit cursor and bsi parse would either fail
+            // or land on garbage values).
+            assert_ne!(bsi.dsurmod, 0xFF, "dsurmod absent for acmod=2");
+        }
+
+        // Self-decode and check per-channel signal survives.
+        let dparams = CodecParameters::audio(CodecId::new("ac3"));
+        let mut dec = crate::decoder::make_decoder(&dparams).expect("make_decoder");
+        let mut decoded: Vec<i16> = Vec::new();
+        for p in &pkts {
+            dec.send_packet(p).unwrap();
+            if let Ok(Frame::Audio(a)) = dec.receive_frame() {
+                for s in a.data[0].chunks_exact(2) {
+                    decoded.push(i16::from_le_bytes([s[0], s[1]]));
+                }
+            }
+        }
+        let nch = channels as usize;
+        let frames = decoded.len() / nch;
+        let skip = 768usize.min(frames);
+        let usable = frames.saturating_sub(skip);
+        assert!(usable > sr as usize / 4, "decoded too few samples");
+
+        // Per-channel RMS — every channel must carry signal. Decoder
+        // emits in WAV-mask order; for acmod=2+lfeon=1 the mask order
+        // is (FL, FR, LFE) which already matches the bitstream order,
+        // so wave_order::reorder_s16le_in_place is a no-op here.
+        let mut per_ch_rms = vec![0.0f64; nch];
+        for ch in 0..nch {
+            let sq: f64 = (skip..frames)
+                .map(|n| decoded[n * nch + ch] as f64)
+                .map(|s| s * s)
+                .sum();
+            per_ch_rms[ch] = (sq / usable as f64).sqrt();
+        }
+        eprintln!("2.1 self-decode per-ch RMS: {:?}", per_ch_rms);
+        for (ch, rms) in per_ch_rms.iter().enumerate() {
+            assert!(*rms > 50.0, "channel {ch} RMS too low: {rms}");
+        }
+    }
+
+    /// Round-78: ffmpeg cross-decode of a 2.1 (acmod=2 + lfeon=1)
+    /// stream. Encodes an (L, R, LFE) signal and pipes the syncframes
+    /// through ffmpeg's AC-3 decoder. ffmpeg refuses to decode a
+    /// malformed BSI (e.g. emitting `phsflginu` outside acmod==2 would
+    /// shift every subsequent block-0 field by 1 bit and trigger
+    /// "frame sync error" / "cplcoe" mismatch). A clean exit + non-zero
+    /// per-channel RMS proves the wire-level conformance of the new
+    /// 2.1 emit path.
+    ///
+    /// Skips when ffmpeg is missing.
+    #[test]
+    fn two_one_lfe_ffmpeg_crossdecode() {
+        use std::process::Command;
+        let sr = 48_000u32;
+        let channels: u16 = 3;
+        let dur = 0.5f32;
+        let nsamp = (sr as f32 * dur) as usize;
+        let mut pcm = vec![0i16; nsamp * channels as usize];
+        for n in 0..nsamp {
+            let t = n as f32 / sr as f32;
+            for (c, freq) in [220.0f32, 440.0, 80.0].iter().enumerate() {
+                let s = (2.0 * std::f32::consts::PI * freq * t).sin() * 0.30;
+                let q = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                pcm[n * channels as usize + c] = q;
+            }
+        }
+        let mut bytes = Vec::with_capacity(pcm.len() * 2);
+        for s in &pcm {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(sr);
+        params.channels = Some(channels);
+        params.sample_format = Some(SampleFormat::S16);
+        params.channel_layout = Some(ChannelLayout::Stereo21);
+        let mut enc = make_encoder(&params).expect("make_encoder");
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: nsamp as u32,
+            pts: Some(0),
+            data: vec![bytes],
+        }))
+        .unwrap();
+        let _ = enc.flush();
+        let mut ac3_bytes: Vec<u8> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => ac3_bytes.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        let in_path = std::env::temp_dir().join("oxideav_ac3_21_enc.ac3");
+        let out_path = std::env::temp_dir().join("oxideav_ac3_21_dec.pcm");
+        std::fs::write(&in_path, &ac3_bytes).expect("write ac3");
+        let _ = std::fs::remove_file(&out_path);
+        let out = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "ac3",
+                "-i",
+            ])
+            .arg(&in_path)
+            .args([
+                "-f",
+                "s16le",
+                "-acodec",
+                "pcm_s16le",
+                "-ac",
+                "3",
+                "-ar",
+                "48000",
+            ])
+            .arg(&out_path)
+            .status();
+        let _ = std::fs::remove_file(&in_path);
+        let Ok(status) = out else {
+            eprintln!("ffmpeg unavailable — skipping 2.1 cross-decode gate");
+            return;
+        };
+        if !status.success() {
+            panic!("ffmpeg failed to decode our 2.1 AC-3 output");
+        }
+        let Ok(decoded_bytes) = std::fs::read(&out_path) else {
+            panic!("ffmpeg produced no decode output");
+        };
+        let _ = std::fs::remove_file(&out_path);
+        let nch = channels as usize;
+        let total = decoded_bytes.len() / 2;
+        let frames = total / nch;
+        assert!(frames > sr as usize / 4, "ffmpeg decoded too few samples");
+        let skip = 768usize.min(frames);
+        let usable = frames.saturating_sub(skip);
+        let samples: Vec<i16> = decoded_bytes
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let mut per_ch_rms = vec![0.0f64; nch];
+        for ch in 0..nch {
+            let sq: f64 = (skip..frames)
+                .map(|n| samples[n * nch + ch] as f64)
+                .map(|s| s * s)
+                .sum();
+            per_ch_rms[ch] = (sq / usable as f64).sqrt();
+        }
+        eprintln!("ffmpeg 2.1 decode per-ch RMS: {:?}", per_ch_rms);
+        for (ch, rms) in per_ch_rms.iter().enumerate() {
+            assert!(
+                *rms > 50.0,
+                "ffmpeg-decoded ch{ch} RMS too low: {rms} — channel was lost",
+            );
+        }
     }
 
     /// Round-19: ffmpeg cross-decode of a 5.1 stream. Encodes a 5.1
