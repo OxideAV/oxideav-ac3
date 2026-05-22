@@ -41,7 +41,16 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       RMS of the input (`two_one_lfe_ffmpeg_crossdecode`). LFE
       spectrally constrained to 0–120 Hz per §7.1.3 (round 30):
       MDCT bins ≥ 2 are zeroed before exponent extraction;
-      `LFE_END_MANT=7` is unchanged for bitstream compatibility
+      `LFE_END_MANT=7` is unchanged for bitstream compatibility.
+      Round 91 added a self-decode roundtrip for the previously
+      untested 2/2 (acmod=6 = L,R,Ls,Rs, 4 fbw channels) path plus
+      per-channel PSNR-floored regression tests for 2/2 (4ch),
+      3/2 (5ch), and 5.1 (6ch) layouts — each fbw slot is asserted
+      `>= 10 dB` PSNR vs the source PCM after a per-channel lag
+      search (1024-sample correlator, ±2048-sample window). Headline
+      figures on the synthesised 220×n Hz multitone fixture: 2/2
+      24-32 dB per ch (320 kbps default), 5.0 10-33 dB per ch
+      (384 kbps default), 5.1 10-33 dB per ch (448 kbps default)
 - [x] Spec-§8.2.2 transient detector — 4th-order Butterworth 8 kHz
       cascaded-biquad HPF + hierarchical 3-level peak-ratio test
       (T₁=0.1 / T₂=0.075 / T₃=0.05); per-channel state. Replaces the

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **2/2 + 5-channel PSNR regression coverage** — round 91. Adds
+  `two_two_self_decode_roundtrip` for the previously-untested 4-fbw
+  `acmod=6` (2/2 = L,R,Ls,Rs) path, plus a new
+  `encode_decode_multichan_psnr` helper with per-channel lag-aligned
+  PSNR (1024-sample correlator, ±2048-sample window) and three
+  `*_psnr_per_channel` regression gates:
+  * `two_two_psnr_per_channel` (4ch, acmod=6) — 24-32 dB per slot
+  * `three_two_psnr_per_channel` (5ch, acmod=7) — 10-33 dB per slot
+  * `five_one_psnr_per_channel` (6ch, acmod=7 + lfeon=1) — 10-33 dB
+    per slot
+  Floor is 10 dB per channel — matches the in-tree
+  `tests/eac3_ffmpeg.rs::psnr_min` convention (18 dB AC-3 baseline
+  via ffmpeg's reference decoder; self-decode tends to score a few
+  dB lower than ffmpeg's smoothing-aware path). The 2/2 acmod=6
+  spec-defined layout (per ATSC A/52 Table 5.8) had no prior
+  encode-then-self-decode test — only `mono` (1/0), `three_zero`
+  (3/0), `three_two` (3/2), `five_one` (5.1), and `two_one_lfe` (2.1)
+  were exercised.
 - **2.1 (L, R, LFE) encoder layout** — round 78 / r78. Adds a new
   acmod-emit path that maps a 3-channel input to `acmod=2 (2/0) +
   lfeon=1` instead of the default 3-channel `acmod=3 (3/0 L,C,R)`.

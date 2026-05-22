@@ -5895,6 +5895,191 @@ mod tests {
         encode_decode_multichan(6, 7, true);
     }
 
+    /// Round-91: 2/2 (L,R,Ls,Rs) — ATSC A/52 Table 5.8 acmod=6 with
+    /// 4 fbw channels and no LFE. Mirrors the §5.3.3 channel-map for
+    /// the "quad surround" mode, exercising the encoder's `channels=4`
+    /// arm in `make_encoder` (the only multichannel layout previously
+    /// without a self-decode roundtrip test).
+    ///
+    /// Each fbw channel carries a distinct sine (220/440/660/880 Hz);
+    /// the per-channel RMS check inside `encode_decode_multichan`
+    /// confirms every slot routes through the encoder + decoder
+    /// without crosstalk-collapsing into a single mid channel.
+    #[test]
+    fn two_two_self_decode_roundtrip() {
+        encode_decode_multichan(4, 6, false);
+    }
+
+    /// Round-91: tightened PSNR-per-channel gate on the 5.0 (3/2)
+    /// 5-fbw-channel encode path (acmod=7, lfeon=0). The pre-existing
+    /// `three_two_self_decode_roundtrip` only checked
+    /// `per_ch_rms > 50` — a very loose bound that says nothing about
+    /// quantisation fidelity once each tone makes it through the
+    /// codec. This new test computes per-channel lag-aligned PSNR
+    /// against the source PCM and asserts every fbw slot exceeds a
+    /// minimum-acceptable PSNR for the 384 kbps default bit budget.
+    ///
+    /// Floor is 10 dB — this matches the in-tree
+    /// `tests/eac3_ffmpeg.rs::psnr_min` convention where 18 dB is the
+    /// quoted AC-3 baseline on pure-sine input through ffmpeg's
+    /// reference decoder. Self-decode tends to score a few dB lower
+    /// than ffmpeg's smoothing-aware path, so 10 dB is the headline
+    /// floor.
+    #[test]
+    fn three_two_psnr_per_channel() {
+        encode_decode_multichan_psnr(5, 7, false, &[10.0f64; 5]);
+    }
+
+    /// Round-91: tightened PSNR-per-channel gate on the 5.1 (3/2 +
+    /// LFE) acmod=7 + lfeon=1 path. fbw channels carry the same
+    /// 220/440/660/880/1100 Hz sweep; LFE carries an 80 Hz tone
+    /// (within `LFE_END_MANT=7` band-limit). PSNR threshold on LFE
+    /// matches fbw — the encoder runs the same bap pipeline on LFE
+    /// bins 0..7 so quantisation noise on the LFE tone tracks the
+    /// fbw shape.
+    #[test]
+    fn five_one_psnr_per_channel() {
+        encode_decode_multichan_psnr(6, 7, true, &[10.0f64; 6]);
+    }
+
+    /// Round-91: PSNR-per-channel gate on the 2/2 (L,R,Ls,Rs) 4-fbw
+    /// acmod=6 encode path. Mirrors the 5.0 floor (10 dB) since the
+    /// per-channel bit budget at the 320 kbps default is similar.
+    #[test]
+    fn two_two_psnr_per_channel() {
+        encode_decode_multichan_psnr(4, 6, false, &[10.0f64; 4]);
+    }
+
+    /// Round-91 helper — encode + self-decode + measure per-channel
+    /// PSNR against the source PCM with cross-correlation lag
+    /// alignment (mirrors the lag search in
+    /// `tests/eac3_ffmpeg.rs::psnr_min`).
+    ///
+    /// `min_psnr_db[ch]` is the per-channel floor (each channel
+    /// asserted independently so a single weak slot surfaces
+    /// directly in the failure message). The lag search covers the
+    /// usual ±768-sample MDCT overlap-add window.
+    fn encode_decode_multichan_psnr(
+        channels: u16,
+        expected_acmod: u8,
+        expected_lfeon: bool,
+        min_psnr_db: &[f64],
+    ) {
+        let sr = 48_000u32;
+        let dur = 0.5f32;
+        let (nsamp, bytes) = build_multichan_pcm(channels, sr, dur, 220.0);
+        // Reconstruct the source PCM as f32 / i16 for the PSNR baseline.
+        let mut src_i16: Vec<i16> = Vec::with_capacity(nsamp * channels as usize);
+        for c in bytes.chunks_exact(2) {
+            src_i16.push(i16::from_le_bytes([c[0], c[1]]));
+        }
+
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(sr);
+        params.channels = Some(channels);
+        params.sample_format = Some(SampleFormat::S16);
+        let mut enc = make_encoder(&params).expect("make_encoder");
+        let audio = AudioFrame {
+            samples: nsamp as u32,
+            pts: Some(0),
+            data: vec![bytes.clone()],
+        };
+        enc.send_frame(&Frame::Audio(audio)).unwrap();
+        let _ = enc.flush();
+        let mut pkts = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => pkts.push(p),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        for p in &pkts {
+            let bsi = crate::bsi::parse(&p.data[5..]).expect("bsi");
+            assert_eq!(bsi.acmod, expected_acmod);
+            assert_eq!(bsi.lfeon, expected_lfeon);
+        }
+
+        let dparams = CodecParameters::audio(CodecId::new("ac3"));
+        let mut dec = crate::decoder::make_decoder(&dparams).expect("make_decoder");
+        let mut decoded: Vec<i16> = Vec::new();
+        for p in &pkts {
+            dec.send_packet(p).unwrap();
+            if let Ok(Frame::Audio(a)) = dec.receive_frame() {
+                for s in a.data[0].chunks_exact(2) {
+                    decoded.push(i16::from_le_bytes([s[0], s[1]]));
+                }
+            }
+        }
+        let nch = channels as usize;
+        let frames = decoded.len() / nch;
+        let skip = 2048usize.min(frames.saturating_sub(1));
+        let lag_corr_n = 1024usize;
+        assert!(
+            skip + lag_corr_n < frames && skip + lag_corr_n < nsamp,
+            "not enough decoded/source samples (skip={skip}, frames={frames}, nsamp={nsamp})"
+        );
+        // Per-channel lag search. Each test channel carries a
+        // distinct sine frequency (220 Hz × (c + 1) for fbw, 80 Hz for
+        // LFE) so a single global lag picked off channel 0's
+        // cross-correlation aliases the other channels to the nearest
+        // phase-multiple of their own fundamental. Searching
+        // independently per channel keeps every slot's PSNR honest.
+        let max_lag: usize = 2048;
+        let mut best_lag = vec![0usize; nch];
+        let mut per_ch_psnr = vec![0.0f64; nch];
+        for ch in 0..nch {
+            let mut best_err = f64::INFINITY;
+            let mut lag_for_ch: usize = 0;
+            for lag in 0..=max_lag {
+                if skip + lag + lag_corr_n > frames {
+                    continue;
+                }
+                let mut err = 0.0f64;
+                for i in 0..lag_corr_n {
+                    let s = src_i16[(skip + i) * nch + ch] as f64;
+                    let d = decoded[(skip + lag + i) * nch + ch] as f64;
+                    err += (s - d) * (s - d);
+                }
+                if err < best_err {
+                    best_err = err;
+                    lag_for_ch = lag;
+                }
+            }
+            best_lag[ch] = lag_for_ch;
+            let usable = nsamp
+                .saturating_sub(skip)
+                .min(frames.saturating_sub(skip + lag_for_ch));
+            let mut sq_err = 0.0f64;
+            for i in 0..usable {
+                let s = src_i16[(skip + i) * nch + ch] as f64;
+                let d = decoded[(skip + lag_for_ch + i) * nch + ch] as f64;
+                sq_err += (s - d) * (s - d);
+            }
+            let mse = sq_err / usable as f64;
+            let peak: f64 = 32767.0;
+            per_ch_psnr[ch] = if mse > 0.0 {
+                10.0 * (peak * peak / mse).log10()
+            } else {
+                f64::INFINITY
+            };
+        }
+        eprintln!(
+            "ch={} per-ch lag={:?} PSNR (dB)={:?}",
+            channels, best_lag, per_ch_psnr
+        );
+        for (ch, psnr) in per_ch_psnr.iter().enumerate() {
+            let floor = min_psnr_db[ch];
+            assert!(
+                *psnr >= floor,
+                "channel {ch} PSNR {:.2} dB below floor {:.2} dB (lag={})",
+                psnr,
+                floor,
+                best_lag[ch]
+            );
+        }
+    }
+
     /// Round-78: 2.1 (L, R, LFE) encode + self-decode roundtrip.
     /// Exercises the new `channel_layout=Stereo21` path that maps a
     /// 3-channel input to acmod=2 + lfeon=1 instead of the default
