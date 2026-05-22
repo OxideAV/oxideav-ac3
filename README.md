@@ -60,7 +60,17 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       after the global `(csnr, fsnr)` selection so individual fbw
       channels can spend residual budget bits matching their mask
       headroom. Bitstream syntax always allowed it; the encoder now
-      uses it.
+      uses it. **Round 95** retired the round-23 index-order
+      round-robin in favour of a two-stage **equalise + spread-cap**
+      greedy: an equalisation pass bumps minimum-`fsnroffst_ch`
+      channels until none fit, then a residual pass spreads any
+      remaining slack subject to `max(fsnroffst_ch) - min(...) ≤ 2`.
+      Closes the long-standing imbalance where a low-frequency tone
+      on slot 0 (cheap per-bump mantissa cost) ran away to
+      `fsnroffst_ch=15` while higher-frequency siblings stayed at
+      the global baseline. Encoder-policy only — §5.4.3.40 defines
+      the wire field, the choice of value is non-normative
+      (`encoder::tune_snroffst_per_channel_spread_bounded`).
 - [x] Per-channel exponent strategy selection (§7.1.3 / §5.4.3.22,
       round 28 + 29) — encoder anchor blocks (block 0 / 3) pick
       D15 (grpsize=1), D25 (grpsize=2), or D45 (grpsize=4) per channel

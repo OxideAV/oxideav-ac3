@@ -3087,7 +3087,8 @@ pub(crate) fn tune_snroffst_with_plan(
     }
 
     // -----------------------------------------------------------------
-    // Per-channel fsnroffst refinement (round-23/103, §5.4.3.40).
+    // Per-channel fsnroffst refinement (round-23/103, §5.4.3.40;
+    // r95 fairness fix).
     //
     // After the global (csnr, fsnr) is chosen above, the budget is
     // typically not exhausted — many channels only need fsnr=k while a
@@ -3096,14 +3097,24 @@ pub(crate) fn tune_snroffst_with_plan(
     // residual budget per-channel turns leftover bits into per-channel
     // PSNR.
     //
-    // Greedy refinement: while at least one channel can have its
-    // fsnroffst incremented by 1 without overshooting `budget`, pick
-    // the channel that delivers the largest mantissa-bit increase per
-    // step (= the channel whose mask has the most low-bap bins to
-    // promote — the ones that benefit most). For simplicity we just
-    // pick the lowest-numbered channel that fits each round; the
-    // order matters only marginally because the bumps are 1-step and
-    // the total slack is usually 1-3 bumps per channel.
+    // **Bump ordering** — round-23 visited channels in `0..nchan`
+    // index order. When a low-index channel's signal had little HF
+    // energy (e.g. a 220 Hz tone on ch=0 in a 5-channel sine-sweep),
+    // each of its bumps cost very few mantissa bits, so under
+    // round-robin it consumed almost all of the residual budget
+    // (capping at fsnroffst=15) before higher-index channels could
+    // bump even once. R91's per-channel PSNR gates exposed this:
+    // the 3/2 self-decode trace recorded L=32.7 dB while C=10.5 dB
+    // and R=11.0 dB barely cleared the 10 dB floor.
+    //
+    // R95 swaps the inner loop to **least-served first**: per round,
+    // we walk the channels in ascending current `fsnroffst_ch[ch]`
+    // (ch index as tiebreaker), so the channel furthest behind gets
+    // first crack at the slack each pass. The non-normative policy
+    // matches ATSC A/52:2018 Annex C's guidance that the encoder
+    // SHOULD balance the per-channel SNR — §5.4.3.40 itself only
+    // defines the bitstream field; the choice of `fsnroffst[ch]`
+    // value is left to the encoder.
     //
     // We don't tune cplfsnroffst / lfefsnroffst per-channel here —
     // they're singletons in the bitstream syntax and the cpl/lfe
@@ -3162,14 +3173,59 @@ pub(crate) fn tune_snroffst_with_plan(
         }
         mantissa_bits_total(&bps, end, nchan, cpl, lfeon)
     };
-    // Per-channel greedy bumps. Cap iterations at MAX_FBW * 16 (15 max
-    // bump per channel) to bound the worst-case work.
+    // Per-channel greedy bumps, **least-served first with fairness
+    // cap** (r95).
+    //
+    // Two-stage greedy:
+    //
+    //   1. **Equalisation pass** — repeatedly bump every channel
+    //      currently sitting at the round-wide minimum
+    //      `fsnroffst_ch`. Walked in ascending-fsnr / ascending-ch
+    //      order. This guarantees every fbw channel gets at least
+    //      `min(fsnroffst_ch[..nchan])` bumps before any one runs
+    //      ahead.
+    //
+    //   2. **Free-bump pass** — once the equalisation pass stalls
+    //      (= no minimum-channel bump fits, e.g. because a
+    //      high-frequency channel can't afford another bump on the
+    //      remaining budget), fall back to a per-channel greedy
+    //      walk that lets cheap-bump channels consume the residual
+    //      slack. This recovers the old behaviour for slack that
+    //      *no* channel can spread fairly.
+    //
+    // The equalisation pass closes the long-standing r91 gap where a
+    // low-frequency-tone channel (220 Hz on slot 0 in the per-channel
+    // PSNR tests) consumed ~15 bumps before higher-frequency
+    // siblings managed one each, leaving the 660 Hz centre slot
+    // pinned at fsnroffst_ch = 0 while slot 0 sat at 15.
+    //
+    // ATSC A/52:2018 §5.4.3.40 only defines the bitstream field;
+    // the encoder's choice of value is non-normative. The Annex C
+    // reference encoder suggests balancing the per-channel SNR; the
+    // fairness cap is one realisation of that guidance.
+    let mut order: [usize; MAX_FBW] = [0; MAX_FBW];
+
+    // Stage 1: equalisation. Bump the minimum-fsnr channels until
+    // none of them fit further bumps.
     for _round in 0..(MAX_FBW * 16) {
-        let mut bumped = false;
+        let mut min_fsnr: u8 = u8::MAX;
         for ch in 0..nchan {
-            if best.fsnroffst_ch[ch] >= 15 {
-                continue;
+            if best.fsnroffst_ch[ch] < 15 && best.fsnroffst_ch[ch] < min_fsnr {
+                min_fsnr = best.fsnroffst_ch[ch];
             }
+        }
+        if min_fsnr == u8::MAX {
+            break;
+        }
+        let mut n_eligible = 0usize;
+        for ch in 0..nchan {
+            if best.fsnroffst_ch[ch] == min_fsnr {
+                order[n_eligible] = ch;
+                n_eligible += 1;
+            }
+        }
+        let mut bumped = false;
+        for &ch in &order[..n_eligible] {
             let mut trial = best;
             trial.fsnroffst_ch[ch] += 1;
             let trial_used = recompute_used(&trial);
@@ -3181,6 +3237,59 @@ pub(crate) fn tune_snroffst_with_plan(
         if !bumped {
             break;
         }
+    }
+
+    // Stage 2: free residual-bump pass with **spread cap**. Sort
+    // eligible channels by ascending current `fsnroffst_ch`. A
+    // channel is only eligible if its fsnr_ch stays within
+    // `FAIR_SPREAD` of the round-wide minimum after the bump —
+    // this prevents a single cheap-mantissa channel (low-frequency
+    // tone) from running away to fsnr_ch=15 while siblings sit at 0.
+    //
+    // FAIR_SPREAD=2 gives every fbw channel within 2 fine SNR
+    // steps of any other. fsnr is 4 bits / channel, so 2 steps
+    // corresponds to roughly 1.5 dB of per-channel SNR variance
+    // — well below the 10 dB floor while leaving slack for cheap
+    // channels to absorb otherwise-wasted budget.
+    const FAIR_SPREAD: u8 = 2;
+    for _round in 0..(MAX_FBW * 16) {
+        let cur_min = (0..nchan)
+            .map(|ch| best.fsnroffst_ch[ch])
+            .min()
+            .unwrap_or(0);
+        let mut n_eligible = 0usize;
+        for ch in 0..nchan {
+            if best.fsnroffst_ch[ch] < 15
+                && best.fsnroffst_ch[ch].saturating_sub(cur_min) < FAIR_SPREAD
+            {
+                order[n_eligible] = ch;
+                n_eligible += 1;
+            }
+        }
+        if n_eligible == 0 {
+            break;
+        }
+        order[..n_eligible].sort_by_key(|&ch| best.fsnroffst_ch[ch]);
+
+        let mut bumped = false;
+        for &ch in &order[..n_eligible] {
+            let mut trial = best;
+            trial.fsnroffst_ch[ch] += 1;
+            let trial_used = recompute_used(&trial);
+            if trial_used <= budget {
+                best = trial;
+                bumped = true;
+            }
+        }
+        if !bumped {
+            break;
+        }
+    }
+    if std::env::var("AC3_DEBUG_PERCH_SNR").is_ok() {
+        eprintln!(
+            "tune_snroffst: csnr={} fsnr={} fsnr_ch={:?} cpl_fsnr={} lfe_fsnr={}",
+            best.csnroffst, best.fsnroffst, best.fsnroffst_ch, best.cplfsnroffst, best.lfefsnroffst,
+        );
     }
     best
 }
@@ -5948,6 +6057,94 @@ mod tests {
     #[test]
     fn two_two_psnr_per_channel() {
         encode_decode_multichan_psnr(4, 6, false, &[10.0f64; 4]);
+    }
+
+    /// Round-95: `tune_snroffst_with_plan` per-channel fsnroffst
+    /// fairness regression. Synthetic exponents simulate a
+    /// 5-channel scenario where channel 0 has near-zero PSD (so its
+    /// per-bump mantissa cost is tiny) and channels 1..4 carry
+    /// dense HF energy (large per-bump cost). The r91 round-robin
+    /// would let ch=0 reach `fsnroffst_ch=15` while ch=1..4 stayed
+    /// at the global baseline; r95's equalise + spread-cap two-stage
+    /// greedy keeps the per-channel spread ≤ 2 + cheap-bump residual.
+    ///
+    /// The test asserts the **maximum** fsnroffst_ch minus the
+    /// **minimum** fsnroffst_ch is bounded — without the fix the
+    /// spread reached 15 on this input shape.
+    #[test]
+    fn tune_snroffst_per_channel_spread_bounded() {
+        use crate::audblk::{BLOCKS_PER_FRAME, N_COEFFS};
+        let nchan = 5usize;
+        let end = 253usize;
+        // Build per-channel exponent grids. ch=0: all-quiet (exp=24
+        // means PSD ~ 0). ch=1..4: HF-rich (low exps in upper bins
+        // = high PSD across the band, so each fsnr bump moves many
+        // bap-bins from bap=0 to bap=1+, costing real mantissa
+        // bits).
+        let mut exps: Vec<Vec<[u8; N_COEFFS]>> = vec![
+            vec![[24u8; N_COEFFS]; BLOCKS_PER_FRAME];
+            nchan + 2 /* +cpl +lfe slots */
+        ];
+        for ch in 1..nchan {
+            for blk in 0..BLOCKS_PER_FRAME {
+                for bin in 0..end {
+                    // Low exps in upper half = strong HF energy.
+                    exps[ch][blk][bin] = if bin < end / 2 { 8 } else { 4 };
+                }
+            }
+        }
+        // Couple-pseudo and LFE slots are also populated to keep
+        // recompute_used valid (the cpl/lfe paths are gated off by
+        // CouplingPlan::in_use=false and lfeon=false below).
+        let ba = BitAllocParams {
+            sdcycod: 2,
+            fdcycod: 1,
+            sgaincod: 1,
+            dbpbcod: 2,
+            floorcod: 4,
+            csnroffst: 32,
+            fsnroffst: 0,
+            fsnroffst_ch: [0u8; MAX_FBW],
+            cplfsnroffst: 0,
+            lfefsnroffst: 0,
+            fgaincod: 4,
+            cplfgaincod: 4,
+            lfefgaincod: 4,
+        };
+        let cpl = CouplingPlan::default();
+        let dba = DbaPlan::default();
+        let exp_strategies = [1u8; BLOCKS_PER_FRAME];
+        // Pick a frame_bytes that yields a tight budget. 384 kbps
+        // → ~1536 B / frame at 48 kHz.
+        let frame_bytes = 1536usize;
+        let fscod = 0u8;
+        let tuned = tune_snroffst_with_plan(
+            &ba,
+            &exps,
+            end,
+            nchan,
+            fscod,
+            frame_bytes,
+            &exp_strategies,
+            None,
+            &cpl,
+            &dba,
+            7,     // acmod
+            false, // lfeon
+        );
+        let min_v = (0..nchan).map(|c| tuned.fsnroffst_ch[c]).min().unwrap();
+        let max_v = (0..nchan).map(|c| tuned.fsnroffst_ch[c]).max().unwrap();
+        let spread = max_v - min_v;
+        // Without r95 the spread reaches 14-15 on this input
+        // (cheap-bump ch=0 runs away to 15 while expensive-bump
+        // ch=1..4 stay at the global baseline). r95 bounds the
+        // spread to FAIR_SPREAD + at-most-one-residual = 3.
+        assert!(
+            spread <= 3,
+            "fsnroffst_ch spread {} > 3 (values {:?}); the r95 fairness cap regressed",
+            spread,
+            &tuned.fsnroffst_ch[..nchan]
+        );
     }
 
     /// Round-91 helper — encode + self-decode + measure per-channel

@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Per-channel fsnroffst encoder policy** — round 95. Replaces the
+  round-23 index-order round-robin in `tune_snroffst_with_plan` with
+  a two-stage greedy that closes the asymmetry r91's per-channel
+  PSNR gates exposed (channel 0 reaching `fsnroffst_ch=15` while
+  siblings stayed at the global baseline).
+  * **Stage 1 — equalise.** Each round we bump every channel
+    currently at the minimum `fsnroffst_ch` that still fits the
+    frame budget. Every fbw channel reaches `min(fsnroffst_ch)`
+    before any one runs ahead.
+  * **Stage 2 — spread-capped residual.** A channel only enters the
+    free-bump pass if `fsnroffst_ch[ch] - min(fsnroffst_ch[..]) <
+    FAIR_SPREAD` (FAIR_SPREAD=2, ≈1.5 dB per-channel SNR variance).
+    This prevents a cheap-mantissa channel from monopolising slack
+    that the spec lets a single channel claim.
+  ATSC A/52:2018 §5.4.3.40 only defines the bitstream field; the
+  encoder's choice of value is non-normative (Annex C reference
+  encoder suggests balancing the per-channel SNR). New regression:
+  `tune_snroffst_per_channel_spread_bounded` synthesises a
+  5-channel exponent grid with one cheap-bump channel and four
+  expensive-bump channels and asserts the post-tune
+  `max(fsnroffst_ch) - min(fsnroffst_ch) ≤ 3` — pre-r95 this
+  spread reached 14-15. The change is encoder-policy only and the
+  existing per-channel PSNR floors (`two_two_psnr_per_channel`,
+  `three_two_psnr_per_channel`, `five_one_psnr_per_channel`) hold
+  unchanged on the 220×n Hz multitone fixture; PSNR is bap-cap-bound
+  on those pure-sine inputs, so the fairness fix is visible in the
+  per-channel `fsnroffst_ch` array (now `[2, 1, 1, 2, 0]` instead of
+  `[15, 1, 1, 2, 0]` on the tight-budget redistribution frames) but
+  not in the test PSNR numbers. New `AC3_DEBUG_PERCH_SNR=1` env var
+  prints the post-tune `(csnr, fsnr, fsnr_ch, cpl_fsnr, lfe_fsnr)`
+  tuple per frame for A/B sweeps.
+
 ### Added
 
 - **2/2 + 5-channel PSNR regression coverage** — round 91. Adds
