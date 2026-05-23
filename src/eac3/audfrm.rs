@@ -201,6 +201,18 @@ pub struct AudFrm {
     /// `lfeahtinu` flag (single LFE channel). Populated by
     /// [`parse_phase_b`] when `nlferegs == 1` and `lfeon == true`.
     pub lfeahtinu: bool,
+    /// Per-fbw-channel `chintransproc[ch]` (§2.3.2.21 / Table E1.3) —
+    /// `true` when channel `ch` carries transient pre-noise time-scaling
+    /// synthesis data this frame. Only meaningful when `transproce`.
+    pub chintransproc: [bool; MAX_FBW],
+    /// Per-fbw-channel `transprocloc[ch]` (10 bits, §2.3.2.22). The
+    /// transient location relative to the first decoded PCM sample of
+    /// the frame, in units of 4 samples — multiply by 4 to get the
+    /// sample index (§E.3.7.2). Only valid when `chintransproc[ch]`.
+    pub transprocloc: [u16; MAX_FBW],
+    /// Per-fbw-channel `transproclen[ch]` (8 bits, §2.3.2.23) — the time
+    /// scaling length in samples. Only valid when `chintransproc[ch]`.
+    pub transproclen: [u16; MAX_FBW],
 }
 
 impl AudFrm {
@@ -233,6 +245,9 @@ impl AudFrm {
             chahtinu: [false; MAX_FBW],
             cplahtinu: false,
             lfeahtinu: false,
+            chintransproc: [false; MAX_FBW],
+            transprocloc: [0; MAX_FBW],
+            transproclen: [0; MAX_FBW],
         }
     }
 }
@@ -462,13 +477,18 @@ fn parse_tail(br: &mut BitReader<'_>, a: &mut AudFrm, bsi: &Bsi) -> Result<()> {
     }
     // snroffststr 1 / 2 → per-block values, parsed inside audblk.
 
-    // ---- transient pre-noise processing ----
+    // ---- transient pre-noise processing (§2.3.2.20-23 / Table E1.3) ----
+    // Capture the per-channel transient-location / time-scaling-length
+    // parameters so the §E.3.7.2 PCM-domain synthesis can run after
+    // overlap-add. Previously these were read for cursor alignment only
+    // and discarded (the dsp then errored the whole frame).
     if a.transproce {
-        for _ch in 0..nfchans {
+        for ch in 0..nfchans.min(MAX_FBW) {
             let chintransproc = br.read_u32(1)? != 0;
+            a.chintransproc[ch] = chintransproc;
             if chintransproc {
-                let _transprocloc = br.read_u32(10)?;
-                let _transproclen = br.read_u32(8)?;
+                a.transprocloc[ch] = br.read_u32(10)? as u16;
+                a.transproclen[ch] = br.read_u32(8)? as u16;
             }
         }
     }

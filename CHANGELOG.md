@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **E-AC-3 transient pre-noise processing (TPNP) decode** — round 103.
+  Implements the §E.3.7.2 PCM-domain time-scaling synthesis, replacing
+  the round-2 whole-frame reject (`transproce == 1` previously errored
+  the entire syncframe, muting otherwise-decodable audio).
+  * **Parse** (`eac3::audfrm::parse_tail`): the per-fbw-channel
+    `chintransproc[ch]` (1 bit), `transprocloc[ch]` (10 bits, in
+    4-sample units), and `transproclen[ch]` (8 bits) are now stored on
+    `AudFrm` instead of being read-and-discarded for cursor alignment.
+  * **Synthesis** (`eac3::dsp::apply_transient_prenoise`, called after
+    overlap-add): for each fbw channel carrying TPNP data it (1) derives
+    `transloc = 4·transprocloc`, the containing audio block's leading
+    edge `aud_blk_samp_loc`, the pre-noise length `pnlen`, and the total
+    correction length `tot_corr_len = pnlen + translen + TC1`; (2) copies
+    a `2·TC1 + pnlen`-sample synthesis buffer from earlier (cleaner)
+    PCM; (3) overwrites the pre-transient region with three windows —
+    fade-out/in over `TC1 = 256`, full synth overwrite, fade-in/out over
+    `TC2 = 128` — using complementary Hann cross-fades (the spec permits
+    "nearly any pair of constant-amplitude cross-fade windows"). LFE
+    never carries TPNP; the baseband decode is untouched (TPNP is a
+    quality enhancement on already-valid samples).
+  * **Cross-frame note**: §E.3.7.1 allows a frame-N transient to
+    reference frame-(N-1) tail samples; the round-103 path clamps such
+    reads to index 0 (conservative single-frame behaviour) and a future
+    round can thread the previous frame's tail through
+    `Eac3DecoderState`.
+  * 4 unit tests in `eac3::dsp::tpnp_tests` cover the no-op cases
+    (transient at/after frame end, block-aligned transient), the
+    constant-signal-survives-cross-fade invariant, and the region-2
+    full-overwrite-equals-synthesis-source property.
 - **E-AC-3 spectral extension (SPX) decode** — round 100. Implements
   the §E.2.3.3 SPX strategy + coordinate syntax and the §E.3.6
   high-frequency regeneration, replacing the round-4 `spxinu == 1`

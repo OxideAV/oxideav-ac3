@@ -216,10 +216,35 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       (`audblk::spx_tests`). Note: the three SPX-active corpus fixtures
       (`eac3-stereo-48000-192kbps`, `eac3-256-coeff-block`,
       `eac3-from-ac3-bitstream-recombination`) remain floor-bound on a
-      pre-existing coupling/bit-allocation cursor drift affecting a subset
-      of their non-SPX frames — the same drift that mutes a few AC-3
-      fixtures (`ac3-32000hz-stereo`) — so end-to-end PSNR there awaits
-      that separate fix.
+      pre-existing bit-allocation cursor drift affecting a subset of their
+      non-SPX frames — the same drift that mutes a few AC-3 fixtures
+      (`ac3-32000hz-stereo`) — so end-to-end PSNR there awaits that
+      separate fix. For `ac3-32000hz-stereo` specifically, the first
+      syncframe decodes bit-exactly (≤2 LSB) but the second over-reads
+      mantissas — the bap array for its D15/full-bandwidth/no-coupling
+      blocks comes out more generous than the reference encoder budgeted,
+      so blocks explode then exhaust the frame. Pinpointing it needs a
+      per-block reference, which the shipped `trace.txt` cannot provide
+      (it was captured from a 12-frame stream while `input.ac3` carries
+      11 frames — see followups).
+- [x] E-AC-3 decoder — **transient pre-noise processing (TPNP)** decode
+      (round 103 / r103). Implements the §E.3.7.2 PCM-domain time-scaling
+      synthesis, replacing the round-2 whole-frame reject that errored any
+      syncframe with `transproce == 1`. The audfrm parser now stores the
+      per-fbw-channel `chintransproc` / `transprocloc` (4-sample units) /
+      `transproclen` fields; after overlap-add, `apply_transient_prenoise`
+      reconstructs the pre-transient region for each TPNP channel from a
+      `2·TC1 + pnlen`-sample synthesis buffer copied from earlier audio
+      and cross-fades it over the noisy original (fade window `TC1 = 256`,
+      overwrite middle, fade window `TC2 = 128`; complementary Hann
+      windows per §E.3.7.2's "any constant-amplitude cross-fade pair").
+      LFE never carries TPNP and the baseband decode is unchanged — TPNP
+      is a quality enhancement on already-valid samples. The §E.3.7.1
+      cross-frame case (a frame-N transient referencing frame-(N-1) tail)
+      is clamped to the current frame (single-frame conservative path);
+      no corpus fixture carries `transproce == 1`, so the synthesis math
+      is covered by 4 unit tests (`eac3::dsp::tpnp_tests`) rather than an
+      end-to-end PSNR gate.
 
 ## Installation
 

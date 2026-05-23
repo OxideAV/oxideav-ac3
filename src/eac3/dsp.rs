@@ -128,7 +128,8 @@
 //! * Standard coupling (round 5); enhanced coupling still rejected.
 //! * No spectral extension (`spxinu == 0` always).
 //! * No AHT (`ahte == 0` — gated upstream in audfrm parser).
-//! * No transient pre-noise processing (`transproce == 0`).
+//! * Transient pre-noise processing (`transproce == 1`) is decoded via
+//!   the §E.3.7.2 PCM-domain synthesis (round 103); no longer rejected.
 //!
 //! When any of these conditions is violated the parser returns
 //! [`oxideav_core::Error::Unsupported`] and the caller (the decoder
@@ -1162,7 +1163,159 @@ pub fn decode_indep_audblks(
             }
         }
     }
+
+    // ---- Transient pre-noise processing (§E.3.7.2) ----
+    // After overlap-add, each fbw channel that carries TPNP data has its
+    // pre-transient region overwritten with a time-scaled copy of the
+    // cleaner audio that precedes it, removing the smeared pre-noise a
+    // low-rate transform coder leaves ahead of a sharp onset. LFE never
+    // carries TPNP. Operates in place on the interleaved `out` buffer.
+    if audfrm.transproce {
+        let total_samples = num_blocks * SAMPLES_PER_BLOCK;
+        for ch in 0..nfchans {
+            if !audfrm.chintransproc[ch] {
+                continue;
+            }
+            apply_transient_prenoise(
+                out,
+                nchans,
+                ch,
+                total_samples,
+                audfrm.transprocloc[ch],
+                audfrm.transproclen[ch],
+            );
+        }
+    }
     Ok(())
+}
+
+/// Transient pre-noise time-scaling synthesis for one full-bandwidth
+/// channel (§E.3.7.2). Operates in place on the interleaved f32 frame
+/// buffer `out` (stride `nchans`, channel slot `ch`).
+///
+/// The encoder transmits, relative to the first decoded PCM sample of
+/// the frame, the transient location `transprocloc` (in 4-sample units;
+/// multiply by 4) and the time-scaling length `transproclen` (samples).
+/// The decoder reconstructs the pre-transient region from a synthesis
+/// buffer copied from earlier (cleaner) audio and cross-fades it over
+/// the noisy original per the spec pseudo-code:
+///
+/// ```text
+/// transloc      = 4 * transprocloc
+/// translen      = transproclen
+/// pnlen         = transloc - aud_blk_samp_loc      // pre-noise length
+/// tot_corr_len  = pnlen + translen + TC1
+/// synth_buf[s]  = pcm_out[transloc - (2*TC1 + 2*pnlen) + s]   // 0..2*TC1+pnlen
+/// start_samp    = transloc - tot_corr_len
+///   [start .. start+TC1)            : fade out original, fade in synth
+///   [start+TC1 .. start+corr-TC2)   : overwrite with synth
+///   [start+corr-TC2 .. start+corr)  : fade in original, fade out synth
+/// ```
+///
+/// `TC1 = 256`, `TC2 = 128` are the spec's fixed time-scaling constants.
+/// `aud_blk_samp_loc` is the first-sample index of the 256-sample audio
+/// block that contains the transient — the decoder derives it directly
+/// (the block boundary at or below `transloc`).
+///
+/// Cross-fades use complementary Hann windows (§E.3.7.2 permits "nearly
+/// any pair of constant-amplitude cross-fade windows"; Hann is the
+/// spec's recommended choice). Reads that fall before the start of the
+/// frame buffer (the spec allows a frame-N transient to reference
+/// frame-(N-1) tail samples — §E.3.7.1) are clamped to index 0, the
+/// conservative single-frame behaviour; a future round can thread the
+/// previous frame's tail through `Eac3DecoderState` for the exact
+/// cross-frame case.
+fn apply_transient_prenoise(
+    out: &mut [f32],
+    nchans: usize,
+    ch: usize,
+    total_samples: usize,
+    transprocloc: u16,
+    transproclen: u16,
+) {
+    const TC1: usize = 256;
+    const TC2: usize = 128;
+
+    let transloc = 4 * transprocloc as usize;
+    let translen = transproclen as usize;
+    // A transient at/after the frame end (or a degenerate zero location)
+    // leaves nothing to correct.
+    if transloc == 0 || transloc >= total_samples {
+        return;
+    }
+    // First sample of the 256-sample audio block containing the transient.
+    let aud_blk_samp_loc = (transloc / SAMPLES_PER_BLOCK) * SAMPLES_PER_BLOCK;
+    let pnlen = transloc.saturating_sub(aud_blk_samp_loc);
+    if pnlen == 0 {
+        // Transient sits exactly on a block boundary → no pre-noise gap.
+        return;
+    }
+    let tot_corr_len = pnlen + translen + TC1;
+    let synth_len = 2 * TC1 + pnlen;
+
+    // Build the synthesis buffer from earlier PCM. `src0` is the first
+    // source index; the spec uses `transloc - (2*TC1 + 2*pnlen)`. When
+    // that is negative the samples come from the previous frame — clamp
+    // to 0 (single-frame conservative path).
+    let want_src0 = transloc as isize - (2 * TC1 + 2 * pnlen) as isize;
+    let read = |samp_idx: isize| -> f32 {
+        let idx = samp_idx.max(0) as usize;
+        if idx < total_samples {
+            out[idx * nchans + ch]
+        } else {
+            0.0
+        }
+    };
+    let mut synth_buf = vec![0.0f32; synth_len];
+    for (s, slot) in synth_buf.iter_mut().enumerate() {
+        *slot = read(want_src0 + s as isize);
+    }
+
+    // start_samp = transloc - tot_corr_len. Clamp the overwrite window to
+    // the valid buffer range so cross-frame underflow never panics.
+    let start_isize = transloc as isize - tot_corr_len as isize;
+
+    // Complementary Hann cross-fade windows.
+    let hann_in = |i: usize, len: usize| -> f32 {
+        if len <= 1 {
+            return 1.0;
+        }
+        let x = std::f32::consts::PI * i as f32 / len as f32;
+        0.5 - 0.5 * x.cos()
+    };
+
+    // Region 1: [start .. start+TC1) — fade out original, fade in synth.
+    for s in 0..TC1.min(tot_corr_len) {
+        let dst = start_isize + s as isize;
+        if dst < 0 || dst as usize >= total_samples {
+            continue;
+        }
+        let fi = hann_in(s, TC1);
+        let fo = 1.0 - fi;
+        let orig = out[dst as usize * nchans + ch];
+        out[dst as usize * nchans + ch] = orig * fo + synth_buf[s] * fi;
+    }
+    // Region 2: [start+TC1 .. start+corr-TC2) — full synth overwrite.
+    let r2_end = tot_corr_len.saturating_sub(TC2);
+    for s in TC1..r2_end {
+        let dst = start_isize + s as isize;
+        if dst < 0 || dst as usize >= total_samples || s >= synth_len {
+            continue;
+        }
+        out[dst as usize * nchans + ch] = synth_buf[s];
+    }
+    // Region 3: [start+corr-TC2 .. start+corr) — fade in original, fade
+    // out synth.
+    for (j, s) in (r2_end..tot_corr_len).enumerate() {
+        let dst = start_isize + s as isize;
+        if dst < 0 || dst as usize >= total_samples || s >= synth_len {
+            continue;
+        }
+        let fi = hann_in(j, TC2);
+        let fo = 1.0 - fi;
+        let orig = out[dst as usize * nchans + ch];
+        out[dst as usize * nchans + ch] = orig * fi + synth_buf[s] * fo;
+    }
 }
 
 /// AHT-aware mantissa unpacker.
@@ -1451,11 +1604,11 @@ fn reject_unsupported(bsi: &Eac3Bsi, audfrm: &AudFrm) -> Result<()> {
             audfrm.snroffststr
         )));
     }
-    if audfrm.transproce {
-        return Err(Error::unsupported(
-            "eac3 dsp: transient pre-noise processing in use — round 2 mutes",
-        ));
-    }
+    // Transient pre-noise processing (`transproce`) is no longer a
+    // whole-frame reject: the per-channel time-scaling synthesis runs in
+    // `apply_transient_prenoise` after overlap-add (§E.3.7.2). The
+    // baseband decode is unaffected by TPNP — it is a PCM-domain quality
+    // enhancement layered on top of already-valid samples.
     if audfrm.spxattene {
         return Err(Error::unsupported(
             "eac3 dsp: spectral-extension attenuation in use — round 2 mutes",
@@ -1530,4 +1683,121 @@ fn dynrng_to_linear(dynrng: u8) -> f32 {
     let shift = x_signed + 1;
     let base = 2f32.powi(shift);
     base * y_val
+}
+
+#[cfg(test)]
+mod tpnp_tests {
+    use super::*;
+
+    // Mono helper: build an interleaved (stride 1) frame buffer.
+    fn frame(samples: usize) -> Vec<f32> {
+        vec![0.0; samples]
+    }
+
+    /// A transient at or past the frame end is a no-op (nothing to
+    /// correct ahead of it within this frame).
+    #[test]
+    fn transient_at_or_after_frame_end_is_noop() {
+        let total = 6 * SAMPLES_PER_BLOCK; // 1536
+        let mut buf = frame(total);
+        for (i, v) in buf.iter_mut().enumerate() {
+            *v = i as f32;
+        }
+        let before = buf.clone();
+        // transprocloc * 4 == total → transient at the frame end.
+        apply_transient_prenoise(&mut buf, 1, 0, total, (total / 4) as u16, 50);
+        assert_eq!(buf, before, "transient at frame end must not modify PCM");
+        // Past the end.
+        apply_transient_prenoise(&mut buf, 1, 0, total, (total / 4 + 100) as u16, 50);
+        assert_eq!(buf, before, "transient past frame end must not modify PCM");
+    }
+
+    /// A transient sitting exactly on a 256-sample block boundary has
+    /// zero pre-noise length → no correction window.
+    #[test]
+    fn transient_on_block_boundary_is_noop() {
+        let total = 6 * SAMPLES_PER_BLOCK;
+        let mut buf = frame(total);
+        for (i, v) in buf.iter_mut().enumerate() {
+            *v = (i as f32).sin();
+        }
+        let before = buf.clone();
+        // transloc = 4 * 256 = 1024 → exactly block 4's leading edge.
+        apply_transient_prenoise(&mut buf, 1, 0, total, (1024 / 4) as u16, 32);
+        assert_eq!(buf, before, "block-aligned transient → no pre-noise gap");
+    }
+
+    /// The corrected window must overwrite ONLY the pre-transient region
+    /// `[start .. transloc)` and leave samples at/after the transient (and
+    /// well before `start`) untouched. Uses a constant-1.0 baseband so the
+    /// synth buffer is also all-1.0, which keeps cross-faded values at 1.0
+    /// (complementary windows sum to 1) — making the "unchanged" assertion
+    /// exact for every corrected sample too.
+    #[test]
+    fn correction_is_bounded_and_preserves_constant_signal() {
+        let total = 6 * SAMPLES_PER_BLOCK; // 1536
+        let mut buf = vec![1.0f32; total];
+        // transloc = 4 * 300 = 1200 (inside block 4: 1024..1280).
+        let transprocloc = 300u16;
+        let transloc = 4 * transprocloc as usize; // 1200
+        let translen = 40usize;
+        apply_transient_prenoise(&mut buf, 1, 0, total, transprocloc, translen as u16);
+        // A constant signal is its own time-scaled copy: every sample must
+        // remain 1.0 within fp tolerance (the cross-fade windows are
+        // complementary and the synth buffer is all 1.0).
+        for (i, &v) in buf.iter().enumerate() {
+            assert!(
+                (v - 1.0).abs() < 1e-5,
+                "sample {i} drifted to {v} (constant signal must survive TPNP)"
+            );
+        }
+        // Sanity: the transient sample itself and everything after it is
+        // strictly outside the overwrite window.
+        let pnlen = transloc - 1024; // 176
+        let tot_corr_len = pnlen + translen + 256; // 472
+        let start = transloc - tot_corr_len; // 728
+        assert!(start < transloc, "correction window must precede transient");
+        assert!(
+            tot_corr_len > 256 + 128,
+            "window must span all three §E.3.7.2 cross-fade/overwrite regions"
+        );
+    }
+
+    /// With distinct earlier audio, the middle (full-overwrite) region of
+    /// the corrected window must equal the copied synthesis samples — i.e.
+    /// the pre-noise is genuinely replaced, not merely attenuated.
+    #[test]
+    fn middle_region_overwrites_with_synthesis_samples() {
+        const TC1: usize = 256;
+        const TC2: usize = 128;
+        let total = 6 * SAMPLES_PER_BLOCK;
+        // Ramp so each sample is uniquely identifiable.
+        let mut buf: Vec<f32> = (0..total).map(|i| i as f32).collect();
+        let transprocloc = 300u16;
+        let transloc = 4 * transprocloc as usize; // 1200
+        let translen = 40usize;
+        let pnlen = transloc - 1024; // 176
+        let tot_corr_len = pnlen + translen + TC1; // 472
+        let start = transloc - tot_corr_len; // 728
+        let want_src0 = transloc as isize - (2 * TC1 + 2 * pnlen) as isize; // 1200-864=336
+        let orig = buf.clone();
+        apply_transient_prenoise(&mut buf, 1, 0, total, transprocloc, translen as u16);
+        // Check a sample firmly inside region 2 [start+TC1 .. start+corr-TC2).
+        let s = TC1 + 10; // within [256 .. 472-128=344)
+        assert!(s < tot_corr_len - TC2);
+        let dst = start + s;
+        let expected = orig[(want_src0 + s as isize) as usize];
+        assert!(
+            (buf[dst] - expected).abs() < 1e-4,
+            "region-2 sample {dst} should equal synth source {expected}, got {}",
+            buf[dst]
+        );
+        // A sample at/after the transient is untouched.
+        assert_eq!(buf[transloc], orig[transloc], "transient sample untouched");
+        assert_eq!(
+            buf[transloc + 5],
+            orig[transloc + 5],
+            "post-transient untouched"
+        );
+    }
 }

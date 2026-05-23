@@ -87,8 +87,13 @@
 //!   `eac3-low-bitrate-32kbps` at **66 dB**.
 //! * **Per-block SNR-offset** (`snroffststr != 0`) — needs the
 //!   audblk-level `snroffste` parser. Same situation as above.
-//! * **Transient pre-noise processing** (`transproce == 1`) — the
-//!   `transprocloc` / `transproclen` per-channel attenuation envelope.
+//! * **Transient pre-noise processing** (`transproce == 1`) —
+//!   **landed** (round 103). The per-channel `chintransproc` /
+//!   `transprocloc` / `transproclen` fields are stored on
+//!   [`audfrm::AudFrm`] and the §E.3.7.2 PCM-domain time-scaling
+//!   synthesis runs in [`dsp::decode_indep_audblks`] after overlap-add
+//!   (see `dsp::apply_transient_prenoise`). The cross-frame reference
+//!   case (§E.3.7.1) is clamped to the current frame for now.
 //! * **256-coeff-block-per-syncframe variants** (`numblkscod < 3`).
 //!   The parser handles them; the silent-PCM path produces an output
 //!   of the right length only.
