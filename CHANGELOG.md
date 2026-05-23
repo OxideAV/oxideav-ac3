@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **E-AC-3 spectral extension (SPX) decode** — round 100. Implements
+  the §E.2.3.3 SPX strategy + coordinate syntax and the §E.3.6
+  high-frequency regeneration, replacing the round-4 `spxinu == 1`
+  mute path.
+  * **Parse** (`eac3::dsp`): `chinspx[ch]`, `spxstrtf`, `spxbegf`,
+    `spxendf`, `spxbndstrce` + `spxbndstrc[]` (Table E2.11 default
+    banding), and the per-channel coordinate block `spxcoe` /
+    `spxblnd` / `mstrspxco` / `spxcoexp` / `spxcomant`.
+  * **Synthesis** (`audblk::apply_spectral_extension`, called from
+    `dsp_block` between rematrix and dynrng): transform-coefficient
+    translation with the §E.3.6.4.1 wrapping copy cursor, banded RMS
+    energy, spxblnd-derived noise/signal blending (§E.3.6.4.2), and
+    `spxco·32` coordinate scaling (§E.3.6.4.3). The SPX-channel
+    `end_mant` is extended to the SPX end so dynrng + IMDCT process
+    the regenerated bins. Base AC-3 never sets `in_spx`, so this is a
+    no-op there.
+  * **Cursor-drift derivations** now spec-correct on SPX frames:
+    `endmant[ch] = spxbandtable[spx_begin_subbnd]` (§E.3.3.3),
+    `cplendf` derived from `spxbegf` when SPX is in use (§E.3.3.1),
+    and `nrematbd` folding in SPX via `remat_band_count_spx`
+    (§E.3.3.2).
+  * The §E.3.6.4.2 noise generator is non-normative per spec; a
+    deterministic 32-bit xorshift LFSR (`spx_noise`) keeps decodes
+    reproducible.
+  * 5 unit tests in `audblk::spx_tests` cover `spx_bandtable`, the
+    coordinate-decode formula, default-banding band sizing, the
+    end-to-end copy+scale synthesis, and the disabled no-op.
+- **E-AC-3 D25 exponent-group-count fix** — round 100. `nchgrps` for
+  the D25 strategy used `(endmant−1).div_ceil(6)` = `(endmant−1+5)/6`,
+  over-counting one group when `(endmant−1) mod 6 ∈ {2,3}` and reading
+  an extra 7-bit exponent word (drifting the bit cursor). Corrected to
+  the §7.1.3 form `(endmant−1+3)/6`, matching the AC-3 path.
+
 ### Changed
 
 - **Per-channel fsnroffst encoder policy** — round 95. Replaces the

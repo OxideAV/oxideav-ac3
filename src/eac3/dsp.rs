@@ -1,9 +1,25 @@
-//! E-AC-3 audio-block DSP pipeline — rounds 2 / 4-stub / 5 / 6.
+//! E-AC-3 audio-block DSP pipeline — rounds 2 / 4-stub / 5 / 6 / 7-SPX.
 //!
 //! Translates the parsed [`super::bsi::Bsi`] + [`super::audfrm::AudFrm`]
 //! into the existing AC-3 [`crate::audblk::Ac3State`] shape so the §7
 //! DSP helpers (`decode_exponents`, `run_bit_allocation`,
 //! `unpack_mantissas`, `dsp_block`) can be reused without modification.
+//!
+//! ## Round 7 (this commit) — Spectral Extension (SPX) decode
+//!
+//! The audblk parser now decodes the full §E.2.3.3 SPX strategy +
+//! coordinate syntax (replacing the round-4 `spxinu == 1` mute):
+//! `chinspx[ch]`, `spxstrtf`, `spxbegf`, `spxendf`, `spxbndstrce` +
+//! `spxbndstrc[]` (with the Table E2.11 default banding), and the
+//! per-channel coordinate block `spxcoe` / `spxblnd` / `mstrspxco` /
+//! `spxcoexp` / `spxcomant`. SPX-channel `endmant` is set to the SPX
+//! begin frequency (§E.3.3.3), `chbwcod` is skipped for SPX channels,
+//! `cplendf` is derived from `spxbegf` when SPX is in use (§E.3.3.1),
+//! and `nrematbd` folds in SPX (§E.3.3.2) — three derivations that
+//! previously drifted the bit cursor on SPX frames. The §E.3.6
+//! high-frequency regeneration itself (coefficient translation, noise
+//! blending, banded RMS scaling, coordinate scaling) runs in
+//! [`crate::audblk::dsp_block`] via `apply_spectral_extension`.
 //!
 //! ## Round 6 (this commit) — Adaptive Hybrid Transform (AHT)
 //!
@@ -187,6 +203,21 @@ use super::aht::{self, AHT_BLOCKS};
 use super::audfrm::{self, AhtRegsHints, AudFrm};
 use super::bsi::{Bsi as Eac3Bsi, StreamType};
 
+/// Default spectral-extension banding structure `defspxbndstrc[]` per
+/// Table E2.11. Indexed by absolute SPX sub-band number; a `true` (the
+/// '1' entries at sub-bands 8, 10, 12, 14, 16) means "merge into the
+/// previous band". Used the first time SPX is active in a frame when
+/// `spxbndstrce == 0`.
+const DEFAULT_SPX_BNDSTRC: [bool; 18] = {
+    let mut t = [false; 18];
+    t[8] = true;
+    t[10] = true;
+    t[12] = true;
+    t[14] = true;
+    t[16] = true;
+    t
+};
+
 /// Decode one E-AC-3 independent substream's audblks into interleaved
 /// f32 PCM. Returns `Ok(())` on a successful clean walk, or `Err(...)`
 /// if any block hits a feature we don't support (caller substitutes
@@ -266,6 +297,11 @@ pub fn decode_indep_audblks(
     // syncframe so we keep them as locals here rather than on `state`.
     let mut firstcplcos: [bool; MAX_FBW] = [true; MAX_FBW];
     let mut firstcplleak = true;
+    // §E.2.3.3.9 firstspxcos[ch] — "have we seen explicit SPX
+    // coordinates for channel ch yet this frame". Resets every
+    // syncframe; the first block in which a channel is in SPX carries an
+    // implicit `spxcoe[ch] = 1`.
+    let mut firstspxcos: [bool; MAX_FBW] = [true; MAX_FBW];
 
     // §7.2.2.6 — clear leftover coupling state at the top of every
     // frame so a previous frame's `cpl_in_use` doesn't leak forward
@@ -273,6 +309,13 @@ pub fn decode_indep_audblks(
     state.cpl_in_use = false;
     for ch in 0..MAX_FBW {
         state.channels[ch].in_coupling = false;
+    }
+
+    // §E.3.6 — clear SPX state at the top of every frame so a previous
+    // frame's spxinu / band structure doesn't leak forward.
+    state.spx_in_use = false;
+    for ch in 0..MAX_FBW {
+        state.channels[ch].in_spx = false;
     }
 
     // ---- §3.4 AHT pre-buffered coefficients ----
@@ -347,33 +390,141 @@ pub fn decode_indep_audblks(
             }
         }
 
-        // ---- spectral extension strategy block (§E.1.3.5.1) ----
+        // ---- spectral extension strategy block (§E.1.3.5 / §E.3.6) ----
         //
         // Per Table E1.4, blk 0 has implicit `spxstre = 1` with the
         // 1-bit `spxinu[0]` emitted directly; subsequent blocks emit
         // `spxstre[blk]` (1 bit) + (only if spxstre[blk]) `spxinu[blk]`.
         //
-        // Round 4 stub: SPX-active frames mute. The spec (§E.1.3.5.1
-        // / §E.2.2.5.4) describes a parametric high-frequency
-        // reconstruction (similar to AAC's SBR): bins in the SPX
-        // region [spxbegf .. spxendf] are derived from low-frequency
-        // bins via per-band amplitude (`spxbndcoeff`) + blending
-        // (`spxblnd`) coefficients, plus a coupling-style coordinate
-        // table (`mstrspxco`/`spxcoexp`/`spxcomant`). FFmpeg's eac3
-        // encoder doesn't emit SPX (per `eac3-low-rate-stereo-64kbps/
-        // notes.md` "gap"), so no corpus fixture currently exercises
-        // this path.
+        // The §E.3.6 SPX decode is a parametric high-frequency
+        // reconstruction (the E-AC-3 analogue of SBR): the band
+        // [spx_begin .. spx_end) is copied from low-frequency bins,
+        // blended with banded noise, and scaled by per-band coordinates.
+        // The strategy fields here set up the sub-band → band geometry;
+        // the per-channel coordinate block (below) supplies spxco /
+        // spxblnd; the synthesis itself runs in `audblk::dsp_block`.
         let spxstre = if blk == 0 { true } else { br.read_u32(1)? != 0 };
         if spxstre {
             let spxinu = br.read_u32(1)? != 0;
+            state.spx_in_use = spxinu;
             if spxinu {
-                return Err(Error::unsupported(
-                    "eac3 audblk: spxinu == 1 (spectral extension active) — \
-                     round 4 stub mutes; full §E.2.2.5.4 SPX decode is a follow-up",
-                ));
+                // §E.2.3.3.3 chinspx[ch].
+                if bsi.acmod == 0x1 {
+                    state.channels[0].in_spx = true;
+                } else {
+                    for ch in 0..nfchans {
+                        state.channels[ch].in_spx = br.read_u32(1)? != 0;
+                    }
+                }
+                // §E.2.3.3.4-6 spxstrtf (2) + spxbegf (3) + spxendf (3).
+                state.spx_strtf = br.read_u32(2)? as u8;
+                let spxbegf = br.read_u32(3)? as usize;
+                let spxendf = br.read_u32(3)? as usize;
+                state.spx_begin_subbnd = if spxbegf < 6 {
+                    spxbegf + 2
+                } else {
+                    spxbegf * 2 - 3
+                };
+                state.spx_end_subbnd = if spxendf < 3 {
+                    spxendf + 5
+                } else {
+                    spxendf * 2 + 3
+                };
+                if state.spx_end_subbnd <= state.spx_begin_subbnd || state.spx_end_subbnd > 17 {
+                    return Err(Error::invalid(
+                        "eac3 audblk: SPX sub-band range invalid (end <= begin or > 17)",
+                    ));
+                }
+                // §E.2.3.3.7-8 spxbndstrce + spxbndstrc[bnd]. When the
+                // exist bit is 0 in the first SPX block use the default
+                // banding (Table E2.11); in later blocks reuse the prior
+                // structure (already on `state.spx_bndstrc`).
+                let spxbndstrce = br.read_u32(1)? != 0;
+                if spxbndstrce {
+                    state.spx_bndstrc = [false; 18];
+                    for bnd in (state.spx_begin_subbnd + 1)..state.spx_end_subbnd {
+                        state.spx_bndstrc[bnd] = br.read_u32(1)? != 0;
+                    }
+                } else if firstspxcos.iter().take(nfchans).all(|&f| f) {
+                    // First SPX block this frame, no explicit structure →
+                    // default banding per Table E2.11 (merge bit set on
+                    // odd sub-bands 8,10,12,14,16).
+                    state.spx_bndstrc = DEFAULT_SPX_BNDSTRC;
+                }
+                // Derive nspxbnds + per-band size (§E.3.6.2).
+                let mut nspxbnds = 1usize;
+                let mut sztab = [0usize; 18];
+                sztab[0] = 12;
+                for bnd in (state.spx_begin_subbnd + 1)..state.spx_end_subbnd {
+                    if !state.spx_bndstrc[bnd] {
+                        sztab[nspxbnds] = 12;
+                        nspxbnds += 1;
+                    } else {
+                        sztab[nspxbnds - 1] += 12;
+                    }
+                }
+                state.spx_nbnds = nspxbnds;
+                state.spx_bndsztab = sztab;
+            } else {
+                // §E.2.3.3.2 — SPX not in use this block; clear per-ch
+                // flags and arm firstspxcos for the next active block.
+                for ch in 0..nfchans {
+                    state.channels[ch].in_spx = false;
+                    firstspxcos[ch] = true;
+                }
             }
         }
-        // No additional SPX coordinate fields when spxinu == 0.
+
+        // ---- spectral extension coordinates (§E.1.3.5 / §E.3.6.3) ----
+        if state.spx_in_use {
+            for ch in 0..nfchans {
+                if state.channels[ch].in_spx {
+                    // §E.2.3.3.9 spxcoe[ch] — implicit 1 on the first SPX
+                    // block for this channel; explicit thereafter.
+                    let spxcoe = if firstspxcos[ch] {
+                        firstspxcos[ch] = false;
+                        true
+                    } else {
+                        br.read_u32(1)? != 0
+                    };
+                    if spxcoe {
+                        // §E.2.3.3.10-11 spxblnd (5) + mstrspxco (2).
+                        let spxblnd = br.read_u32(5)? as f32;
+                        let mstrspxco = br.read_u32(2)? as i32;
+                        let noffset = spxblnd / 32.0;
+                        // §E.3.6.4.2.1 blend factors per band.
+                        let spx_begin_tc = 25 + 12 * state.spx_begin_subbnd;
+                        let spx_end_tc = 25 + 12 * state.spx_end_subbnd;
+                        let mut spxmant = spx_begin_tc as f32;
+                        for bnd in 0..state.spx_nbnds {
+                            let bandsize = state.spx_bndsztab[bnd] as f32;
+                            let mut nratio =
+                                (spxmant + 0.5 * bandsize) / spx_end_tc as f32 - noffset;
+                            nratio = nratio.clamp(0.0, 1.0);
+                            state.channels[ch].spx_nblend[bnd] = nratio.sqrt();
+                            state.channels[ch].spx_sblend[bnd] = (1.0 - nratio).sqrt();
+                            spxmant += bandsize;
+                        }
+                        // §E.2.3.3.12-13 + §E.3.6.3 per-band coordinate.
+                        for bnd in 0..state.spx_nbnds {
+                            let spxcoexp = br.read_u32(4)? as i32;
+                            let spxcomant = br.read_u32(2)? as f32;
+                            let temp = if spxcoexp == 15 {
+                                spxcomant / 4.0
+                            } else {
+                                (spxcomant + 4.0) / 8.0
+                            };
+                            let shift = spxcoexp + 3 * mstrspxco;
+                            state.channels[ch].spx_coord[bnd] = temp * 2f32.powi(-shift);
+                        }
+                    }
+                    // spxcoe == 0 → reuse the prior block's coordinates +
+                    // blend factors (already on `state.channels[ch]`).
+                } else {
+                    firstspxcos[ch] = true;
+                }
+            }
+        }
 
         // ---- coupling strategy block (Table E1.4 + §E.1.3.3.5) ----
         //
@@ -416,9 +567,16 @@ pub fn decode_indep_audblks(
                 };
                 // §E.1.3.3.9 cplbegf (4 bits).
                 state.cpl_begf = br.read_u32(4)? as u8;
-                // §E.1.3.3.10 cplendf (4 bits when SPX is off; we
-                // already required spxinu == 0 above).
-                state.cpl_endf = br.read_u32(4)? as u8;
+                // §E.1.3.3.10 cplendf. Read 4 bits only when SPX is OFF;
+                // when SPX is in use the spec derives cplendf from the
+                // SPX begin so the coupled region ends one bin below the
+                // SPX region (spxbegf < 6 → cplendf = spxbegf − 2, else
+                // spxbegf·2 − 7 — both equal spx_begin_subbnd − 4).
+                state.cpl_endf = if state.spx_in_use {
+                    (state.spx_begin_subbnd as i32 - 4).max(0) as u8
+                } else {
+                    br.read_u32(4)? as u8
+                };
                 // §5.4.3.12 spec envelope: the upper sub-band index is
                 // `cplendf + 2`, so `ncplsubnd = 3 + cplendf - cplbegf
                 // >= 1` is the actual validity test (equivalently
@@ -552,7 +710,16 @@ pub fn decode_indep_audblks(
         if bsi.acmod == 0x2 {
             let rematstr = if blk == 0 { true } else { br.read_u32(1)? != 0 };
             if rematstr {
-                let n_remat = crate::audblk::remat_band_count(cplinu, state.cpl_begf);
+                // §E.3.3.2 nrematbd — folds in spectral extension: when
+                // SPX is in use without coupling the band count drops to
+                // 3 for spxbegf < 2 (spx_begin_subbnd < 4). Using the
+                // base count here drifts the bit cursor on SPX frames.
+                let n_remat = crate::audblk::remat_band_count_spx(
+                    cplinu,
+                    state.cpl_begf,
+                    state.spx_in_use,
+                    state.spx_begin_subbnd,
+                );
                 for rbnd in 0..n_remat {
                     let v = br.read_u32(1)? != 0;
                     state.rematflg[rbnd] = v;
@@ -579,11 +746,13 @@ pub fn decode_indep_audblks(
         let lfeexpstr = if lfeon { audfrm.lfeexpstr[blk] } else { 0u8 };
 
         // §E.1.3.4.5 chbwcod — only when chexpstr != REUSE AND the
-        // channel is not in coupling AND not in spectral extension
-        // (we already require !spxinu).
+        // channel is neither in coupling NOR in spectral extension
+        // (per the audblk syntax: `if((!chincpl[ch]) && (!chinspx[ch]))
+        // {chbwcod[ch]}`). SPX channels derive their bandwidth from the
+        // SPX begin frequency instead.
         let mut chbwcod = [0u8; MAX_FBW];
         for ch in 0..nfchans {
-            if chexpstr[ch] != 0 && !state.channels[ch].in_coupling {
+            if chexpstr[ch] != 0 && !state.channels[ch].in_coupling && !state.channels[ch].in_spx {
                 chbwcod[ch] = br.read_u32(6)? as u8;
                 if chbwcod[ch] > 60 {
                     return Err(Error::invalid(
@@ -635,10 +804,15 @@ pub fn decode_indep_audblks(
         // ---- fbw exponents ----
         for ch in 0..nfchans {
             if chexpstr[ch] != 0 {
-                // Coupled channels stop at cpl_begf_mant; un-coupled
-                // channels go up to 37 + 3·(chbwcod+12).
+                // Coupled channels stop at cpl_begf_mant; SPX channels
+                // stop at the SPX begin frequency (§E.3.3.3:
+                // endmant = spxbandtable[spx_begin_subbnd] =
+                // 25 + 12·spx_begin_subbnd); un-coupled / un-SPX channels
+                // go up to 37 + 3·(chbwcod+12).
                 let end = if state.channels[ch].in_coupling {
                     state.cpl_begf_mant
+                } else if state.channels[ch].in_spx {
+                    25 + 12 * state.spx_begin_subbnd
                 } else {
                     37 + 3 * (chbwcod[ch] as usize + 12)
                 };
@@ -650,9 +824,16 @@ pub fn decode_indep_audblks(
                     3 => 4,
                     _ => 1,
                 };
+                // §7.1.3 nchgrps[ch]:
+                //   D15 → (end-1)/3, D25 → (end-1+3)/6, D45 → (end-1+9)/12
+                // (all truncated). The D25 form here previously used
+                // `div_ceil(6)` = `(end-1+5)/6`, which over-counts groups
+                // by one when `(end-1) mod 6 ∈ {2,3}` — that reads an
+                // extra 7-bit exponent word and drifts the bit cursor on
+                // D25 channels (the AC-3 path already uses the +3 form).
                 let nchgrps = match chexpstr[ch] {
                     1 => (end - 1) / 3,
-                    2 => (end - 1).div_ceil(6),
+                    2 => (end - 1 + 3) / 6,
                     3 => (end - 1 + 9) / 12,
                     _ => 0,
                 };
@@ -687,6 +868,10 @@ pub fn decode_indep_audblks(
                 // prior block had this channel un-coupled with a
                 // different end_mant.
                 state.channels[ch].end_mant = state.cpl_begf_mant;
+            } else if state.channels[ch].in_spx {
+                // Reuse path for an SPX channel: coded mantissas stop at
+                // the SPX begin frequency (§E.3.3.3).
+                state.channels[ch].end_mant = 25 + 12 * state.spx_begin_subbnd;
             }
         }
         if lfeon && lfeexpstr != 0 {

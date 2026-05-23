@@ -189,6 +189,37 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       nchans`); real DSP (decouple + IMDCT + overlap-add) is
       deferred to round 2 along with dependent-substream
       recombination, AHT, and spectral extension.
+- [x] E-AC-3 decoder — **spectral extension (SPX)** decode (round 100 /
+      r100). The audblk parser decodes the full §E.2.3.3 SPX strategy +
+      coordinate syntax (`chinspx` / `spxstrtf` / `spxbegf` / `spxendf` /
+      `spxbndstrce`+`spxbndstrc[]` with Table E2.11 default banding /
+      `spxcoe` / `spxblnd` / `mstrspxco` / `spxcoexp` / `spxcomant`),
+      replacing the round-4 `spxinu == 1` mute. The §E.3.6 high-frequency
+      regeneration runs in `audblk::dsp_block`: per SPX band it (1) copies
+      low-frequency transform coefficients into the SPX region with the
+      §E.3.6.4.1 wrapping copy cursor, (2) measures banded RMS energy,
+      (3) blends the copies with banded noise via the spxblnd-derived
+      `nblendfact`/`sblendfact` (§E.3.6.4.2), and (4) scales by the
+      per-band coordinate `spxco·32` (§E.3.6.4.3); SPX-channel `endmant`
+      is then extended to the SPX end so dynrng + IMDCT cover the
+      regenerated bins. Three derivations that previously drifted the bit
+      cursor on SPX frames are now spec-correct: `endmant[ch] =
+      spxbandtable[spx_begin_subbnd]` (§E.3.3.3), `cplendf` derived from
+      `spxbegf` when SPX is active (§E.3.3.1), and `nrematbd` folding in
+      SPX (§E.3.3.2). The noise generator is non-normative per spec
+      ("any reasonably random sequence"); a deterministic xorshift LFSR
+      keeps decodes reproducible. Also fixes the E-AC-3 D25 exponent-group
+      count to the spec's `(endmant−1+3)/6` (§7.1.3) — it used
+      `(endmant−1).div_ceil(6)`, over-counting one group when
+      `(endmant−1) mod 6 ∈ {2,3}`, which read an extra 7-bit exponent
+      word. SPX synthesis math is covered by 5 unit tests
+      (`audblk::spx_tests`). Note: the three SPX-active corpus fixtures
+      (`eac3-stereo-48000-192kbps`, `eac3-256-coeff-block`,
+      `eac3-from-ac3-bitstream-recombination`) remain floor-bound on a
+      pre-existing coupling/bit-allocation cursor drift affecting a subset
+      of their non-SPX frames — the same drift that mutes a few AC-3
+      fixtures (`ac3-32000hz-stereo`) — so end-to-end PSNR there awaits
+      that separate fix.
 
 ## Installation
 

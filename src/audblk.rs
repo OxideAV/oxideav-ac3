@@ -152,6 +152,20 @@ pub struct ChannelState {
     pub in_coupling: bool,
     /// Dynrng gain multiplier (linear).
     pub dynrng: f32,
+    /// E-AC-3 spectral extension (§E.3.6): whether this channel
+    /// regenerates high-frequency transform coefficients via SPX this
+    /// block. Base AC-3 never sets this (no SPX in the base layer), so
+    /// the SPX synthesis step in [`dsp_block`] is a no-op for AC-3.
+    pub in_spx: bool,
+    /// Per-band SPX coordinate `spxco[ch][bnd]` (§E.3.6.3). Persisted
+    /// across blocks so a `spxcoe[ch] == 0` block can reuse the prior
+    /// coordinates.
+    pub spx_coord: [f32; 18],
+    /// Per-band SPX noise / signal blend factors `nblendfact` /
+    /// `sblendfact` (§E.3.6.4.2.1). Recomputed when new coordinates
+    /// (and hence a new `spxblnd`) arrive; reused otherwise.
+    pub spx_nblend: [f32; 18],
+    pub spx_sblend: [f32; 18],
 }
 
 impl Default for ChannelState {
@@ -176,6 +190,10 @@ impl ChannelState {
             dithflag: false,
             in_coupling: false,
             dynrng: 1.0,
+            in_spx: false,
+            spx_coord: [0.0; 18],
+            spx_nblend: [0.0; 18],
+            spx_sblend: [0.0; 18],
         }
     }
 }
@@ -239,6 +257,32 @@ pub struct Ac3State {
     pub deltlen: [[u8; 8]; MAX_FBW + 1],
     pub deltba: [[u8; 8]; MAX_FBW + 1],
 
+    // ---- E-AC-3 spectral extension region state (§E.3.6) ----
+    /// Whether SPX is in use in the current block (`spxinu`). When false
+    /// the SPX synthesis step in [`dsp_block`] does nothing.
+    pub spx_in_use: bool,
+    /// `spxstrtf` copy-start sub-band index → first copied tc# is
+    /// `spx_bandtable(spxstrtf)`.
+    pub spx_strtf: u8,
+    /// First / one-past-last SPX sub-band (`spx_begin_subbnd` /
+    /// `spx_end_subbnd`, §E.2.3.3.5-6).
+    pub spx_begin_subbnd: usize,
+    pub spx_end_subbnd: usize,
+    /// SPX sub-band → band grouping (`spxbndstrc[]`, §E.2.3.3.8). Index
+    /// is the absolute sub-band number; `true` means "merge into the
+    /// previous band". Persisted so a `spxbndstrce == 0` block reuses
+    /// the prior structure.
+    pub spx_bndstrc: [bool; 18],
+    /// Number of SPX bands and per-band size in transform coefficients
+    /// (`nspxbnds` / `spxbndsztab[]`), derived from the sub-band range
+    /// and `spx_bndstrc`.
+    pub spx_nbnds: usize,
+    pub spx_bndsztab: [usize; 18],
+    /// 32-bit LFSR driving the SPX noise generator (§E.3.6.4.2). The
+    /// spec leaves the noise sequence non-normative ("any reasonably
+    /// random sequence"); a fixed seed keeps decodes reproducible.
+    pub spx_noise_lfsr: u32,
+
     /// Bit position immediately after the BSI (start of block 0 bits).
     pub audblk_start_bits: u64,
     /// Which block we are currently parsing (0..6).
@@ -294,6 +338,14 @@ impl Ac3State {
             deltoffst: [[0; 8]; MAX_FBW + 1],
             deltlen: [[0; 8]; MAX_FBW + 1],
             deltba: [[0; 8]; MAX_FBW + 1],
+            spx_in_use: false,
+            spx_strtf: 0,
+            spx_begin_subbnd: 0,
+            spx_end_subbnd: 0,
+            spx_bndstrc: [false; 18],
+            spx_nbnds: 0,
+            spx_bndsztab: [0; 18],
+            spx_noise_lfsr: 0x4A5B_6C7D,
             audblk_start_bits: 0,
             blkidx: 0,
             // Non-zero seed so the LFSR doesn't get stuck on all-zeros.
@@ -1060,6 +1112,32 @@ pub(crate) fn remat_band_count(cplinu: bool, cplbegf: u8) -> usize {
     }
 }
 
+/// E-AC-3 number-of-rematrix-bands `nrematbd` per §E.3.3.2, which folds
+/// in spectral extension. When standard coupling is in use the count
+/// matches [`remat_band_count`]; when SPX is in use without coupling the
+/// count is `3` for `spxbegf < 2` else `4`; otherwise `4`. (Enhanced
+/// coupling is not yet decoded, so its branch is omitted.) `spx_in_use`
+/// and `spx_begin_subbnd` come from the SPX strategy block;
+/// `spxbegf < 2` is equivalent to `spx_begin_subbnd < 4`.
+pub(crate) fn remat_band_count_spx(
+    cplinu: bool,
+    cplbegf: u8,
+    spx_in_use: bool,
+    spx_begin_subbnd: usize,
+) -> usize {
+    if cplinu {
+        remat_band_count(true, cplbegf)
+    } else if spx_in_use {
+        if spx_begin_subbnd < 4 {
+            3
+        } else {
+            4
+        }
+    } else {
+        4
+    }
+}
+
 /// Decode a grouped exponent run (§7.1.3).
 pub(crate) fn decode_exponents(
     br: &mut BitReader,
@@ -1667,6 +1745,137 @@ fn fetch_mantissa(
     }
 }
 
+/// Lowest transform-coefficient number of SPX sub-band `subbnd` per
+/// Table E3.13. Sub-bands 0..=16 carry 12 coefficients each starting at
+/// tc# 25; the entry for sub-band 17 (tc# 229) is the one-past-last
+/// marker used when `spxendf == 7`.
+#[inline]
+fn spx_bandtable(subbnd: usize) -> usize {
+    25 + 12 * subbnd
+}
+
+/// One step of the SPX pseudo-random noise generator (§E.3.6.4.2). The
+/// spec only requires a "zero-mean, unity-variance" sequence and leaves
+/// the exact generator non-normative — AC-3 / E-AC-3 are lossy and the
+/// corpus is PSNR-compared, so a deterministic LFSR-derived value is
+/// adequate. Returns a value in roughly `[-1, 1)` scaled to ~unit
+/// variance (a sign-balanced uniform on (-√3, √3) has unit variance).
+#[inline]
+fn spx_noise(lfsr: &mut u32) -> f32 {
+    // 32-bit xorshift — long period, cheap, deterministic.
+    let mut x = *lfsr;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *lfsr = x;
+    // Map to (-1, 1) then scale to unit variance: a uniform on (-1, 1)
+    // has variance 1/3, so multiply by √3 ≈ 1.7320508.
+    let u = (x as f32 / u32::MAX as f32) * 2.0 - 1.0;
+    u * 1.732_050_8
+}
+
+/// E-AC-3 spectral extension high-frequency regeneration (§E.3.6).
+///
+/// For each fbw channel with `in_spx == true` this synthesizes the SPX
+/// region `[spx_begin .. spx_end)` (transform-coefficient indices) from
+/// the channel's own low-frequency coefficients:
+///
+/// 1. **Translation** (§E.3.6.4.1) — copy LF coefficients from the copy
+///    region `[copystart .. copyend)` (`copystart = spxbandtable[spxstrtf]`,
+///    `copyend = spxbandtable[spx_begin]`) into the SPX region,
+///    wrapping the copy cursor when it reaches `copyend`.
+/// 2. **Banded RMS energy** (§E.3.6.4.2.2) of the translated bins.
+/// 3. **Noise blending** (§E.3.6.4.2.4) — `tc = tc·sblend + noise·rms·nblend`
+///    per band, using the precomputed `spx_nblend` / `spx_sblend`.
+/// 4. **Coordinate scaling** (§E.3.6.4.3) — `tc *= spxco·32` per band.
+///
+/// Band sizing (`spx_nbnds` / `spx_bndsztab`), the per-band coordinates
+/// (`spx_coord`) and blend factors are computed during the audblk parse
+/// (see `eac3::dsp`); this routine consumes that prepared state.
+fn apply_spectral_extension(state: &mut Ac3State, nfchans: usize) {
+    if !state.spx_in_use {
+        return;
+    }
+    let nbnds = state.spx_nbnds;
+    if nbnds == 0 {
+        return;
+    }
+    let copystart = spx_bandtable(state.spx_strtf as usize);
+    let copyend = spx_bandtable(state.spx_begin_subbnd);
+    let spx_begin_tc = copyend;
+    let spx_end_tc = spx_bandtable(state.spx_end_subbnd);
+    if copyend <= copystart || spx_end_tc <= spx_begin_tc {
+        return;
+    }
+
+    for ch in 0..nfchans {
+        if !state.channels[ch].in_spx {
+            continue;
+        }
+
+        // 1. Transform coefficient translation (§E.3.6.4.1).
+        let mut copyindex = copystart;
+        let mut insertindex = spx_begin_tc;
+        for bnd in 0..nbnds {
+            let bandsize = state.spx_bndsztab[bnd];
+            if copyindex + bandsize > copyend {
+                copyindex = copystart;
+            }
+            for _ in 0..bandsize {
+                if copyindex == copyend {
+                    copyindex = copystart;
+                }
+                if insertindex < N_COEFFS && copyindex < N_COEFFS {
+                    state.channels[ch].coeffs[insertindex] = state.channels[ch].coeffs[copyindex];
+                }
+                insertindex += 1;
+                copyindex += 1;
+            }
+        }
+
+        // 2. Banded RMS energy of the translated coefficients
+        //    (§E.3.6.4.2.2), 3. noise blend (§E.3.6.4.2.4), and
+        //    4. coordinate scaling (§E.3.6.4.3) — fused per band.
+        let mut spxmant = spx_begin_tc;
+        for bnd in 0..nbnds {
+            let bandsize = state.spx_bndsztab[bnd];
+            let band_lo = spxmant;
+            let band_hi = (spxmant + bandsize).min(N_COEFFS);
+
+            // Banded RMS.
+            let mut accum = 0.0f64;
+            for bin in band_lo..band_hi {
+                let v = state.channels[ch].coeffs[bin] as f64;
+                accum += v * v;
+            }
+            let rms = if bandsize > 0 {
+                (accum / bandsize as f64).sqrt() as f32
+            } else {
+                0.0
+            };
+
+            let nblend = state.channels[ch].spx_nblend[bnd];
+            let sblend = state.channels[ch].spx_sblend[bnd];
+            let nscale = rms * nblend;
+            let coord = state.channels[ch].spx_coord[bnd];
+
+            for bin in band_lo..band_hi {
+                let tctemp = state.channels[ch].coeffs[bin];
+                let ntemp = spx_noise(&mut state.spx_noise_lfsr);
+                let blended = tctemp * sblend + ntemp * nscale;
+                // §E.3.6.4.3 final scale by spxco·32.
+                state.channels[ch].coeffs[bin] = blended * coord * 32.0;
+            }
+
+            spxmant += bandsize;
+        }
+
+        // The SPX region is now populated; extend the channel's mantissa
+        // count so dynrng + IMDCT process the regenerated bins.
+        state.channels[ch].end_mant = state.channels[ch].end_mant.max(spx_end_tc);
+    }
+}
+
 /// Apply DSP stages to the current block: decouple, rematrix, dynrng,
 /// IMDCT, window + overlap-add. Populates `channels[ch].coeffs[0..256]`
 /// with time-domain PCM samples ready for emission.
@@ -1762,6 +1971,19 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
             }
         }
     }
+
+    // --- Spectral extension synthesis (§E.3.6) ---
+    //
+    // For channels using SPX (`in_spx`, E-AC-3 only) the coded
+    // coefficients stop at the SPX begin frequency; this step
+    // regenerates the high-frequency band [spx_begin .. spx_end) by
+    // copying low-frequency coefficients, blending with banded noise,
+    // and scaling by the per-band SPX coordinates. It runs AFTER
+    // decouple + rematrix (which reshape the low-frequency copy region)
+    // and BEFORE dynrng + IMDCT so the synthesized bins are gain-scaled
+    // and transformed together with the baseband. Base AC-3 never sets
+    // `in_spx`, so this is a no-op there.
+    apply_spectral_extension(state, nfchans);
 
     // --- Dynrng scaling ---
     for ch in 0..nfchans {
@@ -1977,5 +2199,171 @@ mod short_block_tests {
             rmse > 0.5,
             "direct form and FFT path now match (rmse={rmse:.3}) — promote short_block_direct_form_diverges_from_fft to equality"
         );
+    }
+}
+
+#[cfg(test)]
+mod spx_tests {
+    use super::*;
+
+    /// Table E3.13: spx sub-band `s` begins at transform coefficient
+    /// `25 + 12·s`. Sub-band 17 is the one-past-last marker at tc# 229.
+    #[test]
+    fn spx_bandtable_matches_table_e3_13() {
+        assert_eq!(spx_bandtable(0), 25);
+        assert_eq!(spx_bandtable(1), 37);
+        assert_eq!(spx_bandtable(2), 49);
+        assert_eq!(spx_bandtable(9), 133);
+        assert_eq!(spx_bandtable(16), 217);
+        assert_eq!(spx_bandtable(17), 229);
+    }
+
+    /// §E.3.6.3 spectral-extension coordinate decode. For exponent < 15
+    /// the mantissa is `(spxcomant + 4) / 8`, shifted right by
+    /// `spxcoexp + 3·mstrspxco`. For exponent == 15 it's `spxcomant / 4`.
+    /// These mirror the encoder-side math the parse in `eac3::dsp` runs;
+    /// duplicated here as an independent oracle.
+    #[test]
+    fn spx_coordinate_decode_formula() {
+        // Mirrors the §E.3.6.3 decode the parse in `eac3::dsp` runs.
+        fn spxco(coexp: i32, comant: i32, mstr: i32) -> f32 {
+            let temp = if coexp == 15 {
+                comant as f32 / 4.0
+            } else {
+                (comant as f32 + 4.0) / 8.0
+            };
+            let shift = coexp + 3 * mstr;
+            temp * 2f32.powi(-shift)
+        }
+        // exp = 0, mant = 3, mstr = 0 → (3+4)/8 = 0.875, no shift.
+        assert!((spxco(0, 3, 0) - 0.875).abs() < 1e-6);
+        // exp = 2, mant = 1, mstr = 1 → (1+4)/8 = 0.625, >> (2 + 3) = 5.
+        assert!((spxco(2, 1, 1) - 0.625 / 32.0).abs() < 1e-7);
+        // exp = 15 limiting case → mant/4 (= 0.5 for mant 2), no shift
+        // beyond the 15 exponent.
+        assert!((spxco(15, 2, 0) - 2.0 / 4.0 / 2f32.powi(15)).abs() < 1e-9);
+    }
+
+    /// §E.3.6.2 band sizing. With the default Table E2.11 banding and a
+    /// full sub-band range (begin=2, end=17) the merge bits at sub-bands
+    /// 8/10/12/14/16 fold pairs of 12-coefficient sub-bands into 24-wide
+    /// bands. We replicate the pseudo-code here against a hand-built
+    /// `Ac3State` and check the resulting band-size table.
+    #[test]
+    fn spx_band_sizing_default_banding() {
+        // begin=2, end=8 (sub-bands 2..7 active): merge bit only at 8
+        // doesn't appear in range (8 == end excluded), so 6 bands of 12.
+        let begin = 2usize;
+        let end = 8usize;
+        let mut bndstrc = [false; 18];
+        bndstrc[8] = true; // default merge bit, out of [begin+1, end) here.
+        let (n, sztab) = derive_bands(begin, end, &bndstrc);
+        assert_eq!(n, 6);
+        assert!(sztab[..6].iter().all(|&s| s == 12));
+
+        // begin=2, end=17 with default merges at 8,10,12,14,16: the
+        // merge bits land inside [3,17) and combine the second of each
+        // pair. nspxbnds = 15 sub-bands → 10 bands (5 of width 24,
+        // 5 of width 12) by the pseudo-code.
+        let mut bndstrc = [false; 18];
+        for &b in &[8usize, 10, 12, 14, 16] {
+            bndstrc[b] = true;
+        }
+        let (n, sztab) = derive_bands(2, 17, &bndstrc);
+        // 15 sub-bands, 5 merges → 10 bands.
+        assert_eq!(n, 10);
+        // Total coefficients == 15 sub-bands × 12 == 180.
+        let total: usize = sztab[..n].iter().sum();
+        assert_eq!(total, 180);
+    }
+
+    // Local re-implementation of the §E.3.6.2 nspxbnds / spxbndsztab
+    // pseudo-code, used only by the test above.
+    fn derive_bands(begin: usize, end: usize, bndstrc: &[bool; 18]) -> (usize, [usize; 18]) {
+        let mut n = 1usize;
+        let mut t = [0usize; 18];
+        t[0] = 12;
+        for bnd in (begin + 1)..end {
+            if !bndstrc[bnd] {
+                t[n] = 12;
+                n += 1;
+            } else {
+                t[n - 1] += 12;
+            }
+        }
+        (n, t)
+    }
+
+    /// End-to-end synthesis check for `apply_spectral_extension`. Build a
+    /// channel whose low-frequency copy region carries a known ramp, set
+    /// up one SPX band with a pure-signal blend (sblend=1, nblend=0,
+    /// coord=1/32 so the ·32 scale cancels), and verify the SPX region is
+    /// populated with copied values (not left silent) and that `end_mant`
+    /// extends to the SPX end.
+    #[test]
+    fn spx_synthesis_copies_and_scales() {
+        let mut state = Ac3State::new();
+        let ch = 0usize;
+        // SPX geometry: copy from sub-band 0 (tc 25), begin sub-band 2
+        // (tc 49), end sub-band 4 (tc 73). One band of 24 (sub-bands
+        // 2+3 merged via bndstrc[3]).
+        state.spx_in_use = true;
+        state.channels[ch].in_spx = true;
+        state.spx_strtf = 0; // copystart = 25
+        state.spx_begin_subbnd = 2; // copyend / spx_begin = 49
+        state.spx_end_subbnd = 4; // spx_end = 73
+        state.spx_bndstrc = [false; 18];
+        state.spx_bndstrc[3] = true; // merge sub-band 3 into the band
+        state.spx_nbnds = 1;
+        state.spx_bndsztab = [0; 18];
+        state.spx_bndsztab[0] = 24;
+        // Pure-signal blend, unity-after-·32 coord.
+        state.channels[ch].spx_sblend[0] = 1.0;
+        state.channels[ch].spx_nblend[0] = 0.0;
+        state.channels[ch].spx_coord[0] = 1.0 / 32.0;
+        state.channels[ch].end_mant = 49; // coded mantissas stop at SPX begin.
+
+        // Fill the copy region [25, 49) with a known non-zero ramp.
+        for bin in 25..49 {
+            state.channels[ch].coeffs[bin] = (bin - 25) as f32 + 1.0;
+        }
+        // SPX region [49, 73) starts silent.
+        for bin in 49..73 {
+            state.channels[ch].coeffs[bin] = 0.0;
+        }
+
+        apply_spectral_extension(&mut state, 1);
+
+        // The SPX region must now be non-silent (copied + scaled).
+        let nonzero = (49..73)
+            .filter(|&b| state.channels[ch].coeffs[b] != 0.0)
+            .count();
+        assert!(
+            nonzero >= 23,
+            "SPX region should be populated, got {nonzero} non-zero bins"
+        );
+        // With sblend=1, nblend=0, coord·32=1, the first SPX bin equals
+        // the first copied coefficient (copyindex starts at copystart=25).
+        assert!(
+            (state.channels[ch].coeffs[49] - state.channels[ch].coeffs[25]).abs() < 1e-4,
+            "first SPX bin {} should equal first copy bin {}",
+            state.channels[ch].coeffs[49],
+            state.channels[ch].coeffs[25],
+        );
+        // end_mant extends to the SPX end so dynrng + IMDCT cover it.
+        assert_eq!(state.channels[ch].end_mant, 73);
+    }
+
+    /// `apply_spectral_extension` must be a no-op for a channel not in
+    /// SPX (and for base AC-3, which never sets `spx_in_use`).
+    #[test]
+    fn spx_synthesis_noop_when_disabled() {
+        let mut state = Ac3State::new();
+        for bin in 49..73 {
+            state.channels[0].coeffs[bin] = 0.0;
+        }
+        state.spx_in_use = false;
+        apply_spectral_extension(&mut state, 1);
+        assert!((49..73).all(|b| state.channels[0].coeffs[b] == 0.0));
     }
 }

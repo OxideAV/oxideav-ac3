@@ -68,17 +68,22 @@
 //!   probe described in §3.4.2 (or a deferred audfrm parse with full
 //!   audblk pre-walk). The `cplahtinu` / `lfeahtinu` bit streams
 //!   themselves are already wired through [`audfrm::AudFrm`].
-//! * **Spectral Extension (SPX)** — `spxinu == 1` still mutes per
-//!   §E.2.2.5.4. SPX needs the `spxcoexp`/`spxcomant` coordinate
-//!   decoder + the noise-blend / amplitude-fold reconstruction
-//!   pipeline. No corpus fixture exercises SPX yet.
-//! * **Spectral Extension (SPX)** decode — `spxinu == 1` blocks still
-//!   mute. The corpus fixtures `eac3-stereo-48000-192kbps`,
-//!   `eac3-256-coeff-block`, and `eac3-from-ac3-bitstream-recombination`
-//!   spend most blocks in SPX-active state; until SPX decode lands they
-//!   self-decode to ~8-14 dB PSNR (silent fallback bleed). The
-//!   non-SPX fixtures decode cleanly: `eac3-5.1-48000-384kbps` at
-//!   **90 dB**, `eac3-low-rate-stereo-64kbps` at **72 dB**,
+//! * **Spectral Extension (SPX)** decode — **landed**. `spxinu == 1`
+//!   blocks now parse the full §E.2.3.3 strategy + coordinate fields
+//!   (chinspx / spxstrtf / spxbegf / spxendf / spxbndstrc / spxcoe /
+//!   spxblnd / mstrspxco / spxcoexp / spxcomant) and run the §E.3.6
+//!   high-frequency regeneration (translate → noise-blend → coordinate
+//!   scale) in [`crate::audblk::dsp_block`]. The `nrematbd` (§E.3.3.2)
+//!   and `cplendf`-when-SPX (§E.3.3.1) derivations are wired so the bit
+//!   cursor no longer drifts on the SPX-strategy fields. The corpus
+//!   fixtures `eac3-stereo-48000-192kbps`, `eac3-256-coeff-block`, and
+//!   `eac3-from-ac3-bitstream-recombination` are *additionally* gated
+//!   by a pre-existing coupling/bit-allocation cursor drift on a subset
+//!   of their non-SPX frames (the same drift that leaves a handful of
+//!   AC-3 fixtures muted), so end-to-end PSNR on those three is still
+//!   floor-bound until that drift is fixed. The non-SPX fixtures decode
+//!   cleanly: `eac3-5.1-48000-384kbps` at **90 dB**,
+//!   `eac3-low-rate-stereo-64kbps` at **72 dB**,
 //!   `eac3-low-bitrate-32kbps` at **66 dB**.
 //! * **Per-block SNR-offset** (`snroffststr != 0`) — needs the
 //!   audblk-level `snroffste` parser. Same situation as above.
