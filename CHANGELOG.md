@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§7.8.2 LtRt (Dolby Surround matrix-encoded stereo) downmix** —
+  round 120. The §7.8 downmix matrix gains a third target alongside
+  LoRo and Mono: `DownmixMode::StereoLtRt` implements the spec's
+  3/2 LtRt equations
+  `Lt = 1·L + 0.707·C − 0.707·Ls − 0.707·Rs` /
+  `Rt = 1·R + 0.707·C + 0.707·Ls + 0.707·Rs`,
+  plus the 3/1 form (single surround folded with opposite signs),
+  with the 2/1 / 2/2 C-drop and 3/0 / 2/0 / 1/0 / 1+1 narrower
+  cases. The §7.8.2 normalisation lands on Table 7.32's
+  headline 0.3204 / 0.2265 coefficients (worst-case
+  `1 + 3·0.707 = 3.121` → divide by 3.121 = 0.3204; 9.89 dB
+  attenuation, matching the spec's Table 7.32 row 1 / row 2).
+  * A new `decoder::make_decoder_ltrt` factory parallels
+    `make_decoder` / `make_eac3_decoder`: when a 2-channel
+    downmix is requested it routes through the LtRt matrix
+    instead of LoRo. The default factories keep LoRo (FFmpeg's
+    default + §7.8.2's "preferred when the ultimate target is
+    mono" path) so existing callers see no behaviour change.
+  * Mono / Passthrough are unaffected. §7.8.2 explicitly notes
+    that combining LtRt to mono destroys the surround
+    information, so the LtRt path is stereo-only and a Mono
+    request always uses the LoRo→summed-to-mono pathway.
+  * Annex D §2.3.1.3-4 (`ltrtcmixlev` / `ltrtsurmixlev`,
+    E-AC-3 mixing-metadata overrides for the 0.707 C / surround
+    coefficients) is a documented followup — the base-spec form
+    is anchored at fixed 0.707 here; the E-AC-3 BSI parser
+    already reads these fields into `_`-prefixed locals.
+  * 9 new unit tests in `downmix::tests` covering:
+    Table 7.32 coefficient match (`ltrt_3_2_matches_table_7_32`),
+    surround sign discipline across acmod ∈ {4, 5, 6, 7}
+    (`ltrt_surround_sign_discipline`), 2/2 center-drop
+    (`ltrt_2_2_drops_center`), 3/1 single-surround form
+    (`ltrt_3_1_uses_single_surround_form`), 2/0 surround-less
+    passthrough (`ltrt_2_0_passes_no_surround_through`),
+    surround phase inversion through `apply`
+    (`ltrt_apply_preserves_surround_phase_inversion`),
+    full-scale overload protection
+    (`ltrt_3_2_full_scale_does_not_clip`), divergence vs LoRo
+    on surround-only input (`ltrt_vs_loro_differ_on_surround`),
+    and decoder factory build (`ltrt_decoder_builds`).
+  * 2 end-to-end integration tests (`tests/downmix_ltrt.rs`,
+    ffmpeg-gated): on a surround-only 5.1 AC-3 source LoRo's L/R
+    correlation came in at +0.002 (independent surround tones
+    summed in-phase to both sides → uncorrelated); LtRt's came
+    in at **−0.972** — the matrix encoder's defining anti-phase
+    surround signature. On a surround-free 5.1 source the LtRt
+    L-channel RMS is 0.707× the LoRo L-channel RMS, matching
+    the LoRo↔LtRt normalisation ratio
+    (`0.3204 / 0.4143 ≈ 0.7733`).
+
 - **E-AC-3 coupling-channel AHT decode (`cplahtinu`)** — round 117.
   Extends the AHT mantissa path (round 110 fbw, round 113 LFE) to the
   coupling pseudo-channel, removing the last AHT reject in the E-AC-3

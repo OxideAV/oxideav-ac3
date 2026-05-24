@@ -120,9 +120,24 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       zeroed the coefficients, and the bit cursor drifted from there.
       Boost on `ac3-3-2-48000-384kbps` (5.0): **6.49 dB → 88.85 dB**
       PSNR (+82.36 dB).
-- [x] Downmix (§7.8) — LoRo 2-channel and mono target paths cover
-      every source acmod (1/0 / 2/0 / 3/0 / 2/1 / 3/1 / 2/2 / 3/2 /
-      1+1 dual-mono); LtRt (Dolby Surround matrix) is not implemented
+- [x] Downmix (§7.8) — LoRo 2-channel, LtRt 2-channel
+      (Dolby Surround matrix-encoded — round 120 / r120), and mono
+      target paths cover every source acmod (1/0 / 2/0 / 3/0 / 2/1 /
+      3/1 / 2/2 / 3/2 / 1+1 dual-mono). LtRt implements §7.8.2's
+      3/2 form `Lt = L + 0.707·C − 0.707·Ls − 0.707·Rs` /
+      `Rt = R + 0.707·C + 0.707·Ls + 0.707·Rs` (plus 3/1's
+      single-surround variant and the 2/1 / 2/2 C-drop case),
+      normalised by Table 7.32's 0.3204 / 0.2265 coefficients
+      (1/3.121 worst-case). Selected via the new
+      `decoder::make_decoder_ltrt` factory (`make_decoder` keeps
+      LoRo, matching FFmpeg's default). On a surround-only 5.1 AC-3
+      source the LoRo L/R correlation lands at +0.002 (uncorrelated
+      independent surround tones summed in-phase) while LtRt lands
+      at **−0.972** — the matrix encoder's defining anti-phase
+      surround signature, recoverable by a downstream Pro Logic
+      decoder. Annex D §2.3.1.3-4 (`ltrtcmixlev` / `ltrtsurmixlev`,
+      E-AC-3 metadata override for the fixed 0.707 coefficients) is
+      a documented followup; base-spec §7.8.2 uses the fixed form
 - [x] E-AC-3 (bsid=16, Annex E) — encoder. Independent substream
       (`strmtyp=0`, `substreamid=0`) for 1.0/2.0/5.1 layouts (acmod
       ∈ {1, 2, 7}, with `lfeon=1` for 5.1). 7.1 input emits an

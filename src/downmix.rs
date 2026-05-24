@@ -8,10 +8,13 @@
 //!
 //! ## Scope
 //!
-//! - **Target layouts:** 2-channel `LoRo` stereo and 1-channel mono.
-//!   `LtRt` (Dolby Surround matrix) is not yet implemented — the
-//!   decoder advertises `LoRo` which spec §7.8.2 calls the "preferred"
-//!   downmix when the ultimate target is mono anyway.
+//! - **Target layouts:** 2-channel `LoRo` (conventional stereo),
+//!   2-channel `LtRt` (Dolby Surround matrix-encoded stereo per
+//!   §7.8.2's `Lt = L + 0.707·C − 0.707·Ls − 0.707·Rs` / `Rt = R +
+//!   0.707·C + 0.707·Ls + 0.707·Rs`), and 1-channel mono. Per §7.8.2
+//!   LoRo is the preferred downmix when the ultimate target is mono;
+//!   LtRt is selected only when the consumer wants a matrix-encoded
+//!   pair to feed a surround decoder downstream.
 //! - **Source layouts:** every `acmod` ≥ 1 (1/0, 2/0, 3/0, 2/1, 3/1,
 //!   2/2, 3/2). `acmod = 0` (dual-mono 1+1) is handled by routing Ch1
 //!   into the Left output and Ch2 into the Right, which is the "Stereo"
@@ -38,8 +41,17 @@ use crate::tables::{CENTER_MIX_LEVEL, SURROUND_MIX_LEVEL};
 pub enum DownmixMode {
     /// Leave the source channels untouched.
     Passthrough,
-    /// Mix every source channel into a 2-channel LoRo pair.
+    /// Mix every source channel into a 2-channel LoRo pair (§7.8.2's
+    /// conventional stereo equations).
     Stereo,
+    /// Mix every source channel into a 2-channel LtRt pair — the
+    /// §7.8.2 Dolby Surround matrix-encoded stereo form. Surrounds
+    /// fold in with opposite signs into Lt vs Rt at a fixed 0.707
+    /// coefficient so a downstream matrix decoder (Pro Logic et al.)
+    /// can recover them. Spec equations:
+    ///   `Lt = L + 0.707·C − 0.707·Ls − 0.707·Rs`
+    ///   `Rt = R + 0.707·C + 0.707·Ls + 0.707·Rs`
+    StereoLtRt,
     /// Mix every source channel into a single mono channel.
     Mono,
 }
@@ -48,7 +60,11 @@ impl DownmixMode {
     /// Resolve from a user-requested output channel count (`None`
     /// meaning "pass through"). A requested count that matches the
     /// source `nfchans` also becomes `Passthrough`, even when LFE is
-    /// on — AC-3 never downmixes LFE explicitly.
+    /// on — AC-3 never downmixes LFE explicitly. `Some(2)` resolves
+    /// to [`Self::Stereo`] (LoRo); selecting LtRt requires explicit
+    /// API (decoder setter) since the wire `dsurmod` field advertises
+    /// whether the program *was* matrix-encoded but does not mandate
+    /// a particular downmix target.
     pub fn resolve(requested: Option<u16>, source_nfchans: u8) -> Self {
         match requested {
             None => Self::Passthrough,
@@ -119,6 +135,7 @@ impl Downmix {
 
         match mode {
             DownmixMode::Stereo => Self::fill_stereo(&mut out, bsi.acmod, clev, slev),
+            DownmixMode::StereoLtRt => Self::fill_stereo_ltrt(&mut out, bsi.acmod),
             DownmixMode::Mono => Self::fill_mono(&mut out, bsi.acmod, clev, slev),
             DownmixMode::Passthrough => unreachable!(),
         }
@@ -209,6 +226,112 @@ impl Downmix {
 
         out.out_channels = 2;
         // Normalise per §7.8.2: divide each row so its sum is ≤ 1.
+        Self::normalise(&mut out.out_coeffs);
+    }
+
+    /// LtRt 2-channel matrix-encoded stereo downmix per §7.8.2. The
+    /// 3/2 base equations are
+    ///   `Lt = 1.0·L + 0.707·C − 0.707·Ls − 0.707·Rs`
+    ///   `Rt = 1.0·R + 0.707·C + 0.707·Ls + 0.707·Rs`
+    /// and for 3/1 (single surround S folded in):
+    ///   `Lt = 1.0·L + 0.707·C − 0.707·S`
+    ///   `Rt = 1.0·R + 0.707·C + 0.707·S`
+    /// LtRt uses fixed 0.707 coefficients for the C and surround terms
+    /// — §7.8.2 does not parameterise on `cmixlev` / `surmixlev` (those
+    /// only steer the LoRo case). The base-spec form is anchored here;
+    /// Annex D §2.3.1.3-4 (`ltrtcmixlev` / `ltrtsurmixlev`) is an
+    /// E-AC-3-only mixing-metadata override and is a noted followup.
+    ///
+    /// Worst-case sum of |coeffs| is 1 + 3·0.707 = 3.121, so the
+    /// §7.8.2 normalisation scales every coefficient by 1/3.121 =
+    /// 0.3204 to prevent overflow (9.89 dB attenuation). The
+    /// surround-channel sign discipline is what makes the downstream
+    /// matrix decoder recoverable: the surround source ends up
+    /// out-of-phase between Lt and Rt, which the matrix decoder pulls
+    /// out into a single back channel.
+    fn fill_stereo_ltrt(out: &mut Self, acmod: u8) {
+        // Slot layout [L, C, R, Ls/S, Rs] per Table 5.8. Surround
+        // channels enter with -0.707 on Lt and +0.707 on Rt. Center
+        // is symmetric.
+        const K: f32 = 0.707;
+        match acmod {
+            0 => {
+                // 1+1 dual mono — no matrix encoding makes sense
+                // (no surround information to preserve), so fall back
+                // to the §7.8.1 'Stereo' dualmode path: Ch1 → Lt,
+                // Ch2 → Rt. This is a sentinel choice; an LtRt request
+                // on a dual-mono source is degenerate but should still
+                // produce something playable.
+                out.out_coeffs[0][0] = 1.0;
+                out.out_coeffs[1][2] = 1.0;
+            }
+            1 => {
+                // 1/0 — pure center → both outputs get -3 dB of C.
+                // Symmetric with the LoRo case (no surround sign play).
+                out.out_coeffs[0][0] = K;
+                out.out_coeffs[1][0] = K;
+            }
+            2 => {
+                // 2/0 — pass through. No surround to matrix-encode.
+                out.out_coeffs[0][0] = 1.0;
+                out.out_coeffs[1][2] = 1.0;
+            }
+            3 => {
+                // 3/0 — L, C, R. No surround info; symmetric with LoRo.
+                out.out_coeffs[0][0] = 1.0;
+                out.out_coeffs[0][1] = K;
+                out.out_coeffs[1][1] = K;
+                out.out_coeffs[1][2] = 1.0;
+            }
+            4 => {
+                // 2/1 — L, R, S. Single surround folds in with -K on
+                // Lt and +K on Rt (spec drops the C term).
+                out.out_coeffs[0][0] = 1.0;
+                out.out_coeffs[0][3] = -K;
+                out.out_coeffs[1][2] = 1.0;
+                out.out_coeffs[1][3] = K;
+            }
+            5 => {
+                // 3/1 — L, C, R, S. Single surround folds with opposite
+                // signs into Lt/Rt; C symmetric.
+                out.out_coeffs[0][0] = 1.0;
+                out.out_coeffs[0][1] = K;
+                out.out_coeffs[0][3] = -K;
+                out.out_coeffs[1][1] = K;
+                out.out_coeffs[1][2] = 1.0;
+                out.out_coeffs[1][3] = K;
+            }
+            6 => {
+                // 2/2 — L, R, Ls, Rs. Both surrounds fold with
+                // opposite signs into Lt/Rt. C term dropped per §7.8.2
+                // 'if center is missing'.
+                out.out_coeffs[0][0] = 1.0;
+                out.out_coeffs[0][3] = -K;
+                out.out_coeffs[0][4] = -K;
+                out.out_coeffs[1][2] = 1.0;
+                out.out_coeffs[1][3] = K;
+                out.out_coeffs[1][4] = K;
+            }
+            _ => {
+                // 3/2 (acmod=7) and defensive fall-through — the
+                // canonical §7.8.2 LtRt equations.
+                out.out_coeffs[0][0] = 1.0;
+                out.out_coeffs[0][1] = K;
+                out.out_coeffs[0][3] = -K;
+                out.out_coeffs[0][4] = -K;
+                out.out_coeffs[1][1] = K;
+                out.out_coeffs[1][2] = 1.0;
+                out.out_coeffs[1][3] = K;
+                out.out_coeffs[1][4] = K;
+            }
+        }
+
+        out.out_channels = 2;
+        // Normalise per §7.8.2 — Self::normalise uses |coeff| so the
+        // negative surround weights count correctly toward the bound.
+        // For 3/2 with K=0.707 the row-sum-of-|coeffs| is 3.121, so the
+        // normalised L-coefficient is 1/3.121 = 0.3204 (Table 7.32's
+        // headline value).
         Self::normalise(&mut out.out_coeffs);
     }
 
@@ -474,6 +597,175 @@ mod tests {
             assert!(out[n * 2].abs() <= 1.0 + 1e-6);
             assert!(out[n * 2 + 1].abs() <= 1.0 + 1e-6);
         }
+    }
+
+    #[test]
+    fn ltrt_3_2_matches_table_7_32() {
+        // 3/2 LtRt: Lt = L + 0.707 C − 0.707 Ls − 0.707 Rs.
+        // Unscaled row-sum-of-|coeffs| = 1 + 3·0.707 = 3.121.
+        // After §7.8.2 normalisation each coeff is divided by 3.121, so
+        // the L term lands at 1/3.121 = 0.3204 (Table 7.32, headline).
+        let bsi = fake_bsi(7, 0, 0, false);
+        let d = Downmix::from_bsi(&bsi, DownmixMode::StereoLtRt);
+        assert_eq!(d.output_channels(), 2);
+        assert!((d.out_coeffs[0][0] - 0.3204).abs() < 1e-3);
+        // The 0.707 terms (C, Ls, Rs) scale to 0.707/3.121 = 0.2265
+        // (Table 7.32's second row).
+        assert!((d.out_coeffs[0][1] - 0.2265).abs() < 1e-3);
+        assert!((d.out_coeffs[0][3] + 0.2265).abs() < 1e-3); // -K
+        assert!((d.out_coeffs[0][4] + 0.2265).abs() < 1e-3); // -K
+                                                             // Rt mirrors with +K for both surrounds.
+        assert!((d.out_coeffs[1][2] - 0.3204).abs() < 1e-3);
+        assert!((d.out_coeffs[1][1] - 0.2265).abs() < 1e-3);
+        assert!((d.out_coeffs[1][3] - 0.2265).abs() < 1e-3); // +K
+        assert!((d.out_coeffs[1][4] - 0.2265).abs() < 1e-3); // +K
+    }
+
+    #[test]
+    fn ltrt_surround_sign_discipline() {
+        // The whole point of LtRt vs LoRo is that the surround folds
+        // in with OPPOSITE signs into Lt vs Rt — that's what a Pro Logic
+        // matrix decoder pulls out. Verify the sign pattern across every
+        // surround-bearing acmod.
+        for &acmod in &[4u8, 5, 6, 7] {
+            let bsi = fake_bsi(acmod, 0, 0, false);
+            let d = Downmix::from_bsi(&bsi, DownmixMode::StereoLtRt);
+            // Surround slot 3 (S or Ls): negative on Lt, positive on Rt.
+            assert!(
+                d.out_coeffs[0][3] < 0.0,
+                "acmod={} Lt slot 3 should be negative, got {}",
+                acmod,
+                d.out_coeffs[0][3]
+            );
+            assert!(
+                d.out_coeffs[1][3] > 0.0,
+                "acmod={} Rt slot 3 should be positive, got {}",
+                acmod,
+                d.out_coeffs[1][3]
+            );
+            // The two surround terms must be equal-magnitude in opposite
+            // signs at the same slot — that's what makes the matrix
+            // decoder's subtraction recover the surround source.
+            assert!((d.out_coeffs[0][3] + d.out_coeffs[1][3]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn ltrt_2_2_drops_center() {
+        // §7.8.2: 'if the center channel is missing (2/2 or 2/1 mode)
+        // the C term is dropped.' acmod=6 (2/2) has no center.
+        let bsi = fake_bsi(6, 0, 0, false);
+        let d = Downmix::from_bsi(&bsi, DownmixMode::StereoLtRt);
+        assert_eq!(d.out_coeffs[0][1], 0.0, "Lt center weight must be zero");
+        assert_eq!(d.out_coeffs[1][1], 0.0, "Rt center weight must be zero");
+        // The two surrounds still ride in with opposite signs.
+        assert!(d.out_coeffs[0][3] < 0.0);
+        assert!(d.out_coeffs[0][4] < 0.0);
+        assert!(d.out_coeffs[1][3] > 0.0);
+        assert!(d.out_coeffs[1][4] > 0.0);
+    }
+
+    #[test]
+    fn ltrt_3_1_uses_single_surround_form() {
+        // §7.8.2: 3/1 form is Lt = L + 0.707 C − 0.707 S; Rt mirror.
+        // acmod=5 (3/1). Single surround S sits at slot 3; slot 4 must
+        // stay zero.
+        let bsi = fake_bsi(5, 0, 0, false);
+        let d = Downmix::from_bsi(&bsi, DownmixMode::StereoLtRt);
+        assert_eq!(d.out_coeffs[0][4], 0.0);
+        assert_eq!(d.out_coeffs[1][4], 0.0);
+        assert!(d.out_coeffs[0][3] < 0.0);
+        assert!(d.out_coeffs[1][3] > 0.0);
+        // Center is present (acmod 5 has C).
+        assert!(d.out_coeffs[0][1] > 0.0);
+        assert!(d.out_coeffs[1][1] > 0.0);
+    }
+
+    #[test]
+    fn ltrt_2_0_passes_no_surround_through() {
+        // 2/0 has no surround to matrix-encode; the LtRt path falls back
+        // to plain L→Lt, R→Rt. Sums equal 1 so no normalisation kicks in.
+        let bsi = fake_bsi(2, 0xFF, 0xFF, false);
+        let d = Downmix::from_bsi(&bsi, DownmixMode::StereoLtRt);
+        assert_eq!(d.out_coeffs[0][0], 1.0);
+        assert_eq!(d.out_coeffs[1][2], 1.0);
+        for slot in 1..5 {
+            assert_eq!(d.out_coeffs[0][slot], 0.0);
+        }
+    }
+
+    #[test]
+    fn ltrt_apply_preserves_surround_phase_inversion() {
+        // Push a +1.0 signal on Ls only (fbw index 3 on acmod=7 source
+        // layout). Lt should come out negative; Rt positive; same
+        // magnitude. This is the matrix encoder's defining behaviour.
+        let bsi = fake_bsi(7, 0, 0, false);
+        let d = Downmix::from_bsi(&bsi, DownmixMode::StereoLtRt);
+        let mut src: [[f32; 256]; 5] = [[0.0; 256]; 5];
+        for n in 0..256 {
+            src[3][n] = 1.0; // Ls
+        }
+        let mut out = vec![0.0f32; 256 * 2];
+        d.apply(&src, 256, &mut out);
+        for n in 0..256 {
+            let lt = out[n * 2];
+            let rt = out[n * 2 + 1];
+            assert!(lt < 0.0, "Lt should be negative, got {}", lt);
+            assert!(rt > 0.0, "Rt should be positive, got {}", rt);
+            assert!(
+                (lt + rt).abs() < 1e-6,
+                "Lt + Rt should cancel, got {}",
+                lt + rt
+            );
+        }
+    }
+
+    #[test]
+    fn ltrt_3_2_full_scale_does_not_clip() {
+        // Worst case: every source channel at full scale. Even with sign
+        // flips the row-sum-of-|coeffs| ≤ 1 invariant means the result
+        // stays within ±1.
+        let bsi = fake_bsi(7, 0, 0, false);
+        let d = Downmix::from_bsi(&bsi, DownmixMode::StereoLtRt);
+        let mut src: [[f32; 256]; 5] = [[1.0; 256]; 5];
+        // Make R negative so the Rt row's L=0 / R=1 / C+Ls+Rs at +K
+        // does not phase-cancel and we hit the true magnitude bound.
+        for n in 0..256 {
+            src[2][n] = 1.0;
+        }
+        let mut out = vec![0.0f32; 256 * 2];
+        d.apply(&src, 256, &mut out);
+        for n in 0..256 {
+            assert!(out[n * 2].abs() <= 1.0 + 1e-6);
+            assert!(out[n * 2 + 1].abs() <= 1.0 + 1e-6);
+        }
+    }
+
+    #[test]
+    fn ltrt_vs_loro_differ_on_surround() {
+        // LoRo sums surrounds with the SAME sign into Lt and Rt; LtRt
+        // inverts. Plant +1 on Ls and Rs simultaneously and verify the
+        // difference: LoRo doubles up, LtRt mostly cancels.
+        let bsi = fake_bsi(7, 0, 0, false);
+        let loro = Downmix::from_bsi(&bsi, DownmixMode::Stereo);
+        let ltrt = Downmix::from_bsi(&bsi, DownmixMode::StereoLtRt);
+        let mut src: [[f32; 256]; 5] = [[0.0; 256]; 5];
+        for n in 0..256 {
+            src[3][n] = 1.0; // Ls
+            src[4][n] = 1.0; // Rs
+        }
+        let mut loro_out = vec![0.0f32; 256 * 2];
+        let mut ltrt_out = vec![0.0f32; 256 * 2];
+        loro.apply(&src, 256, &mut loro_out);
+        ltrt.apply(&src, 256, &mut ltrt_out);
+        // LoRo Lt gets +slev·Ls and Lt's slot-4 is zero (LoRo only puts
+        // Rs into Ro, not Lo). LtRt Lt gets -K·Ls + -K·Rs, summing to
+        // a strongly negative number. Whatever the exact magnitudes,
+        // the SIGN of Lt differs between LoRo and LtRt for this input.
+        let loro_lt = loro_out[0];
+        let ltrt_lt = ltrt_out[0];
+        assert!(loro_lt > 0.0, "LoRo Lt should be positive, got {}", loro_lt);
+        assert!(ltrt_lt < 0.0, "LtRt Lt should be negative, got {}", ltrt_lt);
     }
 
     #[test]

@@ -33,6 +33,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         state: Ac3State::new(),
         eac3_state: eac3::Eac3DecoderState::default(),
         requested_channels: params.channels,
+        prefer_ltrt: false,
     }))
 }
 
@@ -49,6 +50,28 @@ pub fn make_eac3_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         state: Ac3State::new(),
         eac3_state: eac3::Eac3DecoderState::default(),
         requested_channels: params.channels,
+        prefer_ltrt: false,
+    }))
+}
+
+/// Variant of [`make_decoder`] that selects the §7.8.2 **LtRt**
+/// (Dolby Surround matrix-encoded) downmix when a 2-channel target is
+/// requested. Equivalent to `make_decoder` when the caller did not
+/// request a stereo downmix (`params.channels != Some(2)` or the
+/// source is already mono/stereo). The LtRt downmix preserves
+/// surround information so a downstream matrix decoder (Pro Logic
+/// et al.) can recover Ls/Rs from the stereo pair; LoRo's
+/// straight-sum mix is unrecoverable in that sense.
+pub fn make_decoder_ltrt(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    Ok(Box::new(Ac3Decoder {
+        codec_id: params.codec_id.clone(),
+        time_base: TimeBase::new(1, 48_000),
+        pending: None,
+        eof: false,
+        state: Ac3State::new(),
+        eac3_state: eac3::Eac3DecoderState::default(),
+        requested_channels: params.channels,
+        prefer_ltrt: true,
     }))
 }
 
@@ -67,6 +90,13 @@ struct Ac3Decoder {
     /// stereo, `None` = passthrough of whatever the bitstream carries.
     /// Drives the §7.8 matrix in [`Ac3Decoder::process_frame`].
     requested_channels: Option<u16>,
+    /// When `true` and a 2-channel downmix is requested, use the
+    /// §7.8.2 **LtRt** (Dolby Surround matrix-encoded) equations
+    /// instead of LoRo. Toggled by [`make_decoder_ltrt`]; the regular
+    /// [`make_decoder`] / [`make_eac3_decoder`] factories leave this
+    /// off (LoRo is §7.8.2's "preferred when mono is the ultimate
+    /// target" path and matches FFmpeg's default).
+    prefer_ltrt: bool,
 }
 
 impl Decoder for Ac3Decoder {
@@ -235,8 +265,19 @@ impl Ac3Decoder {
 
         // 2) Pick a §7.8 downmix mode from the requested output channel
         //    count (falls back to passthrough when unset or equal to
-        //    source width).
-        let dmx_mode = DownmixMode::resolve(self.requested_channels, bsi.nfchans);
+        //    source width). When `prefer_ltrt` is set, promote a
+        //    LoRo (`Stereo`) selection to LtRt — Mono / Passthrough
+        //    are unaffected (LtRt is a stereo-target option only,
+        //    §7.8.2 explicitly notes "if the LtRt downmix is combined
+        //    to mono, the surround information will be lost").
+        let dmx_mode = {
+            let base = DownmixMode::resolve(self.requested_channels, bsi.nfchans);
+            if self.prefer_ltrt && matches!(base, DownmixMode::Stereo) {
+                DownmixMode::StereoLtRt
+            } else {
+                base
+            }
+        };
         let (out_channels, out_samples) = if matches!(dmx_mode, DownmixMode::Passthrough) {
             (src_channels, floats.clone())
         } else {
@@ -316,6 +357,16 @@ mod tests {
     fn decoder_builds() {
         let params = CodecParameters::audio(CodecId::new("ac3"));
         let dec = make_decoder(&params).unwrap();
+        assert_eq!(dec.codec_id().as_str(), "ac3");
+    }
+
+    /// The LtRt factory must accept the same parameters as the default
+    /// factory and produce a working decoder.
+    #[test]
+    fn ltrt_decoder_builds() {
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.channels = Some(2);
+        let dec = make_decoder_ltrt(&params).unwrap();
         assert_eq!(dec.codec_id().as_str(), "ac3");
     }
 }
