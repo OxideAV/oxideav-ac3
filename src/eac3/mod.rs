@@ -64,10 +64,15 @@
 //!
 //! ## Deferred to round 7 and beyond
 //!
-//! * Multichannel / coupled / LFE AHT — needs the iterative nchregs
-//!   probe described in §3.4.2 (or a deferred audfrm parse with full
-//!   audblk pre-walk). The `cplahtinu` / `lfeahtinu` bit streams
-//!   themselves are already wired through [`audfrm::AudFrm`].
+//! * Multichannel / coupled / LFE AHT — **landed**. Multichannel fbw
+//!   (round 110), LFE (round 113), and coupling (round 117) AHT all
+//!   decode via [`dsp::decode_indep_audblks`], driven by the
+//!   regs-derived phase-B parse ([`dsp::compute_aht_regs`] feeds
+//!   [`audfrm::parse_phase_b`]). The `cplahtinu` / `lfeahtinu` bit
+//!   streams are wired through [`audfrm::AudFrm`]; the coupling-AHT
+//!   mantissa block is read interleaved with the first coupled fbw
+//!   channel and its coefficients land in the coupling pseudo-channel
+//!   slot before the §7.4 decouple step.
 //! * **Spectral Extension (SPX)** decode — **landed**. `spxinu == 1`
 //!   blocks now parse the full §E.2.3.3 strategy + coordinate fields
 //!   (chinspx / spxstrtf / spxbegf / spxendf / spxbndstrc / spxcoe /

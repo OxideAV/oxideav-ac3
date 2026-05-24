@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **E-AC-3 coupling-channel AHT decode (`cplahtinu`)** — round 117.
+  Extends the AHT mantissa path (round 110 fbw, round 113 LFE) to the
+  coupling pseudo-channel, removing the last AHT reject in the E-AC-3
+  decoder.
+  * **Interleaved coupling read in AHT frames**: the coupling-channel
+    mantissa block (standard *or* AHT) is now read INSIDE the fbw
+    channel loop of `eac3::dsp::unpack_mixed_mantissas`, right after the
+    first coupled channel's mantissas — gated by `got_cplchan` exactly as
+    the base-AC-3 mantissa loop (Table E1.4
+    `if(cplinu[blk] && chincpl[ch] && !got_cplchan)`). The round-110/113
+    mixed path skipped coupling entirely; only the blanket `cplahtinu`
+    reject had hidden a latent cursor desync for *standard*
+    (`cplahtinu == 0`) coupling in an AHT frame, which is now also fixed.
+  * **Coupling-AHT synthesis** (`cplahtinu == 1`): the front-loaded
+    coupling-AHT block — `cplgaqmod` (2 bits) + `cplgaqgain` words + the
+    per-bin VQ (Tables E4.1..E4.7) or scalar/GAQ (Table E3.5) mantissas
+    across all six AHT sub-blocks over the coupling range
+    `[cpl_begf_mant, cpl_endf_mant)` — is decoded once (the
+    `ncplregs == 1` / `ncplblks == 6` eligibility block), IDCT-II'd
+    (§3.4.5), scaled by `2^-exp`, and cached for the per-block dispatch
+    loop. `decode_aht_channel_mantissas` now takes a `start` bin so the
+    coupling range maps to the same psd/mask/exp slots the §7.4 decouple
+    step reads; the cached coupling coefficients are loaded into the
+    `MAX_FBW` pseudo-channel slot before `dsp_block` runs decouple.
+  * No corpus fixture exercises coupling AHT (FFmpeg's eac3 encoder
+    emits neither coupling-AHT nor LFE-AHT), so the synthesis is covered
+    by 3 unit tests (`eac3::dsp::cpl_aht_tests`): the standard-coupling
+    interleave regression, the zero-mantissa front-load + cache, and the
+    VQ regime (IDCT-II block variation + zero-below-`cpl_begf_mant`).
+  * The dsp no longer rejects ANY AHT flag — fbw, LFE, and coupling AHT
+    all decode.
 - **E-AC-3 LFE-channel AHT decode + standard-LFE mantissa fix** — round
   113. Extends the round-110 multichannel fbw AHT path to the LFE
   channel, the immediately-next §3.4.2 element after fbw AHT.

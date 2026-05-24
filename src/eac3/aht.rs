@@ -65,8 +65,13 @@
 //!   remap (Table E3.6).
 //! * fbw-channel AHT mantissa unpack + cross-block IDCT.
 //! * Coupling / LFE AHT (`cplahtinu`, `lfeahtinu`) — wired through
-//!   the per-channel iteration so 6-block-coupling and AHT-LFE
-//!   fixtures decode, but no corpus fixture currently exercises them.
+//!   the per-channel iteration (LFE round 113, coupling round 117) so
+//!   6-block-coupling and AHT-LFE syncframes decode; the helper routines
+//!   here (`hebap_from_address`, `fill_gaqbin`, `gaq_sections`,
+//!   `read_gaq_gains`, `vq_lookup`, `read_scalar_aht_mantissas`,
+//!   `idct_ii_6`) are channel-agnostic and serve all three paths
+//!   unchanged. No corpus fixture currently exercises coupling/LFE AHT,
+//!   so those paths are covered by unit tests in `super::dsp`.
 //!
 //! Symbol naming follows the spec: `hebap`, `chgaqmod`, `chgaqgain`,
 //! `chgaqbin`, `pre_chmant` and the `[k][j]` (bin, AHT-block) ordering

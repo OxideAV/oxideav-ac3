@@ -41,9 +41,14 @@
 //! matching base AC-3 §7.3.5 (round 6's per-channel grouping was correct
 //! only for the mono case). LFE-AHT (`lfeahtinu`) synthesis decodes as of
 //! round 113 (and the previously-skipped standard LFE mantissa read in
-//! the AHT path is fixed). Coupling-AHT (`cplahtinu`) synthesis remains
-//! deferred: such frames are rejected as `Unsupported` after the
-//! regs-driven phase-B parse confirms the flag.
+//! the AHT path is fixed). Coupling-AHT (`cplahtinu`) synthesis decodes
+//! as of round 117: the coupling-channel AHT mantissa block (the
+//! `cplgaqmod` word, gain words, 6×ncplmant VQ/GAQ mantissas, then IDCT
+//! per §3.4) is read inline with the first coupled fbw channel — gated by
+//! `got_cplchan` exactly as the base-AC-3 mantissa loop — over the
+//! coupling range `[cpl_begf_mant, cpl_endf_mant)`, and its per-block
+//! coefficients are loaded into the coupling pseudo-channel slot before
+//! the §7.4 decouple step. No AHT flag is rejected by the dsp any more.
 //!
 //! Per-bin AHT decode flow:
 //!
@@ -253,20 +258,13 @@ pub fn decode_indep_audblks(
     // `parse_phase_b` then reads `chahtinu[ch]` for every fbw channel
     // with `nchregs[ch] == 1` (multichannel-capable as of round 110),
     // plus `cplahtinu` / `lfeahtinu` when their regs gate fires.
-    // fbw AHT (round 110) and LFE AHT (round 113) both decode; only
-    // coupling-AHT synthesis is still deferred, so after parsing we
-    // reject solely the frames that carry `cplahtinu` set.
+    // fbw AHT (round 110), LFE AHT (round 113), and coupling-AHT
+    // (round 117) all decode now, so no AHT flag is rejected here.
     let mut audfrm_local;
     let audfrm: &AudFrm = if audfrm.aht_phase_b_pending {
         audfrm_local = audfrm.clone();
         let hints = compute_aht_regs(&audfrm_local, bsi);
         audfrm::parse_phase_b(br, &mut audfrm_local, bsi, &hints)?;
-        if audfrm_local.cplahtinu {
-            return Err(Error::unsupported(
-                "eac3 dsp: coupling-AHT in use (cplahtinu) — fbw + LFE AHT decode; \
-                 coupled-channel AHT synthesis deferred.",
-            ));
-        }
         &audfrm_local
     } else {
         audfrm
@@ -338,9 +336,11 @@ pub fn decode_indep_audblks(
     //
     // The arrays carry one slot per `state.channels` index — fbw 0..5,
     // the coupling pseudo-channel at `MAX_FBW`, and the LFE channel at
-    // `MAX_FBW + 1` — so the LFE-AHT path (round 113) shares the same
-    // cache+flag machinery as the fbw channels. Coupling-AHT
-    // (`cplahtinu`) stays deferred, so the `MAX_FBW` slot is never set.
+    // `MAX_FBW + 1` — so the LFE-AHT path (round 113) and the
+    // coupling-AHT path (round 117) share the same cache+flag machinery
+    // as the fbw channels. The `MAX_FBW` (coupling) slot is armed when
+    // `cplahtinu == 1`; the coupling mantissa block is read interleaved
+    // with the first coupled fbw channel inside `unpack_mixed_mantissas`.
     // ~42 KB total (7 slots × 6 blks × 256 bins × 4 B). Heap-allocate so
     // we don't blow the audio thread's modest stack budget.
     const AHT_SLOTS: usize = MAX_FBW + 2;
@@ -351,6 +351,7 @@ pub fn decode_indep_audblks(
     let mut aht_filled: [bool; AHT_SLOTS] = [false; AHT_SLOTS];
     if audfrm.ahte {
         aht_pending[..nfchans].copy_from_slice(&audfrm.chahtinu[..nfchans]);
+        aht_pending[MAX_FBW] = audfrm.cplahtinu;
         if lfeon {
             aht_pending[lfe_slot] = audfrm.lfeahtinu;
         }
@@ -1143,6 +1144,7 @@ pub fn decode_indep_audblks(
                 &mut aht_filled,
                 nfchans,
                 lfeon,
+                cplinu,
             )?;
         } else {
             audblk::unpack_mantissas(state, &ac3_bsi, br)?;
@@ -1161,6 +1163,26 @@ pub fn decode_indep_audblks(
                 for bin in end..N_COEFFS {
                     state.channels[ch].coeffs[bin] = 0.0;
                 }
+            }
+        }
+        // Coupling pseudo-channel (round 117): when coupling-AHT is in
+        // use, load this block's cached coupling coefficients into the
+        // `MAX_FBW` slot BEFORE `dsp_block` runs §7.4 decouple — the
+        // decouple step reads `channels[MAX_FBW].coeffs[bin]` and scatters
+        // it into the fbw channels via the cplco coordinates. The valid
+        // span is the coupling range `[cpl_begf_mant, cpl_endf_mant)`, not
+        // the `end_mant` window the fbw/LFE channels use.
+        if cplinu && aht_filled[MAX_FBW] {
+            let start = state.cpl_begf_mant;
+            let end_c = state.cpl_endf_mant.min(N_COEFFS);
+            for bin in 0..start {
+                state.channels[MAX_FBW].coeffs[bin] = 0.0;
+            }
+            for bin in start..end_c {
+                state.channels[MAX_FBW].coeffs[bin] = aht_coeffs[MAX_FBW][blk][bin];
+            }
+            for bin in end_c..N_COEFFS {
+                state.channels[MAX_FBW].coeffs[bin] = 0.0;
             }
         }
 
@@ -1345,12 +1367,18 @@ fn apply_transient_prenoise(
 /// by `2^-exp`, and cache the per-block coefficients in
 /// `aht_coeffs[ch][blk][bin]` for the per-block dispatch loop above.
 ///
-/// Coupling AHT (`cplahtinu`) is **not** handled here — the dispatch
-/// never sets `aht_pending[MAX_FBW]`. The LFE channel **is** handled
-/// (round 113): after the fbw loop, slot `MAX_FBW + 1` runs either the
-/// standard 7-mantissa LFE read (`lfeahtinu == 0`) or the front-loaded
-/// LFE-AHT block (`lfeahtinu == 1`, `aht_pending[lfe] == true`),
-/// matching the §E.1.3.2 `if(lfeon)` tail of the audblk mantissa loop.
+/// Coupling AHT (`cplahtinu`, round 117) **is** handled: the coupling
+/// pseudo-channel slot `MAX_FBW` is read interleaved INSIDE the fbw
+/// channel loop, right after the first coupled channel's mantissas (the
+/// `got_cplchan` gate, matching Table E1.4). When `cplahtinu == 1` the
+/// front-loaded coupling-AHT block (`cplgaqmod` + gains + 6×ncplmant +
+/// IDCT) fills the cache over `[cpl_begf_mant, cpl_endf_mant)`; when
+/// `cplahtinu == 0` the standard coupling mantissas are read there
+/// instead (never dithered, §7.3.4 para 1). The LFE channel **is**
+/// handled (round 113): after the fbw loop, slot `MAX_FBW + 1` runs
+/// either the standard 7-mantissa LFE read (`lfeahtinu == 0`) or the
+/// front-loaded LFE-AHT block (`lfeahtinu == 1`, `aht_pending[lfe] ==
+/// true`), matching the §E.1.3.2 `if(lfeon)` tail of the audblk loop.
 ///
 /// Multichannel note (round 110): the non-AHT (standard scalar) channels
 /// share the bap-1/2/4 triplet/pair grouping buffers across channels in
@@ -1362,6 +1390,7 @@ fn apply_transient_prenoise(
 /// across the standard channels present in this audblk's mantissa stream.
 /// The standard LFE read shares the same grouping buffers (the base path
 /// also threads LFE bap-1/2/4 mantissas through the fbw groups).
+#[allow(clippy::too_many_arguments)]
 fn unpack_mixed_mantissas(
     state: &mut Ac3State,
     br: &mut BitReader<'_>,
@@ -1370,6 +1399,7 @@ fn unpack_mixed_mantissas(
     aht_filled: &mut [bool],
     nfchans: usize,
     lfeon: bool,
+    cplinu: bool,
 ) -> Result<()> {
     // Clear per-block transform-coefficient state for every channel —
     // standard mantissas overwrite bins 0..end_mant, AHT mantissas
@@ -1398,6 +1428,14 @@ fn unpack_mixed_mantissas(
     // pull the mantissa block and IDCT it. We walk channels in order
     // (matching the spec's `for ch in 0..nfchans` loop) so the bit
     // cursor advances in the same order whether AHT is in use or not.
+    //
+    // The coupling-channel mantissas (standard or AHT) are read
+    // interleaved INSIDE this loop, right after the FIRST coupled
+    // channel's mantissas, gated by `got_cplchan` — exactly as the base
+    // AC-3 [`audblk::unpack_mantissas`] does (Table E1.4:
+    // `if(cplinu[blk] && chincpl[ch] && !got_cplchan)`).
+    let cpl = MAX_FBW;
+    let mut got_cplchan = false;
     for ch in 0..nfchans {
         let end = state.channels[ch].end_mant;
         if aht_filled[ch] {
@@ -1405,45 +1443,98 @@ fn unpack_mixed_mantissas(
             // here. The per-block dispatch loop in
             // `decode_indep_audblks` will load coefficients from
             // `aht_coeffs[ch][blk]` after this function returns.
-            continue;
-        }
-        if aht_pending[ch] {
+        } else if aht_pending[ch] {
             // First AHT-active block for this channel — read GAQ side
             // info + 6×nmant mantissas + IDCT into the coefficient
             // cache. AHT reads a self-contained VQ/GAQ codeword stream
             // and never touches the shared grouping buffers above.
             let snroffset =
                 (((state.snroffst_coarse as i32 - 15) << 4) + state.fsnroffst[ch] as i32) << 2;
-            decode_aht_channel_mantissas(state, ch, end, snroffset, br, &mut aht_coeffs[ch])?;
+            decode_aht_channel_mantissas(state, ch, 0, end, snroffset, br, &mut aht_coeffs[ch])?;
             aht_filled[ch] = true;
             aht_pending[ch] = false;
-            continue;
+        } else {
+            // Standard scalar mantissa path — uses the canonical base-AC-3
+            // `fetch_mantissa` so bap-1/2/4 grouping shares the buffers above
+            // across all standard channels (§7.3.5) and bap=0 dither matches
+            // the base path's LFSR (§7.3.4).
+            let dith = state.channels[ch].dithflag;
+            for bin in 0..end {
+                let bap = state.channels[ch].bap[bin];
+                let val = audblk::fetch_mantissa(
+                    br,
+                    bap,
+                    &mut grp1,
+                    &mut grp1_n,
+                    &mut grp2,
+                    &mut grp2_n,
+                    &mut grp4,
+                    &mut grp4_n,
+                    false,
+                )?;
+                let final_val = if bap == 0 && dith {
+                    audblk::dither_lfsr(&mut state.dither_lfsr_state)
+                } else {
+                    val
+                };
+                let e = state.channels[ch].exp[bin] as i32;
+                state.channels[ch].coeffs[bin] = final_val * 2f32.powi(-e);
+            }
         }
-        // Standard scalar mantissa path — uses the canonical base-AC-3
-        // `fetch_mantissa` so bap-1/2/4 grouping shares the buffers above
-        // across all standard channels (§7.3.5) and bap=0 dither matches
-        // the base path's LFSR (§7.3.4).
-        let dith = state.channels[ch].dithflag;
-        for bin in 0..end {
-            let bap = state.channels[ch].bap[bin];
-            let val = audblk::fetch_mantissa(
-                br,
-                bap,
-                &mut grp1,
-                &mut grp1_n,
-                &mut grp2,
-                &mut grp2_n,
-                &mut grp4,
-                &mut grp4_n,
-                false,
-            )?;
-            let final_val = if bap == 0 && dith {
-                audblk::dither_lfsr(&mut state.dither_lfsr_state)
+
+        // ---- coupling-channel mantissas (Table E1.4) ----
+        // Read once per block, immediately after the first coupled
+        // channel, before moving on to later channels. Both the standard
+        // (`cplahtinu == 0`) and AHT (`cplahtinu == 1`, round 117)
+        // branches land here so the bit cursor stays aligned.
+        if cplinu && state.channels[ch].in_coupling && !got_cplchan {
+            got_cplchan = true;
+            let start = state.cpl_begf_mant;
+            let end_c = state.cpl_endf_mant;
+            if aht_filled[cpl] {
+                // Coupling-AHT cache populated on a prior block — no bits.
+            } else if aht_pending[cpl] {
+                // First (and only) coupling-AHT block this frame: §3.4.3.1
+                // hebap masking uses the coupling fine-SNR offset
+                // (`cpl_fsnroffst`). The bins span the coupling range
+                // [cpl_begf_mant, cpl_endf_mant); the cache is loaded into
+                // the cpl pseudo-channel slot for the per-block decouple
+                // step in `dsp_block`.
+                let snroffset =
+                    (((state.snroffst_coarse as i32 - 15) << 4) + state.cpl_fsnroffst as i32) << 2;
+                decode_aht_channel_mantissas(
+                    state,
+                    cpl,
+                    start,
+                    end_c,
+                    snroffset,
+                    br,
+                    &mut aht_coeffs[cpl],
+                )?;
+                aht_filled[cpl] = true;
+                aht_pending[cpl] = false;
             } else {
-                val
-            };
-            let e = state.channels[ch].exp[bin] as i32;
-            state.channels[ch].coeffs[bin] = final_val * 2f32.powi(-e);
+                // Standard coupling-channel read. Coupling mantissas are
+                // never dithered (§7.3.4 para 1: dither is applied after a
+                // channel is extracted from the coupling channel), so the
+                // bap=0 LFSR substitution is skipped here.
+                for bin in start..end_c {
+                    let bap = state.channels[cpl].bap[bin];
+                    let val = audblk::fetch_mantissa(
+                        br,
+                        bap,
+                        &mut grp1,
+                        &mut grp1_n,
+                        &mut grp2,
+                        &mut grp2_n,
+                        &mut grp4,
+                        &mut grp4_n,
+                        false,
+                    )?;
+                    let e = state.channels[cpl].exp[bin] as i32;
+                    state.channels[cpl].coeffs[bin] = val * 2f32.powi(-e);
+                }
+            }
         }
     }
 
@@ -1470,7 +1561,7 @@ fn unpack_mixed_mantissas(
             // per-channel `fsnroffst[ch]`.
             let snroffset =
                 (((state.snroffst_coarse as i32 - 15) << 4) + state.lfefsnroffst as i32) << 2;
-            decode_aht_channel_mantissas(state, lfe, end, snroffset, br, &mut aht_coeffs[lfe])?;
+            decode_aht_channel_mantissas(state, lfe, 0, end, snroffset, br, &mut aht_coeffs[lfe])?;
             aht_filled[lfe] = true;
             aht_pending[lfe] = false;
         } else {
@@ -1528,6 +1619,7 @@ fn unpack_mixed_mantissas(
 fn decode_aht_channel_mantissas(
     state: &mut Ac3State,
     ch: usize,
+    start: usize,
     end: usize,
     snroffset: i32,
     br: &mut BitReader<'_>,
@@ -1538,13 +1630,17 @@ fn decode_aht_channel_mantissas(
     // The masking curve `state.channels[ch].mask` is in the spec's
     // banded representation (50 entries indexed by masktab[bin]). We
     // reproduce the per-band post-processing inline (`mask_after_floor`)
-    // so our hebap lookup matches the encoder's choice exactly.
+    // so our hebap lookup matches the encoder's choice exactly. The
+    // mantissa range is `[start, end)`: fbw/LFE channels start at bin 0,
+    // the coupling pseudo-channel (round 117) starts at `cpl_begf_mant`
+    // and ends at `cpl_endf_mant`. `hebap` is indexed by absolute bin so
+    // it lines up with `psd`/`exp`/the per-block coefficient cache.
     let mut hebap = vec![0u8; end.max(1)];
-    {
+    if start < end {
         use crate::tables::{BNDSZ, BNDTAB, FLOORTAB, MASKTAB};
         let floor = FLOORTAB[state.floorcod as usize];
-        let mut i = 0usize;
-        let mut j = MASKTAB[i] as usize;
+        let mut i = start;
+        let mut j = MASKTAB[start] as usize;
         while i < end {
             let lastbin = (BNDTAB[j] as usize + BNDSZ[j] as usize).min(end);
             let mut m = state.channels[ch].mask[j] as i32;
@@ -1563,10 +1659,14 @@ fn decode_aht_channel_mantissas(
         }
     }
 
-    // ---- 2. gaqmod (chgaqmod / lfegaqmod, 2 bits) ----
+    // ---- 2. gaqmod (chgaqmod / cplgaqmod / lfegaqmod, 2 bits) ----
     let gaqmod = br.read_u32(2)? as u8;
 
     // ---- 3. compute gaqbin[bin] (Table E3.3 logic) ----
+    // `fill_gaqbin` walks `hebap[..]` from index 0; bins below `start`
+    // have `hebap == 0` (left zero above) so they classify as non-GAQ
+    // and never consume a gain word, matching the spec's
+    // `for(bin = cplstrtmant; bin < cplendmant; ...)` GAQ-active scan.
     let mut gaqbin = vec![0i8; end.max(1)];
     let active = aht::fill_gaqbin(&hebap, gaqmod, &mut gaqbin);
 
@@ -1578,7 +1678,7 @@ fn decode_aht_channel_mantissas(
     // ---- 5/6/7. per-bin mantissa decode + IDCT + scale ----
     let mut gain_iter = gain_words.into_iter();
     let mut x = [0.0f32; 6];
-    for bin in 0..end {
+    for bin in start..end {
         let h = hebap[bin];
         if h == 0 {
             // Zero-mantissa bin — coefficients are 0 across all blocks.
@@ -2054,6 +2154,7 @@ mod lfe_aht_tests {
             &mut filled,
             0,
             true,
+            false,
         )
         .expect("decode");
 
@@ -2115,6 +2216,7 @@ mod lfe_aht_tests {
             &mut filled,
             0,
             true,
+            false,
         )
         .expect("block 0 decode");
         assert_eq!(br.bit_position(), 2, "only lfegaqmod consumed");
@@ -2136,6 +2238,7 @@ mod lfe_aht_tests {
             &mut filled,
             0,
             true,
+            false,
         )
         .expect("block 1 decode");
         assert_eq!(
@@ -2190,6 +2293,7 @@ mod lfe_aht_tests {
             &mut filled,
             0,
             true,
+            false,
         )
         .expect("decode");
         assert_eq!(
@@ -2208,6 +2312,248 @@ mod lfe_aht_tests {
         assert!(
             varies,
             "IDCT-II of a VQ codeword must yield block-varying coefficients"
+        );
+    }
+}
+
+/// Round-117 tests for the coupling branch of [`unpack_mixed_mantissas`].
+///
+/// Before round 117 the dsp rejected any AHT syncframe with `cplahtinu ==
+/// 1`. These tests drive the new coupling-AHT path (and the interleaved
+/// standard coupling read inside an AHT frame) directly through
+/// `unpack_mixed_mantissas` with a hand-built `Ac3State`, mirroring the
+/// round-113 LFE tests. The coupling pseudo-channel lives at slot
+/// `MAX_FBW`; its mantissas span `[cpl_begf_mant, cpl_endf_mant)`.
+#[cfg(test)]
+mod cpl_aht_tests {
+    use super::*;
+
+    const CPL: usize = MAX_FBW;
+    const AHT_SLOTS: usize = MAX_FBW + 2;
+
+    fn empty_aht() -> (
+        Vec<[[f32; N_COEFFS]; AHT_BLOCKS]>,
+        [bool; AHT_SLOTS],
+        [bool; AHT_SLOTS],
+    ) {
+        (
+            vec![[[0.0; N_COEFFS]; AHT_BLOCKS]; AHT_SLOTS],
+            [false; AHT_SLOTS],
+            [false; AHT_SLOTS],
+        )
+    }
+
+    /// One fbw channel in coupling + a standard (`cplahtinu == 0`)
+    /// coupling read, all inside an AHT frame (a different channel uses
+    /// AHT). The coupling mantissas MUST be consumed right after the fbw
+    /// channel's mantissas (the `got_cplchan` interleave). The fbw channel
+    /// here has `end_mant == cpl_begf_mant` (fully coupled), so it reads no
+    /// mantissas of its own; the only bits in the stream are the coupling
+    /// mantissas. This is the regression guard for the interleave order.
+    #[test]
+    fn standard_coupling_mantissas_consumed_in_aht_frame() {
+        let mut state = Ac3State::new();
+        // 1 fbw channel, fully coupled from bin 0.
+        let cpl_begf_mant = 0usize;
+        let cpl_endf_mant = 6usize; // 6 coupling bins
+        state.cpl_begf_mant = cpl_begf_mant;
+        state.cpl_endf_mant = cpl_endf_mant;
+        state.channels[0].end_mant = cpl_begf_mant; // fully coupled
+        state.channels[0].in_coupling = true;
+        // Coupling channel quantiser: bap=5 → 4 bits/bin, no grouping.
+        for bin in cpl_begf_mant..cpl_endf_mant {
+            state.channels[CPL].bap[bin] = 5;
+            state.channels[CPL].exp[bin] = 2;
+        }
+
+        // 6 × 4-bit coupling mantissa codewords, MSB-first.
+        let codes = [1u32, 3, 5, 9, 12, 15];
+        let mut w = oxideav_core::bits::BitWriter::new();
+        for c in codes {
+            w.write_u32(c, 4);
+        }
+        let bytes = w.into_bytes();
+        let mut br = BitReader::new(&bytes);
+
+        let (mut cache, mut pending, mut filled) = empty_aht();
+        // nfchans = 1, lfeon = false, cplinu = true. No AHT-pending
+        // channel here, but the function is still exercised on the
+        // coupling interleave path (the dispatch arms it whenever ahte).
+        unpack_mixed_mantissas(
+            &mut state,
+            &mut br,
+            &mut cache,
+            &mut pending,
+            &mut filled,
+            1,
+            false,
+            true,
+        )
+        .expect("decode");
+
+        assert_eq!(
+            br.bit_position(),
+            6u64 * 4,
+            "exactly 6 × 4-bit coupling mantissas must be consumed"
+        );
+        assert!(!filled[CPL], "standard coupling never fills the AHT cache");
+        let c = &state.channels[CPL].coeffs;
+        assert!(c[..cpl_endf_mant].iter().all(|v| v.is_finite()));
+        assert_ne!(
+            c[0], c[5],
+            "different coupling codewords reconstruct different coeffs"
+        );
+    }
+
+    /// Coupling-AHT (`cplahtinu == 1`) with every coupling bin driven to
+    /// `hebap == 0`: the front-loaded block reads only the 2-bit
+    /// `cplgaqmod`, fills the 6-block cache with zeros over the coupling
+    /// range, sets `aht_filled[CPL]`, and the SECOND call reads no bits.
+    #[test]
+    fn cpl_aht_zero_mantissa_frontloads_and_caches() {
+        let mut state = Ac3State::new();
+        let start = 37usize; // cpl_begf_mant for cplbegf=0
+        let end = 49usize; // 12 coupling bins
+        state.cpl_begf_mant = start;
+        state.cpl_endf_mant = end;
+        state.channels[0].end_mant = start; // fully coupled fbw 0
+        state.channels[0].in_coupling = true;
+
+        // floorcod 0 → floor 0x2f0; mask 0, snroffset 0 → mask_after_floor
+        // == floor, psd 0 → negative address → clamps to 0 → hebap 0.
+        state.floorcod = 0;
+        state.snroffst_coarse = 15;
+        state.cpl_fsnroffst = 0;
+        for bin in start..end {
+            state.channels[CPL].psd[bin] = 0;
+            state.channels[CPL].exp[bin] = 2;
+        }
+        for m in state.channels[CPL].mask.iter_mut() {
+            *m = 0;
+        }
+
+        // cplgaqmod = 0 (2 bits), then nothing (all bins zero).
+        let mut w = oxideav_core::bits::BitWriter::new();
+        w.write_u32(0, 2);
+        let bytes = w.into_bytes();
+        let mut br = BitReader::new(&bytes);
+
+        let (mut cache, mut pending, mut filled) = empty_aht();
+        pending[CPL] = true; // cplahtinu == 1
+
+        // Block 0 — front-load.
+        unpack_mixed_mantissas(
+            &mut state,
+            &mut br,
+            &mut cache,
+            &mut pending,
+            &mut filled,
+            1,
+            false,
+            true,
+        )
+        .expect("block 0 decode");
+        assert_eq!(br.bit_position(), 2, "only cplgaqmod consumed");
+        assert!(filled[CPL], "coupling-AHT cache filled after block 0");
+        assert!(!pending[CPL], "pending cleared after front-load");
+        for blk in 0..AHT_BLOCKS {
+            for bin in start..end {
+                assert_eq!(cache[CPL][blk][bin], 0.0, "zero-hebap → zero coeffs");
+            }
+        }
+
+        // Block 1 — cached, must read no further bits.
+        let pos_before = br.bit_position();
+        unpack_mixed_mantissas(
+            &mut state,
+            &mut br,
+            &mut cache,
+            &mut pending,
+            &mut filled,
+            1,
+            false,
+            true,
+        )
+        .expect("block 1 decode");
+        assert_eq!(
+            br.bit_position(),
+            pos_before,
+            "subsequent coupling-AHT blocks read no bits"
+        );
+    }
+
+    /// Coupling-AHT with bins in the VQ regime (`hebap == 1`): the
+    /// front-loaded block reads `cplgaqmod` + one 2-bit VQ index per
+    /// coupling bin, runs the §3.4.5 IDCT-II, and caches block-varying
+    /// per-bin coefficients only across the coupling range — bins below
+    /// `cpl_begf_mant` stay zero (the encoder never codes them).
+    #[test]
+    fn cpl_aht_vq_regime_runs_idct_and_zero_below_begf() {
+        let mut state = Ac3State::new();
+        let start = 37usize;
+        let end = 43usize; // 6 coupling bins
+        state.cpl_begf_mant = start;
+        state.cpl_endf_mant = end;
+        state.channels[0].end_mant = start;
+        state.channels[0].in_coupling = true;
+
+        // floorcod 7 → floor -2048; mask 0, snroffset 0 → mask_after_floor
+        // == 0. psd 48 → (48 >> 5) = 1 → HEBAPTAB[1] = 1 → VQ, 2 bits.
+        state.floorcod = 7;
+        state.snroffst_coarse = 15;
+        state.cpl_fsnroffst = 0;
+        for bin in start..end {
+            state.channels[CPL].psd[bin] = 48;
+            state.channels[CPL].exp[bin] = 0;
+        }
+        for m in state.channels[CPL].mask.iter_mut() {
+            *m = 0;
+        }
+
+        // cplgaqmod = 0 (2 bits), then 6 × 2-bit VQ indices (all index 0).
+        let mut w = oxideav_core::bits::BitWriter::new();
+        w.write_u32(0, 2);
+        for _ in start..end {
+            w.write_u32(0, 2);
+        }
+        let bytes = w.into_bytes();
+        let mut br = BitReader::new(&bytes);
+
+        let (mut cache, mut pending, mut filled) = empty_aht();
+        pending[CPL] = true;
+
+        unpack_mixed_mantissas(
+            &mut state,
+            &mut br,
+            &mut cache,
+            &mut pending,
+            &mut filled,
+            1,
+            false,
+            true,
+        )
+        .expect("decode");
+        assert_eq!(
+            br.bit_position(),
+            2 + (end - start) as u64 * 2,
+            "cplgaqmod + one 2-bit VQ index per coupling bin"
+        );
+        assert!(filled[CPL]);
+        // Bins below cpl_begf_mant are never coded → cache stays zero.
+        for blk in 0..AHT_BLOCKS {
+            for bin in 0..start {
+                assert_eq!(cache[CPL][blk][bin], 0.0, "no coupling coeffs below begf");
+            }
+        }
+        // The IDCT-II of a VQ codeword yields six distinct block values for
+        // at least one coupling bin.
+        let varies = (start..end).any(|bin| {
+            let first = cache[CPL][0][bin];
+            (0..AHT_BLOCKS).any(|blk| (cache[CPL][blk][bin] - first).abs() > 1e-9)
+        });
+        assert!(
+            varies,
+            "IDCT-II of a coupling VQ codeword must yield block-varying coeffs"
         );
     }
 }
