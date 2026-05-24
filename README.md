@@ -246,19 +246,25 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       is covered by 4 unit tests (`eac3::dsp::tpnp_tests`) rather than an
       end-to-end PSNR gate.
 - [x] E-AC-3 decoder — **Adaptive Hybrid Transform (AHT)** decode,
-      multichannel full-bandwidth (round 6 mono → round 110 / r110). The
-      §3.4 AHT path front-loads 6×N high-efficiency mantissas (VQ Tables
-      E4.1-E4.7 for `1 ≤ hebap ≤ 7`, scalar/GAQ for `hebap ≥ 8`), inverse
-      DCT-II's per bin (§3.4.5), and caches the per-block coefficients for
-      the standard IMDCT + overlap-add. Round 110 lifts the round-6
-      mono-only restriction: the §3.4.2 helper variables `nchregs[ch]` /
-      `ncplregs` / `nlferegs` are derived directly from the already-parsed
-      per-block exponent strategies (no audblk pre-walk), so every fbw
-      channel with `nchregs[ch] == 1` decodes via AHT. Non-AHT channels in
-      a mixed frame now share the §7.3.5 bap-1/2/4 grouping buffers across
-      channels (round 6's per-channel grouping was correct only for mono).
-      Lacks coupling-AHT (`cplahtinu`) and LFE-AHT (`lfeahtinu`) synthesis
-      — those frames are still rejected as `Unsupported`.
+      multichannel full-bandwidth + LFE (round 6 mono → round 110 fbw →
+      round 113 LFE / r113). The §3.4 AHT path front-loads 6×N
+      high-efficiency mantissas (VQ Tables E4.1-E4.7 for `1 ≤ hebap ≤ 7`,
+      scalar/GAQ for `hebap ≥ 8`), inverse DCT-II's per bin (§3.4.5), and
+      caches the per-block coefficients for the standard IMDCT +
+      overlap-add. Round 110 lifts the round-6 mono-only restriction: the
+      §3.4.2 helper variables `nchregs[ch]` / `ncplregs` / `nlferegs` are
+      derived directly from the already-parsed per-block exponent
+      strategies (no audblk pre-walk), so every fbw channel with
+      `nchregs[ch] == 1` decodes via AHT. Non-AHT channels in a mixed
+      frame share the §7.3.5 bap-1/2/4 grouping buffers across channels
+      (round 6's per-channel grouping was correct only for mono). Round
+      113 wires the LFE channel into the AHT mantissa path: the
+      `lfeahtinu == 1` LFE-AHT block (`lfegaqmod` + gains + 6×7 mantissas
+      + IDCT) decodes, and the previously-skipped *standard* LFE
+      mantissas (`lfeahtinu == 0`) are now read — fixing a latent
+      bit-cursor desync that hit any AHT frame carrying an LFE channel.
+      Lacks coupling-AHT (`cplahtinu`) synthesis — those frames are
+      still rejected as `Unsupported`.
 
 ## Installation
 

@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **E-AC-3 LFE-channel AHT decode + standard-LFE mantissa fix** — round
+  113. Extends the round-110 multichannel fbw AHT path to the LFE
+  channel, the immediately-next §3.4.2 element after fbw AHT.
+  * **Latent desync fixed**: the round-110 AHT mantissa unpacker
+    (`eac3::dsp::unpack_mixed_mantissas`) walked only the fbw channels
+    and never read the LFE channel's mantissas. Any AHT syncframe that
+    carried an LFE channel therefore desynced the bit cursor at the
+    §E.1.3.2 `if(lfeon)` mantissa tail — even when the LFE used
+    *standard* (`lfeahtinu == 0`) coding. The mixed path now reads the
+    7 standard LFE mantissas (sharing the fbw bap-1/2/4 grouping
+    buffers, §7.3.5), exactly where the base AC-3 unpacker does.
+  * **LFE-AHT synthesis** (`lfeahtinu == 1`): the front-loaded LFE-AHT
+    block — `lfegaqmod` (2 bits) + `lfegaqgain` words + the per-bin VQ
+    (Tables E4.1..E4.7) or scalar/GAQ (Table E3.5) mantissas across all
+    six AHT sub-blocks — is decoded once (block 0, the
+    `nlferegs == 1` eligibility block), IDCT-II'd (§3.4.5), scaled by
+    `2^-exp`, and cached for the per-block dispatch loop.
+    `decode_aht_channel_mantissas` is now channel-agnostic: it takes the
+    masking `snroffset` so the LFE path can feed `lfefsnroffst` into the
+    §3.4.3.1 hebap derivation where the fbw path feeds `fsnroffst[ch]`.
+  * The blanket `cplahtinu || lfeahtinu` reject in `decode_indep_audblks`
+    is narrowed to `cplahtinu` only — coupling-channel AHT synthesis
+    remains deferred; fbw + LFE AHT now decode.
+  * The AHT coefficient cache and `aht_pending`/`aht_filled` flag arrays
+    grow from `MAX_FBW` to `MAX_FBW + 2` slots so the LFE channel
+    (`state.channels[MAX_FBW + 1]`) shares the same machinery.
+  * 3 unit tests (`eac3::dsp::lfe_aht_tests`): standard-LFE mantissa bit
+    consumption (regression guard for the desync), LFE-AHT zero-hebap
+    front-load + cache + zero-bit replay on later blocks, and LFE-AHT
+    VQ-regime IDCT producing block-varying cached coefficients.
+
 - **E-AC-3 multichannel full-bandwidth AHT decode** — round 110. Extends
   the round-6 mono-only Adaptive Hybrid Transform path to any number of
   fbw channels. The §3.4.2 helper variables `nchregs[ch]` / `ncplregs` /
