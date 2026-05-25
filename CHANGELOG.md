@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.6...v0.0.7) - 2026-05-25
+
+### Other
+
+- eac3 round 129 (r129): surface mixmdata mix levels + route through downmix
+- ac3 round 126 (r126): Annex D §2.3 alternate-syntax mix-level params
+- ac3 round 120 (r120): §7.8.2 LtRt matrix-encoded stereo downmix
+- decode coupling-channel AHT (cplahtinu) — round 117
+- reword LFE-drop rationale to spec-permitted/observable terms (clean-room comment hygiene)
+- eac3 decoder round 113 (r113): LFE-channel AHT decode + standard-LFE mantissa fix
+- multichannel full-bandwidth AHT decode (§3.4.2 nregs)
+- eac3 decoder round 103 (r103): transient pre-noise processing (TPNP) decode
+- eac3 decoder round 100 (r100): spectral extension (SPX) decode
+- ac3 encoder round 95 (r95): fairness fix for per-channel fsnroffst greedy
+- ac3 encoder round 91 (r91): 2/2 acmod=6 self-decode test + per-channel PSNR regression gates for 2/2, 5.0, 5.1
+- ac3 encoder round 78 (r78): 2.1 (L,R,LFE) acmod=2 + lfeon=1 emit path
+- rewrite two source comments to remove ffmpeg-internals language
+- eac3 round 72 (r72): Table E2.10 frame-based exponent strategy decode
+- ac3 round 7 (r7): widen coupling-range check to spec envelope
+- ac3/eac3 round 6 (r6): emit decoder PCM in WAV-mask channel order
+
 ### Added
 
 - **E-AC-3 mixmdata mix-level surfacing + downmix routing** —
