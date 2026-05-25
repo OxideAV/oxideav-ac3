@@ -1828,6 +1828,8 @@ fn build_ac3_bsi_shim(bsi: &Eac3Bsi) -> Ac3Bsi {
         cmixlev: 0xFF,
         surmixlev: 0xFF,
         dsurmod: 0xFF,
+        annex_d_mix_levels: None,
+        dmixmod: 0xFF,
         bits_consumed: 0,
     }
 }

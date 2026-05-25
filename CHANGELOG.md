@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Annex D §2.3 alternate-syntax mix-level parameters** — round 126.
+  Closes the round-120 followup to honour Annex D `ltrtcmixlev` /
+  `ltrtsurmixlev` / `lorocmixlev` / `lorosurmixlev` instead of the
+  body-spec fixed coefficients.
+  * `bsi::parse` now detects `bsid == 6` (§2.1) and switches the
+    post-`origbs` parse from the body `timecod1e/timecod2e` slots to
+    the Annex D `xbsi1e/xbsi2e` blocks (Table D2.1). Both shapes occupy
+    the same 30-bit window so the surrounding cursor is unchanged.
+  * `Bsi` gains `annex_d_mix_levels: Option<AnnexDMixLevels>` carrying
+    the four 3-bit codewords (`ltrtcmixlev` / `ltrtsurmixlev` /
+    `lorocmixlev` / `lorosurmixlev`), plus `dmixmod: u8` (Table D2.2
+    preferred-stereo-downmix advisory; `0xFF` when absent).
+  * `Downmix::from_bsi` consults the Annex D fields when present:
+    LtRt uses `ltrtcmixlev` / `ltrtsurmixlev` instead of the §7.8.2
+    fixed 0.707; LoRo uses `lorocmixlev` / `lorosurmixlev` instead of
+    the body `cmixlev` / `surmixlev`. Mono keeps the body fields per
+    §7.8.2 (Annex D has no mono-specific mix levels). Without the
+    Annex D extension the matrix is byte-identical to the round-120
+    behaviour.
+  * Tables D2.3-D2.6 are exposed as `annex_d_center_mix_gain` /
+    `annex_d_surround_mix_gain`. Reserved codes `000/001/010` on the
+    surround tables resolve to `0.841` per §2.3.1.4 / §2.3.1.6
+    "decoder shall use a value of 0.841".
+  * 7 unit tests: `parses_annex_d_bsid_6_xbsi1_mix_levels` /
+    `parses_annex_d_bsid_6_no_xbsi1` exercise the BSI cursor;
+    `annex_d_center_mix_gain_matches_table_d2_3` /
+    `annex_d_surround_mix_gain_substitutes_reserved_with_0_841` pin
+    the spec tables; `ltrt_3_2_honours_annex_d_ltrtcmixlev_override` /
+    `ltrt_reserved_surround_code_substitutes_0_841` /
+    `loro_honours_annex_d_lorocmixlev_override` /
+    `ltrt_without_annex_d_uses_fixed_0_707` verify the downmix
+    matrix tracks the overrides without regressing the body path.
+
 - **§7.8.2 LtRt (Dolby Surround matrix-encoded stereo) downmix** —
   round 120. The §7.8 downmix matrix gains a third target alongside
   LoRo and Mono: `DownmixMode::StereoLtRt` implements the spec's

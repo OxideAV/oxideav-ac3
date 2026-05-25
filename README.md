@@ -124,20 +124,27 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       (Dolby Surround matrix-encoded — round 120 / r120), and mono
       target paths cover every source acmod (1/0 / 2/0 / 3/0 / 2/1 /
       3/1 / 2/2 / 3/2 / 1+1 dual-mono). LtRt implements §7.8.2's
-      3/2 form `Lt = L + 0.707·C − 0.707·Ls − 0.707·Rs` /
-      `Rt = R + 0.707·C + 0.707·Ls + 0.707·Rs` (plus 3/1's
+      3/2 form `Lt = L + clev·C − slev·Ls − slev·Rs` /
+      `Rt = R + clev·C + slev·Ls + slev·Rs` (plus 3/1's
       single-surround variant and the 2/1 / 2/2 C-drop case),
       normalised by Table 7.32's 0.3204 / 0.2265 coefficients
-      (1/3.121 worst-case). Selected via the new
-      `decoder::make_decoder_ltrt` factory (`make_decoder` keeps
-      LoRo, matching FFmpeg's default). On a surround-only 5.1 AC-3
-      source the LoRo L/R correlation lands at +0.002 (uncorrelated
-      independent surround tones summed in-phase) while LtRt lands
-      at **−0.972** — the matrix encoder's defining anti-phase
-      surround signature, recoverable by a downstream Pro Logic
-      decoder. Annex D §2.3.1.3-4 (`ltrtcmixlev` / `ltrtsurmixlev`,
-      E-AC-3 metadata override for the fixed 0.707 coefficients) is
-      a documented followup; base-spec §7.8.2 uses the fixed form
+      (1/3.121 worst-case at default clev=slev=0.707). Selected via
+      the new `decoder::make_decoder_ltrt` factory (`make_decoder`
+      keeps LoRo, matching FFmpeg's default). On a surround-only 5.1
+      AC-3 source the LoRo L/R correlation lands at +0.002
+      (uncorrelated independent surround tones summed in-phase)
+      while LtRt lands at **−0.972** — the matrix encoder's defining
+      anti-phase surround signature, recoverable by a downstream Pro
+      Logic decoder. **Round 126** wires Annex D §2.3 (alternate
+      bit-stream syntax, `bsid == 6`) into the BSI parser + downmix:
+      the `xbsi1` block surfaces `ltrtcmixlev` / `ltrtsurmixlev` /
+      `lorocmixlev` / `lorosurmixlev` (Tables D2.3-D2.6, 3-bit
+      codewords; reserved surround codes `000/001/010` resolve to
+      0.841 per spec) plus the `dmixmod` preferred-target advisory,
+      and `Downmix::from_bsi` consults them for the per-target gain
+      instead of the fixed §7.8.2 0.707 (LtRt) / body
+      `cmixlev`/`surmixlev` (LoRo). Without the Annex D extension the
+      matrix is byte-identical to round-120 behaviour.
 - [x] E-AC-3 (bsid=16, Annex E) — encoder. Independent substream
       (`strmtyp=0`, `substreamid=0`) for 1.0/2.0/5.1 layouts (acmod
       ∈ {1, 2, 7}, with `lfeon=1` for 5.1). 7.1 input emits an

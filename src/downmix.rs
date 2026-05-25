@@ -33,7 +33,7 @@
 //! Construction is cheap (just a 5×2 matrix of `f32`) so callers can
 //! cache a `Downmix` across syncframes or build one per block.
 
-use crate::bsi::Bsi;
+use crate::bsi::{annex_d_center_mix_gain, annex_d_surround_mix_gain, Bsi};
 use crate::tables::{CENTER_MIX_LEVEL, SURROUND_MIX_LEVEL};
 
 /// Output layout requested from the decoder.
@@ -122,21 +122,46 @@ impl Downmix {
         // "intermediate" coefficient per spec. Our `CENTER_MIX_LEVEL`
         // table already repeats the middle value at index 3 so the
         // reserved code resolves to 0.595 / 0.500.
-        let clev = if bsi.cmixlev == 0xFF {
+        let base_clev = if bsi.cmixlev == 0xFF {
             0.707
         } else {
             CENTER_MIX_LEVEL[(bsi.cmixlev & 0x3) as usize]
         };
-        let slev = if bsi.surmixlev == 0xFF {
+        let base_slev = if bsi.surmixlev == 0xFF {
             0.707
         } else {
             SURROUND_MIX_LEVEL[(bsi.surmixlev & 0x3) as usize]
         };
 
+        // Annex D §2.3.1.3-6 (and Annex E mixmdata) provide a refined
+        // 3-bit mix level per downmix target. When present they
+        // override the body 2-bit fields for that target's downmix —
+        // §7.8 still uses the body fields when xbsi1 is absent.
+        let (loro_clev, loro_slev) = if let Some(m) = bsi.annex_d_mix_levels {
+            (
+                annex_d_center_mix_gain(m.lorocmixlev),
+                annex_d_surround_mix_gain(m.lorosurmixlev),
+            )
+        } else {
+            (base_clev, base_slev)
+        };
+        let (ltrt_clev, ltrt_slev) = if let Some(m) = bsi.annex_d_mix_levels {
+            (
+                annex_d_center_mix_gain(m.ltrtcmixlev),
+                annex_d_surround_mix_gain(m.ltrtsurmixlev),
+            )
+        } else {
+            // Body §7.8.2: LtRt uses a fixed 0.707 for the C and
+            // surround coefficients regardless of `cmixlev`/`surmixlev`.
+            (0.707, 0.707)
+        };
+
         match mode {
-            DownmixMode::Stereo => Self::fill_stereo(&mut out, bsi.acmod, clev, slev),
-            DownmixMode::StereoLtRt => Self::fill_stereo_ltrt(&mut out, bsi.acmod),
-            DownmixMode::Mono => Self::fill_mono(&mut out, bsi.acmod, clev, slev),
+            DownmixMode::Stereo => Self::fill_stereo(&mut out, bsi.acmod, loro_clev, loro_slev),
+            DownmixMode::StereoLtRt => {
+                Self::fill_stereo_ltrt(&mut out, bsi.acmod, ltrt_clev, ltrt_slev)
+            }
+            DownmixMode::Mono => Self::fill_mono(&mut out, bsi.acmod, base_clev, base_slev),
             DownmixMode::Passthrough => unreachable!(),
         }
         out
@@ -231,29 +256,29 @@ impl Downmix {
 
     /// LtRt 2-channel matrix-encoded stereo downmix per §7.8.2. The
     /// 3/2 base equations are
-    ///   `Lt = 1.0·L + 0.707·C − 0.707·Ls − 0.707·Rs`
-    ///   `Rt = 1.0·R + 0.707·C + 0.707·Ls + 0.707·Rs`
+    ///   `Lt = 1.0·L + clev·C − slev·Ls − slev·Rs`
+    ///   `Rt = 1.0·R + clev·C + slev·Ls + slev·Rs`
     /// and for 3/1 (single surround S folded in):
-    ///   `Lt = 1.0·L + 0.707·C − 0.707·S`
-    ///   `Rt = 1.0·R + 0.707·C + 0.707·S`
-    /// LtRt uses fixed 0.707 coefficients for the C and surround terms
-    /// — §7.8.2 does not parameterise on `cmixlev` / `surmixlev` (those
-    /// only steer the LoRo case). The base-spec form is anchored here;
-    /// Annex D §2.3.1.3-4 (`ltrtcmixlev` / `ltrtsurmixlev`) is an
-    /// E-AC-3-only mixing-metadata override and is a noted followup.
+    ///   `Lt = 1.0·L + clev·C − slev·S`
+    ///   `Rt = 1.0·R + clev·C + slev·S`
+    /// where `clev` / `slev` default to the §7.8.2 fixed 0.707
+    /// coefficients but may be overridden via Annex D §2.3.1.3-4
+    /// (`ltrtcmixlev` / `ltrtsurmixlev`, `bsid == 6` streams) — those
+    /// fields refine the C / surround gain per encoder authoring.
     ///
-    /// Worst-case sum of |coeffs| is 1 + 3·0.707 = 3.121, so the
-    /// §7.8.2 normalisation scales every coefficient by 1/3.121 =
-    /// 0.3204 to prevent overflow (9.89 dB attenuation). The
-    /// surround-channel sign discipline is what makes the downstream
-    /// matrix decoder recoverable: the surround source ends up
-    /// out-of-phase between Lt and Rt, which the matrix decoder pulls
-    /// out into a single back channel.
-    fn fill_stereo_ltrt(out: &mut Self, acmod: u8) {
+    /// Worst-case sum of |coeffs| is `1 + clev + 2·slev`. With the
+    /// default 0.707/0.707 it lands at 3.121 → §7.8.2 normalisation
+    /// scales every coefficient by 1/3.121 = 0.3204 (9.89 dB
+    /// attenuation; Table 7.32 headline). Stronger mix levels just
+    /// move the normalisation factor — the surround-channel sign
+    /// discipline is invariant, which is what makes the downstream
+    /// matrix decoder recoverable.
+    fn fill_stereo_ltrt(out: &mut Self, acmod: u8, clev: f32, slev: f32) {
         // Slot layout [L, C, R, Ls/S, Rs] per Table 5.8. Surround
-        // channels enter with -0.707 on Lt and +0.707 on Rt. Center
-        // is symmetric.
-        const K: f32 = 0.707;
+        // channels enter with -slev on Lt and +slev on Rt. Center
+        // is symmetric (+clev on both).
+        let c = clev;
+        let k = slev;
         match acmod {
             0 => {
                 // 1+1 dual mono — no matrix encoding makes sense
@@ -266,10 +291,11 @@ impl Downmix {
                 out.out_coeffs[1][2] = 1.0;
             }
             1 => {
-                // 1/0 — pure center → both outputs get -3 dB of C.
-                // Symmetric with the LoRo case (no surround sign play).
-                out.out_coeffs[0][0] = K;
-                out.out_coeffs[1][0] = K;
+                // 1/0 — pure center → both outputs get the C gain
+                // (default -3 dB = 0.707). Symmetric with the LoRo case
+                // (no surround sign play).
+                out.out_coeffs[0][0] = c;
+                out.out_coeffs[1][0] = c;
             }
             2 => {
                 // 2/0 — pass through. No surround to matrix-encode.
@@ -279,59 +305,60 @@ impl Downmix {
             3 => {
                 // 3/0 — L, C, R. No surround info; symmetric with LoRo.
                 out.out_coeffs[0][0] = 1.0;
-                out.out_coeffs[0][1] = K;
-                out.out_coeffs[1][1] = K;
+                out.out_coeffs[0][1] = c;
+                out.out_coeffs[1][1] = c;
                 out.out_coeffs[1][2] = 1.0;
             }
             4 => {
-                // 2/1 — L, R, S. Single surround folds in with -K on
-                // Lt and +K on Rt (spec drops the C term).
+                // 2/1 — L, R, S. Single surround folds in with -k on
+                // Lt and +k on Rt (spec drops the C term).
                 out.out_coeffs[0][0] = 1.0;
-                out.out_coeffs[0][3] = -K;
+                out.out_coeffs[0][3] = -k;
                 out.out_coeffs[1][2] = 1.0;
-                out.out_coeffs[1][3] = K;
+                out.out_coeffs[1][3] = k;
             }
             5 => {
                 // 3/1 — L, C, R, S. Single surround folds with opposite
                 // signs into Lt/Rt; C symmetric.
                 out.out_coeffs[0][0] = 1.0;
-                out.out_coeffs[0][1] = K;
-                out.out_coeffs[0][3] = -K;
-                out.out_coeffs[1][1] = K;
+                out.out_coeffs[0][1] = c;
+                out.out_coeffs[0][3] = -k;
+                out.out_coeffs[1][1] = c;
                 out.out_coeffs[1][2] = 1.0;
-                out.out_coeffs[1][3] = K;
+                out.out_coeffs[1][3] = k;
             }
             6 => {
                 // 2/2 — L, R, Ls, Rs. Both surrounds fold with
                 // opposite signs into Lt/Rt. C term dropped per §7.8.2
                 // 'if center is missing'.
                 out.out_coeffs[0][0] = 1.0;
-                out.out_coeffs[0][3] = -K;
-                out.out_coeffs[0][4] = -K;
+                out.out_coeffs[0][3] = -k;
+                out.out_coeffs[0][4] = -k;
                 out.out_coeffs[1][2] = 1.0;
-                out.out_coeffs[1][3] = K;
-                out.out_coeffs[1][4] = K;
+                out.out_coeffs[1][3] = k;
+                out.out_coeffs[1][4] = k;
             }
             _ => {
                 // 3/2 (acmod=7) and defensive fall-through — the
                 // canonical §7.8.2 LtRt equations.
                 out.out_coeffs[0][0] = 1.0;
-                out.out_coeffs[0][1] = K;
-                out.out_coeffs[0][3] = -K;
-                out.out_coeffs[0][4] = -K;
-                out.out_coeffs[1][1] = K;
+                out.out_coeffs[0][1] = c;
+                out.out_coeffs[0][3] = -k;
+                out.out_coeffs[0][4] = -k;
+                out.out_coeffs[1][1] = c;
                 out.out_coeffs[1][2] = 1.0;
-                out.out_coeffs[1][3] = K;
-                out.out_coeffs[1][4] = K;
+                out.out_coeffs[1][3] = k;
+                out.out_coeffs[1][4] = k;
             }
         }
 
         out.out_channels = 2;
         // Normalise per §7.8.2 — Self::normalise uses |coeff| so the
         // negative surround weights count correctly toward the bound.
-        // For 3/2 with K=0.707 the row-sum-of-|coeffs| is 3.121, so the
-        // normalised L-coefficient is 1/3.121 = 0.3204 (Table 7.32's
-        // headline value).
+        // For 3/2 with clev=slev=0.707 the row-sum-of-|coeffs| is
+        // 3.121, so the normalised L-coefficient is 1/3.121 = 0.3204
+        // (Table 7.32's headline value); Annex D mix levels just move
+        // the normalisation factor without changing the sign discipline.
         Self::normalise(&mut out.out_coeffs);
     }
 
@@ -481,6 +508,32 @@ mod tests {
             cmixlev,
             surmixlev,
             dsurmod: 0xFF,
+            annex_d_mix_levels: None,
+            dmixmod: 0xFF,
+            bits_consumed: 0,
+        }
+    }
+
+    fn fake_bsi_annex_d(
+        acmod: u8,
+        lfeon: bool,
+        mix: crate::bsi::AnnexDMixLevels,
+        dmixmod: u8,
+    ) -> Bsi {
+        let nfchans = crate::tables::acmod_nfchans(acmod);
+        Bsi {
+            bsid: 6,
+            bsmod: 0,
+            acmod,
+            nfchans,
+            lfeon,
+            nchans: nfchans + u8::from(lfeon),
+            dialnorm: 27,
+            cmixlev: 0xFF,
+            surmixlev: 0xFF,
+            dsurmod: 0xFF,
+            annex_d_mix_levels: Some(mix),
+            dmixmod,
             bits_consumed: 0,
         }
     }
@@ -776,5 +829,108 @@ mod tests {
         assert_eq!(DownmixMode::resolve(Some(1), 2), DownmixMode::Mono);
         assert_eq!(DownmixMode::resolve(Some(1), 5), DownmixMode::Mono);
         assert_eq!(DownmixMode::resolve(Some(6), 5), DownmixMode::Passthrough);
+    }
+
+    /// Annex D §2.3.1.3 — `ltrtcmixlev` overrides the §7.8.2 fixed
+    /// 0.707 center gain. Use 1.000 (code `010`) so the post-
+    /// normalisation Lt center weight exceeds the default-0.707 case
+    /// by a measurable margin.
+    #[test]
+    fn ltrt_3_2_honours_annex_d_ltrtcmixlev_override() {
+        use crate::bsi::AnnexDMixLevels;
+        let mix = AnnexDMixLevels {
+            ltrtcmixlev: 0b010,   // 1.000
+            ltrtsurmixlev: 0b100, // 0.707 (default)
+            lorocmixlev: 0b100,   // 0.707
+            lorosurmixlev: 0b100, // 0.707
+        };
+        let bsi = fake_bsi_annex_d(7, false, mix, 0xFF);
+        let d = Downmix::from_bsi(&bsi, DownmixMode::StereoLtRt);
+        // Pre-normalise: |row| = 1 + 1.0 + 2*0.707 = 3.414, so the
+        // normalised L weight is 1/3.414 ≈ 0.2929, C weight is the
+        // same. Both bigger than the 0.707-clev would produce on the
+        // C slot (0.2265) and smaller on the L slot (0.3204).
+        let l = d.out_coeffs[0][0];
+        let c = d.out_coeffs[0][1];
+        assert!(
+            (l - 0.2929).abs() < 1e-3,
+            "Lt L weight: want 0.2929, got {}",
+            l
+        );
+        assert!(
+            (c - 0.2929).abs() < 1e-3,
+            "Lt C weight (ltrtcmixlev=010 → 1.0): want 0.2929, got {}",
+            c
+        );
+        // Surround sign discipline preserved.
+        assert!(d.out_coeffs[0][3] < 0.0);
+        assert!(d.out_coeffs[1][3] > 0.0);
+    }
+
+    /// Annex D §2.3.1.4 — reserved `ltrtsurmixlev` codes (000/001/010)
+    /// substitute 0.841 per spec note. Verify the coefficient ends up
+    /// at 0.841 / row-sum, not the default 0.707 / row-sum.
+    #[test]
+    fn ltrt_reserved_surround_code_substitutes_0_841() {
+        use crate::bsi::AnnexDMixLevels;
+        let mix = AnnexDMixLevels {
+            ltrtcmixlev: 0b100,   // 0.707
+            ltrtsurmixlev: 0b001, // reserved → 0.841
+            lorocmixlev: 0b100,
+            lorosurmixlev: 0b100,
+        };
+        let bsi = fake_bsi_annex_d(7, false, mix, 0xFF);
+        let d = Downmix::from_bsi(&bsi, DownmixMode::StereoLtRt);
+        // Pre-normalise row sum: 1 + 0.707 + 2*0.841 = 3.389.
+        // Surround weight after normalise = -0.841/3.389 ≈ -0.2482.
+        let s = d.out_coeffs[0][3];
+        assert!(
+            (s.abs() - 0.2482).abs() < 1e-3,
+            "Lt surround weight: want 0.2482, got {}",
+            s
+        );
+        assert!(s < 0.0, "Lt surround weight must still be negative");
+    }
+
+    /// Annex D §2.3.1.5 — `lorocmixlev` overrides the body `cmixlev`
+    /// for the LoRo downmix specifically. Verify a non-default
+    /// override propagates into the LoRo C weight.
+    #[test]
+    fn loro_honours_annex_d_lorocmixlev_override() {
+        use crate::bsi::AnnexDMixLevels;
+        let mix = AnnexDMixLevels {
+            ltrtcmixlev: 0b100,
+            ltrtsurmixlev: 0b100,
+            lorocmixlev: 0b010,   // 1.000 — louder than the 0.707 default
+            lorosurmixlev: 0b100, // 0.707
+        };
+        let bsi = fake_bsi_annex_d(7, false, mix, 0xFF);
+        let d = Downmix::from_bsi(&bsi, DownmixMode::Stereo);
+        // Default LoRo (clev=0.707, slev=0.707) row = [1, 0.707, 0,
+        // 0.707, 0], sum=2.414 → C weight = 0.707/2.414 = 0.2928.
+        // With lorocmixlev=010 → clev=1.0, row = [1, 1.0, 0, 0.707, 0],
+        // sum=2.707 → C weight = 1.0/2.707 = 0.3694.
+        let c = d.out_coeffs[0][1];
+        assert!(
+            (c - 0.3694).abs() < 1e-3,
+            "LoRo C weight (lorocmixlev=010 → 1.0): want 0.3694, got {}",
+            c
+        );
+    }
+
+    /// When `bsid != 6` (no Annex D extension) the §7.8.2 base form
+    /// applies — LtRt is the fixed-0.707 case, completely uninfluenced
+    /// by `cmixlev` / `surmixlev`. Regression guard for the round-126
+    /// refactor that introduced parameterisation.
+    #[test]
+    fn ltrt_without_annex_d_uses_fixed_0_707() {
+        // Set body cmixlev to 0.500 (code 0b10) just to confirm it
+        // does NOT bleed into the LtRt path. Behaviour must match the
+        // pre-round-126 baseline.
+        let bsi = fake_bsi(7, 0b10, 0b10, false);
+        let d = Downmix::from_bsi(&bsi, DownmixMode::StereoLtRt);
+        assert!((d.out_coeffs[0][0] - 0.3204).abs() < 1e-3);
+        assert!((d.out_coeffs[0][1] - 0.2265).abs() < 1e-3);
+        assert!((d.out_coeffs[0][3] + 0.2265).abs() < 1e-3);
     }
 }

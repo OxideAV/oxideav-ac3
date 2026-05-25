@@ -286,6 +286,8 @@ fn matrix_mapping_for_3_2_matches_spec() {
         cmixlev: 0,
         surmixlev: 0,
         dsurmod: 0xFF,
+        annex_d_mix_levels: None,
+        dmixmod: 0xFF,
         bits_consumed: 0,
     };
     let dmx = Downmix::from_bsi(&bsi, DownmixMode::Stereo);
