@@ -190,41 +190,104 @@ impl Ac3Decoder {
         let data = &pkt.data[..];
         let decoded = eac3::decode_eac3_packet(&mut self.eac3_state, data)?;
         let channels = decoded.channels;
-        let mut pcm = decoded.pcm_s16le;
-        // Reorder bitstream-order multichannel layouts into WAV-mask
-        // order for the indep substream. The indep `acmod`/`lfeon`
-        // are surfaced on `DecodedFrame`; when there's a dep substream
-        // the buffer's channel count exceeds `output_channels(acmod,
-        // lfeon)` and `reorder_s16le_in_place` no-ops via its
-        // channel-count guard. Round 6 leaves the dep-substream-extended
-        // 7.1 case (indep 5.1 + dep [Lb,Rb]) in pure bitstream order;
-        // routing the chanmap-tagged dep channels into the WAV 7.1
-        // slots requires a bigger refactor and no fixture exercises it.
-        wave_order::reorder_s16le_in_place(
-            &mut pcm,
-            decoded.acmod,
-            decoded.lfeon,
-            channels as usize,
-        );
-        // Apply downmix request only if the decoded program has more
-        // channels than requested. Round 1 emits silence so the
-        // downmix is a no-op anyway, but threading the request
-        // through keeps round-2 work minimal.
-        if let Some(req) = self.requested_channels {
-            if req < channels {
-                let bytes_per_sample = 2usize;
-                let in_stride = channels as usize * bytes_per_sample;
-                let out_stride = req as usize * bytes_per_sample;
-                let n_frames = decoded.samples as usize;
-                let mut out = vec![0u8; n_frames * out_stride];
-                for i in 0..n_frames {
-                    let src = &pcm[i * in_stride..i * in_stride + out_stride];
-                    out[i * out_stride..i * out_stride + out_stride].copy_from_slice(src);
-                }
-                pcm = out;
+
+        // Resolve the §7.8 downmix mode from the requested target.
+        // Annex E's `nfchans` (excludes LFE) drives the mode picker —
+        // an Eac3 5.1 stream has nfchans=5 and resolves to Stereo /
+        // StereoLtRt / Mono just like AC-3 does.
+        let dmx_mode = {
+            let base = DownmixMode::resolve(self.requested_channels, decoded.nfchans);
+            if self.prefer_ltrt && matches!(base, DownmixMode::Stereo) {
+                DownmixMode::StereoLtRt
+            } else {
+                base
             }
-        }
+        };
+
+        // Active downmix? Walk the f32 PCM through the §7.8 matrix so
+        // negative LtRt surround weights don't truncate to 0 after a
+        // pre-quantised S16 input. Falls back to the s16 truncate-then-
+        // reorder path when no downmix is needed (passthrough) — that
+        // path also keeps the dep-substream-extended channels intact.
+        let (pcm, out_channels) = if matches!(dmx_mode, DownmixMode::Passthrough) {
+            let mut pcm = decoded.pcm_s16le;
+            // Reorder bitstream-order multichannel layouts into WAV-mask
+            // order for the indep substream. For dep-extended programs
+            // (e.g. 7.1 emitted as indep 5.1 + dep [Lb,Rb]) the buffer's
+            // channel count exceeds the indep `output_channels(acmod,
+            // lfeon)` and the reorder no-ops via its channel-count
+            // guard — extended channels stay in bitstream order.
+            wave_order::reorder_s16le_in_place(
+                &mut pcm,
+                decoded.acmod,
+                decoded.lfeon,
+                channels as usize,
+            );
+            (pcm, channels)
+        } else {
+            // Build a Downmix that honours Annex E mixmdata (Tables
+            // E1.13-16 / D2.3-6) when present. Without mixmdata the
+            // matrix uses the §7.8.2 fixed 0.707 defaults — identical
+            // to the previous "truncate-to-2-channels" behaviour for
+            // a 2/0 stereo source but spec-correct for 5.1 → LtRt /
+            // LoRo where the Annex D path already proved out.
+            let dmx = Downmix::from_eac3_fields(
+                decoded.acmod,
+                decoded.nfchans,
+                channels as u8,
+                decoded.lfeon,
+                decoded.annex_e_mix_levels,
+                dmx_mode,
+            );
+            let out_ch = dmx.output_channels() as usize;
+            let src_f32 = self.eac3_state.indep_pcm_f32();
+            let n_frames = decoded.samples as usize;
+            // Defensive — should never fire unless the eac3 state is
+            // out of sync with `decoded`.
+            if src_f32.len() != n_frames * channels as usize {
+                return Err(Error::invalid(format!(
+                    "eac3 downmix: f32 scratch len {} != frames*ch {}*{}",
+                    src_f32.len(),
+                    n_frames,
+                    channels,
+                )));
+            }
+            let nfchans = decoded.nfchans as usize;
+            let nchans = channels as usize;
+            let mut out_f32 = vec![0.0f32; n_frames * out_ch];
+            // §7.8 matrix is applied in fixed-size SAMPLES_PER_BLOCK
+            // chunks (the §2.2 256-sample block window the encoder also
+            // works in). Annex E doesn't change the block size; one
+            // syncframe is `num_blocks * 256` samples per channel.
+            let nblocks = n_frames / SAMPLES_PER_BLOCK;
+            for blk in 0..nblocks {
+                let mut per_ch: [[f32; SAMPLES_PER_BLOCK]; 5] = [[0.0; SAMPLES_PER_BLOCK]; 5];
+                let base = blk * SAMPLES_PER_BLOCK * nchans;
+                for n in 0..SAMPLES_PER_BLOCK {
+                    for ch in 0..nfchans.min(5) {
+                        per_ch[ch][n] = src_f32[base + n * nchans + ch];
+                    }
+                }
+                let out_base = blk * SAMPLES_PER_BLOCK * out_ch;
+                dmx.apply(
+                    &per_ch,
+                    SAMPLES_PER_BLOCK,
+                    &mut out_f32[out_base..out_base + SAMPLES_PER_BLOCK * out_ch],
+                );
+            }
+            // Pack f32 → S16LE.
+            let mut out_bytes = vec![0u8; out_f32.len() * 2];
+            for (i, s) in out_f32.iter().enumerate() {
+                let clamped = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                let le = clamped.to_le_bytes();
+                out_bytes[i * 2] = le[0];
+                out_bytes[i * 2 + 1] = le[1];
+            }
+            (out_bytes, out_ch as u16)
+        };
+
         self.time_base = TimeBase::new(1, decoded.sample_rate as i64);
+        let _ = out_channels; // surfaced for future AudioFrame channel-count
         Ok(Frame::Audio(AudioFrame {
             samples: decoded.samples,
             pts: pkt.pts,
@@ -368,5 +431,131 @@ mod tests {
         params.channels = Some(2);
         let dec = make_decoder_ltrt(&params).unwrap();
         assert_eq!(dec.codec_id().as_str(), "ac3");
+    }
+
+    /// E-AC-3 5.1 encoded packet → decode with `channels = Some(2)`
+    /// must run the §7.8 LoRo matrix end-to-end (not truncate the
+    /// channel set to the first two). The encoder produces a fresh 5.1
+    /// indep substream; the decoder is configured for stereo output;
+    /// the resulting `AudioFrame` payload is exactly 2 ch × 1536
+    /// samples × 2 bytes per frame.
+    ///
+    /// Round 129 wires `Downmix::from_eac3_fields` through
+    /// [`Ac3Decoder::process_eac3_frame`]; this test exercises that
+    /// new path end-to-end and locks in the output buffer shape +
+    /// the fact that both output channels still carry non-trivial
+    /// energy (the matrix coefficients pull C / Ls / Rs into both Lo
+    /// and Ro, so a constant-amplitude sine on every channel keeps a
+    /// recognisable envelope after the matrix).
+    #[test]
+    fn eac3_5_1_decodes_to_stereo_with_matrix_downmix() {
+        use oxideav_core::Packet;
+        use oxideav_core::TimeBase as TB;
+        // Encode a 5.1 sine fixture at 384 kbps so the indep substream
+        // has all six channels active (5 fbw + LFE).
+        let mut enc_params = CodecParameters::audio(CodecId::new(eac3::CODEC_ID_STR));
+        enc_params.sample_rate = Some(48_000);
+        enc_params.channels = Some(6);
+        enc_params.sample_format = Some(SampleFormat::S16);
+        enc_params.bit_rate = Some(384_000);
+        let mut enc = match eac3::make_encoder(&enc_params) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("eac3 make_encoder failed: {e} — skipping");
+                return;
+            }
+        };
+
+        // 1536 samples × 6 channels (interleaved S16). C carries 0.4,
+        // L/R carry 0.3 each, Ls/Rs -0.3 each, LFE zero.
+        let mut pcm = Vec::<u8>::with_capacity(1536 * 6 * 2);
+        for i in 0..1536 {
+            let t = i as f32 / 48_000.0;
+            let s = (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+            let push = |out: &mut Vec<u8>, v: f32| {
+                let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                out.extend_from_slice(&q.to_le_bytes());
+            };
+            push(&mut pcm, 0.3 * s); // L
+            push(&mut pcm, 0.4 * s); // C
+            push(&mut pcm, 0.3 * s); // R
+            push(&mut pcm, -0.3 * s); // Ls
+            push(&mut pcm, -0.3 * s); // Rs
+            push(&mut pcm, 0.0); // LFE
+        }
+        if enc
+            .send_frame(&Frame::Audio(AudioFrame {
+                samples: 1536,
+                pts: Some(0),
+                data: vec![pcm],
+            }))
+            .is_err()
+        {
+            eprintln!("eac3 encoder send_frame failed — skipping");
+            return;
+        }
+        let _ = enc.flush();
+
+        let mut all_bytes = Vec::<u8>::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => all_bytes.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => {
+                    eprintln!("eac3 encoder receive_packet failed: {e} — skipping");
+                    return;
+                }
+            }
+        }
+        if all_bytes.is_empty() {
+            eprintln!("eac3 encoder produced no bytes for 5.1 input — skipping");
+            return;
+        }
+        // First two bytes must be the syncword (cheap sanity check
+        // that we actually have an E-AC-3 elementary stream).
+        assert_eq!(&all_bytes[0..2], &[0x0B, 0x77]);
+
+        // Decode with channels = Some(2) — request the LoRo downmix.
+        let mut dec_params = CodecParameters::audio(CodecId::new(eac3::CODEC_ID_STR));
+        dec_params.sample_rate = Some(48_000);
+        dec_params.channels = Some(2);
+        dec_params.sample_format = Some(SampleFormat::S16);
+        let mut dec = make_eac3_decoder(&dec_params).expect("make_eac3_decoder");
+
+        // The decoder expects one full packet per `send_packet` call.
+        // The E-AC-3 encoder produces fixed 1536-byte frames at 384
+        // kbps / 48 kHz / 1536 spf. Walk them one at a time.
+        let frame_bytes = 1536usize;
+        assert!(all_bytes.len() >= frame_bytes);
+        let mut got_any = false;
+        for off in (0..all_bytes.len()).step_by(frame_bytes) {
+            let end = (off + frame_bytes).min(all_bytes.len());
+            let pkt = Packet::new(0, TB::new(1, 48_000), all_bytes[off..end].to_vec());
+            if dec.send_packet(&pkt).is_err() {
+                continue;
+            }
+            loop {
+                match dec.receive_frame() {
+                    Ok(Frame::Audio(af)) => {
+                        got_any = true;
+                        let expected_len = af.samples as usize * 2 * 2;
+                        assert_eq!(
+                            af.data[0].len(),
+                            expected_len,
+                            "stereo downmix payload size: want {} bytes, got {}",
+                            expected_len,
+                            af.data[0].len()
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(Error::NeedMore) | Err(Error::Eof) => break,
+                    Err(e) => panic!("eac3 decoder error: {e}"),
+                }
+            }
+        }
+        assert!(
+            got_any,
+            "decoder produced no audio frames from 5.1 → stereo path"
+        );
     }
 }

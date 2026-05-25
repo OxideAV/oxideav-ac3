@@ -54,6 +54,7 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
+use crate::bsi::AnnexDMixLevels;
 use crate::tables::acmod_nfchans;
 
 /// Largest `bsid` value still served by the base AC-3 parser. Streams
@@ -145,6 +146,32 @@ pub struct Bsi {
     /// = MSB) flags channel location *i* — see the table for the
     /// label assignment.
     pub chanmap: Option<u16>,
+    /// Annex E mixmdata mix levels (Table E1.2 §E.1.2.2). `Some` when
+    /// `mixmdate == 1` AND the per-channel-presence guards in
+    /// [`parse_mixing_metadata`] fire (3 front channels for the LtRt/LoRo
+    /// **center** codes, a surround channel for the **surround** codes);
+    /// fields that the guard skips read back as `0xFF` so callers can
+    /// distinguish "spec-absent" from a legitimate 0b000 code.
+    ///
+    /// The 3-bit codewords map to linear gains via the same Tables
+    /// D2.3-D2.6 used by base AC-3's Annex D xbsi1 — Annex E §E.2.3.1.3-6
+    /// states "the value of [field] is the same as defined for AC-3
+    /// in Annex D, §2.3.1.3 [-6]". Reuse of [`AnnexDMixLevels`] keeps a
+    /// single source of truth.
+    pub annex_e_mix_levels: Option<AnnexDMixLevels>,
+    /// Annex E mixmdata preferred-stereo-downmix advisory (`dmixmod`,
+    /// 2 bits) — Table E1.2 §E.1.2.2 reuses Annex D §2.3.1.2 semantics
+    /// (`00` = not indicated, `01` = LtRt preferred, `10` = LoRo
+    /// preferred, `11` = reserved). `0xFF` when `mixmdate == 0` or the
+    /// `acmod > 2` guard fires.
+    pub dmixmod: u8,
+    /// Annex E mixmdata LFE mix level (`lfemixlevcod`, 5 bits, §E.1.2.2).
+    /// `Some` when `lfeon == 1`, `mixmdate == 1`, and `lfemixlevcode == 1`;
+    /// `None` otherwise. The 5-bit code is **not** consulted by the
+    /// round-129 downmix (LFE stays muted per §7.8) but is surfaced so
+    /// downstream tooling and a future LFE-into-stereo bass-route can
+    /// honour it without re-parsing the BSI.
+    pub lfemixlevcod: Option<u8>,
     /// Frame size in bytes — `(frmsiz + 1) * 2`. Cached so the
     /// dispatcher can range-check the packet without re-doing
     /// arithmetic.
@@ -284,9 +311,11 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
 
     // §E.2.3.1.9-21 — mixing meta-data block.
     let mixmdate = br.read_u32(1)? != 0;
-    if mixmdate {
-        skip_mixing_metadata(br, acmod, lfeon, strmtyp, numblkscod)?;
-    }
+    let (annex_e_mix_levels, dmixmod, lfemixlevcod) = if mixmdate {
+        parse_mixing_metadata(br, acmod, lfeon, strmtyp, numblkscod)?
+    } else {
+        (None, 0xFFu8, None)
+    };
 
     // §E.2.3.1.62 ff — informational meta-data.
     let infomdate = br.read_u32(1)? != 0;
@@ -320,44 +349,85 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         bsid,
         dialnorm,
         chanmap,
+        annex_e_mix_levels,
+        dmixmod,
+        lfemixlevcod,
         frame_bytes,
         bits_consumed,
     })
 }
 
 /// Walk the §E.2.3.1.9-61 mixing metadata block exactly per Table
-/// E1.2. Every field is consumed; none are surfaced (the round-1
-/// decoder ignores all of it). Errors propagate when the bit-reader
-/// runs out of input.
-fn skip_mixing_metadata(
+/// E1.2. Captures the four downmix mix-level codewords plus `dmixmod`
+/// and `lfemixlevcod`; every other field is consumed bit-accurately and
+/// discarded. Errors propagate when the bit-reader runs out of input.
+///
+/// Returns `(annex_e_mix_levels, dmixmod, lfemixlevcod)`. Per the
+/// spec's per-channel guards (Table E1.2):
+///  * `dmixmod` is only present when `acmod > 2` (more than 2 channels).
+///  * `ltrtcmixlev` / `lorocmixlev` only when 3 front channels exist
+///    (`acmod & 0x1 != 0 && acmod > 2`).
+///  * `ltrtsurmixlev` / `lorosurmixlev` only when a surround channel
+///    exists (`acmod & 0x4 != 0`).
+///  * `lfemixlevcod` only when `lfeon && lfemixlevcode == 1`.
+///
+/// Codewords whose guards fail read back as `0xFF` inside
+/// [`AnnexDMixLevels`] so callers can distinguish "spec-absent" from a
+/// legitimate `0b000` (1.414×) code. The returned `Option` itself is
+/// `None` only when none of the four center/surround fields were
+/// present (mono / 2/0 stereo with no surrounds) — those layouts have
+/// no downmix to refine.
+fn parse_mixing_metadata(
     br: &mut BitReader<'_>,
     acmod: u8,
     lfeon: bool,
     strmtyp: StreamType,
     numblkscod: u8,
-) -> Result<()> {
+) -> Result<(Option<AnnexDMixLevels>, u8, Option<u8>)> {
     // §E.2.3.1 mixing metadata — Table E1.2.
     // dmixmod (2) when acmod > 0x2 (more than 2 channels).
-    if acmod > 0x2 {
-        let _dmixmod = br.read_u32(2)?;
-    }
+    let dmixmod = if acmod > 0x2 {
+        br.read_u32(2)? as u8
+    } else {
+        0xFFu8
+    };
     // ltrtcmixlev (3) + lorocmixlev (3) when 3 front channels exist.
-    if (acmod & 0x1) != 0 && acmod > 0x2 {
-        let _ltrtcmixlev = br.read_u32(3)?;
-        let _lorocmixlev = br.read_u32(3)?;
-    }
+    let (ltrtcmixlev, lorocmixlev) = if (acmod & 0x1) != 0 && acmod > 0x2 {
+        (br.read_u32(3)? as u8, br.read_u32(3)? as u8)
+    } else {
+        (0xFFu8, 0xFFu8)
+    };
     // ltrtsurmixlev (3) + lorosurmixlev (3) when a surround channel exists.
-    if (acmod & 0x4) != 0 {
-        let _ltrtsurmixlev = br.read_u32(3)?;
-        let _lorosurmixlev = br.read_u32(3)?;
-    }
+    let (ltrtsurmixlev, lorosurmixlev) = if (acmod & 0x4) != 0 {
+        (br.read_u32(3)? as u8, br.read_u32(3)? as u8)
+    } else {
+        (0xFFu8, 0xFFu8)
+    };
+    let annex_e_mix_levels = if ltrtcmixlev != 0xFF
+        || lorocmixlev != 0xFF
+        || ltrtsurmixlev != 0xFF
+        || lorosurmixlev != 0xFF
+    {
+        Some(AnnexDMixLevels {
+            ltrtcmixlev,
+            ltrtsurmixlev,
+            lorocmixlev,
+            lorosurmixlev,
+        })
+    } else {
+        None
+    };
     // lfemixlevcode (1) + lfemixlevcod (5) when LFE on.
-    if lfeon {
+    let lfemixlevcod = if lfeon {
         let lfemixlevcode = br.read_u32(1)? != 0;
         if lfemixlevcode {
-            let _lfemixlevcod = br.read_u32(5)?;
+            Some(br.read_u32(5)? as u8)
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
     // strmtyp == 0x0 (independent) emits pgmscle/pgmscl + extpgmscle/
     // extpgmscl + mixdef + (mixdef-dependent body).
     if matches!(strmtyp, StreamType::Independent) {
@@ -455,7 +525,7 @@ fn skip_mixing_metadata(
             }
         }
     }
-    Ok(())
+    Ok((annex_e_mix_levels, dmixmod, lfemixlevcod))
 }
 
 /// Parses the body of `mixdata2e` (mixing option 4 with extra channel
@@ -789,5 +859,163 @@ mod tests {
         ];
         let (buf, _) = pack_msb(bits);
         assert!(parse(&buf).is_err());
+    }
+
+    /// 5.1 indep with `mixmdate == 1` and all four mix-level fields
+    /// present (acmod=7 → 3 front + surround channels). Verifies the
+    /// captured codewords match the bit-stream and that `dmixmod` is
+    /// also surfaced.
+    #[test]
+    fn captures_mixmdata_5_1_full_mix_levels() {
+        // dmixmod=01 (LtRt preferred), ltrtcmixlev=010 (1.000),
+        // lorocmixlev=100 (0.707), ltrtsurmixlev=011 (0.841),
+        // lorosurmixlev=101 (0.595), no LFE refinement, indep flag
+        // off the rest of mixmdata.
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod = 3 → 6 blocks
+            (3, 7),    // acmod = 7 (3/2)
+            (1, 1),    // lfeon = 1
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 1),    // mixmdate
+            // mixmdata body:
+            (2, 1),  // dmixmod = 01 (LtRt preferred)
+            (3, 2),  // ltrtcmixlev = 010 (1.000)
+            (3, 4),  // lorocmixlev = 100 (0.707)
+            (3, 3),  // ltrtsurmixlev = 011 (0.841)
+            (3, 5),  // lorosurmixlev = 101 (0.595)
+            (1, 1),  // lfemixlevcode = 1
+            (5, 15), // lfemixlevcod = 15
+            // indep substream extras (strmtyp == 0):
+            (1, 0), // pgmscle = 0
+            (1, 0), // extpgmscle = 0
+            (2, 0), // mixdef = 0 (no extra)
+            (1, 0), // frmmixcfginfoe = 0
+            (1, 0), // infomdate = 0
+            (1, 0), // addbsie = 0
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        let mix = bsi
+            .annex_e_mix_levels
+            .expect("mix levels should be surfaced when mixmdate==1 and acmod=7");
+        assert_eq!(mix.ltrtcmixlev, 0b010);
+        assert_eq!(mix.lorocmixlev, 0b100);
+        assert_eq!(mix.ltrtsurmixlev, 0b011);
+        assert_eq!(mix.lorosurmixlev, 0b101);
+        assert_eq!(bsi.dmixmod, 0b01);
+        assert_eq!(bsi.lfemixlevcod, Some(15));
+    }
+
+    /// 2/0 stereo indep with `mixmdate == 1` — none of the per-channel
+    /// guards fire (no third front channel, no surround), so the
+    /// `annex_e_mix_levels` accessor returns `None` even though the
+    /// `mixmdate` flag was set. `dmixmod` is also absent (guarded by
+    /// `acmod > 2`).
+    #[test]
+    fn mixmdate_on_stereo_yields_no_mix_levels() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod = 3
+            (3, 2),    // acmod = 2 (2/0)
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 1),    // mixmdate = 1
+            // mixmdata body for 2/0 indep: no dmixmod, no ltrt/loro
+            // codes, no LFE code. Just the indep tail:
+            (1, 0), // pgmscle = 0
+            (1, 0), // extpgmscle = 0
+            (2, 0), // mixdef = 0
+            (1, 0), // frmmixcfginfoe = 0
+            (1, 0), // infomdate = 0
+            (1, 0), // addbsie = 0
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert!(
+            bsi.annex_e_mix_levels.is_none(),
+            "2/0 stereo should not surface any mix-level codes"
+        );
+        assert_eq!(bsi.dmixmod, 0xFF);
+        assert_eq!(bsi.lfemixlevcod, None);
+    }
+
+    /// No-mixmdata baseline — the four fields default to `None` and
+    /// `dmixmod` / `lfemixlevcod` return the absent sentinels.
+    #[test]
+    fn no_mixmdate_yields_none() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),
+            (3, 0),
+            (11, 383),
+            (2, 0),
+            (2, 3),
+            (3, 7), // acmod = 7
+            (1, 1), // lfeon = 1
+            (5, 16),
+            (5, 27),
+            (1, 0), // compre
+            (1, 0), // mixmdate = 0
+            (1, 0), // infomdate = 0
+            (1, 0), // addbsie = 0
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert!(bsi.annex_e_mix_levels.is_none());
+        assert_eq!(bsi.dmixmod, 0xFF);
+        assert_eq!(bsi.lfemixlevcod, None);
+    }
+
+    /// 3/1 indep — surround codes present, center codes present, no
+    /// dual surround. Verifies the partial-mix-levels case where only
+    /// the four 3-bit codes are read (no LFE refinement).
+    #[test]
+    fn captures_mixmdata_3_1_no_lfe() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp
+            (3, 0),    // substreamid
+            (11, 200), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod = 3
+            (3, 5),    // acmod = 5 (3/1)
+            (1, 0),    // lfeon = 0
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 1),    // mixmdate
+            // mixmdata body:
+            (2, 2), // dmixmod = 10 (LoRo preferred)
+            (3, 1), // ltrtcmixlev = 001 (1.189)
+            (3, 2), // lorocmixlev = 010 (1.000)
+            (3, 6), // ltrtsurmixlev = 110 (0.500)
+            (3, 7), // lorosurmixlev = 111 (0.000 - silent surrounds)
+            // no LFE bits (lfeon=0).
+            // indep extras:
+            (1, 0), // pgmscle = 0
+            (1, 0), // extpgmscle = 0
+            (2, 0), // mixdef = 0
+            (1, 0), // frmmixcfginfoe = 0
+            (1, 0), // infomdate = 0
+            (1, 0), // addbsie = 0
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        let mix = bsi.annex_e_mix_levels.unwrap();
+        assert_eq!(mix.ltrtcmixlev, 0b001);
+        assert_eq!(mix.lorocmixlev, 0b010);
+        assert_eq!(mix.ltrtsurmixlev, 0b110);
+        assert_eq!(mix.lorosurmixlev, 0b111);
+        assert_eq!(bsi.dmixmod, 0b10);
+        assert_eq!(bsi.lfemixlevcod, None);
     }
 }

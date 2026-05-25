@@ -79,6 +79,29 @@ pub struct Eac3DecoderState {
     pub last_error: Option<String>,
 }
 
+impl Eac3DecoderState {
+    /// Read-only view of the indep substream's per-frame interleaved
+    /// f32 PCM (range -1..1). After [`decode_eac3_packet`] this is the
+    /// indep substream's PCM in `(acmod, lfeon)` bitstream order; if
+    /// any dep substreams contributed in the same packet, their channels
+    /// have been appended at the end, growing the channel count to
+    /// `indep_nchans + Σ dep_nchans` (see
+    /// [`crate::eac3::decoder::splice_dep_into_indep`]).
+    ///
+    /// `process_eac3_frame` consumes this directly when running the
+    /// §7.8 downmix matrix so it can apply per-channel coefficients
+    /// before quantising to S16LE — matrix×S16 would lose 6+ dB of
+    /// headroom per cascade step on negatively-signed weights.
+    pub fn indep_pcm_f32(&self) -> &[f32] {
+        &self.indep_pcm_f32
+    }
+
+    /// Current channel count of [`Self::indep_pcm_f32`].
+    pub fn indep_nchans(&self) -> u16 {
+        self.indep_nchans
+    }
+}
+
 /// Snapshot of the most recent independent substream's output shape
 /// — channels, sample rate, samples per frame.
 #[derive(Clone, Debug)]
@@ -108,6 +131,18 @@ pub struct DecodedFrame {
     pub acmod: u8,
     /// Independent substream's `lfeon` flag (1 bit, §E.1.2.1).
     pub lfeon: bool,
+    /// Independent substream's `nfchans` (= `acmod_nfchans(acmod)`).
+    /// Surfaced so callers building a [`crate::downmix::Downmix`] don't
+    /// have to re-derive it from `channels - lfeon as u16`.
+    pub nfchans: u8,
+    /// Independent substream's Annex E mixmdata refinement
+    /// (§E.2.3.1.3-6). `Some` only when `mixmdate == 1` AND at least
+    /// one of the four 3-bit codes' per-channel guards fired
+    /// (`acmod > 2` for center codes, `acmod & 0x4` for surround
+    /// codes). When `Some`, the [`crate::downmix::Downmix::from_eac3_bsi`]
+    /// constructor uses these as overrides for the §7.8.2 fixed-0.707
+    /// LtRt defaults and the 0.707 LoRo defaults.
+    pub annex_e_mix_levels: Option<crate::bsi::AnnexDMixLevels>,
 }
 
 /// Decode one or more concatenated E-AC-3 syncframes contained in a
@@ -257,6 +292,8 @@ fn decode_indep_substream(
         pcm_s16le,
         acmod: bsi.acmod,
         lfeon: bsi.lfeon,
+        nfchans: bsi.nfchans,
+        annex_e_mix_levels: bsi.annex_e_mix_levels,
     })
 }
 
@@ -381,6 +418,8 @@ fn build_silent_indep(bsi: &Eac3Bsi) -> Result<DecodedFrame> {
         pcm_s16le,
         acmod: bsi.acmod,
         lfeon: bsi.lfeon,
+        nfchans: bsi.nfchans,
+        annex_e_mix_levels: bsi.annex_e_mix_levels,
     })
 }
 

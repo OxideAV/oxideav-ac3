@@ -33,7 +33,8 @@
 //! Construction is cheap (just a 5×2 matrix of `f32`) so callers can
 //! cache a `Downmix` across syncframes or build one per block.
 
-use crate::bsi::{annex_d_center_mix_gain, annex_d_surround_mix_gain, Bsi};
+use crate::bsi::{annex_d_center_mix_gain, annex_d_surround_mix_gain, AnnexDMixLevels, Bsi};
+use crate::eac3::Eac3Bsi;
 use crate::tables::{CENTER_MIX_LEVEL, SURROUND_MIX_LEVEL};
 
 /// Output layout requested from the decoder.
@@ -106,18 +107,6 @@ impl Downmix {
     /// still records the source layout but `out_channels` is set to
     /// `nfchans + lfe`; [`Downmix::apply`] short-circuits.
     pub fn from_bsi(bsi: &Bsi, mode: DownmixMode) -> Self {
-        let mut out = Self {
-            mode,
-            out_coeffs: [[0.0; 5]; 2],
-            out_channels: bsi.nchans,
-            src_acmod: bsi.acmod,
-            src_nfchans: bsi.nfchans,
-            src_lfe: bsi.lfeon,
-        };
-        if matches!(mode, DownmixMode::Passthrough) {
-            return out;
-        }
-
         // §5.4.2.4 / §5.4.2.5 — reserved code 0b11 maps to the
         // "intermediate" coefficient per spec. Our `CENTER_MIX_LEVEL`
         // table already repeats the middle value at index 3 so the
@@ -132,36 +121,145 @@ impl Downmix {
         } else {
             SURROUND_MIX_LEVEL[(bsi.surmixlev & 0x3) as usize]
         };
+        Self::build(
+            mode,
+            bsi.acmod,
+            bsi.nfchans,
+            bsi.nchans,
+            bsi.lfeon,
+            base_clev,
+            base_slev,
+            bsi.annex_d_mix_levels,
+        )
+    }
+
+    /// E-AC-3 field-by-field constructor — equivalent to
+    /// [`Self::from_eac3_bsi`] but lets callers that hold a
+    /// [`crate::eac3::DecodedFrame`] (not the parser-internal `Bsi`)
+    /// build a matrix without re-parsing the syncframe. `acmod` /
+    /// `nfchans` / `nchans` / `lfeon` / `mix` mirror the
+    /// `from_eac3_bsi` fields exactly.
+    pub fn from_eac3_fields(
+        acmod: u8,
+        nfchans: u8,
+        nchans: u8,
+        lfeon: bool,
+        mix: Option<AnnexDMixLevels>,
+        mode: DownmixMode,
+    ) -> Self {
+        Self::build(mode, acmod, nfchans, nchans, lfeon, 0.707, 0.707, mix)
+    }
+
+    /// E-AC-3 (Annex E) counterpart to [`Self::from_bsi`]. Annex E
+    /// removes the body-spec 2-bit `cmixlev` / `surmixlev` fields and
+    /// instead carries refined 3-bit `ltrtcmixlev` / `lorocmixlev` /
+    /// `ltrtsurmixlev` / `lorosurmixlev` codewords inside the
+    /// `mixmdata` block (§E.2.3.1.3-6, Tables E1.13-16 = D2.3-D2.6).
+    ///
+    /// When the producer set `mixmdate == 1` the four 3-bit codes
+    /// override the §7.8 defaults for the LtRt and LoRo targets
+    /// respectively — exactly the same override that base AC-3's
+    /// `bsid == 6` xbsi1 block provides. Without `mixmdate` (or in
+    /// reduced-channel layouts where the per-channel guards skip the
+    /// field), the fixed §7.8.2 LtRt 0.707 and the 0.707 LoRo defaults
+    /// apply (mono / 2/0 stereo never have a downmix to refine).
+    ///
+    /// The Mono target keeps the §7.8.2 fixed 0.707 defaults (Annex E
+    /// mixmdata, like Annex D xbsi1, has no mono-specific mix levels).
+    pub fn from_eac3_bsi(bsi: &Eac3Bsi, mode: DownmixMode) -> Self {
+        // Annex E has no body-spec cmixlev/surmixlev; default to 0.707
+        // (§7.8.2 "if not otherwise specified") for the mono path and
+        // any LoRo/LtRt downmix on a stream that elected to skip the
+        // mixmdata refinement.
+        Self::build(
+            mode,
+            bsi.acmod,
+            bsi.nfchans,
+            bsi.nchans,
+            bsi.lfeon,
+            0.707,
+            0.707,
+            bsi.annex_e_mix_levels,
+        )
+    }
+
+    /// Shared matrix-fill path for the AC-3 (`from_bsi`) and E-AC-3
+    /// (`from_eac3_bsi`) constructors. Resolves the per-target
+    /// (`clev`, `slev`) pair from the Annex D / Annex E mix-level
+    /// codewords when present, falling back to the supplied
+    /// `base_clev` / `base_slev` (which are themselves either the
+    /// AC-3 body 2-bit codes or the §7.8.2 fixed 0.707 defaults for
+    /// Annex E). Then dispatches to `fill_stereo` / `fill_stereo_ltrt`
+    /// / `fill_mono` per `mode`.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        mode: DownmixMode,
+        acmod: u8,
+        nfchans: u8,
+        nchans: u8,
+        lfeon: bool,
+        base_clev: f32,
+        base_slev: f32,
+        mix: Option<AnnexDMixLevels>,
+    ) -> Self {
+        let mut out = Self {
+            mode,
+            out_coeffs: [[0.0; 5]; 2],
+            out_channels: nchans,
+            src_acmod: acmod,
+            src_nfchans: nfchans,
+            src_lfe: lfeon,
+        };
+        if matches!(mode, DownmixMode::Passthrough) {
+            return out;
+        }
 
         // Annex D §2.3.1.3-6 (and Annex E mixmdata) provide a refined
         // 3-bit mix level per downmix target. When present they
-        // override the body 2-bit fields for that target's downmix —
-        // §7.8 still uses the body fields when xbsi1 is absent.
-        let (loro_clev, loro_slev) = if let Some(m) = bsi.annex_d_mix_levels {
-            (
-                annex_d_center_mix_gain(m.lorocmixlev),
-                annex_d_surround_mix_gain(m.lorosurmixlev),
-            )
-        } else {
-            (base_clev, base_slev)
+        // override the body / default for that target's downmix —
+        // missing center / surround codes (0xFF sentinel) fall back to
+        // the base value so a partial mixmdata block still works.
+        let (loro_clev, loro_slev) = match mix {
+            Some(m) => (
+                if m.lorocmixlev == 0xFF {
+                    base_clev
+                } else {
+                    annex_d_center_mix_gain(m.lorocmixlev)
+                },
+                if m.lorosurmixlev == 0xFF {
+                    base_slev
+                } else {
+                    annex_d_surround_mix_gain(m.lorosurmixlev)
+                },
+            ),
+            None => (base_clev, base_slev),
         };
-        let (ltrt_clev, ltrt_slev) = if let Some(m) = bsi.annex_d_mix_levels {
-            (
-                annex_d_center_mix_gain(m.ltrtcmixlev),
-                annex_d_surround_mix_gain(m.ltrtsurmixlev),
-            )
-        } else {
+        let (ltrt_clev, ltrt_slev) = match mix {
+            Some(m) => (
+                if m.ltrtcmixlev == 0xFF {
+                    // §7.8.2 fixed default when only the LoRo codes
+                    // were carried (acmod-guard mismatch).
+                    0.707
+                } else {
+                    annex_d_center_mix_gain(m.ltrtcmixlev)
+                },
+                if m.ltrtsurmixlev == 0xFF {
+                    0.707
+                } else {
+                    annex_d_surround_mix_gain(m.ltrtsurmixlev)
+                },
+            ),
             // Body §7.8.2: LtRt uses a fixed 0.707 for the C and
             // surround coefficients regardless of `cmixlev`/`surmixlev`.
-            (0.707, 0.707)
+            None => (0.707, 0.707),
         };
 
         match mode {
-            DownmixMode::Stereo => Self::fill_stereo(&mut out, bsi.acmod, loro_clev, loro_slev),
+            DownmixMode::Stereo => Self::fill_stereo(&mut out, acmod, loro_clev, loro_slev),
             DownmixMode::StereoLtRt => {
-                Self::fill_stereo_ltrt(&mut out, bsi.acmod, ltrt_clev, ltrt_slev)
+                Self::fill_stereo_ltrt(&mut out, acmod, ltrt_clev, ltrt_slev)
             }
-            DownmixMode::Mono => Self::fill_mono(&mut out, bsi.acmod, base_clev, base_slev),
+            DownmixMode::Mono => Self::fill_mono(&mut out, acmod, base_clev, base_slev),
             DownmixMode::Passthrough => unreachable!(),
         }
         out
@@ -932,5 +1030,71 @@ mod tests {
         assert!((d.out_coeffs[0][0] - 0.3204).abs() < 1e-3);
         assert!((d.out_coeffs[0][1] - 0.2265).abs() < 1e-3);
         assert!((d.out_coeffs[0][3] + 0.2265).abs() < 1e-3);
+    }
+
+    /// E-AC-3 (Annex E) field-based constructor with full mixmdata —
+    /// matrix matches the AC-3 / Annex D path for the same codeword
+    /// set. Regression guard against the shared-fill `build` helper
+    /// diverging between the two parsers.
+    #[test]
+    fn eac3_fields_match_annex_d_for_same_mix_codes() {
+        use crate::bsi::AnnexDMixLevels;
+        let mix = AnnexDMixLevels {
+            ltrtcmixlev: 0b010,   // 1.000
+            ltrtsurmixlev: 0b100, // 0.707
+            lorocmixlev: 0b100,   // 0.707
+            lorosurmixlev: 0b101, // 0.595
+        };
+        let d_e = Downmix::from_eac3_fields(7, 5, 6, true, Some(mix), DownmixMode::StereoLtRt);
+        let bsi = fake_bsi_annex_d(7, true, mix, 0xFF);
+        let d_d = Downmix::from_bsi(&bsi, DownmixMode::StereoLtRt);
+        // Compare both rows coefficient-by-coefficient.
+        for row in 0..2 {
+            for col in 0..5 {
+                assert!(
+                    (d_e.out_coeffs[row][col] - d_d.out_coeffs[row][col]).abs() < 1e-6,
+                    "mismatch row {row} col {col}: e-ac3 {} vs annex-d {}",
+                    d_e.out_coeffs[row][col],
+                    d_d.out_coeffs[row][col],
+                );
+            }
+        }
+        assert_eq!(d_e.output_channels(), 2);
+    }
+
+    /// E-AC-3 without mixmdata — LtRt falls back to the §7.8.2 fixed
+    /// 0.707 defaults exactly like base AC-3 without xbsi1. Matrix is
+    /// byte-identical to the `ltrt_without_annex_d_uses_fixed_0_707`
+    /// baseline (the Eac3 path has no body cmixlev/surmixlev so this
+    /// is the only sensible default).
+    #[test]
+    fn eac3_fields_without_mixmdata_uses_fixed_0_707() {
+        let d = Downmix::from_eac3_fields(7, 5, 6, true, None, DownmixMode::StereoLtRt);
+        assert!((d.out_coeffs[0][0] - 0.3204).abs() < 1e-3);
+        assert!((d.out_coeffs[0][1] - 0.2265).abs() < 1e-3);
+        assert!((d.out_coeffs[0][3] + 0.2265).abs() < 1e-3);
+    }
+
+    /// E-AC-3 LoRo with `lorocmixlev` override — verifies the Annex E
+    /// mix-level codeword takes effect on the LoRo path. Mirror of
+    /// `loro_honours_annex_d_lorocmixlev_override` but via the
+    /// `from_eac3_fields` constructor.
+    #[test]
+    fn eac3_loro_honours_lorocmixlev_override() {
+        use crate::bsi::AnnexDMixLevels;
+        let mix = AnnexDMixLevels {
+            ltrtcmixlev: 0b100,
+            ltrtsurmixlev: 0b100,
+            lorocmixlev: 0b010,   // 1.000
+            lorosurmixlev: 0b100, // 0.707
+        };
+        let d = Downmix::from_eac3_fields(7, 5, 5, false, Some(mix), DownmixMode::Stereo);
+        let c = d.out_coeffs[0][1];
+        // sum = 1 + 1.0 + 0 + 0.707 + 0 = 2.707 → C weight = 1/2.707 = 0.3694.
+        assert!(
+            (c - 0.3694).abs() < 1e-3,
+            "Eac3 LoRo C weight: want 0.3694, got {}",
+            c
+        );
     }
 }

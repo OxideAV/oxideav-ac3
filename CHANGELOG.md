@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **E-AC-3 mixmdata mix-level surfacing + downmix routing** —
+  round 129. Pulls the four 3-bit `ltrtcmixlev` / `ltrtsurmixlev` /
+  `lorocmixlev` / `lorosurmixlev` codewords (§E.2.3.1.3-6, Table E1.2)
+  out of `eac3::bsi::skip_mixing_metadata` (renamed
+  `parse_mixing_metadata`) and routes them through the §7.8 downmix
+  matrix used by `process_eac3_frame`.
+  * `eac3::Bsi` gains `annex_e_mix_levels: Option<AnnexDMixLevels>`
+    (the Annex E mixmdata fields share their value range with
+    Annex D xbsi1 — Tables E1.13-16 = D2.3-D2.6 — so the existing
+    `AnnexDMixLevels` struct is reused), `dmixmod: u8` (the §E.2.3.1.2
+    preferred-stereo-downmix advisory; `0xFF` when absent), and
+    `lfemixlevcod: Option<u8>` (§E.2.3.1 5-bit LFE mix code; surfaced
+    for downstream LFE-bass-routing tooling, not consumed by the
+    round-129 downmix which keeps LFE muted per §7.8).
+  * `downmix::Downmix` gains `from_eac3_bsi(&Eac3Bsi, mode)` and a
+    field-based `from_eac3_fields(acmod, nfchans, nchans, lfeon,
+    mix, mode)` constructor. Both run through a shared private
+    `build` helper that resolves the per-target (`clev`, `slev`) pair
+    from `Option<AnnexDMixLevels>` exactly like `from_bsi` — so the
+    LtRt and LoRo matrices on an E-AC-3 stream with mixmdata are
+    coefficient-identical to a base AC-3 stream carrying the same
+    four xbsi1 codes.
+  * `eac3::DecodedFrame` gains `nfchans: u8` and
+    `annex_e_mix_levels: Option<AnnexDMixLevels>` so the top-level
+    decoder no longer has to re-derive nfchans from `channels - lfeon`
+    or re-parse the BSI to recover the mixmdata.
+  * `eac3::Eac3DecoderState` gains `indep_pcm_f32()` / `indep_nchans()`
+    accessors so `process_eac3_frame` can run the §7.8 matrix on the
+    pre-quantisation f32 PCM (negative LtRt surround weights truncate
+    to 0 if matrixed in S16 space).
+  * `process_eac3_frame` now routes through `Downmix::from_eac3_fields`
+    when a downmix is requested instead of the previous "truncate the
+    interleaved buffer to N channels" shortcut, applying the §7.8.2
+    LoRo / LtRt / mono matrix block-by-block in 256-sample chunks and
+    quantising back to S16LE at the boundary. Passthrough still uses
+    the in-place WAV-mask reorder path for parity with prior rounds.
+  * 8 unit tests:
+    `captures_mixmdata_5_1_full_mix_levels` /
+    `captures_mixmdata_3_1_no_lfe` /
+    `mixmdate_on_stereo_yields_no_mix_levels` /
+    `no_mixmdate_yields_none` exercise the BSI cursor across the
+    per-channel guards and the `mixmdate == 0` baseline;
+    `eac3_fields_match_annex_d_for_same_mix_codes` /
+    `eac3_fields_without_mixmdata_uses_fixed_0_707` /
+    `eac3_loro_honours_lorocmixlev_override` pin the matrix
+    equivalence vs the Annex D path and the override semantics;
+    `eac3_5_1_decodes_to_stereo_with_matrix_downmix` is an end-to-end
+    encode → 5.1 → request stereo decode → verify the 2-channel
+    payload shape via the matrix path (catches a regression where the
+    decoder would still produce a buffer of the right size by
+    truncation even after the matrix wiring breaks).
+
 - **Annex D §2.3 alternate-syntax mix-level parameters** — round 126.
   Closes the round-120 followup to honour Annex D `ltrtcmixlev` /
   `ltrtsurmixlev` / `lorocmixlev` / `lorosurmixlev` instead of the

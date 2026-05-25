@@ -2013,6 +2013,9 @@ mod aht_regs_tests {
             bsid: 16,
             dialnorm: 27,
             chanmap: None,
+            annex_e_mix_levels: None,
+            dmixmod: 0xFF,
+            lfemixlevcod: None,
             frame_bytes: 768,
             bits_consumed: 0,
         }

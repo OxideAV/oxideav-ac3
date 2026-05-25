@@ -144,7 +144,16 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       and `Downmix::from_bsi` consults them for the per-target gain
       instead of the fixed §7.8.2 0.707 (LtRt) / body
       `cmixlev`/`surmixlev` (LoRo). Without the Annex D extension the
-      matrix is byte-identical to round-120 behaviour.
+      matrix is byte-identical to round-120 behaviour. **Round 129**
+      extends the same plumbing to E-AC-3: `eac3::bsi` now captures
+      the four mixmdata mix-level codewords + `dmixmod` +
+      `lfemixlevcod` instead of consuming-and-discarding them, the
+      new `Downmix::from_eac3_bsi` / `from_eac3_fields` constructors
+      share a private `build` helper with `from_bsi` (matrix is
+      coefficient-identical to base AC-3 with the same codes), and
+      `process_eac3_frame` runs the §7.8 matrix on the pre-quantised
+      f32 PCM via `Eac3DecoderState::indep_pcm_f32()` instead of
+      truncating the interleaved buffer to N channels.
 - [x] E-AC-3 (bsid=16, Annex E) — encoder. Independent substream
       (`strmtyp=0`, `substreamid=0`) for 1.0/2.0/5.1 layouts (acmod
       ∈ {1, 2, 7}, with `lfeon=1` for 5.1). 7.1 input emits an
