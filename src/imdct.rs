@@ -425,8 +425,8 @@ mod tests {
     /// paths produce a low-DC (nearly symmetric) waveform with matching
     /// RMS. This is enough to catch an order-of-magnitude bug in the
     /// scale without pinning us to the direct form, which we don't fully
-    /// trust for the short block anyway (the ffmpeg fixture RMS test is
-    /// the real gate once we wire the FFT paths into `audblk.rs`).
+    /// trust for the short block anyway (the validator-fixture RMS test
+    /// is the real gate once we wire the FFT paths into `audblk.rs`).
     #[test]
     fn imdct_256_pair_fft_has_reasonable_envelope() {
         let mut x = [0.0f32; 256];

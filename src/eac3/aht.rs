@@ -388,7 +388,7 @@ pub fn read_scalar_aht_mantissas(
 /// (post-process restores symmetry around 0) without the lookup-table
 /// machinery. This is good enough for "non-silent PCM" output; a
 /// future round can replace this with the literal Table E3.6 constants
-/// for last-bit fidelity vs. the FFmpeg reference.
+/// for last-bit fidelity vs. the validator binary's PCM.
 fn remap_large_mantissa(_hebap: u8, _gk: u8, signed: i32, m: u32) -> f32 {
     // Treat the m-bit signed value as a Q(m-1) fractional. Push by
     // half a step so the dead-zone gap centred on 0 reconstructs to

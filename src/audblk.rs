@@ -578,7 +578,7 @@ pub(crate) fn parse_audblk_into(
             // so the spec's validity envelope is `cplbegf <= cplendf+2`
             // (equivalently `ncplsubnd = 3 + cplendf - cplbegf >= 1`).
             // The earlier strict `cplendf < cplbegf` rejection bombed out
-            // of valid 5.0 (acmod=7 lfeon=0) frames where ffmpeg picks
+            // of valid 5.0 (acmod=7 lfeon=0) frames whose bitstreams pick
             // narrow-coupling configs like (cplbegf=11, cplendf=10), which
             // place coupling on sub-bands 11..=12 (tc bins 169..193) — a
             // perfectly legal 2-sub-band coupling channel. Using signed
@@ -1332,8 +1332,8 @@ pub(crate) fn run_bit_allocation(
     }
 
     // Apply delta bit allocation (§7.2.2.6). Per-band ±6 dB mask offsets
-    // signalled by the encoder. Critical for transient blocks: ffmpeg uses
-    // dba to BOOST the masking floor (less bits assigned) in low-energy
+    // signalled by the encoder. Critical for transient blocks: the §7.2.2.6
+    // mechanism BOOSTs the masking floor (less bits assigned) in low-energy
     // bands during a burst frame, freeing bit budget for the burst peak.
     // Without applying these offsets, our decoder ends up with a different
     // mask shape than the encoder used — and therefore a different bap[]
@@ -1400,7 +1400,7 @@ pub(crate) fn run_bit_allocation(
 
     // ---- Diagnostic trace (gated by `AC3_TRACE_FRAME=N` and `AC3_TRACE_BLK=B`) ----
     // Dumps bndpsd / excite / mask / bap for the requested frame+block. Used
-    // to compare against ffmpeg's reference decode of the same fixture.
+    // to compare against the validator binary's decode of the same fixture.
     // Cheap when the env vars aren't set.
     let trace_frame = std::env::var("AC3_TRACE_FRAME")
         .ok()
@@ -2055,7 +2055,7 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
     //   • cplinu == 1, cplbegf = 0: 2 bands, last ends at bin 36
     //
     // A previous formulation hard-coded the last band's high coefficient at
-    // bin 252 even when coupling was active. On 2/0 frames where ffmpeg
+    // bin 252 even when coupling was active. On 2/0 frames whose bitstream
     // enables rematrixing AND coupling above bin 132 (cplbegf=8 in our
     // transient fixture), this bled the L+R / L-R operation into the
     // coupling region — bins that had just been re-derived from the
@@ -2125,7 +2125,7 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
     // Uses the §7.9.4 FFT-backed decomposition: pre-twiddle → N/4-point
     // complex IFFT (N/8 for short blocks) → post-twiddle → de-interleave.
     // Matches the direct-form reference within f32 precision on the long
-    // path; the short path is validated by the ffmpeg-fixture RMS gate.
+    // path; the short path is validated by the validator-fixture RMS gate.
     let trace_frame_dsp = std::env::var("AC3_TRACE_FRAME")
         .ok()
         .and_then(|s| s.parse::<u64>().ok());
@@ -2271,10 +2271,10 @@ pub fn imdct_512(x: &[f32; 256], out: &mut [f32; 512]) {
     // The AC-3 encoder applies an explicit `-2/N` scale to the forward
     // MDCT (§8.2.3.2). Our decoder undoes that via the IMDCT scale +
     // the `2*(x + delay)` overlap-add (§7.9.4.1 step 6). Calibrated
-    // empirically against ffmpeg on the 440 Hz @ 192 kbps fixture: peak
-    // reference 2897 int16, our output 2895 with `scale = -1.0`. The
-    // sign flip cancels the encoder's `-2/N` sign so positive-amplitude
-    // input reconstructs as positive-amplitude PCM.
+    // empirically against the validator binary on the 440 Hz @ 192 kbps
+    // fixture: peak validator-decoded 2897 int16, our output 2895 with
+    // `scale = -1.0`. The sign flip cancels the encoder's `-2/N` sign so
+    // positive-amplitude input reconstructs as positive-amplitude PCM.
     let scale = -1.0f32;
     for nn in 0..n {
         let mut s = 0.0f32;
@@ -2299,7 +2299,7 @@ mod short_block_tests {
     /// FFT path changed together, and the test can then be tightened
     /// into a proper equality gate. Until then the FFT path is
     /// considered canonical: its PCM output is byte-equivalent to the
-    /// reference S16LE produced by black-box ffmpeg-binary decode of
+    /// reference S16LE produced by black-box validator-binary decode of
     /// transient fixtures (cross-validated in the transient-fixture
     /// integration tests).
     #[test]

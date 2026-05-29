@@ -16,8 +16,11 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       captured into `AudBlkSideInfo` for introspection
 - [x] Exponent decode (§7.1) + parametric bit allocation (§7.2)
 - [x] Mantissa decode (§7.3) with bap=0 dither (§7.3.4)
-- [x] IMDCT synthesis (§7.9) — 512-point long-block path;
-      256-point short-block still uses a reference (non-FFT) IMDCT
+- [x] IMDCT synthesis (§7.9) — both 512-point long-block and
+      256-point short-block paths use the §7.9.4 FFT-backed
+      decomposition (pre-twiddle → N/4-point complex IFFT [N/8 for
+      short blocks] → post-twiddle → de-interleave). The direct-form
+      reference is kept only as a test oracle in `imdct.rs`.
 - [x] Channel coupling (§7.4) + rematrix (§7.5) + dynrng (§7.7) —
       coupling now spans up to 5 fbw channels (encoder + decoder),
       matching the spec's nfchans limit (5.1 minus LFE). At 320 kbps

@@ -27,7 +27,7 @@
 //!    field (Table E2.5) is parsed but not used to reorder — round
 //!    3 simply appends dep channels at the end of the indep program.
 //!    None of the corpus fixtures actually exercise dep substreams
-//!    (FFmpeg's eac3 encoder doesn't emit them per
+//!    (the validator-encoded corpus omits them per
 //!    `eac3-5.1-side-768kbps/notes.md`); the plumbing is in place so
 //!    a future custom-built fixture (or interop with a real DD+
 //!    7.1 stream) works end-to-end.

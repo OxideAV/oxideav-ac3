@@ -1235,7 +1235,8 @@ impl Ac3Encoder {
                     // bitstream entirely; the decoder treats phsflginu
                     // as implicitly 0. Writing it unconditionally
                     // shifts every subsequent block-0 field by 1 bit,
-                    // which ffmpeg detects as a malformed cplcoe stream.
+                    // which the validator binary detects as a malformed
+                    // cplcoe stream.
                     if self.acmod == 0x2 {
                         bw.write_u32(cpl.phsflginu as u32, 1);
                     }
@@ -1916,10 +1917,9 @@ fn write_exponents_cpl(bw: &mut BitWriter, exp: &[u8; N_COEFFS], start: usize, e
     // Note: the decoder uses `prev = cplabsexp << 1` as the seed, with
     // values up to 30 — but the deltas reconstructed must keep the
     // running exp in [0, 24]. Clamping cplabsexp to 12 (= 24/2) avoids
-    // the case where prev = 30 + small negative delta lands above 24
-    // and ffmpeg rejects the run. (libavcodec clamps absexp_after_seed
-    // to ≤ 24, and any group where the first reconstructed exp > 24
-    // is flagged "expacc out-of-range" by the dexp validity check.)
+    // the case where prev = 30 + small negative delta lands above 24,
+    // which the spec's §7.1 exponent envelope (and the validator
+    // binary's dexp validity check) rejects as out-of-range.
     let first_exp = exp[start] as i32;
     let cplabsexp = ((first_exp + 1) >> 1).clamp(0, 12) as u8;
     bw.write_u32(cplabsexp as u32, 4);
@@ -4270,9 +4270,10 @@ impl CouplingPlan {
 /// Encoder policy (round-18 v1):
 ///   * One segment per fbw channel, spanning a single 1/6th-octave
 ///     band picked by `pick_dba_band`. The delta is `+6 dB` (deltba=4)
-///     which raises the masking floor in that band — ffmpeg uses this
-///     to free a few mantissa bits in psychoacoustically-unimportant
-///     bands during bursts. We pick a band where the band PSD is well
+///     which raises the masking floor in that band — the §7.2.2.6
+///     mechanism uses this to free a few mantissa bits in psycho-
+///     acoustically-unimportant bands during bursts. We pick a band
+///     where the band PSD is well
 ///     below the channel average, which approximates the "this band
 ///     is masked harder than the parametric model thinks" decision.
 ///   * No coupling-channel dba in v1 (cpldeltbae==2 emitted on block 0
@@ -5152,8 +5153,8 @@ mod tests {
 
     /// Per-channel-per-block exponent strategy selection (§7.1.3 /
     /// §5.4.3.22) — verify the encoder picks D25 (`chexpstr=2`) on a
-    /// smooth-envelope source where it's spec-legal, and that ffmpeg
-    /// cross-decodes the resulting bit-stream cleanly.
+    /// smooth-envelope source where it's spec-legal, and that the
+    /// validator binary cross-decodes the resulting bit-stream cleanly.
     ///
     /// Setup: a stereo bass tone (220 Hz) plus a few mid-band
     /// harmonics. The energy is concentrated below ~2 kHz where each
@@ -5164,8 +5165,8 @@ mod tests {
     ///
     /// Gates: (a) `parse_frame_side_info` reads `chexpstr[ch] == 2`
     /// (D25) on at least one anchor block (block 0 or 3) of each
-    /// frame, (b) ffmpeg decodes the elementary stream without error,
-    /// (c) the decoded RMS is non-trivial (not silence).
+    /// frame, (b) the validator binary decodes the elementary stream
+    /// without error, (c) the decoded RMS is non-trivial (not silence).
     #[test]
     fn d25_exp_strategy_selection_and_ffmpeg_crosscheck() {
         use std::process::Command;
@@ -5301,13 +5302,14 @@ mod tests {
     }
 
     /// Round-29 regression: D45 grpsize=4 exponent strategy round-trips
-    /// bit-exact through both the in-tree decoder AND ffmpeg.
+    /// bit-exact through both the in-tree decoder AND the validator
+    /// binary.
     ///
     /// The dba-offset-truncation bug fixed in `build_dba_plan`
     /// (best_band capped at 31 to fit the 5-bit `deltoffst` field per
     /// §5.4.3.51) made the first-frame mantissa stream desync by one
-    /// bit; with the cap this test passes against ffmpeg and against
-    /// our decoder's PSNR floor.
+    /// bit; with the cap this test passes against the validator binary
+    /// and against our decoder's PSNR floor.
     ///
     /// Picks a smooth low-band signal so the strategy selector emits
     /// chexpstr=3 on at least one anchor block per frame.
@@ -6030,10 +6032,10 @@ mod tests {
     ///
     /// Floor is 10 dB — this matches the in-tree
     /// `tests/eac3_ffmpeg.rs::psnr_min` convention where 18 dB is the
-    /// quoted AC-3 baseline on pure-sine input through ffmpeg's
-    /// reference decoder. Self-decode tends to score a few dB lower
-    /// than ffmpeg's smoothing-aware path, so 10 dB is the headline
-    /// floor.
+    /// quoted AC-3 baseline on pure-sine input through the validator
+    /// binary's decoder. Self-decode tends to score a few dB lower
+    /// than the validator's smoothing-aware path, so 10 dB is the
+    /// headline floor.
     #[test]
     fn three_two_psnr_per_channel() {
         encode_decode_multichan_psnr(5, 7, false, &[10.0f64; 5]);
@@ -6575,10 +6577,11 @@ mod tests {
             panic!("ffmpeg produced no decode output");
         };
         let _ = std::fs::remove_file(&out_path);
-        // Per-channel RMS diagnostic. ffmpeg may apply a different
-        // channel reorder (its native AC-3 order is L,R,C,LFE,Ls,Rs
-        // when decoding to PCM), so we just sanity-check that every
-        // channel in the PCM stream carries signal energy — proof
+        // Per-channel RMS diagnostic. The validator binary may apply
+        // a different channel reorder (its native AC-3 order is
+        // L,R,C,LFE,Ls,Rs when decoding to PCM), so we just
+        // sanity-check that every channel in the PCM stream carries
+        // signal energy — proof
         // that the encoder didn't drop any of the 5.1 inputs.
         let nch = channels as usize;
         let total = decoded_bytes.len() / 2;
@@ -7035,8 +7038,8 @@ mod tests {
             let n = decoded.len().min(orig.len());
             // Lag search across the first transient (frame 1 burst at
             // ~ sample 1536+896 = 2432) — the IMDCT priming offset is
-            // 256 samples but ffmpeg-style decoders also have a frame
-            // of look-ahead, so we sweep ±1024.
+            // 256 samples but a frame-aligned reference decoder may
+            // also carry a frame of look-ahead, so we sweep ±1024.
             let mut best_lag = 0i32;
             let mut best_sse = f64::INFINITY;
             for lag in -1024i32..=1024 {

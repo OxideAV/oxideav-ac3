@@ -88,7 +88,7 @@
 //!   so [`audblk::dsp_block`] runs the §7.4 decouple step unchanged.
 //!
 //! `ecplinu == 1` (enhanced coupling) is rejected as `Unsupported` —
-//! none of the FFmpeg eac3 encoder's outputs in the corpus exercise
+//! none of the validator-encoded fixtures in the corpus exercise
 //! that path; standard coupling covers all four 5.1 / low-rate
 //! fixtures (eac3-5.1-48000-384kbps, eac3-5.1-side-768kbps,
 //! eac3-low-rate-stereo-64kbps, eac3-from-ac3-bitstream-recombination).
@@ -122,7 +122,7 @@
 //!
 //! Fixtures unblocked by round 4-bis: `eac3-low-bitrate-32kbps` (AHT
 //! at low bit budgets per its `notes.md`). No corpus fixture
-//! exercises SPX (FFmpeg's eac3 encoder doesn't emit it).
+//! exercises SPX (the validator-encoded corpus omits it).
 //!
 //! ## Scope (round 2)
 //!
@@ -616,7 +616,7 @@ pub fn decode_indep_audblks(
                 // >= 1` is the actual validity test (equivalently
                 // `cplbegf <= cplendf + 2`). The earlier "cplbegf >
                 // cplendf" rejection mirrored the AC-3 round-7 bug —
-                // FFmpeg's E-AC-3 encoder picks narrow configs like
+                // valid corpus bitstreams use narrow configs like
                 // `(cplbegf=11, cplendf=10)` for high-bandwidth
                 // multichannel frames. Use signed arithmetic so the
                 // `3 + cplendf - cplbegf` term can't underflow.
@@ -811,10 +811,10 @@ pub fn decode_indep_audblks(
             // cpl_end - cpl_start = 12 · (cplendf + 3 - cplbegf) =
             // 12 · ncplsubnd which is divisible by 3 for grpsize=1
             // and by 6/12 for grpsize=2/4 only when ncplsubnd is even
-            // (D2/D4). FFmpeg encoders generally pick a strategy that
-            // makes this divisible; if not we'd round down and miss
-            // bins, but this is the spec's `(cpl_end - cpl_start) /
-            // (grpsize × 3)` formula verbatim.
+            // (D2/D4). Spec-conformant encoders generally pick a
+            // strategy that makes this divisible; if not we'd round
+            // down and miss bins, but this is the spec's
+            // `(cpl_end - cpl_start) / (grpsize × 3)` formula verbatim.
             let ncplgrps = (cpl_end - cpl_start) / (grpsize * 3);
             let mut raw_exp = vec![0i32; ncplgrps * 3];
             audblk::decode_exponents(
@@ -1797,7 +1797,7 @@ fn reject_unsupported(bsi: &Eac3Bsi, audfrm: &AudFrm) -> Result<()> {
     // 5-bit `frmcplexpstr` + per-channel `frmchexpstr[ch]` codewords
     // via Table E2.10 into `cplexpstr_blk[]` + `chexpstr_blk_ch[]` so
     // the dsp body sees the same per-block-per-channel shape it
-    // already consumes for the expstre==1 case. Every FFmpeg-produced
+    // already consumes for the expstre==1 case. Every validator-produced
     // E-AC-3 fixture in the corpus picks expstre==0.
     if audfrm.snroffststr != 0 {
         return Err(Error::unsupported(format!(
@@ -1816,9 +1816,9 @@ fn reject_unsupported(bsi: &Eac3Bsi, audfrm: &AudFrm) -> Result<()> {
     // `spxattencod[ch]` fields propagate onto state at the top of
     // `decode_indep_audblks`, and `audblk::apply_spectral_extension`
     // applies the §3.6.4.2.3 5-tap border notch filter when the flag
-    // is set for a channel. When `spxattene == 0` (every FFmpeg-encoded
-    // E-AC-3 fixture in the corpus picks this) the SPX synthesis path
-    // is byte-identical to the round-100 implementation.
+    // is set for a channel. When `spxattene == 0` (every validator-
+    // encoded E-AC-3 fixture in the corpus carries this) the SPX
+    // synthesis path is byte-identical to the round-100 implementation.
     // ahte is now handled by the round-6 phase-B path (mono-only).
     // Defensive: reject any case where phase B was supposed to run
     // but didn't get a chance (caller forgot to call parse_phase_b).

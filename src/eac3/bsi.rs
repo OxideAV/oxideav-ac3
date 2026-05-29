@@ -677,7 +677,7 @@ mod tests {
 
     /// Independent substream, 2/0 stereo, 48 kHz, 6 blocks, 768 byte
     /// frame. dialnorm=27, no compr, no chanmape (indep), no mixmdate,
-    /// no infomdate, no addbsi. Mirrors the FFmpeg-encoded fixture
+    /// no infomdate, no addbsi. Mirrors the validator-encoded fixture
     /// `eac3-stereo-48000-192kbps`.
     #[test]
     fn parses_192kbps_indep_stereo() {

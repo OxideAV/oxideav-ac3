@@ -367,11 +367,11 @@ pub fn parse_with(br: &mut BitReader<'_>, bsi: &Bsi) -> Result<AudFrm> {
     // `if(chexpstr[blk][ch] != reuse) {chbwcod[ch]; ...}`.
     //
     // Earlier rounds inverted this — moving the bits into audblk —
-    // and the round-2 comment doubled down. ffmpeg follows the table
-    // verbatim and rejects every frame our encoder emitted, surfacing
-    // as the cascade "new bit allocation info must be present in
-    // block 0" / "delta bit allocation strategy reserved" / "error in
-    // bit allocation".
+    // and the round-2 comment doubled down. The validator binary
+    // rejects every frame our encoder emitted under the inverted
+    // layout, surfacing as the cascade "new bit allocation info must
+    // be present in block 0" / "delta bit allocation strategy
+    // reserved" / "error in bit allocation".
     if a.expstre {
         for blk in 0..num_blocks {
             if a.cplinu_blk[blk] {
@@ -719,8 +719,9 @@ mod tests {
     fn frame_exp_strat_table_spot_check_e2_10() {
         // Row 0: D15 R R R R R
         assert_eq!(FRAME_EXP_STRAT_TABLE[0], [D15, R, R, R, R, R]);
-        // Row 16: D45 D15 R R R R (the canonical FFmpeg pattern — every
-        // corpus FFmpeg-encoded fixture picks row 16 for fbw channels).
+        // Row 16: D45 D15 R R R R (the prevailing corpus pattern — every
+        // validator-encoded fixture in our corpus picks row 16 for fbw
+        // channels).
         assert_eq!(FRAME_EXP_STRAT_TABLE[16], [D45, D15, R, R, R, R]);
         // Row 28: D45 D45 D45 D25 R R (used by the 64kbps low-rate
         // stereo fixture's frmcplexpstr).
@@ -759,7 +760,7 @@ mod tests {
             bits.push((1, 0));
         }
         // expstre==0 + acmod>1 + ncplblks>0 → frmcplexpstr (5 bits).
-        // Pick row 16 to match the FFmpeg-canonical pattern.
+        // Pick row 16 to match the prevailing corpus pattern.
         bits.push((5, 16));
         // 2 fbw channels × frmchexpstr (5 bits each).
         bits.push((5, 16));

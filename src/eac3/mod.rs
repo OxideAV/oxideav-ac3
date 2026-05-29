@@ -34,8 +34,9 @@
 //!   S16 zeros per syncframe (or `numblks × 256 × nchans` for short-
 //!   block frames). This is enough to unblock the corpus tests,
 //!   which now report measurable per-channel diffs against the
-//!   FFmpeg reference (low PSNR because round-1 is silent, but the
-//!   test machinery runs end-to-end instead of bailing at `bsi.rs`).
+//!   validator binary's decode (low PSNR because round-1 is silent,
+//!   but the test machinery runs end-to-end instead of bailing at
+//!   `bsi.rs`).
 //! * **Encoder** ([`encoder`]) is the existing round-0 emitter for
 //!   1.0 / 2.0 / 5.1 indep substreams + 7.1 indep+dep pair. Untouched
 //!   by this commit.

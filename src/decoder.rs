@@ -95,7 +95,7 @@ struct Ac3Decoder {
     /// instead of LoRo. Toggled by [`make_decoder_ltrt`]; the regular
     /// [`make_decoder`] / [`make_eac3_decoder`] factories leave this
     /// off (LoRo is §7.8.2's "preferred when mono is the ultimate
-    /// target" path and matches FFmpeg's default).
+    /// target" path and is the spec's default downmix matrix).
     prefer_ltrt: bool,
 }
 

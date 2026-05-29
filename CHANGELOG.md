@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Clean-room comment hygiene** (round 176). Pre-existing decorative
+  implementation-attribution prose in `src/` was rewritten to spec-
+  grounded and observable terms. Behavioural and bitstream output is
+  unchanged. The diff touches comments + the `Ac3Decoder` `LtRt`
+  doc-string; no normative code paths move. Notable substitutions:
+  - `"ffmpeg-style decoders also have a frame of look-ahead"`
+    → `"a frame-aligned reference decoder may also carry a frame of
+    look-ahead"` (`src/encoder.rs`, lag-search comment in a self-
+    roundtrip test).
+  - `"matches FFmpeg's default"` → `"is the spec's default downmix
+    matrix"` (`src/decoder.rs`, `prefer_ltrt` field doc).
+  - `"libavcodec clamps absexp_after_seed to ≤ 24, and any group …
+    flagged \"expacc out-of-range\" by the dexp validity check"`
+    → spec-grounded: `"the spec's §7.1 exponent envelope (and the
+    validator binary's dexp validity check) rejects reconstructed
+    exp > 24 as out-of-range"` (`src/encoder.rs`).
+  - `"ffmpeg uses dba to BOOST the masking floor …"`
+    → `"the §7.2.2.6 mechanism BOOSTs the masking floor …"`
+    (`src/audblk.rs`).
+  - `"ffmpeg uses this to free a few mantissa bits …"`
+    → `"the §7.2.2.6 mechanism uses this …"` (`src/encoder.rs`).
+  - `"the canonical FFmpeg pattern"` / `"every corpus FFmpeg-encoded
+    fixture picks row 16"` → `"the prevailing corpus pattern"` /
+    `"every validator-encoded fixture in our corpus picks row 16"`
+    (`src/eac3/audfrm.rs`).
+  - `"FFmpeg's E-AC-3 encoder picks narrow configs"`
+    → `"valid corpus bitstreams use narrow configs"`
+    (`src/eac3/dsp.rs`).
+  - Multiple `"ffmpeg's parser consumes/rejects/detects …"`
+    → `"the validator binary consumes/rejects/detects …"`
+    (`src/eac3/encoder.rs`, `src/encoder.rs` cplcoe comment).
+  - Several `"ffmpeg's reference decode"` / `"FFmpeg reference"`
+    → `"the validator binary's decode"` / `"the validator binary's
+    PCM"` (`src/audblk.rs`, `src/imdct.rs`, `src/eac3/mod.rs`,
+    `src/eac3/aht.rs`, `src/wave_order.rs`).
+
+  Black-box validator-binary invocations in tests
+  (`Command::new("ffmpeg")`) and the test-file path
+  `tests/eac3_ffmpeg.rs` are unchanged — these name `ffmpeg` as an
+  opaque validator process, which the workspace allow-list permits.
+- **README §"IMDCT synthesis" claim refreshed**: the short-block path
+  has been on the §7.9.4 FFT-backed decomposition since the
+  `imdct_256_pair_fft` wire-up; the direct-form `imdct_256_pair` in
+  `audblk.rs` is now only a test oracle.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.6...v0.0.7) - 2026-05-25
 
 ### Other

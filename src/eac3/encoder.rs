@@ -729,10 +729,10 @@ impl Eac3Encoder {
         // says "the fields for the full exponent strategy shall be
         // present in each audio block" — but Table E1.3 makes clear
         // those fields are still emitted in audfrm, just indexed by
-        // block. ffmpeg's parser consumes them in audfrm and rejects
-        // any frame that doesn't supply them, surfacing as the
-        // "new bit allocation info must be present in block 0" /
-        // "delta bit allocation strategy reserved" / "error in bit
+        // block. The validator binary's parser consumes them in audfrm
+        // and rejects any frame that doesn't supply them, surfacing
+        // as the "new bit allocation info must be present in block 0"
+        // / "delta bit allocation strategy reserved" / "error in bit
         // allocation" cascade once the parser misaligns.
         //
         // Coupling: cplinu==0 for every block of every substream we

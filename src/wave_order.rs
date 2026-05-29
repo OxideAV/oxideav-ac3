@@ -20,9 +20,9 @@
 //! interleaved frame).
 //!
 //! Consumers that interpret the decoded PCM as a WAV file (or any
-//! WAVE_FORMAT_EXTENSIBLE-compliant sink — ffmpeg's `pcm_s16le` mux,
-//! foobar2000, miniaudio, …) expect samples laid out in the
-//! `dwChannelMask` / SMPTE order:
+//! WAVE_FORMAT_EXTENSIBLE-compliant sink — e.g. a validator binary's
+//! `pcm_s16le` mux, foobar2000, miniaudio, …) expect samples laid
+//! out in the `dwChannelMask` / SMPTE order:
 //!
 //! | bit | speaker            |
 //! |-----|--------------------|
@@ -41,7 +41,7 @@
 //!
 //! Round 6 of `oxideav-ac3` adds this conversion so the decoder's S16
 //! output is byte-for-byte identical (modulo IMDCT rounding) to the
-//! reference S16LE PCM produced by black-box ffmpeg-binary decode of
+//! reference S16LE PCM produced by black-box validator-binary decode of
 //! the same fixtures; validated in the multichannel reorder integration
 //! tests in `tests/`. Mono and stereo paths are a no-op.
 //!
@@ -104,13 +104,14 @@ pub fn wave_to_bitstream_map(acmod: u8, lfeon: bool) -> [u8; 8] {
         4 => {
             // 2/1 — bitstream (L, R, S). WAV channel-mask convention
             // for "stereo + back center" is L, R, BC at bits {0, 1,
-            // 8}. ffmpeg's AC-3 decoder maps S to the BACK_CENTER
-            // slot but the mask emitted in expected.wav for AC-3 2/1
-            // uses BL (bit 4) — verified empirically by the
-            // ac3-2-1-48000-256kbps fixture: ours-ch0=L, ours-ch1=R,
-            // ours-ch2=S already line up with ref ch0..ch2 (the
-            // 31.79 % match-pct on round 5 was the L+R hit, ch2
-            // diverging because of IMDCT rounding on the S channel).
+            // 8}. The validator binary's AC-3 decoder maps S to the
+            // BACK_CENTER slot, but the mask emitted in expected.wav
+            // for AC-3 2/1 uses BL (bit 4) — verified empirically by
+            // the ac3-2-1-48000-256kbps fixture: ours-ch0=L,
+            // ours-ch1=R, ours-ch2=S already line up with ref
+            // ch0..ch2 (the 31.79 % match-pct on round 5 was the L+R
+            // hit, ch2 diverging because of IMDCT rounding on the S
+            // channel).
             // We therefore leave 2/1 unpermuted: bitstream (L, R, S)
             // → WAV (L, R, S).
             map[0] = 0; // L
