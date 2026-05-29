@@ -30,18 +30,14 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       language and to keep zero-overhead decoding the default. The
       CRC-16 primitive (poly 0x8005, MSB-first) moved from
       `src/encoder.rs` to a new `src/crc.rs` module so the encoder
-      + decoder share one byte-exact implementation. **Known
-      issue**: our own AC-3 encoder currently stores `crc2` in
-      direct form (`data mod g(x)`) instead of the augmented form
-      (`data·x^16 mod g(x)`) the §7.10.1 residue test implies, so
-      our self-produced bitstreams fail the verifier's `crc2_ok`
-      (`crc1_ok` still passes because the encoder solves crc1
-      correctly). A spec-strict decoder will mark those frames
-      crc2-invalid; a §6.1.2 lenient decoder still plays them. The
-      one-line encoder fix (`payload || [0, 0]` flush before the
-      CRC) is deferred to a follow-up round because it changes
-      every encoded bitstream and warrants its own cross-decode
-      audit.
+      + decoder share one byte-exact implementation. **Round 187**
+      closes the r182 follow-up: both encoders now emit `crc2` in
+      the §7.10.1 **augmented form** (`r(x) = data·x^16 mod g(x)`,
+      computed as `ac3_crc_update(ac3_crc_update(0, body), &[0,
+      0])`), so a spec-strict residue-checking decoder accepts our
+      own bitstreams on `crc2_ok` as well as `crc1_ok`. The three
+      decoder tests that previously pinned the r182 deferral now
+      assert `crc2_ok = Some(true)` on encoder output.
 - [x] Audio-block parse (§5.4.3) — every §5.4.3.x field cited and
       captured into `AudBlkSideInfo` for introspection
 - [x] Exponent decode (§7.1) + parametric bit allocation (§7.2)

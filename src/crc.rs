@@ -24,18 +24,14 @@
 //! `residue([2..crc1_end]) == 0`. The verifier below implements
 //! that residue check.
 //!
-//! Note: our own AC-3 encoder currently stores `crc2 =
-//! ac3_crc_update(0, last_3_8_payload)` (a direct-form CRC of
-//! `data mod g(x)`) into the trailing field, which does NOT
-//! satisfy the spec's residue-zero property when shifted through.
-//! That is a separate encoder bug (the spec implies an augmented
-//! `data·x^16 mod g(x)` form), to be addressed in a follow-up
-//! round. The verifier here is spec-correct against the reference
-//! formulation and against any third-party encoder that follows
-//! §7.10.1 (including ffmpeg). When applied to our own encoder's
-//! current output, `crc2_ok` returns `Some(false)` even though
-//! `crc1_ok` returns `Some(true)`. This is intentional:
-//! `verify_packet_crc` reports the spec property, not the bug.
+//! Our own AC-3 and E-AC-3 encoders emit both CRC words in the
+//! spec's reference form: `crc1` is solved via
+//! `ac3_crc_solve_prefix` (gauss-elimination over GF(2)) so the
+//! LFSR reaches zero at the 5/8 boundary, and `crc2` is computed
+//! in **augmented** form (`ac3_crc_update(0, body || [0, 0])`) so
+//! the LFSR reaches zero at frame end. The augmented form follows
+//! the standard CRC codeword property `data·x^16 + r(x) ≡ 0 mod
+//! g(x)` — see encoder `emit_*_packet` for the placement.
 //!
 //! Both checks are bit-exact CRC-16 over poly 0x8005, MSB-first.
 
@@ -426,8 +422,8 @@ mod tests {
     /// 5/8 point, and the trailing 2 bytes are filled with the
     /// *augmented* CRC (`ac3_crc_update(0, data || [0, 0])`) so
     /// the LFSR residue is zero at the end of the whole frame
-    /// too. This mirrors what a spec-compliant encoder (e.g.
-    /// ffmpeg) writes for `crc2`.
+    /// too. This mirrors what a §7.10.1-compliant encoder
+    /// writes for `crc2`.
     #[test]
     fn synthetic_frame_passes_both_checks() {
         let frame_bytes = 256usize;

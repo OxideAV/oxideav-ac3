@@ -1613,18 +1613,36 @@ impl Ac3Encoder {
             "crc1 solver produced a non-zero residue"
         );
 
-        // crc2 covers the last 3/8 of the syncframe: bytes
-        // five_eighths_bytes .. frame_bytes with the 2-byte crc2 field
-        // itself at the tail. The CRC value to emit is the running CRC
-        // over the data without the field; ATSC A/52 §6.1.7 verifiers
-        // compare the recomputed value to the stored bytes (not a
-        // residue check), which suits this "augmented" CRC formulation
-        // — the residue-of-the-augmented-stream property only holds in
-        // the direct CRC formulation.
-        let crc2_val = ac3_crc_update(0, &frame[five_eighths_bytes..(self.frame_bytes - 2)]);
+        // crc2 covers the entire post-syncword region of the
+        // syncframe per §7.10.1: "if the calculation is continued
+        // until all data in the syncframe has been shifted through,
+        // and the value is again equal to zero, then crc2 is
+        // considered valid." This is the **augmented-form**
+        // emit: the LFSR is shifted past the body bytes AND past
+        // 16 trailing zero bits (the crc2 field placeholder), and
+        // the resulting register value is written into the crc2
+        // field. By the standard CRC-augmented-codeword property
+        // (`data·x^16 + r(x) ≡ 0 mod g(x)`), the residue check
+        // `ac3_crc_update(0, &frame[2..frame_bytes]) == 0` then
+        // succeeds on the decoder side.
+        //
+        // We can start the running CRC at byte five_eighths_bytes
+        // rather than at byte 2 because the crc1 solver above
+        // already drove the register to zero at the 5/8 boundary
+        // (asserted by the debug_assert), so the residue from
+        // [2..five_eighths_bytes] is identically zero and chaining
+        // forward from five_eighths_bytes is equivalent to chaining
+        // from byte 2.
+        let body_residue = ac3_crc_update(0, &frame[five_eighths_bytes..(self.frame_bytes - 2)]);
+        let crc2_val = ac3_crc_update(body_residue, &[0u8, 0u8]);
         let n = self.frame_bytes;
         frame[n - 2] = (crc2_val >> 8) as u8;
         frame[n - 1] = (crc2_val & 0xFF) as u8;
+        debug_assert_eq!(
+            ac3_crc_update(0, &frame[2..self.frame_bytes]),
+            0,
+            "crc2 emit produced a non-zero post-syncword residue"
+        );
 
         self.packet_queue.push(
             Packet::new(0, TimeBase::new(1, self.sample_rate as i64), frame).with_pts(self.pts),

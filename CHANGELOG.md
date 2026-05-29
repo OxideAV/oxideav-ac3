@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **AC-3 + E-AC-3 encoder `crc2` emit now uses the spec's augmented
+  CRC form** (round 187 / r187). ATSC A/52:2018 §7.10.1 defines a
+  valid `crc2` as the value the LFSR holds at end-of-frame after
+  shifting through the post-syncword body *and* the 16-bit crc2
+  field — equivalently `r(x) = data·x^16 mod g(x)` (the augmented
+  CRC codeword property `data·x^16 + r(x) ≡ 0 mod g(x)`). The
+  previous emit stored `ac3_crc_update(0, &frame[body_start..(n -
+  2)])` (a direct-form `data mod g(x)` value), which a
+  spec-strict residue-checking decoder marks invalid because
+  shifting that value through the trailing LFSR positions yields a
+  non-zero register. Each encoder now does
+  `ac3_crc_update(ac3_crc_update(0, body), &[0, 0])` and a debug
+  assertion pins the post-syncword residue to zero on every
+  emitted syncframe. AC-3 (`encoder.rs::emit_frame_packet`)
+  chains from the 5/8 boundary (the crc1 solver guarantees the
+  running CRC is zero there); E-AC-3
+  (`eac3/encoder.rs::emit_packet`) starts from byte 2 because
+  Annex E syncframes carry no `crc1`. `crc1` emit is unchanged
+  (already spec-correct via `ac3_crc_solve_prefix`); body and side
+  info bytes are unchanged. The r182 verifier now reports
+  `crc2_ok = Some(true)` on our own emitted bitstreams, so a
+  lenient §6.1.2 decoder behaves identically (it always accepted
+  on `crc1_ok = true`) but a strict residue-checking decoder will
+  no longer flag our frames as `crc2`-invalid.
+
+  The three r182 decoder tests that pinned the bug now assert
+  `crc2_ok = Some(true)` on encoder output:
+  `verify_packet_crc_matches_residue_on_ffmpeg_fixture` (residue
+  check against the FFmpeg fixture, unchanged); the renamed
+  `ac3_encoder_output_has_spec_correct_crc1_and_crc2` (asserts
+  both crc fields on our own AC-3 output);
+  `verify_packet_crc_dispatches_eac3_path_correctly` (asserts
+  `crc2_ok = Some(true)` on our own E-AC-3 output, plus the
+  `crc1_ok = None` dispatch contract). The deferred-followup
+  caveat in the r182 README + crc module docs is removed.
+
 ### Added
 
 - **§7.10.1 CRC verification API** (round 182). The CRC-16

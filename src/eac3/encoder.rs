@@ -942,10 +942,23 @@ impl Eac3Encoder {
         let mut frame = bw.into_bytes();
         debug_assert_eq!(frame.len(), sub.frame_bytes);
 
-        let crc2_val = ac3_crc_update(0, &frame[2..(sub.frame_bytes - 2)]);
+        // crc2 in augmented form per §7.10.1 (Annex E §E.1.2 inherits
+        // the same residue check). Shift the body + 16 trailing zero
+        // bits through the LFSR; the resulting register value goes in
+        // the crc2 field so a spec-strict decoder's residue check
+        // `ac3_crc_update(0, post_syncword) == 0` succeeds. E-AC-3
+        // syncframes have no crc1 (§E.1.2 elides it), so the running
+        // CRC starts at byte 2 (post-syncword).
+        let body_residue = ac3_crc_update(0, &frame[2..(sub.frame_bytes - 2)]);
+        let crc2_val = ac3_crc_update(body_residue, &[0u8, 0u8]);
         let n = sub.frame_bytes;
         frame[n - 2] = (crc2_val >> 8) as u8;
         frame[n - 1] = (crc2_val & 0xFF) as u8;
+        debug_assert_eq!(
+            ac3_crc_update(0, &frame[2..sub.frame_bytes]),
+            0,
+            "E-AC-3 crc2 emit produced a non-zero post-syncword residue"
+        );
         Ok(frame)
     }
 }
