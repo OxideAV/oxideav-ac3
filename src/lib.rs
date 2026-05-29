@@ -21,6 +21,7 @@
 
 pub mod audblk;
 pub mod bsi;
+pub mod crc;
 pub mod decoder;
 pub mod downmix;
 pub mod eac3;

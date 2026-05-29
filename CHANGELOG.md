@@ -7,7 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **§7.10.1 CRC verification API** (round 182). The CRC-16
+  primitive that the encoder uses to fill `crc1` is now exposed
+  for decoder-side validation under a new `crc` module:
+  `verify_ac3_syncframe`, `verify_eac3_syncframe`,
+  `crc1_boundary_bytes`, the public `CrcStatus` enum, and the
+  top-level `decoder::verify_packet_crc` peek-and-dispatch
+  function. The verifier implements the spec's **residue check**:
+  shift the post-syncword data through the LFSR (with the stored
+  CRC fields included) and the register must read zero at the
+  end. The decode pipeline does not call this automatically — it
+  stays opt-in to match the spec's "may be used at the discretion
+  of the decoder" language and to keep zero-overhead decoding the
+  default. Empirically validated against the FFmpeg-produced
+  `tests/fixtures/sine440_stereo.ac3` corpus: every syncframe in
+  the fixture satisfies the spec residue check on both `crc1` and
+  `crc2`. `CrcStatus` reports `crc1_ok` / `crc2_ok` independently
+  so callers can implement either of the §6.1.2 strategies
+  (accept on either CRC valid, or require both). E-AC-3 reports
+  `crc1_ok = None` (the Annex E syncframe has no `crc1` field per
+  Table E1.2). Adds 14 unit tests on the new primitive + 3
+  end-to-end tests
+  (`verify_packet_crc_matches_residue_on_ffmpeg_fixture`,
+  `ac3_encoder_output_has_spec_correct_crc1`,
+  `verify_packet_crc_dispatches_eac3_path_correctly`) and
+  single-bit-flip tamper detection on the ffmpeg fixture path.
+  Total +17 lib tests; full suite remains green (134 → 151
+  lib tests, all integration tests unchanged).
+
+### Known issues
+
+- **Our own AC-3 / E-AC-3 encoder writes `crc2` in direct form**
+  (`data mod g(x)`) rather than the augmented form
+  (`data·x^16 mod g(x)`) the §7.10.1 residue test implies. The
+  encoder's `crc1` is spec-compliant (a future-round
+  `ac3_crc_solve_prefix` already drives the 5/8 residue to zero
+  per the spec). The `crc2` mismatch means our emitted bitstreams
+  will be flagged as crc2-invalid by spec-strict decoders running
+  the residue check (a §6.1.2 lenient decoder that accepts on
+  either CRC will still play them because `crc1` validates). The
+  fix is a small encoder change: replace `crc2 = ac3_crc_update(
+  0, payload)` with `crc2 = ac3_crc_update(0, payload || [0, 0])`
+  so the trailing 16 zero bits flush the LFSR through `data·x^16
+  mod g(x)`. Deferred to a future round because it changes every
+  encoded bitstream and warrants its own ffmpeg cross-decode
+  audit. The new `decoder::tests::ac3_encoder_output_has_spec_
+  correct_crc1` test will tighten once the encoder fix lands.
+
 ### Changed
+
+- **CRC-16 primitive moved to a shared module** (round 182).
+  `ac3_crc_update` and `ac3_crc_solve_prefix` now live in
+  `crate::crc` instead of `crate::encoder` so the decoder can
+  reuse the same byte-exact LFSR. `crate::encoder` re-exports the
+  two functions under their original names (`pub(crate) use
+  crate::crc::{ac3_crc_update, ac3_crc_solve_prefix}`) so the
+  `eac3/encoder.rs` call sites continue to compile unchanged. No
+  bitstream output is affected; the diff is purely a code move +
+  an additive public API.
 
 - **Clean-room comment hygiene** (round 176). Pre-existing decorative
   implementation-attribution prose in `src/` was rewritten to spec-

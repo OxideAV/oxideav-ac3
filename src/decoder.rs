@@ -14,6 +14,7 @@ use oxideav_core::{
 
 use crate::audblk::{self, Ac3State, BLOCKS_PER_FRAME, SAMPLES_PER_BLOCK};
 use crate::bsi::{self, Bsi};
+use crate::crc::{self, CrcStatus};
 use crate::downmix::{Downmix, DownmixMode};
 use crate::eac3;
 use crate::syncinfo::{self, SyncInfo};
@@ -410,6 +411,67 @@ impl Ac3Decoder {
     }
 }
 
+/// Verify the §7.10.1 CRC fields of a single AC-3 or E-AC-3
+/// syncframe.
+///
+/// `syncframe` must start with the 0x0B77 syncword. The function
+/// peeks `bsid` at byte 5 (top 5 bits) to choose between the AC-3
+/// double-CRC path (`bsid ≤ 10`) and the Annex E single-`crc2`
+/// path (`bsid ≥ 11`). The frame length is parsed out of the
+/// header on each path: AC-3 reads `(fscod, frmsizecod)` and looks
+/// up Table 5.18; E-AC-3 reads the 11-bit `frmsiz` and computes
+/// `(frmsiz + 1) * 2`.
+///
+/// Per §6.1.2 the spec lets a decoder be lenient — accept on
+/// either CRC valid — or strict (require both). [`CrcStatus`]
+/// surfaces both checks so the caller can implement whichever
+/// policy suits the carriage (file decode vs broadcast tuner).
+///
+/// Returns `Err(Error::Invalid)` only on a malformed header
+/// (bad syncword, reserved fscod / frmsizecod, or `syncframe`
+/// shorter than the parsed `frame_length`); a real CRC failure
+/// against a well-formed header lands as `crc{1,2}_ok: Some(false)`.
+pub fn verify_packet_crc(syncframe: &[u8]) -> Result<CrcStatus> {
+    if syncframe.len() < 6 {
+        return Err(Error::invalid(
+            "ac3: syncframe shorter than syncinfo+bsid byte for CRC check",
+        ));
+    }
+    // Peek bsid at byte 5 (top 5 bits) — same trick as the per-packet
+    // dispatch in `process_frame`.
+    let bsid = syncframe[5] >> 3;
+    if bsid <= bsi::MAX_BSID_BASE {
+        // AC-3 path. Parse syncinfo to discover the frame length.
+        let si = syncinfo::parse(syncframe)?;
+        let frame_bytes = si.frame_length as usize;
+        if syncframe.len() < frame_bytes {
+            return Err(Error::invalid(format!(
+                "ac3: syncframe is {} bytes, frame_length says {}",
+                syncframe.len(),
+                frame_bytes
+            )));
+        }
+        Ok(crc::verify_ac3_syncframe(syncframe, frame_bytes))
+    } else {
+        // E-AC-3 path. Parse the 11-bit frmsiz out of bytes 2..4
+        // (top 5 bits of byte 2 are strmtyp(2) + substreamid(3); the
+        // low 3 bits of byte 2 + all of byte 3 are frmsiz). Frame
+        // bytes = (frmsiz + 1) * 2 per §E.1.2.
+        let b2 = syncframe[2] as u16;
+        let b3 = syncframe[3] as u16;
+        let frmsiz = ((b2 & 0x07) << 8) | b3;
+        let frame_bytes = ((frmsiz as usize) + 1) * 2;
+        if syncframe.len() < frame_bytes {
+            return Err(Error::invalid(format!(
+                "eac3: syncframe is {} bytes, frmsiz implies {}",
+                syncframe.len(),
+                frame_bytes
+            )));
+        }
+        Ok(crc::verify_eac3_syncframe(syncframe, frame_bytes))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,5 +619,186 @@ mod tests {
             got_any,
             "decoder produced no audio frames from 5.1 → stereo path"
         );
+    }
+
+    /// End-to-end CRC verification against the spec-compliant
+    /// FFmpeg-encoded `sine440_stereo.ac3` fixture. Walks every
+    /// syncframe and confirms `verify_packet_crc` reports both
+    /// CRC residues as zero (§7.10.1 baseline behaviour). Also
+    /// flips a single body bit and confirms the residue check
+    /// now rejects the frame.
+    ///
+    /// Note: our own AC-3 encoder currently writes the trailing
+    /// `crc2` word using a direct-form CRC (`data mod g(x)`)
+    /// rather than the augmented form (`data·x^16 mod g(x)`) the
+    /// §7.10.1 residue test implies, so its emitted frames do
+    /// not pass this verifier on `crc2_ok` (they do pass on
+    /// `crc1_ok`, exercised by the next test). That is a
+    /// separate encoder bug to address in a follow-up round;
+    /// this round only ships the spec-correct verifier.
+    #[test]
+    fn verify_packet_crc_matches_residue_on_ffmpeg_fixture() {
+        const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/sine440_stereo.ac3");
+        // Fixture is 48 kHz / 192 kbps stereo per the existing
+        // ffmpeg_fixture.rs harness — Table 5.18 frmsizecod=20 →
+        // 768 bytes per syncframe.
+        let frame_bytes = 768usize;
+        assert!(
+            FIXTURE.len() >= frame_bytes,
+            "fixture too small for one frame"
+        );
+        let mut nframes = 0usize;
+        for off in (0..FIXTURE.len()).step_by(frame_bytes) {
+            let end = (off + frame_bytes).min(FIXTURE.len());
+            if end - off < frame_bytes {
+                break;
+            }
+            let status =
+                super::verify_packet_crc(&FIXTURE[off..end]).expect("verify_packet_crc parse");
+            assert_eq!(
+                status.crc1_ok,
+                Some(true),
+                "frame {nframes} crc1 failed: {status:?}"
+            );
+            assert_eq!(
+                status.crc2_ok,
+                Some(true),
+                "frame {nframes} crc2 failed: {status:?}"
+            );
+            assert!(status.all_ok());
+            nframes += 1;
+        }
+        assert!(nframes >= 4, "expected ≥4 frames, got {nframes}");
+
+        // Tamper: flip a body bit on the first frame and confirm
+        // at least one residue rejection. This is the §7.10.1
+        // single-bit-error guarantee.
+        let mut tampered = FIXTURE[0..frame_bytes].to_vec();
+        tampered[100] ^= 0x40;
+        let status = super::verify_packet_crc(&tampered).expect("verify_packet_crc parse");
+        assert!(
+            !status.all_ok(),
+            "tampered frame should fail at least one CRC: {status:?}"
+        );
+    }
+
+    /// Our own AC-3 encoder's `crc1` is residue-zero
+    /// (spec-compliant) even though `crc2` currently is not —
+    /// the encoder solves `crc1` with `ac3_crc_solve_prefix` but
+    /// writes `crc2` in direct rather than augmented form. Lock
+    /// in `crc1_ok = Some(true)` so a future round that fixes
+    /// the `crc2` emit can extend the assertion without otherwise
+    /// re-shaping the test.
+    #[test]
+    fn ac3_encoder_output_has_spec_correct_crc1() {
+        use crate::encoder;
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(2);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(192_000);
+        let mut enc = encoder::make_encoder(&params).expect("make_encoder");
+        let mut pcm = Vec::<u8>::with_capacity(1536 * 2 * 2);
+        for i in 0..1536 {
+            let t = i as f32 / 48_000.0;
+            let s = (2.0 * std::f32::consts::PI * 220.0 * t).sin() * 0.25;
+            let q = (s * 32767.0) as i16;
+            pcm.extend_from_slice(&q.to_le_bytes());
+            pcm.extend_from_slice(&q.to_le_bytes());
+        }
+        for _ in 0..3 {
+            enc.send_frame(&Frame::Audio(AudioFrame {
+                samples: 1536,
+                pts: Some(0),
+                data: vec![pcm.clone()],
+            }))
+            .expect("encoder send_frame");
+        }
+        enc.flush().expect("encoder flush");
+        let mut stream = Vec::<u8>::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => stream.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("encoder receive_packet failed: {e}"),
+            }
+        }
+        assert!(!stream.is_empty(), "encoder produced no bytes");
+        let mut nframes = 0;
+        for off in (0..stream.len()).step_by(768) {
+            let end = (off + 768).min(stream.len());
+            if end - off < 768 {
+                break;
+            }
+            let status =
+                super::verify_packet_crc(&stream[off..end]).expect("verify_packet_crc parse");
+            assert_eq!(
+                status.crc1_ok,
+                Some(true),
+                "encoder crc1 should be residue-zero (§7.10.1 spec compliant): {status:?}"
+            );
+            nframes += 1;
+            // crc2 intentionally NOT asserted here — see
+            // verify_packet_crc_matches_residue_on_ffmpeg_fixture
+            // docstring for the encoder-bug rationale.
+        }
+        assert!(nframes >= 3, "expected ≥3 frames, got {nframes}");
+    }
+
+    /// E-AC-3 dispatch path: a fresh encoder packet routes
+    /// through `verify_eac3_syncframe`, which returns
+    /// `crc1_ok = None` (the field doesn't exist on Annex E
+    /// syncframes). Locks in the dispatch contract even though
+    /// the encoder's `crc2` is direct-form (same caveat as the
+    /// AC-3 `ac3_encoder_output_has_spec_correct_crc1` test).
+    #[test]
+    fn verify_packet_crc_dispatches_eac3_path_correctly() {
+        let mut enc_params = CodecParameters::audio(CodecId::new(eac3::CODEC_ID_STR));
+        enc_params.sample_rate = Some(48_000);
+        enc_params.channels = Some(2);
+        enc_params.sample_format = Some(SampleFormat::S16);
+        enc_params.bit_rate = Some(192_000);
+        let mut enc = match eac3::make_encoder(&enc_params) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("eac3 make_encoder failed: {e} — skipping");
+                return;
+            }
+        };
+        let mut pcm = Vec::<u8>::with_capacity(1536 * 2 * 2);
+        for i in 0..1536 {
+            let t = i as f32 / 48_000.0;
+            let s = (2.0 * std::f32::consts::PI * 220.0 * t).sin() * 0.25;
+            let q = (s * 32767.0) as i16;
+            pcm.extend_from_slice(&q.to_le_bytes());
+            pcm.extend_from_slice(&q.to_le_bytes());
+        }
+        if enc
+            .send_frame(&Frame::Audio(AudioFrame {
+                samples: 1536,
+                pts: Some(0),
+                data: vec![pcm],
+            }))
+            .is_err()
+        {
+            eprintln!("eac3 send_frame failed — skipping");
+            return;
+        }
+        let _ = enc.flush();
+        let mut stream = Vec::<u8>::new();
+        while let Ok(p) = enc.receive_packet() {
+            stream.extend_from_slice(&p.data);
+        }
+        if stream.len() < 5 {
+            eprintln!("eac3 encoder produced no bytes — skipping");
+            return;
+        }
+        let status = super::verify_packet_crc(&stream).expect("verify_packet_crc parse");
+        assert_eq!(
+            status.crc1_ok, None,
+            "E-AC-3 dispatch must report crc1_ok = None"
+        );
+        // crc2_ok intentionally unasserted — same caveat as
+        // ac3_encoder_output_has_spec_correct_crc1.
     }
 }

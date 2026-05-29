@@ -12,6 +12,36 @@ framework but usable standalone.
 Early WIP. Implementation follows the A/52 spec incrementally:
 
 - [x] Sync frame + BSI parse (§5.3 / §5.4.1-2)
+- [x] **§7.10.1 CRC verification API** (round 182). Opt-in
+      decoder side: `decoder::verify_packet_crc(syncframe) ->
+      CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)
+      vs E-AC-3 (single `crc2`) and returns `crc1_ok` / `crc2_ok`
+      independently so callers can implement either §6.1.2
+      strategy (accept on either CRC valid, or require both). The
+      verifier implements the spec's **residue check**: shift the
+      post-syncword data through the LFSR (with the stored CRC
+      fields included) and the register must read zero at the end.
+      Validated end-to-end against the existing FFmpeg-encoded
+      `tests/fixtures/sine440_stereo.ac3` corpus — every syncframe
+      satisfies the residue check; a single body-bit flip then
+      breaks at least one CRC. The decode pipeline does not call
+      the verifier automatically; it stays opt-in to match the
+      spec's "may be used at the discretion of the decoder"
+      language and to keep zero-overhead decoding the default. The
+      CRC-16 primitive (poly 0x8005, MSB-first) moved from
+      `src/encoder.rs` to a new `src/crc.rs` module so the encoder
+      + decoder share one byte-exact implementation. **Known
+      issue**: our own AC-3 encoder currently stores `crc2` in
+      direct form (`data mod g(x)`) instead of the augmented form
+      (`data·x^16 mod g(x)`) the §7.10.1 residue test implies, so
+      our self-produced bitstreams fail the verifier's `crc2_ok`
+      (`crc1_ok` still passes because the encoder solves crc1
+      correctly). A spec-strict decoder will mark those frames
+      crc2-invalid; a §6.1.2 lenient decoder still plays them. The
+      one-line encoder fix (`payload || [0, 0]` flush before the
+      CRC) is deferred to a follow-up round because it changes
+      every encoded bitstream and warrants its own cross-decode
+      audit.
 - [x] Audio-block parse (§5.4.3) — every §5.4.3.x field cited and
       captured into `AudBlkSideInfo` for introspection
 - [x] Exponent decode (§7.1) + parametric bit allocation (§7.2)
