@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.7...v0.0.8) - 2026-05-30
+
+### Other
+
+- ac3 round 190 (r190): refresh stale lib.rs + eac3/mod.rs module docstrings
+- ac3 round 187 (r187): encoder crc2 in §7.10.1 augmented form
+- ac3 round 182 (r182): opt-in §7.10.1 decoder CRC verification API
+- ac3 round 176 (r176): clean-room comment hygiene — scrub decorative implementation-attribution prose
+- eac3 round 172 (r172): SPX attenuation (§3.6.4.2.3) border notch filter
+
 ### Documentation
 
 - **Refresh stale `lib.rs` and `eac3/mod.rs` module docstrings**
