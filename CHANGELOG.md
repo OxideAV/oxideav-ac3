@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **Refresh stale `lib.rs` and `eac3/mod.rs` module docstrings**
+  (round 190 / r190). The crate-root docstring previously billed
+  the codec as an "initial skeleton" that "emits PCM frames
+  (currently silence)" with "real IMDCT, bit allocation, exponent
+  decode, and mantissa dequantization … staged for follow-up
+  commits", and listed `audblk` + transform synthesis as `TODO`.
+  This is the page docs.rs shows as the public landing for
+  `oxideav-ac3`; it was about 180 round commits out of date.
+  Rewritten to describe the actual module layout — `syncinfo` /
+  `bsi` / `audblk` / `imdct` / `mdct` / `downmix` / `wave_order` /
+  `encoder` / `eac3` / `crc` — with each entry pinned to the
+  spec section it implements (§5..§7 for base AC-3, §E for
+  E-AC-3). The E-AC-3 register-block comment in `lib.rs` was
+  similarly stale ("Decoder side: round-1 path parses the BSI +
+  audfrm bit-accurately and emits silent PCM … Real DSP
+  (decouple + IMDCT) lands in round 2") and is rewritten to
+  describe the actual decoder path (AHT on fbw / LFE / coupling
+  channels, SPX with SPXATTEN border notch, transient pre-noise,
+  LoRo / LtRt downmix). `src/eac3/mod.rs`'s round-1 / round-2 /
+  round-6 / "deferred to round 7 and beyond" headings are
+  replaced with a status-based "Module layout" + "Known decoder
+  gaps" pair so future doc.rs visitors don't have to reason about
+  round numbering. The README's per-feature checklist stays the
+  authoritative source for round-by-round status.
+
+  No code, normative comments, or test behaviour changes; the
+  diff is comments + module-level `//!` docstrings only.
+  Behavioural test machinery (151 lib tests + integration suite)
+  is byte-identical pre/post.
+
 ### Fixed
 
 - **AC-3 + E-AC-3 encoder `crc2` emit now uses the spec's augmented

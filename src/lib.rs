@@ -1,21 +1,49 @@
-//! Pure-Rust **AC-3 (Dolby Digital)** audio decoder.
+//! Pure-Rust **AC-3 (Dolby Digital)** + **E-AC-3 (Enhanced AC-3,
+//! a.k.a. Dolby Digital Plus)** audio decoder + encoder.
 //!
-//! Implements ATSC A/52:2018 (= ETSI TS 102 366) elementary AC-3 streams.
+//! Implements ATSC A/52:2018 (= ETSI TS 102 366) elementary streams:
+//! base AC-3 (`bsid ≤ 10`) and Annex E (`bsid ∈ {11..=16}`).
 //!
-//! # Status
+//! # Architecture
 //!
-//! Initial skeleton: sync-frame + BSI parsing is complete and the decoder
-//! emits PCM frames (currently silence) with correct shape — real IMDCT,
-//! bit allocation, exponent decode, and mantissa dequantization are
-//! staged for follow-up commits.
-//!
-//! Architecture follows the spec's natural pipeline:
+//! The pipeline follows the spec's natural ordering. Each stage is a
+//! module that owns one slice of §5..§7 (base AC-3) or §E (E-AC-3):
 //!
 //! 1. [`syncinfo`] — 16-bit sync word 0x0B77, crc1, fscod, frmsizecod,
 //!    frame-length table lookup (§5.3.1 / §5.4.1 / Table 5.18).
-//! 2. [`bsi`] — Bit Stream Information: bsid (≤8 for base AC-3), bsmod,
-//!    acmod → channel-layout + lfeon + dialnorm + optional timecodes.
-//! 3. `audblk` + transform synthesis — TODO.
+//! 2. [`bsi`] — Bit Stream Information: bsid, bsmod, acmod →
+//!    channel-layout + lfeon + dialnorm + optional timecodes /
+//!    Annex D §2.3 alternate-syntax mix-level params (§5.4.2).
+//! 3. [`audblk`] — per-block exponent decode (§7.1), parametric bit
+//!    allocation (§7.2 with §7.2.2.6 delta-bit-allocation), mantissa
+//!    decode (§7.3), channel coupling (§7.4), rematrixing (§7.5),
+//!    dynamic-range compression (§7.7).
+//! 4. [`imdct`] + [`mdct`] — §7.9.4 FFT-backed 512-point IMDCT and
+//!    256-point short-block pair plus the forward transforms used by
+//!    the encoder; the direct-form references in `audblk` are kept
+//!    only as test oracles.
+//! 5. [`downmix`] — §7.8 LoRo + §7.8.2 LtRt (Dolby Surround
+//!    matrix-encoded) downmix matrices for every source acmod, with
+//!    Annex D §2.3 / E-AC-3 mixmdata mix-level extension routing.
+//! 6. [`wave_order`] — WAVE_FORMAT_EXTENSIBLE dwChannelMask channel
+//!    reorder for front-centre-bearing layouts (`acmod ∈ {3, 5, 7}`).
+//! 7. [`encoder`] — full base AC-3 encoder (acmod 1/0..3/2 + LFE,
+//!    per-channel D15/D25/D45 exponent strategies, DBA, 5-fbw
+//!    coupling, per-channel `fsnroffst[ch]` tuning, per-block
+//!    snroffst redistribution, §7.10.1 dual-CRC emission).
+//! 8. [`eac3`] — Annex E decoder + encoder. Decoder covers BSI,
+//!    audfrm (Tables E1.2 / E1.3), audblk DSP, §3.4 Adaptive Hybrid
+//!    Transform on fbw / LFE / coupling channels, §3.6 spectral
+//!    extension with §3.6.4.2.3 SPXATTEN border notch, and §3.7.2
+//!    transient pre-noise processing. Encoder covers
+//!    indep+dep-substream pairs for 1.0 / 2.0 / 5.1 / 7.1 layouts;
+//!    SPX and AHT are out of scope on the encoder side.
+//! 9. [`crc`] — §7.10.1 CRC-16 over poly 0x8005, shared between
+//!    encoder (forward generation, augmented form for crc2) and the
+//!    opt-in [`decoder::verify_packet_crc`] residue check.
+//!
+//! See `README.md` for the round-by-round status checklist and the
+//! per-feature dB measurements.
 
 #![allow(clippy::needless_range_loop)]
 
@@ -82,16 +110,19 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .encoder(make_encoder),
     );
 
-    // E-AC-3 (Annex E). Accepts mono, stereo, and 7.1 input on the
-    // encoder side. 7.1 (8 ch) emits an independent substream pair:
-    // indep substream carries a 5.1 downmix (acmod=7, lfeon=1) and
-    // dep substream 0 carries Lb/Rb back surrounds with chanmap bit
-    // 6 set (Lrs/Rrs pair) per ATSC A/52 Annex E §E.2.3.1.7-8 /
-    // §E.3.8.2. SPX / AHT are out of scope.
+    // E-AC-3 (Annex E). Accepts mono, stereo, 5.1, and 7.1 input on
+    // the encoder side. 7.1 (8 ch) emits an independent substream
+    // pair: indep substream carries a 5.1 program (acmod=7, lfeon=1)
+    // and dep substream 0 carries Lb/Rb back surrounds with chanmap
+    // bit 6 set (Lrs/Rrs pair) per ATSC A/52 Annex E §E.2.3.1.7-8 /
+    // §E.3.8.2. Encoder-side SPX and AHT are out of scope (decoder
+    // implements both).
     //
-    // Decoder side: round-1 path parses the BSI + audfrm bit-
-    // accurately and emits silent PCM of the correct shape. Real DSP
-    // (decouple + IMDCT) lands in round 2.
+    // Decoder side: full Annex E DSP — §3.4 Adaptive Hybrid
+    // Transform on fbw / LFE / coupling channels, §3.6 spectral
+    // extension with §3.6.4.2.3 SPXATTEN border notch, §3.7.2
+    // transient pre-noise processing, and §7.8 LoRo / LtRt downmix
+    // including mixmdata mix-level routing.
     let eac3_cid = CodecId::new(CODEC_ID_STR_EAC3);
     let eac3_dec_caps = CodecCapabilities::audio("eac3_sw_dec")
         .with_lossy(true)

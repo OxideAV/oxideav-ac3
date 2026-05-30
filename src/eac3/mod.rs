@@ -9,100 +9,55 @@
 //! for backward-compatible variants) selects the syntax — base-AC-3
 //! decoders MUST mute on bsid > 10 per A/52 §E.2.3.1.6.
 //!
-//! ## Round-1 scope (this commit)
+//! ## Module layout
 //!
-//! * **BSI parser** ([`bsi`]) covers Table E1.2 in full: stream type,
-//!   substream id, frame size, sample-rate code (incl. fscod2 reduced
-//!   rates), number of blocks, channel layout, dialnorm, compression,
-//!   `chanmape`/`chanmap` for dependent substreams, the entire
-//!   `mixmdate`/`infomdate`/`addbsi` opt-in chain. Values not used
-//!   by the round-1 decoder are still consumed bit-accurately so the
-//!   bit cursor lands on the start of `audfrm()`.
-//! * **audfrm parser** ([`audfrm`]) covers Table E1.3: the 11 strategy
-//!   flags, frame-level exponent strategies (`frmcplexpstr`,
+//! * **[`bsi`]** — Table E1.2 parser: stream type, substream id,
+//!   frame size, sample-rate code (incl. fscod2 reduced rates),
+//!   number of blocks, channel layout, dialnorm, compression,
+//!   `chanmape`/`chanmap` for dependent substreams, plus the full
+//!   `mixmdate`/`infomdate`/`addbsi` opt-in chain.
+//! * **[`audfrm`]** — Table E1.3 parser: the 11 strategy flags,
+//!   frame-level exponent strategies (`frmcplexpstr`,
 //!   `frmchexpstr`, `lfeexpstr` runs), AHT in-use flags, frame-level
 //!   SNR offsets, transient pre-noise + spectral-extension attenuation
-//!   parameters, and the per-block start info. Like BSI, every field
-//!   is consumed even when its value is ignored.
-//! * **audblk parsing** is deferred to round 2 — the round-1 decoder
-//!   does not walk per-block bits; instead, after parsing BSI +
-//!   audfrm, it advances by `bsi.frame_bytes` and emits silent PCM
-//!   of shape `bsi.num_blocks × 256 × nchans` S16. Coupling,
-//!   rematrixing, IMDCT, overlap-add all land in round 2.
-//! * **Decoder** ([`decoder`]) wires BSI + audfrm + silent emit into
-//!   a top-level per-substream decode that produces `1536 × nchans`
-//!   S16 zeros per syncframe (or `numblks × 256 × nchans` for short-
-//!   block frames). This is enough to unblock the corpus tests,
-//!   which now report measurable per-channel diffs against the
-//!   validator binary's decode (low PSNR because round-1 is silent,
-//!   but the test machinery runs end-to-end instead of bailing at
-//!   `bsi.rs`).
-//! * **Encoder** ([`encoder`]) is the existing round-0 emitter for
-//!   1.0 / 2.0 / 5.1 indep substreams + 7.1 indep+dep pair. Untouched
-//!   by this commit.
+//!   parameters, per-block start info. Two-phase: [`audfrm::parse_with`]
+//!   stops at the AHT anchor when `ahte == 1`; once the dsp pre-walk has
+//!   produced `nchregs[ch]` / `ncplregs` / `nlferegs` from the per-block
+//!   exponent strategies, [`audfrm::parse_phase_b`] consumes the
+//!   variable-width `chahtinu` / `cplahtinu` / `lfeahtinu` bits.
+//! * **[`aht`]** — Adaptive Hybrid Transform (§3.4). VQ codebooks
+//!   E4.1..E4.7 (956 × 6 i16) + `hebap` pointer table (E3.1) +
+//!   quantiser-bit table (E3.2). [`aht::vq_lookup`] /
+//!   [`aht::read_scalar_aht_mantissas`] plus the §3.4.5 inverse
+//!   DCT-II ([`aht::idct_ii_6`]).
+//! * **[`dsp`]** — per-frame DSP: §7.4 decouple, AHT mantissa cache,
+//!   §3.6 spectral extension (translate → noise-blend → coordinate
+//!   scale + §3.6.4.2.3 SPXATTEN border notch), §3.7.2 transient
+//!   pre-noise processing (PCM-domain time-scaling synthesis).
+//! * **[`decoder`]** — top-level per-substream decode. Routes packets
+//!   with `bsid ∈ {11..=16}` through BSI → audfrm phase-A → dsp
+//!   pre-walk → audfrm phase-B → audblk DSP → IMDCT → overlap-add →
+//!   §7.8 downmix.
+//! * **[`encoder`]** — Annex E encoder. Indep substream for
+//!   1.0 / 2.0 / 5.1 layouts (acmod ∈ {1, 2, 7} with `lfeon=1` for
+//!   5.1); 7.1 input emits an indep+dep substream pair (indep
+//!   carries the 5.1 program, dep 0 carries Lb/Rb back surrounds
+//!   with chanmap bit 6 set per §E.2.3.1.7-8 / §E.3.8.2). Encoder-
+//!   side SPX, AHT, and enhanced coupling are out of scope.
 //!
-//! ## Round 6 (this commit) — Adaptive Hybrid Transform (AHT)
+//! ## Known decoder gaps
 //!
-//! * **VQ codebooks E4.1..E4.7** — 956 entries × 6 i16 transcribed
-//!   from A/52:2018 Annex E §4 into [`tables::aht_codebooks`]. Plus
-//!   the `hebap` pointer table (E3.1) and quantiser-bit table (E3.2)
-//!   in [`aht`].
-//! * **Phase-B audfrm parse** — [`audfrm::parse_with`] now stops at
-//!   the AHT anchor when `ahte == 1`, leaving the variable-width
-//!   `chahtinu` / `cplahtinu` / `lfeahtinu` bits for [`audfrm::parse_phase_b`]
-//!   once the dsp pre-walk has produced `nchregs[ch]` / `ncplregs` /
-//!   `nlferegs` from the per-block exponent strategies.
-//! * **AHT mantissa decode** ([`aht::vq_lookup`] /
-//!   [`aht::read_scalar_aht_mantissas`]) + **§3.4.5 inverse DCT-II**
-//!   ([`aht::idct_ii_6`]) routed through a per-frame coefficient
-//!   cache in [`dsp::decode_indep_audblks`]. AHT-active channels read
-//!   their full 6×nmant mantissa block in audblk[0]'s mantissa step;
-//!   audblks 1..5 pull pre-computed coefficients from the cache.
-//! * **Round-6 scope is mono-only** — multichannel / LFE / coupled AHT
-//!   needs the 2-pass nchregs probe (round 7). The
-//!   `eac3-low-bitrate-32kbps` fixture is the only AHT-active fixture
-//!   in the corpus.
-//!
-//! ## Deferred to round 7 and beyond
-//!
-//! * Multichannel / coupled / LFE AHT — **landed**. Multichannel fbw
-//!   (round 110), LFE (round 113), and coupling (round 117) AHT all
-//!   decode via [`dsp::decode_indep_audblks`], driven by the
-//!   regs-derived phase-B parse ([`dsp::compute_aht_regs`] feeds
-//!   [`audfrm::parse_phase_b`]). The `cplahtinu` / `lfeahtinu` bit
-//!   streams are wired through [`audfrm::AudFrm`]; the coupling-AHT
-//!   mantissa block is read interleaved with the first coupled fbw
-//!   channel and its coefficients land in the coupling pseudo-channel
-//!   slot before the §7.4 decouple step.
-//! * **Spectral Extension (SPX)** decode — **landed**. `spxinu == 1`
-//!   blocks now parse the full §E.2.3.3 strategy + coordinate fields
-//!   (chinspx / spxstrtf / spxbegf / spxendf / spxbndstrc / spxcoe /
-//!   spxblnd / mstrspxco / spxcoexp / spxcomant) and run the §E.3.6
-//!   high-frequency regeneration (translate → noise-blend → coordinate
-//!   scale) in [`crate::audblk::dsp_block`]. The `nrematbd` (§E.3.3.2)
-//!   and `cplendf`-when-SPX (§E.3.3.1) derivations are wired so the bit
-//!   cursor no longer drifts on the SPX-strategy fields. The corpus
-//!   fixtures `eac3-stereo-48000-192kbps`, `eac3-256-coeff-block`, and
-//!   `eac3-from-ac3-bitstream-recombination` are *additionally* gated
-//!   by a pre-existing coupling/bit-allocation cursor drift on a subset
-//!   of their non-SPX frames (the same drift that leaves a handful of
-//!   AC-3 fixtures muted), so end-to-end PSNR on those three is still
-//!   floor-bound until that drift is fixed. The non-SPX fixtures decode
-//!   cleanly: `eac3-5.1-48000-384kbps` at **90 dB**,
-//!   `eac3-low-rate-stereo-64kbps` at **72 dB**,
-//!   `eac3-low-bitrate-32kbps` at **66 dB**.
-//! * **Per-block SNR-offset** (`snroffststr != 0`) — needs the
-//!   audblk-level `snroffste` parser. Same situation as above.
-//! * **Transient pre-noise processing** (`transproce == 1`) —
-//!   **landed** (round 103). The per-channel `chintransproc` /
-//!   `transprocloc` / `transproclen` fields are stored on
-//!   [`audfrm::AudFrm`] and the §E.3.7.2 PCM-domain time-scaling
-//!   synthesis runs in [`dsp::decode_indep_audblks`] after overlap-add
-//!   (see `dsp::apply_transient_prenoise`). The cross-frame reference
-//!   case (§E.3.7.1) is clamped to the current frame for now.
-//! * **256-coeff-block-per-syncframe variants** (`numblkscod < 3`).
-//!   The parser handles them; the silent-PCM path produces an output
-//!   of the right length only.
+//! * **Enhanced coupling** (`ecplinu == 1`, §E.1.3.3.7-26) is
+//!   rejected as `Unsupported`. Standard coupling is in.
+//! * **Cross-frame transient pre-noise reference** (§E.3.7.1) is
+//!   clamped to the current frame; intra-frame transients (§E.3.7.2)
+//!   are fully synthesised.
+//! * Three corpus fixtures (`eac3-stereo-48000-192kbps`,
+//!   `eac3-256-coeff-block`, `eac3-from-ac3-bitstream-recombination`)
+//!   remain floor-bound on a pre-existing coupling/bit-allocation
+//!   cursor drift that also leaves a handful of base-AC-3 fixtures
+//!   muted; non-affected fixtures decode at 66-90 dB PSNR (see
+//!   crate `README.md` for the per-fixture numbers).
 
 pub mod aht;
 pub mod audfrm;
