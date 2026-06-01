@@ -73,6 +73,26 @@ pub struct Bsi {
     /// Ch2 heavy compression gain word for 1+1 dual-mono only. `None`
     /// outside `acmod == 0`, or inside `acmod == 0` when `compr2e == 0`.
     pub compr_ch2: Option<CompressionGain>,
+    /// Annex D §2.3.1.8 Dolby Surround EX mode (`dsurexmod`, 2 bits,
+    /// Table D2.7). `Some` only when `bsid == 6` and the `xbsi2e` block
+    /// is present; `None` otherwise. Per the spec note the field's
+    /// semantics are only defined for `acmod ∈ {6, 7}` (2/2 or 3/2) —
+    /// the parser still surfaces the raw decoded variant for other
+    /// `acmod` values so a caller can decide whether to honour the
+    /// hint (encoders treat reserved-combination codes as advisory).
+    pub dsurexmod: Option<DolbySurroundExMode>,
+    /// Annex D §2.3.1.9 Dolby Headphone mode (`dheadphonmod`, 2 bits,
+    /// Table D2.8). `Some` only when `bsid == 6` and the `xbsi2e`
+    /// block is present; `None` otherwise. Per the spec note the
+    /// field's semantics are only defined for `acmod == 2` (2/0
+    /// stereo); the parser still surfaces the raw decoded variant for
+    /// other `acmod` values.
+    pub dheadphonmod: Option<DolbyHeadphoneMode>,
+    /// Annex D §2.3.1.10 A/D converter type (`adconvtyp`, 1 bit, Table
+    /// D2.9). `Some` only when `bsid == 6` and the `xbsi2e` block is
+    /// present; `None` otherwise. `Standard` = generic 24-bit PCM
+    /// converter; `Hdcd` = HDCD-encoded source.
+    pub adconvtyp: Option<AdConverterType>,
     /// Absolute bit position (in bits, measured from the first byte of
     /// `bsi()` input) where the BSI ended. Callers use this to skip
     /// straight to the audio-block area.
@@ -293,6 +313,133 @@ impl CompressionGain {
     }
 }
 
+/// Annex D §2.3.1.8 Dolby Surround EX mode (Table D2.7).
+///
+/// Surfaced on [`Bsi::dsurexmod`] when `bsid == 6` and the `xbsi2e`
+/// block is present. The spec note constrains the meaningful range of
+/// the field to `acmod ∈ {6, 7}` (2/2 and 3/2 — the only layouts that
+/// carry a stereo surround pair); for other `acmod` values the field
+/// is "reserved" but encoders still emit one of the four codepoints,
+/// so the parser surfaces the raw decoded variant and leaves the
+/// caller to honour the spec gating.
+///
+/// "Dolby Pro Logic IIx" is a back-compatible matrix decoder that
+/// recovers a 5.1 or 6.1/7.1 program from a Dolby Surround EX-encoded
+/// stream; "Dolby Pro Logic IIz" is the matrix variant that recovers a
+/// front-height pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DolbySurroundExMode {
+    /// `'00'` — encoding not indicated.
+    NotIndicated,
+    /// `'01'` — explicitly NOT Dolby Surround EX, Pro Logic IIx, or
+    /// Pro Logic IIz encoded.
+    NotEncoded,
+    /// `'10'` — Dolby Surround EX or Pro Logic IIx encoded.
+    SurroundExOrProLogicIIx,
+    /// `'11'` — Dolby Pro Logic IIz encoded.
+    ProLogicIIz,
+}
+
+impl DolbySurroundExMode {
+    /// Decode the 2-bit wire value verbatim per Table D2.7.
+    pub fn from_code(code: u8) -> Self {
+        match code & 0x3 {
+            0 => DolbySurroundExMode::NotIndicated,
+            1 => DolbySurroundExMode::NotEncoded,
+            2 => DolbySurroundExMode::SurroundExOrProLogicIIx,
+            _ => DolbySurroundExMode::ProLogicIIz,
+        }
+    }
+
+    /// Raw 2-bit code as it appeared on the wire.
+    pub fn raw(self) -> u8 {
+        match self {
+            DolbySurroundExMode::NotIndicated => 0,
+            DolbySurroundExMode::NotEncoded => 1,
+            DolbySurroundExMode::SurroundExOrProLogicIIx => 2,
+            DolbySurroundExMode::ProLogicIIz => 3,
+        }
+    }
+}
+
+/// Annex D §2.3.1.9 Dolby Headphone mode (Table D2.8).
+///
+/// Surfaced on [`Bsi::dheadphonmod`] when `bsid == 6` and the `xbsi2e`
+/// block is present. The spec note constrains the meaningful range of
+/// the field to `acmod == 2` (2/0 stereo); for other `acmod` values
+/// the field is "reserved" but the parser still surfaces the raw
+/// decoded variant.
+///
+/// The `'11'` reserved codepoint is mapped to [`DolbyHeadphoneMode::Reserved`];
+/// per the spec a decoder receiving the reserved code "should still
+/// reproduce audio" and is encouraged to treat it as `NotIndicated`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DolbyHeadphoneMode {
+    /// `'00'` — encoding not indicated.
+    NotIndicated,
+    /// `'01'` — explicitly NOT Dolby Headphone encoded.
+    NotEncoded,
+    /// `'10'` — Dolby Headphone encoded.
+    Encoded,
+    /// `'11'` — reserved (treat as [`NotIndicated`](Self::NotIndicated)
+    /// per §2.3.1.9; the decoder must still reproduce audio).
+    Reserved,
+}
+
+impl DolbyHeadphoneMode {
+    /// Decode the 2-bit wire value verbatim per Table D2.8.
+    pub fn from_code(code: u8) -> Self {
+        match code & 0x3 {
+            0 => DolbyHeadphoneMode::NotIndicated,
+            1 => DolbyHeadphoneMode::NotEncoded,
+            2 => DolbyHeadphoneMode::Encoded,
+            _ => DolbyHeadphoneMode::Reserved,
+        }
+    }
+
+    /// Raw 2-bit code as it appeared on the wire.
+    pub fn raw(self) -> u8 {
+        match self {
+            DolbyHeadphoneMode::NotIndicated => 0,
+            DolbyHeadphoneMode::NotEncoded => 1,
+            DolbyHeadphoneMode::Encoded => 2,
+            DolbyHeadphoneMode::Reserved => 3,
+        }
+    }
+}
+
+/// Annex D §2.3.1.10 A/D converter type (Table D2.9). A single bit:
+/// `'0'` indicates a generic / standard PCM A/D converter; `'1'`
+/// indicates an HDCD-encoded source (HDCD packs a "hidden" 4 bits in
+/// the 16-bit PCM LSBs, and downstream equipment may decode them for a
+/// 20-bit dynamic range). The AC-3 decoder treats both identically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdConverterType {
+    /// `'0'` — Standard (generic 24-bit PCM).
+    Standard,
+    /// `'1'` — HDCD-encoded source.
+    Hdcd,
+}
+
+impl AdConverterType {
+    /// Decode the 1-bit wire value verbatim per Table D2.9.
+    pub fn from_code(code: u8) -> Self {
+        if code & 0x1 == 0 {
+            AdConverterType::Standard
+        } else {
+            AdConverterType::Hdcd
+        }
+    }
+
+    /// Raw 1-bit code as it appeared on the wire.
+    pub fn raw(self) -> u8 {
+        match self {
+            AdConverterType::Standard => 0,
+            AdConverterType::Hdcd => 1,
+        }
+    }
+}
+
 /// Annex D §2.3.1.3-6 alternate-syntax mix-level codewords. Each is a
 /// 3-bit value; Tables D2.3 / D2.4 / D2.5 / D2.6 map them to linear
 /// gains via [`annex_d_lt_rt_clev`] / [`annex_d_lt_rt_slev`] /
@@ -449,7 +596,7 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
     // `xbsi1e/xbsi2e` and is identified by `bsid == 6` (§2.1).
     // Both shapes occupy the same fixed 30 bits maximum so the
     // surrounding parse is unchanged.
-    let (annex_d_mix_levels, dmixmod) = if bsid == 6 {
+    let (annex_d_mix_levels, dmixmod, dsurexmod, dheadphonmod, adconvtyp) = if bsid == 6 {
         // Annex D xbsi1 block.
         let xbsi1e = br.read_u32(1)? != 0;
         let (mix, dmm) = if xbsi1e {
@@ -470,17 +617,26 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         } else {
             (None, 0xFFu8)
         };
-        // xbsi2: 2 + 2 + 1 + 8 + 1 = 14 bits, none consumed by the
-        // round-126 decoder.
+        // xbsi2 block — §2.3.1.7-12. 14 bits total: dsurexmod(2) +
+        // dheadphonmod(2) + adconvtyp(1) + xbsi2(8) + encinfo(1). The
+        // last two are reserved-for-future-assignment / encoder-private
+        // respectively and stay discarded.
         let xbsi2e = br.read_u32(1)? != 0;
-        if xbsi2e {
-            let _dsurexmod = br.read_u32(2)?;
-            let _dheadphonmod = br.read_u32(2)?;
-            let _adconvtyp = br.read_u32(1)?;
+        let (dsex, dhpm, adcv) = if xbsi2e {
+            let dsex_raw = br.read_u32(2)? as u8;
+            let dhpm_raw = br.read_u32(2)? as u8;
+            let adcv_raw = br.read_u32(1)? as u8;
             let _xbsi2 = br.read_u32(8)?;
             let _encinfo = br.read_u32(1)?;
-        }
-        (mix, dmm)
+            (
+                Some(DolbySurroundExMode::from_code(dsex_raw)),
+                Some(DolbyHeadphoneMode::from_code(dhpm_raw)),
+                Some(AdConverterType::from_code(adcv_raw)),
+            )
+        } else {
+            (None, None, None)
+        };
+        (mix, dmm, dsex, dhpm, adcv)
     } else {
         // §5.3.2 base syntax — timecod1/timecod2 (never surfaced).
         let timecod1e = br.read_u32(1)? != 0;
@@ -491,7 +647,7 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         if timecod2e {
             let _t2 = br.read_u32(14)?;
         }
-        (None, 0xFFu8)
+        (None, 0xFFu8, None, None, None)
     };
 
     // addbsi — up to 64 bytes of trailing info we can safely skip.
@@ -529,6 +685,9 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         dmixmod,
         compr,
         compr_ch2,
+        dsurexmod,
+        dheadphonmod,
+        adconvtyp,
         bits_consumed,
     })
 }
@@ -1275,5 +1434,174 @@ mod tests {
         let c2 = bsi.compr_ch2.expect("compr2e=1");
         assert_eq!(c2.raw(), 0b1000_0000);
         assert!((c2.decibels() - (-48.165)).abs() < 0.01);
+    }
+
+    // ---------------------------------------------------------------
+    // Annex D §2.3.1.7-10 — xbsi2 informational metadata.
+    // ---------------------------------------------------------------
+
+    /// Table D2.7 — `dsurexmod` decodes verbatim across all 4 codepoints.
+    #[test]
+    fn dsurexmod_decodes_all_4_codepoints() {
+        use DolbySurroundExMode::*;
+        assert_eq!(DolbySurroundExMode::from_code(0b00), NotIndicated);
+        assert_eq!(DolbySurroundExMode::from_code(0b01), NotEncoded);
+        assert_eq!(
+            DolbySurroundExMode::from_code(0b10),
+            SurroundExOrProLogicIIx
+        );
+        assert_eq!(DolbySurroundExMode::from_code(0b11), ProLogicIIz);
+        // raw() round-trip.
+        for code in 0u8..4 {
+            assert_eq!(DolbySurroundExMode::from_code(code).raw(), code);
+        }
+    }
+
+    /// Table D2.8 — `dheadphonmod` decodes verbatim. The `'11'`
+    /// codepoint is `Reserved`; the spec instructs decoders to keep
+    /// reproducing audio when it appears.
+    #[test]
+    fn dheadphonmod_decodes_all_4_codepoints() {
+        use DolbyHeadphoneMode::*;
+        assert_eq!(DolbyHeadphoneMode::from_code(0b00), NotIndicated);
+        assert_eq!(DolbyHeadphoneMode::from_code(0b01), NotEncoded);
+        assert_eq!(DolbyHeadphoneMode::from_code(0b10), Encoded);
+        assert_eq!(DolbyHeadphoneMode::from_code(0b11), Reserved);
+        for code in 0u8..4 {
+            assert_eq!(DolbyHeadphoneMode::from_code(code).raw(), code);
+        }
+    }
+
+    /// Table D2.9 — `adconvtyp` is a single bit (`Standard` vs `Hdcd`).
+    #[test]
+    fn adconvtyp_decodes_both_codepoints() {
+        assert_eq!(AdConverterType::from_code(0), AdConverterType::Standard);
+        assert_eq!(AdConverterType::from_code(1), AdConverterType::Hdcd);
+        // Defensive — `from_code` masks the low bit.
+        assert_eq!(AdConverterType::from_code(2), AdConverterType::Standard);
+        assert_eq!(AdConverterType::from_code(3), AdConverterType::Hdcd);
+        assert_eq!(AdConverterType::Standard.raw(), 0);
+        assert_eq!(AdConverterType::Hdcd.raw(), 1);
+    }
+
+    /// Annex D §2.3.1.7 — `bsid == 6` with `xbsi2e == 1` surfaces the
+    /// three typed playback hints on the parsed [`Bsi`]. Build a 3/2
+    /// frame (acmod=7) with `xbsi1e == 0` (mix-level extensions
+    /// absent), `xbsi2e == 1`, and Table D2.7 / D2.8 / D2.9 codepoints
+    /// `(0b10, 0b00, 0b1)` — Dolby Surround EX on, headphone hint not
+    /// indicated, HDCD source. The body `xbsi2(8)` + `encinfo(1)`
+    /// reserved fields are populated with non-zero bits to verify the
+    /// parser skips them but still surfaces the three typed fields.
+    #[test]
+    fn parse_surfaces_xbsi2_dsurexmod_dheadphonmod_adconvtyp() {
+        // bsid=6 (5), bsmod=0 (3), acmod=7 (3), cmixlev=0 (2),
+        // surmixlev=0 (2), lfeon=0 (1), dialnorm=27 (5),
+        //   compre=0, langcode=0, audprodie=0, copyrightb=0, origbs=0,
+        //   xbsi1e=0,
+        //   xbsi2e=1, dsurexmod=0b10 (Surround EX / PLIIx),
+        //              dheadphonmod=0b00 (NotIndicated),
+        //              adconvtyp=0b1 (Hdcd),
+        //              xbsi2=0b1010_1010 (reserved garbage — must be
+        //                                 parsed-and-discarded),
+        //              encinfo=0b1,
+        //   addbsie=0.
+        let bits: [(u8, u32); 20] = [
+            (5, 6),
+            (3, 0),
+            (3, 7),
+            (2, 0),
+            (2, 0),
+            (1, 0),           // lfeon
+            (5, 27),          // dialnorm
+            (1, 0),           // compre
+            (1, 0),           // langcode
+            (1, 0),           // audprodie
+            (1, 0),           // copyrightb
+            (1, 0),           // origbs
+            (1, 0),           // xbsi1e=0
+            (1, 1),           // xbsi2e=1
+            (2, 0b10),        // dsurexmod = Surround EX / PLIIx
+            (2, 0b00),        // dheadphonmod = NotIndicated
+            (1, 0b1),         // adconvtyp = HDCD
+            (8, 0b1010_1010), // xbsi2 (reserved garbage)
+            (1, 0b1),         // encinfo (encoder-private)
+            (1, 0),           // addbsie
+        ];
+        let bytes = pack_bits(&bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.bsid, 6);
+        assert_eq!(b.acmod, 7);
+        assert!(b.annex_d_mix_levels.is_none());
+        assert_eq!(
+            b.dsurexmod,
+            Some(DolbySurroundExMode::SurroundExOrProLogicIIx)
+        );
+        assert_eq!(b.dheadphonmod, Some(DolbyHeadphoneMode::NotIndicated));
+        assert_eq!(b.adconvtyp, Some(AdConverterType::Hdcd));
+    }
+
+    /// `bsid != 6` falls through the §5.3.2 base syntax — the
+    /// `xbsi2e` block doesn't exist, so the three Annex D fields stay
+    /// `None`. Use the round-202 `parses_minimal_2_0_stereo_bsi`
+    /// fixture (bsid=8, 2/0 stereo) and just assert the new fields.
+    #[test]
+    fn parse_leaves_xbsi2_fields_none_outside_bsid_6() {
+        // Identical layout to `parses_minimal_2_0_stereo_bsi`.
+        let bits: [(u8, u32); 14] = [
+            (5, 0b01000),
+            (3, 0b000),
+            (3, 0b010),
+            (2, 0b00),
+            (1, 0),
+            (5, 27),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+        ];
+        let bytes = pack_bits(&bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.bsid, 8);
+        assert!(b.dsurexmod.is_none());
+        assert!(b.dheadphonmod.is_none());
+        assert!(b.adconvtyp.is_none());
+    }
+
+    /// `bsid == 6` with `xbsi2e == 0` keeps the three Annex D fields at
+    /// `None` even though the alternate syntax is active — the encoder
+    /// chose to omit the playback metadata. The xbsi1 block is also
+    /// disabled here to keep the bit string short.
+    #[test]
+    fn parse_leaves_xbsi2_fields_none_when_xbsi2e_zero() {
+        // bsid=6, acmod=2 (2/0 stereo): no cmix, surmixlev=0xFF guard,
+        // dsurmod present. Skip xbsi1e/xbsi2e/addbsie.
+        let bits: [(u8, u32); 16] = [
+            (5, 6),
+            (3, 0),
+            (3, 2),
+            (2, 0),  // dsurmod
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (1, 0),  // copyrightb
+            (1, 0),  // origbs
+            (1, 0),  // xbsi1e=0
+            (1, 0),  // xbsi2e=0
+            (1, 0),  // addbsie=0
+            (1, 0),  // pad
+            (1, 0),  // pad
+        ];
+        let bytes = pack_bits(&bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.bsid, 6);
+        assert!(b.dsurexmod.is_none());
+        assert!(b.dheadphonmod.is_none());
+        assert!(b.adconvtyp.is_none());
     }
 }

@@ -54,7 +54,9 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
-use crate::bsi::{AnnexDMixLevels, CompressionGain};
+use crate::bsi::{
+    AdConverterType, AnnexDMixLevels, CompressionGain, DolbyHeadphoneMode, DolbySurroundExMode,
+};
 use crate::tables::acmod_nfchans;
 
 /// Largest `bsid` value still served by the base AC-3 parser. Streams
@@ -182,6 +184,29 @@ pub struct Bsi {
     /// Ch2 heavy compression gain word for 1+1 dual-mono only. `None`
     /// outside `acmod == 0`, or inside `acmod == 0` when `compr2e == 0`.
     pub compr_ch2: Option<CompressionGain>,
+    /// Dolby Surround EX mode (§E.2.3.1.x informational metadata, gated
+    /// by `infomdate==1` AND `acmod >= 6`). Carries the same semantics
+    /// as Annex D §2.3.1.8 / Table D2.7 — see
+    /// [`crate::bsi::DolbySurroundExMode`]. `None` when the informational
+    /// metadata block was absent or when `acmod < 6` (no stereo
+    /// surround pair to drive the EX matrix).
+    pub dsurexmod: Option<DolbySurroundExMode>,
+    /// Dolby Headphone mode (§E.2.3.1.x informational metadata, gated
+    /// by `infomdate==1` AND `acmod == 2`). Same semantics as Annex D
+    /// §2.3.1.9 / Table D2.8 — see
+    /// [`crate::bsi::DolbyHeadphoneMode`]. `None` when the
+    /// informational metadata block was absent or when `acmod != 2`.
+    pub dheadphonmod: Option<DolbyHeadphoneMode>,
+    /// A/D converter type for the Ch1 audio production (§E.2.3.1.x
+    /// informational metadata, gated by `infomdate==1` AND
+    /// `audprodie==1`). Same semantics as Annex D §2.3.1.10 / Table
+    /// D2.9 — see [`crate::bsi::AdConverterType`]. `None` when the
+    /// audio-production block was absent.
+    pub adconvtyp: Option<AdConverterType>,
+    /// A/D converter type for the Ch2 audio production in 1+1
+    /// dual-mono (`acmod == 0` AND `audprodi2e == 1`). `None` outside
+    /// 1+1 mode or when `audprodi2e == 0`.
+    pub adconvtyp_ch2: Option<AdConverterType>,
     /// Frame size in bytes — `(frmsiz + 1) * 2`. Cached so the
     /// dispatcher can range-check the packet without re-doing
     /// arithmetic.
@@ -335,9 +360,17 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
 
     // §E.2.3.1.62 ff — informational meta-data.
     let infomdate = br.read_u32(1)? != 0;
-    if infomdate {
-        skip_informational_metadata(br, acmod, fscod, strmtyp, numblkscod)?;
-    }
+    let (dsurexmod, dheadphonmod, adconvtyp, adconvtyp_ch2) = if infomdate {
+        let info = parse_informational_metadata(br, acmod, fscod, strmtyp, numblkscod)?;
+        (
+            info.dsurexmod,
+            info.dheadphonmod,
+            info.adconvtyp,
+            info.adconvtyp_ch2,
+        )
+    } else {
+        (None, None, None, None)
+    };
 
     // addbsi — opt-in trailer of up to 64 bytes.
     let addbsie = br.read_u32(1)? != 0;
@@ -370,6 +403,10 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         lfemixlevcod,
         compr,
         compr_ch2,
+        dsurexmod,
+        dheadphonmod,
+        adconvtyp,
+        adconvtyp_ch2,
         frame_bytes,
         bits_consumed,
     })
@@ -614,42 +651,75 @@ fn parse_mixdata3_block(br: &mut BitReader<'_>) -> Result<u32> {
     Ok(bits)
 }
 
+/// Decoded informational metadata fields surfaced to the public BSI.
+/// Layout mirrors §E.2.3.1.62 ff one-for-one — every field is `None`
+/// when the spec's per-acmod / per-audprodie guard kept its codepoint
+/// off the wire.
+struct InformationalMetadata {
+    dsurexmod: Option<DolbySurroundExMode>,
+    dheadphonmod: Option<DolbyHeadphoneMode>,
+    adconvtyp: Option<AdConverterType>,
+    adconvtyp_ch2: Option<AdConverterType>,
+}
+
 /// Walk the §E.2.3.1.62 ff informational metadata block. The body is
 /// the same structural shape as base AC-3's `bsmod`/`copyrightb`/
 /// `origbs`/`audprodie` chain plus a few Annex E additions
 /// (`sourcefscod`, `convsync`, `blkid`/`frmsizecod` for AC-3-converted
 /// streams).
-fn skip_informational_metadata(
+///
+/// Surfaces `dsurexmod` (§E.2.3.1.x, acmod ∈ {6, 7} guard),
+/// `dheadphonmod` (acmod == 2 guard), and per-channel `adconvtyp` /
+/// `adconvtyp_ch2` (inside the `audprodie` / `audprodi2e` chain). The
+/// remaining service-metadata fields (`bsmod` is parsed in the body
+/// `Bsi`, mix level, room type, source fscod, conv sync, AC-3-convert
+/// blkid / frmsizecod) are still parsed bit-accurately and discarded —
+/// they do not drive playback policy.
+fn parse_informational_metadata(
     br: &mut BitReader<'_>,
     acmod: u8,
     fscod: u8,
     strmtyp: StreamType,
     numblkscod: u8,
-) -> Result<()> {
+) -> Result<InformationalMetadata> {
     let _bsmod = br.read_u32(3)?;
     let _copyrightb = br.read_u32(1)?;
     let _origbs = br.read_u32(1)?;
-    if acmod == 0x2 {
+    let dheadphonmod = if acmod == 0x2 {
         let _dsurmod = br.read_u32(2)?;
-        let _dheadphonmod = br.read_u32(2)?;
-    }
-    if acmod >= 0x6 {
-        let _dsurexmod = br.read_u32(2)?;
-    }
+        let dhpm_raw = br.read_u32(2)? as u8;
+        Some(DolbyHeadphoneMode::from_code(dhpm_raw))
+    } else {
+        None
+    };
+    let dsurexmod = if acmod >= 0x6 {
+        let dsex_raw = br.read_u32(2)? as u8;
+        Some(DolbySurroundExMode::from_code(dsex_raw))
+    } else {
+        None
+    };
     let audprodie = br.read_u32(1)? != 0;
-    if audprodie {
+    let adconvtyp = if audprodie {
         let _mixlevel = br.read_u32(5)?;
         let _roomtyp = br.read_u32(2)?;
-        let _adconvtyp = br.read_u32(1)?;
-    }
-    if acmod == 0 {
+        let adcv_raw = br.read_u32(1)? as u8;
+        Some(AdConverterType::from_code(adcv_raw))
+    } else {
+        None
+    };
+    let adconvtyp_ch2 = if acmod == 0 {
         let audprodi2e = br.read_u32(1)? != 0;
         if audprodi2e {
             let _mixlevel2 = br.read_u32(5)?;
             let _roomtyp2 = br.read_u32(2)?;
-            let _adconvtyp2 = br.read_u32(1)?;
+            let adcv2_raw = br.read_u32(1)? as u8;
+            Some(AdConverterType::from_code(adcv2_raw))
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
     if fscod < 0x3 {
         let _sourcefscod = br.read_u32(1)?;
     }
@@ -666,7 +736,12 @@ fn skip_informational_metadata(
         }
         let _frmsizecod = br.read_u32(6)?;
     }
-    Ok(())
+    Ok(InformationalMetadata {
+        dsurexmod,
+        dheadphonmod,
+        adconvtyp,
+        adconvtyp_ch2,
+    })
 }
 
 #[cfg(test)]
@@ -1069,5 +1144,182 @@ mod tests {
         assert!((cg.linear() - 17.0).abs() < 1e-5);
         // Ch2 word stays None outside acmod==0.
         assert!(bsi.compr_ch2.is_none());
+    }
+
+    /// `infomdate == 0` keeps the three Annex D playback hints at
+    /// `None` even though the BSI is otherwise fully formed. Reuses
+    /// the round-1 192 kbps stereo fixture shape — every existing
+    /// fixture builder sets `infomdate=0`.
+    #[test]
+    fn no_infomdate_yields_no_playback_hints() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod
+            (3, 2),    // acmod
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 0),    // mixmdate
+            (1, 0),    // infomdate = 0
+            (1, 0),    // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert!(bsi.dsurexmod.is_none());
+        assert!(bsi.dheadphonmod.is_none());
+        assert!(bsi.adconvtyp.is_none());
+        assert!(bsi.adconvtyp_ch2.is_none());
+    }
+
+    /// 3/2 indep with `infomdate == 1` and `audprodie == 1` — the
+    /// `dsurexmod` slot (acmod ≥ 6 gate fires) and the `adconvtyp`
+    /// slot (inside the audprodie chain) both surface; `dheadphonmod`
+    /// stays `None` because the acmod == 2 gate doesn't fire.
+    /// `dsurexmod = 0b10` (Dolby Surround EX / PLIIx), `adconvtyp = 1`
+    /// (HDCD).
+    #[test]
+    fn infomdate_surfaces_dsurexmod_and_adconvtyp_on_3_2() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp = indep
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod = 0 (48 kHz)
+            (2, 3),    // numblkscod = 3 (6 blocks → convsync absent)
+            (3, 7),    // acmod = 7 (3/2)
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 0),    // mixmdate
+            (1, 1),    // infomdate = 1
+            // informational metadata body:
+            (3, 0), // bsmod
+            (1, 0), // copyrightb
+            (1, 0), // origbs
+            // acmod != 2 → no dsurmod/dheadphonmod
+            // acmod >= 6 → dsurexmod present
+            (2, 0b10),    // dsurexmod = Surround EX / PLIIx
+            (1, 1),       // audprodie = 1
+            (5, 0b10101), // mixlevel
+            (2, 0b10),    // roomtyp
+            (1, 1),       // adconvtyp = 1 (HDCD)
+            // acmod != 0 → no audprodi2e block
+            (1, 0), // sourcefscod (fscod < 3)
+            // strmtyp == Indep AND numblkscod == 3 → no convsync
+            // strmtyp != Ac3Convert → no blkid/frmsizecod
+            (1, 0), // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert_eq!(
+            bsi.dsurexmod,
+            Some(crate::bsi::DolbySurroundExMode::SurroundExOrProLogicIIx)
+        );
+        // acmod != 2 → dheadphonmod gate didn't fire.
+        assert!(bsi.dheadphonmod.is_none());
+        assert_eq!(bsi.adconvtyp, Some(crate::bsi::AdConverterType::Hdcd));
+        assert!(bsi.adconvtyp_ch2.is_none());
+    }
+
+    /// 2/0 indep with `infomdate == 1` — the `dheadphonmod` slot
+    /// (acmod == 2 gate fires) surfaces; `dsurexmod` and `adconvtyp`
+    /// stay `None` because their respective gates do not fire
+    /// (acmod < 6, audprodie == 0).
+    #[test]
+    fn infomdate_surfaces_dheadphonmod_on_2_0() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod = 3
+            (3, 2),    // acmod = 2 (2/0)
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 0),    // mixmdate
+            (1, 1),    // infomdate = 1
+            // info body:
+            (3, 0),    // bsmod
+            (1, 0),    // copyrightb
+            (1, 0),    // origbs
+            (2, 0b10), // dsurmod (table-D2-style, distinct from dsurexmod)
+            (2, 0b10), // dheadphonmod = Encoded
+            // acmod < 6 → no dsurexmod
+            (1, 0), // audprodie = 0
+            // acmod != 0 → no audprodi2e
+            (1, 0), // sourcefscod
+            // strmtyp == Indep && numblkscod == 3 → no convsync
+            (1, 0), // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert!(bsi.dsurexmod.is_none());
+        assert_eq!(
+            bsi.dheadphonmod,
+            Some(crate::bsi::DolbyHeadphoneMode::Encoded)
+        );
+        assert!(bsi.adconvtyp.is_none());
+        assert!(bsi.adconvtyp_ch2.is_none());
+    }
+
+    /// 1+1 dual-mono indep with `infomdate == 1` and both
+    /// `audprodie == 1` (Ch1) AND `audprodi2e == 1` (Ch2). Both
+    /// `adconvtyp` (Ch1, HDCD) and `adconvtyp_ch2` (Ch2, Standard)
+    /// surface independently. `dsurexmod` / `dheadphonmod` stay `None`
+    /// because their acmod gates (≥6 and ==2 respectively) do not
+    /// fire for acmod=0.
+    #[test]
+    fn infomdate_surfaces_per_channel_adconvtyp_in_dual_mono() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod = 3
+            (3, 0),    // acmod = 0 (1+1)
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm (Ch1)
+            (1, 0),    // compre (Ch1) = 0
+            // 1+1 second-block dialnorm/compr2
+            (5, 27), // dialnorm2
+            (1, 0),  // compr2e
+            (1, 0),  // mixmdate
+            (1, 1),  // infomdate = 1
+            // info body:
+            (3, 0), // bsmod
+            (1, 0), // copyrightb
+            (1, 0), // origbs
+            // acmod != 2 → no dsurmod/dheadphonmod
+            // acmod < 6 → no dsurexmod
+            (1, 1),       // audprodie = 1
+            (5, 0b10000), // mixlevel
+            (2, 0b00),    // roomtyp
+            (1, 1),       // adconvtyp = 1 (Hdcd)
+            // acmod == 0 → audprodi2e block
+            (1, 1),       // audprodi2e = 1
+            (5, 0b00001), // mixlevel2
+            (2, 0b11),    // roomtyp2
+            (1, 0),       // adconvtyp2 = 0 (Standard)
+            (1, 0),       // sourcefscod
+            // strmtyp == Indep && numblkscod == 3 → no convsync
+            (1, 0), // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert_eq!(bsi.acmod, 0);
+        assert_eq!(bsi.adconvtyp, Some(crate::bsi::AdConverterType::Hdcd));
+        assert_eq!(
+            bsi.adconvtyp_ch2,
+            Some(crate::bsi::AdConverterType::Standard)
+        );
+        assert!(bsi.dsurexmod.is_none());
+        assert!(bsi.dheadphonmod.is_none());
     }
 }

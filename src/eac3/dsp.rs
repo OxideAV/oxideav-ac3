@@ -1853,6 +1853,9 @@ fn build_ac3_bsi_shim(bsi: &Eac3Bsi) -> Ac3Bsi {
         dmixmod: 0xFF,
         compr: bsi.compr,
         compr_ch2: bsi.compr_ch2,
+        dsurexmod: None,
+        dheadphonmod: None,
+        adconvtyp: None,
         bits_consumed: 0,
     }
 }
@@ -2041,6 +2044,10 @@ mod aht_regs_tests {
             lfemixlevcod: None,
             compr: None,
             compr_ch2: None,
+            dsurexmod: None,
+            dheadphonmod: None,
+            adconvtyp: None,
+            adconvtyp_ch2: None,
             frame_bytes: 768,
             bits_consumed: 0,
         }

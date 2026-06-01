@@ -58,7 +58,35 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       decode with implicit leading 1, the §7.7.2.2 combined ±48 dB
       range endpoints, `parse()` round-trip via `compre=1`, and the
       1+1 `compr2e` Ch2 round-trip) plus 1 new `eac3::bsi::tests`
-      round-trip.
+      round-trip. **Round 208** lifts the Annex D xbsi2 informational
+      block + the §E.2.3.1.x informational metadata from
+      parse-and-discard to three typed fields:
+      `Bsi::dsurexmod : Option<DolbySurroundExMode>` (Table D2.7 —
+      `NotIndicated` / `NotEncoded` / `SurroundExOrProLogicIIx` /
+      `ProLogicIIz`), `Bsi::dheadphonmod : Option<DolbyHeadphoneMode>`
+      (Table D2.8 — `NotIndicated` / `NotEncoded` / `Encoded` /
+      `Reserved`), and `Bsi::adconvtyp : Option<AdConverterType>`
+      (Table D2.9 — `Standard` / `Hdcd`). Surfaces mirror on the
+      E-AC-3 `Bsi` (the spec's §E.2.3.1.x informational block reuses
+      D2.7-D2.9 verbatim) with the spec's per-acmod gates — `dsurexmod`
+      only when `acmod ≥ 6`, `dheadphonmod` only when `acmod == 2`,
+      `adconvtyp` inside the `audprodie` chain — plus a separate
+      `Eac3Bsi::adconvtyp_ch2` for the 1+1 dual-mono Ch2 `audprodi2e`
+      word. The three fields are per spec purely informational hints
+      for downstream playback equipment (surround upmix processor,
+      headphone virtualiser, HDCD-aware DAC) and do not affect AC-3 /
+      E-AC-3 PCM decode — but surfacing them lets a chain consumer
+      route the hint without re-parsing the BSI. The encoders still
+      emit `xbsi2e=0` / `infomdate=0` for every syncframe so encoder
+      output is byte-identical; the only behaviour change is
+      decoder-side parsing. Covered by 4 new `bsi::tests`
+      (enum-codepoint round-trips for all three tables, `xbsi2e==1`
+      surfacing all three on a 3/2 frame, `None`-stays-`None`
+      assertions for `bsid != 6` and `xbsi2e == 0`) plus 4 new
+      `eac3::bsi::tests` (`infomdate == 0` yields no hints; 3/2 indep
+      `infomdate == 1` surfaces `dsurexmod` + `adconvtyp`; 2/0 indep
+      surfaces `dheadphonmod`; 1+1 dual-mono surfaces both `adconvtyp`
+      and `adconvtyp_ch2` independently).
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)

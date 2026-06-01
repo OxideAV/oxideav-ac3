@@ -290,6 +290,9 @@ fn matrix_mapping_for_3_2_matches_spec() {
         dmixmod: 0xFF,
         compr: None,
         compr_ch2: None,
+        dsurexmod: None,
+        dheadphonmod: None,
+        adconvtyp: None,
         bits_consumed: 0,
     };
     let dmx = Downmix::from_bsi(&bsi, DownmixMode::Stereo);

@@ -630,6 +630,10 @@ mod tests {
             lfemixlevcod: None,
             compr: None,
             compr_ch2: None,
+            dsurexmod: None,
+            dheadphonmod: None,
+            adconvtyp: None,
+            adconvtyp_ch2: None,
             frame_bytes: 768,
             bits_consumed: 0,
         }

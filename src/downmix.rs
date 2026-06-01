@@ -610,6 +610,9 @@ mod tests {
             dmixmod: 0xFF,
             compr: None,
             compr_ch2: None,
+            dsurexmod: None,
+            dheadphonmod: None,
+            adconvtyp: None,
             bits_consumed: 0,
         }
     }
@@ -636,6 +639,9 @@ mod tests {
             dmixmod,
             compr: None,
             compr_ch2: None,
+            dsurexmod: None,
+            dheadphonmod: None,
+            adconvtyp: None,
             bits_consumed: 0,
         }
     }

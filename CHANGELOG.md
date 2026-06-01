@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **xbsi2 / informational-metadata typed surface — Dolby Surround EX,
+  Dolby Headphone, A/D converter type (Tables D2.7 / D2.8 / D2.9 +
+  §E.2.3.1.x)** (round 208 / r208). Three Annex D §2.3.1.7-10 fields
+  that the BSI parser used to consume-and-discard now surface as
+  typed `Option<DolbySurroundExMode>` / `Option<DolbyHeadphoneMode>` /
+  `Option<AdConverterType>` on the base AC-3 `Bsi` (gated by
+  `bsid == 6` AND `xbsi2e == 1`). The Annex E (E-AC-3) `Bsi` carries
+  the same surface — the §E.2.3.1.x informational-metadata block
+  reuses Tables D2.7 / D2.8 / D2.9 verbatim — under the spec's
+  per-acmod gates: `dsurexmod` only when `acmod ≥ 6` (a stereo
+  surround pair exists to drive the EX matrix), `dheadphonmod` only
+  when `acmod == 2` (2/0 stereo), `adconvtyp` inside the `audprodie`
+  chain, and a separate `adconvtyp_ch2` field on the Annex E `Bsi` for
+  the 1+1 dual-mono Ch2 word (`audprodi2e == 1`). All three enums
+  expose `from_code(u8)` / `raw() -> u8` accessors over the spec's
+  small variant sets — `DolbySurroundExMode` covers Tables D2.7's four
+  codepoints (`NotIndicated` / `NotEncoded` /
+  `SurroundExOrProLogicIIx` / `ProLogicIIz`); `DolbyHeadphoneMode`
+  covers D2.8's three indicators plus an explicit `Reserved` variant
+  for the `'11'` codepoint (which the spec mandates the decoder still
+  reproduces audio for, treating as `NotIndicated`); `AdConverterType`
+  covers D2.9's `Standard` / `Hdcd` single-bit choice. These three
+  fields are per the spec text purely informational hints for
+  downstream playback equipment (surround upmix processor, headphone
+  virtualiser, HDCD-aware DAC) and do not affect AC-3 / E-AC-3 PCM
+  decode — but surfacing them lets a chain consumer route the hint
+  without re-parsing the BSI. The encoders still emit `xbsi2e=0` and
+  `infomdate=0` for every syncframe (matching the round-126 / r126
+  default), so the only behavioural change is decoder-side parsing.
+  Covered by 4 new `bsi::tests` (enum-codepoint round-trips for all
+  three tables, an `xbsi2e==1` 3/2 frame surfacing all three typed
+  fields, and a pair of `None`-stays-`None` assertions for `bsid != 6`
+  and `xbsi2e == 0`) plus 4 new `eac3::bsi::tests` (`infomdate == 0`
+  yields no playback hints; 3/2 indep with `infomdate == 1` surfaces
+  `dsurexmod` + `adconvtyp` and leaves `dheadphonmod` `None`; 2/0
+  stereo with `infomdate == 1` surfaces `dheadphonmod` and leaves
+  the other two `None`; 1+1 dual-mono with both `audprodie` and
+  `audprodi2e` set surfaces `adconvtyp` and `adconvtyp_ch2`
+  independently).
+
 - **Heavy compression gain word `compr` typed surface (Table 7.30 /
   §7.7.2.2)** (round 202 / r202). The base AC-3 BSI parser used to
   consume-and-discard the 8-bit `compr` byte (and the Ch2 `compr2`
