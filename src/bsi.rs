@@ -63,6 +63,16 @@ pub struct Bsi {
     /// when absent. `00` = not indicated, `01` = LtRt preferred,
     /// `10` = LoRo preferred, `11` = reserved.
     pub dmixmod: u8,
+    /// Heavy compression gain word (`compr`, §5.4.2.10 / §7.7.2.2). For
+    /// 1+1 dual-mono (`acmod == 0`) this is the Ch1 word; Ch2 is
+    /// surfaced separately as [`Bsi::compr_ch2`]. `Some` when
+    /// `compre == 1` in the bitstream; `None` when the encoder did not
+    /// emit a heavy-compression word for this syncframe (the spec's
+    /// "use `dynrng` instead for this frame" branch).
+    pub compr: Option<CompressionGain>,
+    /// Ch2 heavy compression gain word for 1+1 dual-mono only. `None`
+    /// outside `acmod == 0`, or inside `acmod == 0` when `compr2e == 0`.
+    pub compr_ch2: Option<CompressionGain>,
     /// Absolute bit position (in bits, measured from the first byte of
     /// `bsi()` input) where the BSI ended. Callers use this to skip
     /// straight to the audio-block area.
@@ -200,6 +210,89 @@ impl BitStreamMode {
     }
 }
 
+/// Heavy compression gain word per Table 7.30 + §7.7.2.2.
+///
+/// The wire field is 8 bits, split as `X0 X1 X2 X3 . Y4 Y5 Y6 Y7`:
+///
+/// * The upper nibble `X` is a 4-bit signed integer in the range
+///   `-8..=+7` (transmitted MSB-first). It contributes a gain of
+///   `(X + 1) * 6.02 dB` — i.e. an arithmetic shift on the PCM
+///   sample. The 16 `X` codepoints span `+48.16 dB` (`X=7`) down to
+///   `-42.14 dB` (`X=-8`).
+/// * The lower nibble `Y` is an unsigned fractional value with an
+///   implicit leading `1`, read as `0.1 Y4 Y5 Y6 Y7` in base 2 — i.e.
+///   `(16 + Y) / 32`, ranging from `16/32 = 0.5` to `31/32`. It
+///   represents a linear *attenuation* between `0` dB and `-6.02` dB.
+///
+/// The combined linear gain is `linear = 2^(X+1) * (16 + Y) / 32`;
+/// the combined dB gain runs from `-48.16 dB` (`X=-8`, `Y=0`,
+/// linear `0.5 * 0.5 = 0.25`) up to `+47.89 dB` (`X=7`, `Y=15`,
+/// linear `256 * 31/32`).
+///
+/// Per §7.7.2 the `compr` element is intended to bound the **peak**
+/// playback level for downstream feeds with restricted dynamic range
+/// (RF modulators, hotel-room feeds, etc.). Decoders that have been
+/// instructed to "compress on" SHOULD apply `compr` when present, and
+/// fall back to `dynrng` for syncframes that omit it (§7.7.2.1).
+/// `oxideav-ac3`'s current PCM path does neither — both `compr` and
+/// `dynrng` are left for the application to apply downstream — but
+/// surfacing the typed value here lets a player implement the policy
+/// without re-parsing the BSI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompressionGain {
+    raw: u8,
+}
+
+impl CompressionGain {
+    /// Wrap the 8-bit wire value verbatim. Every byte pattern is valid
+    /// per Table 7.30 (all 256 codepoints map to a defined gain).
+    pub fn from_byte(raw: u8) -> Self {
+        Self { raw }
+    }
+
+    /// Underlying 8-bit wire value — `X0 X1 X2 X3 Y4 Y5 Y6 Y7` packed
+    /// MSB-first.
+    pub fn raw(self) -> u8 {
+        self.raw
+    }
+
+    /// Signed `X` field, in `-8..=+7`. Per the §7.7.2.2 description
+    /// the four upper bits encode `X` as a 4-bit signed integer
+    /// (two's-complement convention: `0b1111 → -1`, `0b1000 → -8`).
+    pub fn x(self) -> i8 {
+        let x4 = (self.raw >> 4) & 0xF;
+        // Sign-extend the 4-bit field.
+        if x4 & 0x8 != 0 {
+            (x4 as i16 - 16) as i8
+        } else {
+            x4 as i8
+        }
+    }
+
+    /// Unsigned `Y` field, in `0..=15`. Combined with the implicit
+    /// leading `1`, it represents `(16 + Y) / 32` per §7.7.2.2.
+    pub fn y(self) -> u8 {
+        self.raw & 0xF
+    }
+
+    /// Linear-domain gain coefficient — multiply the decoded PCM by
+    /// this scalar. Equals `2^(X+1) * (16 + Y) / 32`.
+    pub fn linear(self) -> f32 {
+        let x_shift = (self.x() as i32) + 1; // -7..=+8
+        let y_frac = (16.0 + self.y() as f32) / 32.0; // 0.5..=31/32
+                                                      // 2^x_shift via direct floating multiply: x_shift fits in i32 well
+                                                      // within f32 exponent range (-7..=+8).
+        let two_pow = 2.0f32.powi(x_shift);
+        two_pow * y_frac
+    }
+
+    /// dB-domain gain — `20 * log10(linear())`. Range
+    /// `-48.16 dB ..= +47.89 dB` per Table 7.30 + §7.7.2.2.
+    pub fn decibels(self) -> f32 {
+        20.0 * self.linear().log10()
+    }
+}
+
 /// Annex D §2.3.1.3-6 alternate-syntax mix-level codewords. Each is a
 /// 3-bit value; Tables D2.3 / D2.4 / D2.5 / D2.6 map them to linear
 /// gains via [`annex_d_lt_rt_clev`] / [`annex_d_lt_rt_slev`] /
@@ -304,12 +397,17 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
     // §5.4.2.8: dialnorm=0 is reserved; decoder shall use -31 dB.
     let dialnorm = if dialnorm_raw == 0 { 31 } else { dialnorm_raw };
 
-    // Optional service metadata (§5.4.2.9 ff). We parse-and-discard —
-    // a proper player can tap these later via a second pass.
+    // Optional service metadata (§5.4.2.9 ff). `compr` is surfaced
+    // (Table 7.30); langcode / audprodie are parse-and-discard — they
+    // carry deprecated mix-level/room-type hints and ISO-639 codes
+    // that the decoder doesn't act on. A proper player can tap them
+    // later via a second pass if needed.
     let compre = br.read_u32(1)? != 0;
-    if compre {
-        let _compr = br.read_u32(8)?;
-    }
+    let compr = if compre {
+        Some(CompressionGain::from_byte(br.read_u32(8)? as u8))
+    } else {
+        None
+    };
     let langcode = br.read_u32(1)? != 0;
     if langcode {
         let _langcod = br.read_u32(8)?;
@@ -321,12 +419,14 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
     }
 
     // 1+1 mode (dual mono) carries a second copy of the metadata for Ch2.
-    if acmod == 0 {
+    let compr_ch2 = if acmod == 0 {
         let _dialnorm2 = br.read_u32(5)?;
         let compr2e = br.read_u32(1)? != 0;
-        if compr2e {
-            let _compr2 = br.read_u32(8)?;
-        }
+        let c2 = if compr2e {
+            Some(CompressionGain::from_byte(br.read_u32(8)? as u8))
+        } else {
+            None
+        };
         let langcod2e = br.read_u32(1)? != 0;
         if langcod2e {
             let _langcod2 = br.read_u32(8)?;
@@ -336,7 +436,10 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
             let _mixlevel2 = br.read_u32(5)?;
             let _roomtyp2 = br.read_u32(2)?;
         }
-    }
+        c2
+    } else {
+        None
+    };
 
     let _copyrightb = br.read_u32(1)?;
     let _origbs = br.read_u32(1)?;
@@ -424,6 +527,8 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         dsurmod,
         annex_d_mix_levels,
         dmixmod,
+        compr,
+        compr_ch2,
         bits_consumed,
     })
 }
@@ -914,5 +1019,261 @@ mod tests {
             }
         }
         out
+    }
+
+    // ---------------------------------------------------------------
+    // Heavy compression gain (`compr`) — Table 7.30 / §7.7.2.2.
+    // ---------------------------------------------------------------
+
+    /// X is a 4-bit signed integer with values in `-8..=+7`. Walk every
+    /// `X` codepoint with `Y = 0b1111` (max-Y) and assert the decoded
+    /// `(X, Y)` round-trip matches the bit layout described in §7.7.2.2.
+    #[test]
+    fn compression_gain_x_field_sign_extends_correctly() {
+        // (raw_x_nibble, expected signed value) — every codepoint.
+        let cases = [
+            (0b0000u8, 0i8),
+            (0b0001, 1),
+            (0b0010, 2),
+            (0b0011, 3),
+            (0b0100, 4),
+            (0b0101, 5),
+            (0b0110, 6),
+            (0b0111, 7),
+            (0b1000, -8),
+            (0b1001, -7),
+            (0b1010, -6),
+            (0b1011, -5),
+            (0b1100, -4),
+            (0b1101, -3),
+            (0b1110, -2),
+            (0b1111, -1),
+        ];
+        for (xn, x) in cases {
+            // Y = 0b1010 (arbitrary) — verify X decoding is independent of Y.
+            let cg = CompressionGain::from_byte((xn << 4) | 0b1010);
+            assert_eq!(cg.x(), x, "X mismatch for raw nibble {xn:#06b}");
+            assert_eq!(cg.y(), 0b1010);
+            assert_eq!(cg.raw(), (xn << 4) | 0b1010);
+        }
+    }
+
+    /// Table 7.30 row checks: the dB gain of each `(X, Y=0)` codepoint
+    /// must match the table's "Gain Indicated" column to within 0.005 dB.
+    /// At `Y=0`, the contribution from `Y` is exactly `-6.02 dB`, so the
+    /// table's "X alone = (X+1)*6.02 dB" sums with the Y attenuation to
+    /// `linear = 2^(X+1) * 0.5`, i.e. `(X+1)*6.02 - 6.02 = X*6.02 dB`.
+    /// Therefore the dB at `Y=0` equals `X * 6.02` (Table 7.30 minus
+    /// 6.02 dB across the board).
+    ///
+    /// Equivalently the table's headline rows (e.g. `X=7 → +48.16 dB`)
+    /// describe the X contribution **without** the Y attenuation; the
+    /// effective decoder gain when `Y = 0b1111` (`(16+15)/32 = 31/32 ≈
+    /// -0.28 dB`) drops the headline by 0.276 dB. This test checks both
+    /// the headline (max-Y) and the bottom (Y=0) of every X row.
+    #[test]
+    fn compression_gain_table_7_30_db_endpoints() {
+        // (X, Y=15 dB ≈ headline - 0.276; Y=0 dB = headline - 6.02).
+        let cases = [
+            (7i8, 48.16f32),
+            (6, 42.14),
+            (5, 36.12),
+            (4, 30.10),
+            (3, 24.08),
+            (2, 18.06),
+            (1, 12.04),
+            (0, 6.02),
+            (-1, 0.0),
+            (-2, -6.02),
+            (-3, -12.04),
+            (-4, -18.06),
+            (-5, -24.08),
+            (-6, -30.10),
+            (-7, -36.12),
+            (-8, -42.14),
+        ];
+        for (x, headline_db) in cases {
+            // Pack X into the upper nibble (two's-complement 4-bit).
+            let xn = (x as i16 & 0xF) as u8;
+            // Y = 0b1111 → top of row, dB ≈ headline - 0.276.
+            let max_y = CompressionGain::from_byte((xn << 4) | 0b1111);
+            let max_y_db = max_y.decibels();
+            assert!(
+                (max_y_db - (headline_db - 0.276)).abs() < 0.01,
+                "X={x} Y=15: got {max_y_db:.3} dB, want {:.3} dB",
+                headline_db - 0.276
+            );
+            // Y = 0b0000 → bottom of row, dB = headline - 6.02.
+            let min_y = CompressionGain::from_byte(xn << 4);
+            let min_y_db = min_y.decibels();
+            assert!(
+                (min_y_db - (headline_db - 6.02)).abs() < 0.01,
+                "X={x} Y=0: got {min_y_db:.3} dB, want {:.3} dB",
+                headline_db - 6.02
+            );
+        }
+    }
+
+    /// Y is a 4-bit unsigned mantissa with an implicit leading 1, read
+    /// as `(16 + Y) / 32`. Spot-check the four boundary values per
+    /// §7.7.2.2 ("Y can represent values between 0.111112 (or 31/32) and
+    /// 0.100002 (or 1/2)").
+    #[test]
+    fn compression_gain_y_field_is_fractional_with_leading_one() {
+        // With X = -1 (= 0b1111, gain = 0 dB), linear = 1.0 * (16+Y)/32.
+        let cases = [
+            (0u8, 16.0 / 32.0), // 0.5
+            (1, 17.0 / 32.0),   // 0.53125
+            (15, 31.0 / 32.0),  // 0.96875
+            (8, 24.0 / 32.0),   // 0.75
+        ];
+        for (y, expected) in cases {
+            let cg = CompressionGain::from_byte(0b1111_0000 | y);
+            let lin = cg.linear();
+            assert!(
+                (lin - expected).abs() < 1e-6,
+                "X=-1 Y={y}: got linear={lin}, want {expected}"
+            );
+        }
+    }
+
+    /// Combined-range sanity per §7.7.2.2:
+    /// "The combination of X and Y values allows compr to indicate gain
+    /// changes from 48.16 – 0.28 = +47.89 dB, to –42.14 – 6.02 =
+    /// –48.16 dB."
+    #[test]
+    fn compression_gain_extreme_codepoints_match_spec_range() {
+        let top = CompressionGain::from_byte(0b0111_1111); // X=7, Y=15
+        let bottom = CompressionGain::from_byte(0b1000_0000); // X=-8, Y=0
+
+        assert_eq!(top.x(), 7);
+        assert_eq!(top.y(), 15);
+        // Linear = 2^8 * 31/32 = 248.
+        assert!((top.linear() - 248.0).abs() < 1e-3);
+        // dB = 20*log10(248) ≈ +47.884 dB.
+        assert!((top.decibels() - 47.884).abs() < 0.01);
+
+        assert_eq!(bottom.x(), -8);
+        assert_eq!(bottom.y(), 0);
+        // Linear = 2^-7 * 0.5 = 1/256.
+        assert!((bottom.linear() - 1.0 / 256.0).abs() < 1e-6);
+        // dB = 20*log10(1/256) ≈ -48.165 dB.
+        assert!((bottom.decibels() - (-48.165)).abs() < 0.01);
+    }
+
+    /// `parse()` surfaces `compr` as `Some(CompressionGain)` when the
+    /// `compre` flag is set, and `None` otherwise. Build a 1/0 mono
+    /// BSI with `compre=1` and `compr=0b0001_0000` (X=1, Y=0, linear
+    /// `2^2 * 0.5 = 2.0`, ≈ +6.02 dB), then verify the parser routes
+    /// the byte verbatim into the typed surface.
+    #[test]
+    fn parse_surfaces_compr_when_compre_set() {
+        // 1/0 mono (acmod=1) → no cmixlev / surmixlev / dsurmod.
+        // bsid=8, bsmod=0, acmod=1, lfeon=0, dialnorm=27,
+        //   compre=1, compr=0b0001_0000, langcode=0, audprodie=0,
+        //   copyrightb=0, origbs=0, timecod1e=0, timecod2e=0,
+        //   addbsie=0.
+        let bits: [(u8, u32); 13] = [
+            (5, 8),
+            (3, 0),
+            (3, 1),
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 1),  // compre
+            (8, 0b0001_0000),
+            (1, 0), // langcode
+            (1, 0), // audprodie
+            (1, 0), // copyrightb
+            (1, 0), // origbs
+            (1, 0), // timecod1e
+            (1, 0), // timecod2e + addbsie folded as separate bits below
+        ];
+        let mut bytes = pack_bits(&bits);
+        // Append one more zero bit for addbsie.
+        bytes.push(0);
+        let bsi = parse(&bytes).unwrap();
+        assert_eq!(bsi.acmod, 1);
+        let cg = bsi.compr.expect("compre=1 should surface compr");
+        assert_eq!(cg.raw(), 0b0001_0000);
+        assert_eq!(cg.x(), 1);
+        assert_eq!(cg.y(), 0);
+        assert!((cg.linear() - 2.0).abs() < 1e-6);
+        // 1+1 mode is acmod==0; for acmod==1 the Ch2 word stays None.
+        assert!(bsi.compr_ch2.is_none());
+    }
+
+    /// `parse()` leaves `compr` as `None` when `compre == 0`.
+    #[test]
+    fn parse_leaves_compr_none_when_compre_clear() {
+        // Reuse the minimal 2/0 BSI from `parses_minimal_2_0_stereo_bsi`
+        // — it has compre=0 by construction.
+        let bits: [(u8, u32); 14] = [
+            (5, 0b01000),
+            (3, 0b000),
+            (3, 0b010),
+            (2, 0b00),
+            (1, 0),
+            (5, 27),
+            (1, 0), // compre
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+        ];
+        let bytes = pack_bits(&bits);
+        let bsi = parse(&bytes).unwrap();
+        assert!(bsi.compr.is_none());
+        assert!(bsi.compr_ch2.is_none());
+    }
+
+    /// 1+1 dual-mono (`acmod == 0`) carries a second `compr2` word for
+    /// Ch2 with identical Table 7.30 semantics per §5.4.2.18 ("This
+    /// 8-bit word has the same meaning as compr, except that it applies
+    /// to the second audio channel"). Build a 1+1 BSI with `compre=1`
+    /// (X=-1, Y=15 ≈ -0.276 dB on Ch1) and `compr2e=1` (X=-8, Y=0 ≈
+    /// -48.16 dB on Ch2) and verify both surface independently.
+    #[test]
+    fn parse_surfaces_compr_ch2_in_dual_mono() {
+        // acmod=0 (1+1 dual mono): no cmix/surmix/dsurmod, lfeon possible.
+        //   bsid=8, bsmod=0, acmod=0, lfeon=0, dialnorm=27,
+        //     compre=1, compr=0b1111_1111,
+        //     langcode=0, audprodie=0,
+        //   /* 1+1 second block */
+        //     dialnorm2=27, compr2e=1, compr2=0b1000_0000,
+        //     langcod2e=0, audprodi2e=0,
+        //   copyrightb=0, origbs=0, timecod1e=0, timecod2e=0, addbsie=0.
+        let bits: [(u8, u32); 18] = [
+            (5, 8),
+            (3, 0),
+            (3, 0),
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 1),  // compre
+            (8, 0b1111_1111),
+            (1, 0), // langcode
+            (1, 0), // audprodie
+            (5, 27),
+            (1, 1), // compr2e
+            (8, 0b1000_0000),
+            (1, 0), // langcod2e
+            (1, 0), // audprodi2e
+            (1, 0), // copyrightb
+            (1, 0), // origbs
+            (1, 0), // timecod1e
+            (1, 0), // timecod2e
+        ];
+        let mut bytes = pack_bits(&bits);
+        bytes.push(0); // addbsie + pad
+        let bsi = parse(&bytes).unwrap();
+        assert_eq!(bsi.acmod, 0);
+        let c1 = bsi.compr.expect("compre=1");
+        assert_eq!(c1.raw(), 0b1111_1111);
+        assert!((c1.decibels() - (-0.276)).abs() < 0.01);
+        let c2 = bsi.compr_ch2.expect("compr2e=1");
+        assert_eq!(c2.raw(), 0b1000_0000);
+        assert!((c2.decibels() - (-48.165)).abs() < 0.01);
     }
 }

@@ -608,6 +608,8 @@ mod tests {
             dsurmod: 0xFF,
             annex_d_mix_levels: None,
             dmixmod: 0xFF,
+            compr: None,
+            compr_ch2: None,
             bits_consumed: 0,
         }
     }
@@ -632,6 +634,8 @@ mod tests {
             dsurmod: 0xFF,
             annex_d_mix_levels: Some(mix),
             dmixmod,
+            compr: None,
+            compr_ch2: None,
             bits_consumed: 0,
         }
     }

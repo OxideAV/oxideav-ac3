@@ -628,6 +628,8 @@ mod tests {
             annex_e_mix_levels: None,
             dmixmod: 0xFF,
             lfemixlevcod: None,
+            compr: None,
+            compr_ch2: None,
             frame_bytes: 768,
             bits_consumed: 0,
         }

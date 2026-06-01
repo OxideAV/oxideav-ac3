@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Heavy compression gain word `compr` typed surface (Table 7.30 /
+  §7.7.2.2)** (round 202 / r202). The base AC-3 BSI parser used to
+  consume-and-discard the 8-bit `compr` byte (and the Ch2 `compr2`
+  byte in 1+1 dual-mono mode); both are now surfaced on
+  `Bsi::compr` / `Bsi::compr_ch2` as `Option<CompressionGain>`. A
+  new `bsi::CompressionGain` newtype wraps the byte and exposes
+  the Table 7.30 decomposition: `x() -> i8` (4-bit signed integer
+  in `-8..=+7`, contributing `(X+1)·6.02 dB`), `y() -> u8` (4-bit
+  unsigned mantissa with implicit leading 1, contributing the
+  `(16+Y)/32` linear attenuation between -6.02 dB and -0.28 dB),
+  plus `linear() -> f32` and `decibels() -> f32` accessors. The
+  Annex E (E-AC-3) `Bsi` mirrors the same surface — §E.2.3.1.x
+  reuses Table 7.30 verbatim and points back at the base spec —
+  via the same `CompressionGain` type so a single source of truth
+  drives both parsers. `None` is preserved verbatim when the
+  encoder did not emit a heavy-compression word, so a player can
+  honour the §7.7.2.1 fallback rule ("if compr is not present for
+  a particular syncframe, the dynrng control signal shall be used
+  for that syncframe"). The decoder PCM path is unchanged — both
+  `compr` and `dynrng` continue to be left for the application to
+  apply downstream, matching the spec's "at the discretion of the
+  decoder" language — but the typed surface lets a peak-limited
+  feed (RF-modulator, hotel-room, airline-seat per §7.7.2.1)
+  implement the compress-on policy without re-parsing the
+  bitstream. The encoders still emit `compre=0` for every
+  syncframe (no heavy-compression policy yet), so the new
+  decoder-side parsing is the only behaviour change. Covered by
+  6 new unit tests across `bsi::tests` (every `X` codepoint's
+  two's-complement sign-extension, every Table 7.30 row's dB
+  endpoints at both `Y=0` and `Y=15`, the `Y` fractional decode
+  with implicit leading 1, the §7.7.2.2 combined ±48 dB range
+  endpoints, `parse()` round-trip via `compre=1`, and the 1+1
+  `compr2e` round-trip) plus 1 new `eac3::bsi::tests` round-trip.
+
 - **E-AC-3 dependent-substream chanmap routing (Table E2.5)**
   (round 196 / r196). The decoder now decodes the 16-bit `chanmap`
   field on each dependent substream into an ordered list of

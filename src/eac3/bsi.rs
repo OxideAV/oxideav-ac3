@@ -54,7 +54,7 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
-use crate::bsi::AnnexDMixLevels;
+use crate::bsi::{AnnexDMixLevels, CompressionGain};
 use crate::tables::acmod_nfchans;
 
 /// Largest `bsid` value still served by the base AC-3 parser. Streams
@@ -172,6 +172,16 @@ pub struct Bsi {
     /// downstream tooling and a future LFE-into-stereo bass-route can
     /// honour it without re-parsing the BSI.
     pub lfemixlevcod: Option<u8>,
+    /// Heavy compression gain word (`compr`, §E.2.3.1.x / §5.4.2.10 +
+    /// §7.7.2.2 reused per Annex E). Identical semantics + wire format
+    /// to base AC-3 — see [`CompressionGain`] for the X/Y decode. For
+    /// 1+1 dual-mono (`acmod == 0`) this is the Ch1 word; Ch2 is
+    /// surfaced separately as [`Bsi::compr_ch2`]. `Some` when
+    /// `compre == 1`; `None` otherwise.
+    pub compr: Option<CompressionGain>,
+    /// Ch2 heavy compression gain word for 1+1 dual-mono only. `None`
+    /// outside `acmod == 0`, or inside `acmod == 0` when `compr2e == 0`.
+    pub compr_ch2: Option<CompressionGain>,
     /// Frame size in bytes — `(frmsiz + 1) * 2`. Cached so the
     /// dispatcher can range-check the packet without re-doing
     /// arithmetic.
@@ -284,18 +294,24 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
     let dialnorm = if dialnorm_raw == 0 { 31 } else { dialnorm_raw };
 
     let compre = br.read_u32(1)? != 0;
-    if compre {
-        let _compr = br.read_u32(8)?;
-    }
+    let compr = if compre {
+        Some(CompressionGain::from_byte(br.read_u32(8)? as u8))
+    } else {
+        None
+    };
 
     // 1+1 dual-mono (acmod == 0): second copy of dialnorm + compr.
-    if acmod == 0 {
+    let compr_ch2 = if acmod == 0 {
         let _dialnorm2_raw = br.read_u32(5)?;
         let compr2e = br.read_u32(1)? != 0;
         if compr2e {
-            let _compr2 = br.read_u32(8)?;
+            Some(CompressionGain::from_byte(br.read_u32(8)? as u8))
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
 
     // §E.2.3.1.7-8 — chanmape / chanmap, dependent substream only.
     let chanmap = if matches!(strmtyp, StreamType::Dependent) {
@@ -352,6 +368,8 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         annex_e_mix_levels,
         dmixmod,
         lfemixlevcod,
+        compr,
+        compr_ch2,
         frame_bytes,
         bits_consumed,
     })
@@ -1017,5 +1035,39 @@ mod tests {
         assert_eq!(mix.lorosurmixlev, 0b111);
         assert_eq!(bsi.dmixmod, 0b10);
         assert_eq!(bsi.lfemixlevcod, None);
+    }
+
+    /// E-AC-3 `compre=1` surfaces a `CompressionGain` byte verbatim
+    /// — the Annex E syntax reuses the base AC-3 §7.7.2.2 + Table 7.30
+    /// semantics unchanged.
+    #[test]
+    fn parses_compr_when_compre_set() {
+        // 2/0 indep stereo with compre=1, compr=0b0100_0001 (X=4, Y=1).
+        // Linear = 2^5 * (16+1)/32 = 32 * 17/32 = 17.0; dB = 24.61 dB.
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod = 3
+            (3, 2),    // acmod = 2
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 1),    // compre = 1
+            (8, 0b0100_0001),
+            (1, 0), // mixmdate
+            (1, 0), // infomdate
+            (1, 0), // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        let cg = bsi.compr.expect("compre=1");
+        assert_eq!(cg.raw(), 0b0100_0001);
+        assert_eq!(cg.x(), 4);
+        assert_eq!(cg.y(), 1);
+        assert!((cg.linear() - 17.0).abs() < 1e-5);
+        // Ch2 word stays None outside acmod==0.
+        assert!(bsi.compr_ch2.is_none());
     }
 }

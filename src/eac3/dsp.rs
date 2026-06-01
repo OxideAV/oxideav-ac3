@@ -1851,6 +1851,8 @@ fn build_ac3_bsi_shim(bsi: &Eac3Bsi) -> Ac3Bsi {
         dsurmod: 0xFF,
         annex_d_mix_levels: None,
         dmixmod: 0xFF,
+        compr: bsi.compr,
+        compr_ch2: bsi.compr_ch2,
         bits_consumed: 0,
     }
 }
@@ -2037,6 +2039,8 @@ mod aht_regs_tests {
             annex_e_mix_levels: None,
             dmixmod: 0xFF,
             lfemixlevcod: None,
+            compr: None,
+            compr_ch2: None,
             frame_bytes: 768,
             bits_consumed: 0,
         }

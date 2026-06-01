@@ -30,7 +30,35 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       them. 5 new tests cover the fixed-codepoint rows, the
       overloaded-`0b111` branch, the main/associated partition,
       mnemonic stability, and the `Bsi::service_type()` accessor
-      round-trip through `parse()`.
+      round-trip through `parse()`. **Round 202** lifts the BSI's
+      heavy-compression gain word from parse-and-discard to a typed
+      `Bsi::compr` / `Bsi::compr_ch2` (`Option<CompressionGain>`)
+      surface, mirrored on the Annex E `Bsi`. The `CompressionGain`
+      newtype splits the 8-bit wire field per Table 7.30 + §7.7.2.2
+      into `x() -> i8` (4-bit signed integer, `-8..=+7`, contributing
+      `(X+1)·6.02 dB`) and `y() -> u8` (4-bit unsigned mantissa with
+      implicit leading 1, contributing the `(16+Y)/32` attenuation
+      between -6.02 dB and -0.28 dB), with `linear() -> f32` /
+      `decibels() -> f32` derivatives. Endpoint codepoints land at
+      the spec's documented combined range: `raw=0b0111_1111` (X=7,
+      Y=15) ≈ +47.89 dB, `raw=0b1000_0000` (X=-8, Y=0) ≈
+      -48.16 dB. Annex E reuses Table 7.30 verbatim per §E.2.3.1.x,
+      so the eac3 BSI surfaces the same type — single source of
+      truth for both parsers. `None` is preserved verbatim when the
+      encoder omitted the word, letting a peak-limited player honour
+      the §7.7.2.1 "use dynrng for that syncframe" fallback. The
+      decoder PCM path is unchanged — compr/dynrng remain at the
+      decoder's "discretion" per spec — so the typed surface is
+      pure metadata for downstream RF-modulator / hotel-room feeds
+      that need to bound peak output level without re-parsing the
+      BSI. Encoders still emit `compre=0` (no heavy-compression
+      policy yet). Covered by 6 new `bsi::tests` (every X
+      codepoint's two's-complement sign-extension, every Table 7.30
+      row's dB endpoints at both `Y=0` and `Y=15`, the Y fractional
+      decode with implicit leading 1, the §7.7.2.2 combined ±48 dB
+      range endpoints, `parse()` round-trip via `compre=1`, and the
+      1+1 `compr2e` Ch2 round-trip) plus 1 new `eac3::bsi::tests`
+      round-trip.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)
