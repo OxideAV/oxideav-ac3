@@ -55,7 +55,8 @@ use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
 use crate::bsi::{
-    AdConverterType, AnnexDMixLevels, CompressionGain, DolbyHeadphoneMode, DolbySurroundExMode,
+    AdConverterType, AnnexDMixLevels, AudioProductionInfo, CompressionGain, DolbyHeadphoneMode,
+    DolbySurroundExMode, RoomType,
 };
 use crate::tables::acmod_nfchans;
 
@@ -207,6 +208,17 @@ pub struct Bsi {
     /// dual-mono (`acmod == 0` AND `audprodi2e == 1`). `None` outside
     /// 1+1 mode or when `audprodi2e == 0`.
     pub adconvtyp_ch2: Option<AdConverterType>,
+    /// §E.2.3.1.x audio production information (`mixlevel` + `roomtyp`)
+    /// for the main channel, gated by `infomdate == 1` AND
+    /// `audprodie == 1`. Same semantics as base AC-3 §5.4.2.13-15 — see
+    /// [`AudioProductionInfo`]. `None` when the informational metadata
+    /// block was absent or when the encoder did not emit the production
+    /// chain.
+    pub audio_production: Option<AudioProductionInfo>,
+    /// §E.2.3.1.x Ch2 audio production information for 1+1 dual-mono
+    /// streams (`acmod == 0` AND `audprodi2e == 1`). `None` outside
+    /// 1+1 mode or when the Ch2 production chain was absent.
+    pub audio_production_ch2: Option<AudioProductionInfo>,
     /// Frame size in bytes — `(frmsiz + 1) * 2`. Cached so the
     /// dispatcher can range-check the packet without re-doing
     /// arithmetic.
@@ -360,17 +372,20 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
 
     // §E.2.3.1.62 ff — informational meta-data.
     let infomdate = br.read_u32(1)? != 0;
-    let (dsurexmod, dheadphonmod, adconvtyp, adconvtyp_ch2) = if infomdate {
-        let info = parse_informational_metadata(br, acmod, fscod, strmtyp, numblkscod)?;
-        (
-            info.dsurexmod,
-            info.dheadphonmod,
-            info.adconvtyp,
-            info.adconvtyp_ch2,
-        )
-    } else {
-        (None, None, None, None)
-    };
+    let (dsurexmod, dheadphonmod, adconvtyp, adconvtyp_ch2, audio_production, audio_production_ch2) =
+        if infomdate {
+            let info = parse_informational_metadata(br, acmod, fscod, strmtyp, numblkscod)?;
+            (
+                info.dsurexmod,
+                info.dheadphonmod,
+                info.adconvtyp,
+                info.adconvtyp_ch2,
+                info.audio_production,
+                info.audio_production_ch2,
+            )
+        } else {
+            (None, None, None, None, None, None)
+        };
 
     // addbsi — opt-in trailer of up to 64 bytes.
     let addbsie = br.read_u32(1)? != 0;
@@ -407,6 +422,8 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         dheadphonmod,
         adconvtyp,
         adconvtyp_ch2,
+        audio_production,
+        audio_production_ch2,
         frame_bytes,
         bits_consumed,
     })
@@ -660,6 +677,8 @@ struct InformationalMetadata {
     dheadphonmod: Option<DolbyHeadphoneMode>,
     adconvtyp: Option<AdConverterType>,
     adconvtyp_ch2: Option<AdConverterType>,
+    audio_production: Option<AudioProductionInfo>,
+    audio_production_ch2: Option<AudioProductionInfo>,
 }
 
 /// Walk the §E.2.3.1.62 ff informational metadata block. The body is
@@ -669,12 +688,14 @@ struct InformationalMetadata {
 /// streams).
 ///
 /// Surfaces `dsurexmod` (§E.2.3.1.x, acmod ∈ {6, 7} guard),
-/// `dheadphonmod` (acmod == 2 guard), and per-channel `adconvtyp` /
-/// `adconvtyp_ch2` (inside the `audprodie` / `audprodi2e` chain). The
-/// remaining service-metadata fields (`bsmod` is parsed in the body
-/// `Bsi`, mix level, room type, source fscod, conv sync, AC-3-convert
-/// blkid / frmsizecod) are still parsed bit-accurately and discarded —
-/// they do not drive playback policy.
+/// `dheadphonmod` (acmod == 2 guard), per-channel `adconvtyp` /
+/// `adconvtyp_ch2` (inside the `audprodie` / `audprodi2e` chain), and
+/// the §5.4.2.13-15 audio-production info (`mixlevel` + `roomtyp`,
+/// reused verbatim per §E.2.3.1.x) for the main channel and the Ch2
+/// 1+1 dual-mono mirror. The remaining service-metadata fields
+/// (`bsmod` is parsed in the body `Bsi`, source fscod, conv sync,
+/// AC-3-convert blkid / frmsizecod) are still parsed bit-accurately
+/// and discarded — they do not drive playback policy.
 fn parse_informational_metadata(
     br: &mut BitReader<'_>,
     acmod: u8,
@@ -699,26 +720,38 @@ fn parse_informational_metadata(
         None
     };
     let audprodie = br.read_u32(1)? != 0;
-    let adconvtyp = if audprodie {
-        let _mixlevel = br.read_u32(5)?;
-        let _roomtyp = br.read_u32(2)?;
+    let (audio_production, adconvtyp) = if audprodie {
+        let mixlevel = br.read_u32(5)? as u8;
+        let roomtyp_raw = br.read_u32(2)? as u8;
         let adcv_raw = br.read_u32(1)? as u8;
-        Some(AdConverterType::from_code(adcv_raw))
+        (
+            Some(AudioProductionInfo {
+                mixlevel,
+                roomtyp: RoomType::from_code(roomtyp_raw),
+            }),
+            Some(AdConverterType::from_code(adcv_raw)),
+        )
     } else {
-        None
+        (None, None)
     };
-    let adconvtyp_ch2 = if acmod == 0 {
+    let (audio_production_ch2, adconvtyp_ch2) = if acmod == 0 {
         let audprodi2e = br.read_u32(1)? != 0;
         if audprodi2e {
-            let _mixlevel2 = br.read_u32(5)?;
-            let _roomtyp2 = br.read_u32(2)?;
+            let mixlevel2 = br.read_u32(5)? as u8;
+            let roomtyp2_raw = br.read_u32(2)? as u8;
             let adcv2_raw = br.read_u32(1)? as u8;
-            Some(AdConverterType::from_code(adcv2_raw))
+            (
+                Some(AudioProductionInfo {
+                    mixlevel: mixlevel2,
+                    roomtyp: RoomType::from_code(roomtyp2_raw),
+                }),
+                Some(AdConverterType::from_code(adcv2_raw)),
+            )
         } else {
-            None
+            (None, None)
         }
     } else {
-        None
+        (None, None)
     };
     if fscod < 0x3 {
         let _sourcefscod = br.read_u32(1)?;
@@ -741,6 +774,8 @@ fn parse_informational_metadata(
         dheadphonmod,
         adconvtyp,
         adconvtyp_ch2,
+        audio_production,
+        audio_production_ch2,
     })
 }
 
@@ -1223,6 +1258,17 @@ mod tests {
         assert!(bsi.dheadphonmod.is_none());
         assert_eq!(bsi.adconvtyp, Some(crate::bsi::AdConverterType::Hdcd));
         assert!(bsi.adconvtyp_ch2.is_none());
+        // §E.2.3.1.x reuses §5.4.2.13-15 audio production verbatim —
+        // `audprodie == 1` surfaces (mixlevel=21 → 101 dB SPL,
+        // roomtyp=SmallFlat) and the Ch2 mirror stays None outside
+        // 1+1 mode.
+        let ap = bsi
+            .audio_production
+            .expect("audprodie=1 should surface audio_production");
+        assert_eq!(ap.mixlevel, 0b10101);
+        assert_eq!(ap.peak_mix_level_db_spl(), 101);
+        assert_eq!(ap.roomtyp, crate::bsi::RoomType::SmallFlat);
+        assert!(bsi.audio_production_ch2.is_none());
     }
 
     /// 2/0 indep with `infomdate == 1` — the `dheadphonmod` slot
@@ -1321,5 +1367,49 @@ mod tests {
         );
         assert!(bsi.dsurexmod.is_none());
         assert!(bsi.dheadphonmod.is_none());
+        // §5.4.2.13-15 audio-production block decodes independently
+        // for Ch1 (mixlevel=16 → 96 dB SPL, roomtyp=NotIndicated) and
+        // Ch2 (mixlevel=1 → 81 dB SPL, roomtyp=Reserved). The 1+1
+        // mirror is the canonical test for the audprodi2e chain.
+        let ap1 = bsi
+            .audio_production
+            .expect("audprodie=1 should surface Ch1 audio_production");
+        assert_eq!(ap1.mixlevel, 0b10000);
+        assert_eq!(ap1.peak_mix_level_db_spl(), 96);
+        assert_eq!(ap1.roomtyp, crate::bsi::RoomType::NotIndicated);
+        let ap2 = bsi
+            .audio_production_ch2
+            .expect("audprodi2e=1 should surface Ch2 audio_production");
+        assert_eq!(ap2.mixlevel, 0b00001);
+        assert_eq!(ap2.peak_mix_level_db_spl(), 81);
+        assert_eq!(ap2.roomtyp, crate::bsi::RoomType::Reserved);
+    }
+
+    /// `infomdate == 0` short-circuits the whole §E.2.3.1.x
+    /// informational block: every typed surface stays `None` including
+    /// the freshly-lifted [`crate::bsi::AudioProductionInfo`] mirror.
+    /// Matches the round-208 `no_infomdate_yields_no_playback_hints`
+    /// shape but extended for the round-214 production fields.
+    #[test]
+    fn no_infomdate_yields_no_audio_production() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod
+            (3, 7),    // acmod = 3/2
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 0),    // mixmdate
+            (1, 0),    // infomdate = 0
+            (1, 0),    // addbsie
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert!(bsi.audio_production.is_none());
+        assert!(bsi.audio_production_ch2.is_none());
     }
 }

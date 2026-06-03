@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Audio production information typed surface — `mixlevel` + `roomtyp`
+  (§5.4.2.13-15 / Table 5.12 + §E.2.3.1.x)** (round 214 / r214). The
+  two `audprodie == 1` payload fields the BSI parser used to consume-
+  and-discard now surface as a typed `Option<AudioProductionInfo>` on
+  both the base AC-3 `Bsi` and the Annex E `Bsi`. The struct carries
+  the raw 5-bit `mixlevel` codepoint plus a typed `RoomType` enum
+  (Table 5.12: `NotIndicated` / `LargeXCurve` / `SmallFlat` /
+  `Reserved`); a `peak_mix_level_db_spl()` accessor resolves the
+  spec's `80 + mixlevel` derivation (range 80..=111 dB SPL per
+  §5.4.2.14). The 1+1 dual-mono Ch2 mirror (`audprodi2e == 1`,
+  §5.4.2.21-23) surfaces as a separate `audio_production_ch2` field
+  so a chain consumer routing Ch1/Ch2 to independent SPL-calibrated
+  reproduction buses no longer needs a second BSI walk. Per spec the
+  field "is not typically used within the AC-3 decoder, but may be
+  used by other parts of the audio reproduction equipment" —
+  surfacing the typed values lets cinema / mastering tooling re-target
+  the playback bus to the absolute SPL the mixing engineer was
+  monitoring at without forfeiting decoder-side zero-overhead.
+  Encoders still emit `audprodie == 0` for every syncframe so output
+  is byte-identical; the only behaviour change is decoder-side
+  parsing. Covered by 5 new `bsi::tests` (every Table 5.12 row's
+  round-trip, the `80 + mixlevel` endpoint resolution at 0 / 5 / 31
+  codepoints, the `audprodie == 1` mono surface, the `audprodie == 0`
+  short-circuit, and the 1+1 dual-mono Ch1+Ch2 independent surfacing)
+  plus 1 new `eac3::bsi::tests::no_infomdate_yields_no_audio_production`
+  short-circuit + extended assertions on two pre-existing `infomdate`
+  tests that already exercise `audprodie == 1` (3/2 indep and 1+1
+  dual-mono).
 - **xbsi2 / informational-metadata typed surface — Dolby Surround EX,
   Dolby Headphone, A/D converter type (Tables D2.7 / D2.8 / D2.9 +
   §E.2.3.1.x)** (round 208 / r208). Three Annex D §2.3.1.7-10 fields

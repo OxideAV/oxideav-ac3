@@ -1856,6 +1856,8 @@ fn build_ac3_bsi_shim(bsi: &Eac3Bsi) -> Ac3Bsi {
         dsurexmod: None,
         dheadphonmod: None,
         adconvtyp: None,
+        audio_production: None,
+        audio_production_ch2: None,
         bits_consumed: 0,
     }
 }
@@ -2048,6 +2050,8 @@ mod aht_regs_tests {
             dheadphonmod: None,
             adconvtyp: None,
             adconvtyp_ch2: None,
+            audio_production: None,
+            audio_production_ch2: None,
             frame_bytes: 768,
             bits_consumed: 0,
         }

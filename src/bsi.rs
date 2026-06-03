@@ -93,6 +93,22 @@ pub struct Bsi {
     /// present; `None` otherwise. `Standard` = generic 24-bit PCM
     /// converter; `Hdcd` = HDCD-encoded source.
     pub adconvtyp: Option<AdConverterType>,
+    /// §5.4.2.13-15 audio production information for the main channel
+    /// (Ch1 in a 1+1 dual-mono stream). `Some` only when `audprodie ==
+    /// 1` in the bitstream; `None` otherwise. Carries the `mixlevel`
+    /// (peak mixing-session SPL hint per §5.4.2.14) and the `roomtyp`
+    /// (mixing-room calibration per §5.4.2.15 / Table 5.12). The base
+    /// AC-3 decoder does not act on these fields ("not typically used
+    /// within the AC-3 decoder, but may be used by other parts of the
+    /// audio reproduction equipment") — surfacing them lets a chain
+    /// consumer route the hint without re-parsing the BSI.
+    pub audio_production: Option<AudioProductionInfo>,
+    /// §5.4.2.21-23 audio production information for Ch2 in a 1+1
+    /// dual-mono stream (`acmod == 0` AND `audprodi2e == 1`). `None`
+    /// outside 1+1 mode or when `audprodi2e == 0`. Same semantics as
+    /// [`Bsi::audio_production`] but routed to the Ch2 reproduction
+    /// chain.
+    pub audio_production_ch2: Option<AudioProductionInfo>,
     /// Absolute bit position (in bits, measured from the first byte of
     /// `bsi()` input) where the BSI ended. Callers use this to skip
     /// straight to the audio-block area.
@@ -440,6 +456,88 @@ impl AdConverterType {
     }
 }
 
+/// §5.4.2.15 / Table 5.12 mixing-room type. A 2-bit code describing
+/// the calibration of the mixing room used during the final audio
+/// mixing session.
+///
+/// Per spec the value "is not typically used by the AC-3 decoder, but
+/// may be used by other parts of the audio reproduction equipment".
+/// The reserved code may be interpreted as "not indicated"; we keep
+/// it as its own variant so a careful consumer can still distinguish
+/// "encoder explicitly left the field blank" from "encoder emitted an
+/// invalid codepoint".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoomType {
+    /// `'00'` — not indicated.
+    NotIndicated,
+    /// `'01'` — large room, X-curve monitor calibration.
+    LargeXCurve,
+    /// `'10'` — small room, flat monitor calibration.
+    SmallFlat,
+    /// `'11'` — reserved (treat as
+    /// [`NotIndicated`](Self::NotIndicated) per §5.4.2.15; the
+    /// decoder must still reproduce audio).
+    Reserved,
+}
+
+impl RoomType {
+    /// Decode the 2-bit wire value verbatim per Table 5.12.
+    pub fn from_code(code: u8) -> Self {
+        match code & 0x3 {
+            0 => RoomType::NotIndicated,
+            1 => RoomType::LargeXCurve,
+            2 => RoomType::SmallFlat,
+            _ => RoomType::Reserved,
+        }
+    }
+
+    /// Raw 2-bit code as it appeared on the wire.
+    pub fn raw(self) -> u8 {
+        match self {
+            RoomType::NotIndicated => 0,
+            RoomType::LargeXCurve => 1,
+            RoomType::SmallFlat => 2,
+            RoomType::Reserved => 3,
+        }
+    }
+}
+
+/// §5.4.2.13-15 audio production information block — the
+/// `audprodie==1` payload (and its Ch2 `audprodi2e==1` mirror in 1+1
+/// dual-mono streams). Carries a peak mixing-level hint and the
+/// mixing-room calibration.
+///
+/// Neither field affects AC-3 PCM decoding, but a downstream
+/// SPL-calibrated reproduction chain (cinema / mastering monitor)
+/// can use them to re-target the playback level back to the absolute
+/// SPL the mixing engineer was monitoring at. Per §5.4.2.14 the peak
+/// mixing level is `80 + mixlevel` dB SPL, in the documented range
+/// 80..=111 dB SPL.
+///
+/// The Annex E (E-AC-3) `infomdata` informational block reuses the
+/// same two fields with identical semantics (§E.2.3.1.x) so the type
+/// is shared between the AC-3 and E-AC-3 BSI surfaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioProductionInfo {
+    /// Raw 5-bit `mixlevel` codepoint, in the spec-documented range
+    /// 0..=31. The peak mixing-session SPL is
+    /// `80 + mixlevel` dB SPL — use [`Self::peak_mix_level_db_spl`]
+    /// for the resolved value.
+    pub mixlevel: u8,
+    /// Typed `roomtyp` decode (Table 5.12).
+    pub roomtyp: RoomType,
+}
+
+impl AudioProductionInfo {
+    /// Resolve the [`Self::mixlevel`] codepoint into its absolute
+    /// peak SPL value per §5.4.2.14: the peak mixing level is
+    /// `80 + mixlevel` dB SPL, i.e. in the range 80..=111 dB SPL for
+    /// a 5-bit codepoint.
+    pub fn peak_mix_level_db_spl(self) -> u32 {
+        80 + (self.mixlevel as u32 & 0x1F)
+    }
+}
+
 /// Annex D §2.3.1.3-6 alternate-syntax mix-level codewords. Each is a
 /// 3-bit value; Tables D2.3 / D2.4 / D2.5 / D2.6 map them to linear
 /// gains via [`annex_d_lt_rt_clev`] / [`annex_d_lt_rt_slev`] /
@@ -545,10 +643,11 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
     let dialnorm = if dialnorm_raw == 0 { 31 } else { dialnorm_raw };
 
     // Optional service metadata (§5.4.2.9 ff). `compr` is surfaced
-    // (Table 7.30); langcode / audprodie are parse-and-discard — they
-    // carry deprecated mix-level/room-type hints and ISO-639 codes
-    // that the decoder doesn't act on. A proper player can tap them
-    // later via a second pass if needed.
+    // (Table 7.30); `audprodie` carries the §5.4.2.13-15 mixing-room
+    // hints and is surfaced as a typed [`AudioProductionInfo`]. The
+    // `langcode` codepoint is per §5.4.2.12 a reserved 0xFF and stays
+    // discarded — modern delivery uses the ISO 639-2 language code
+    // in the signaling layer.
     let compre = br.read_u32(1)? != 0;
     let compr = if compre {
         Some(CompressionGain::from_byte(br.read_u32(8)? as u8))
@@ -560,13 +659,19 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         let _langcod = br.read_u32(8)?;
     }
     let audprodie = br.read_u32(1)? != 0;
-    if audprodie {
-        let _mixlevel = br.read_u32(5)?;
-        let _roomtyp = br.read_u32(2)?;
-    }
+    let audio_production = if audprodie {
+        let mixlevel = br.read_u32(5)? as u8;
+        let roomtyp_raw = br.read_u32(2)? as u8;
+        Some(AudioProductionInfo {
+            mixlevel,
+            roomtyp: RoomType::from_code(roomtyp_raw),
+        })
+    } else {
+        None
+    };
 
     // 1+1 mode (dual mono) carries a second copy of the metadata for Ch2.
-    let compr_ch2 = if acmod == 0 {
+    let (compr_ch2, audio_production_ch2) = if acmod == 0 {
         let _dialnorm2 = br.read_u32(5)?;
         let compr2e = br.read_u32(1)? != 0;
         let c2 = if compr2e {
@@ -579,13 +684,19 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
             let _langcod2 = br.read_u32(8)?;
         }
         let audprodi2e = br.read_u32(1)? != 0;
-        if audprodi2e {
-            let _mixlevel2 = br.read_u32(5)?;
-            let _roomtyp2 = br.read_u32(2)?;
-        }
-        c2
+        let ap2 = if audprodi2e {
+            let mixlevel2 = br.read_u32(5)? as u8;
+            let roomtyp2_raw = br.read_u32(2)? as u8;
+            Some(AudioProductionInfo {
+                mixlevel: mixlevel2,
+                roomtyp: RoomType::from_code(roomtyp2_raw),
+            })
+        } else {
+            None
+        };
+        (c2, ap2)
     } else {
-        None
+        (None, None)
     };
 
     let _copyrightb = br.read_u32(1)?;
@@ -688,6 +799,8 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         dsurexmod,
         dheadphonmod,
         adconvtyp,
+        audio_production,
+        audio_production_ch2,
         bits_consumed,
     })
 }
@@ -1569,6 +1682,164 @@ mod tests {
         assert!(b.dsurexmod.is_none());
         assert!(b.dheadphonmod.is_none());
         assert!(b.adconvtyp.is_none());
+    }
+
+    /// §5.4.2.15 / Table 5.12 — every codepoint of `roomtyp` decodes
+    /// to its named variant and round-trips through `raw()`.
+    #[test]
+    fn room_type_table_5_12_round_trip() {
+        for (code, want) in [
+            (0u8, RoomType::NotIndicated),
+            (1, RoomType::LargeXCurve),
+            (2, RoomType::SmallFlat),
+            (3, RoomType::Reserved),
+        ] {
+            let got = RoomType::from_code(code);
+            assert_eq!(got, want, "code={code:02b}");
+            assert_eq!(got.raw(), code, "raw round-trip: code={code:02b}");
+        }
+        // Upper 6 bits of input are ignored — only the low 2 bits matter.
+        assert_eq!(RoomType::from_code(0b1111_1110), RoomType::SmallFlat);
+    }
+
+    /// §5.4.2.14 — `mixlevel` is the 5-bit code, peak SPL is
+    /// `80 + mixlevel` dB. Spot the endpoints (`0` → 80 dB SPL,
+    /// `31` → 111 dB SPL) and a typical mid-range value
+    /// (`mixlevel = 5` → 85 dB SPL, ITU-R BS.775 reference monitor).
+    #[test]
+    fn audio_production_info_peak_db_spl_endpoints() {
+        let lo = AudioProductionInfo {
+            mixlevel: 0,
+            roomtyp: RoomType::NotIndicated,
+        };
+        assert_eq!(lo.peak_mix_level_db_spl(), 80);
+        let mid = AudioProductionInfo {
+            mixlevel: 5,
+            roomtyp: RoomType::LargeXCurve,
+        };
+        assert_eq!(mid.peak_mix_level_db_spl(), 85);
+        let hi = AudioProductionInfo {
+            mixlevel: 31,
+            roomtyp: RoomType::SmallFlat,
+        };
+        assert_eq!(hi.peak_mix_level_db_spl(), 111);
+    }
+
+    /// `parse()` surfaces `audprodie==1` into a typed
+    /// [`AudioProductionInfo`] with the 5-bit `mixlevel` and Table 5.12
+    /// `roomtyp` taken verbatim from the wire. Build a 1/0 mono BSI
+    /// (`acmod=1`) with `audprodie=1`, mixlevel=0b10101 (85 dB SPL),
+    /// roomtyp=0b01 (`LargeXCurve`), and verify both decode correctly.
+    /// `audio_production_ch2` stays `None` because the stream is not
+    /// 1+1 dual-mono.
+    #[test]
+    fn parse_surfaces_audio_production_when_audprodie_set() {
+        let bits: [(u8, u32); 16] = [
+            (5, 8),       // bsid
+            (3, 0),       // bsmod
+            (3, 1),       // acmod = 1/0 mono → no cmix/surmix/dsurmod
+            (1, 0),       // lfeon
+            (5, 27),      // dialnorm
+            (1, 0),       // compre
+            (1, 0),       // langcode
+            (1, 1),       // audprodie = 1
+            (5, 0b10101), // mixlevel = 21 → 101 dB SPL
+            (2, 0b01),    // roomtyp = LargeXCurve
+            // No 1+1 mirror — acmod != 0.
+            (1, 0), // copyrightb
+            (1, 0), // origbs
+            (1, 0), // timecod1e
+            (1, 0), // timecod2e
+            (1, 0), // addbsie
+            (1, 0), // pad
+        ];
+        let bytes = pack_bits(&bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.acmod, 1);
+        let ap = b
+            .audio_production
+            .expect("audprodie=1 should surface audio_production");
+        assert_eq!(ap.mixlevel, 0b10101);
+        assert_eq!(ap.peak_mix_level_db_spl(), 80 + 21);
+        assert_eq!(ap.roomtyp, RoomType::LargeXCurve);
+        // Not 1+1 dual-mono → no Ch2 mirror.
+        assert!(b.audio_production_ch2.is_none());
+    }
+
+    /// `audprodie==0` leaves [`Bsi::audio_production`] as `None`. The
+    /// existing `parses_minimal_2_0_stereo_bsi` fixture exercises this
+    /// case (it clears `audprodie`), so just re-pack a minimal 2/0
+    /// stream and assert.
+    #[test]
+    fn parse_leaves_audio_production_none_when_audprodie_clear() {
+        let bits: [(u8, u32); 14] = [
+            (5, 0b01000),
+            (3, 0b000),
+            (3, 0b010),
+            (2, 0b00),
+            (1, 0),
+            (5, 27),
+            (1, 0), // compre
+            (1, 0), // langcode
+            (1, 0), // audprodie = 0
+            (1, 0), // copyrightb
+            (1, 0), // origbs
+            (1, 0),
+            (1, 0),
+            (1, 0),
+        ];
+        let bytes = pack_bits(&bits);
+        let b = parse(&bytes).unwrap();
+        assert!(b.audio_production.is_none());
+        assert!(b.audio_production_ch2.is_none());
+    }
+
+    /// 1+1 dual-mono (`acmod == 0`) emits an independent `audprodi2e`
+    /// chain for Ch2 per §5.4.2.21-23. Build a stream with Ch1
+    /// audprodie=1 (mixlevel=8, roomtyp=SmallFlat) AND Ch2
+    /// audprodi2e=1 (mixlevel=0, roomtyp=NotIndicated) and verify both
+    /// fields surface independently.
+    #[test]
+    fn parse_surfaces_audio_production_ch2_in_dual_mono() {
+        let bits: [(u8, u32); 20] = [
+            (5, 8),       // bsid
+            (3, 0),       // bsmod
+            (3, 0),       // acmod = 0 (1+1 dual-mono)
+            (1, 0),       // lfeon
+            (5, 27),      // dialnorm
+            (1, 0),       // compre
+            (1, 0),       // langcode
+            (1, 1),       // audprodie = 1
+            (5, 0b01000), // mixlevel = 8 → 88 dB SPL
+            (2, 0b10),    // roomtyp = SmallFlat
+            // 1+1 second block.
+            (5, 27),      // dialnorm2
+            (1, 0),       // compr2e
+            (1, 0),       // langcod2e
+            (1, 1),       // audprodi2e = 1
+            (5, 0b00000), // mixlevel2 = 0 → 80 dB SPL
+            (2, 0b00),    // roomtyp2 = NotIndicated
+            (1, 0),       // copyrightb
+            (1, 0),       // origbs
+            (1, 0),       // timecod1e
+            (1, 0),       // timecod2e
+        ];
+        let mut bytes = pack_bits(&bits);
+        bytes.push(0); // addbsie pad
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.acmod, 0);
+        let ap1 = b
+            .audio_production
+            .expect("audprodie=1 should surface Ch1 production");
+        assert_eq!(ap1.mixlevel, 8);
+        assert_eq!(ap1.peak_mix_level_db_spl(), 88);
+        assert_eq!(ap1.roomtyp, RoomType::SmallFlat);
+        let ap2 = b
+            .audio_production_ch2
+            .expect("audprodi2e=1 should surface Ch2 production");
+        assert_eq!(ap2.mixlevel, 0);
+        assert_eq!(ap2.peak_mix_level_db_spl(), 80);
+        assert_eq!(ap2.roomtyp, RoomType::NotIndicated);
     }
 
     /// `bsid == 6` with `xbsi2e == 0` keeps the three Annex D fields at

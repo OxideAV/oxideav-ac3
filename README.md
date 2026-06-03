@@ -86,7 +86,35 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       `eac3::bsi::tests` (`infomdate == 0` yields no hints; 3/2 indep
       `infomdate == 1` surfaces `dsurexmod` + `adconvtyp`; 2/0 indep
       surfaces `dheadphonmod`; 1+1 dual-mono surfaces both `adconvtyp`
-      and `adconvtyp_ch2` independently).
+      and `adconvtyp_ch2` independently). **Round 214** extends the
+      same parse-and-surface treatment to the §5.4.2.13-15 audio
+      production information block — `mixlevel` (5 bits) + `roomtyp`
+      (2 bits, Table 5.12) lift from parse-and-discard to a typed
+      `Bsi::audio_production: Option<AudioProductionInfo>` (plus an
+      independent `Bsi::audio_production_ch2` mirror for the 1+1
+      dual-mono `audprodi2e` chain per §5.4.2.21-23). The
+      `AudioProductionInfo` struct exposes the raw 5-bit `mixlevel`
+      codepoint, a typed `RoomType` enum (Table 5.12: `NotIndicated`
+      / `LargeXCurve` / `SmallFlat` / `Reserved`), and a
+      `peak_mix_level_db_spl()` accessor resolving the spec's
+      `80 + mixlevel` derivation (range 80..=111 dB SPL per §5.4.2.14).
+      The Annex E `Bsi` carries the same surface — §E.2.3.1.x's
+      informational-metadata block reuses §5.4.2.13-15 verbatim under
+      the `infomdate == 1` gate — so single source of truth for both
+      parsers. Per spec the fields are advisory ("not typically used
+      within the AC-3 decoder, but may be used by other parts of the
+      audio reproduction equipment") so the decoder PCM path is
+      unchanged; the typed surface lets cinema / mastering tooling
+      re-target the playback bus to the absolute mixing-session SPL
+      without re-walking the BSI. Encoders still emit `audprodie=0`
+      so encoder output is byte-identical. Covered by 5 new
+      `bsi::tests` (every Table 5.12 row's round-trip; the
+      `80 + mixlevel` endpoint resolution at 0 / 5 / 31 codepoints;
+      `audprodie == 1` mono surface; `audprodie == 0` short-circuit;
+      and the 1+1 dual-mono Ch1+Ch2 independent surfacing) plus 1
+      new `eac3::bsi::tests::no_infomdate_yields_no_audio_production`
+      and extended assertions on two pre-existing `infomdate` tests
+      that already exercised `audprodie == 1` (3/2 indep + 1+1).
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)

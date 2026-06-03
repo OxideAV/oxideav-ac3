@@ -613,6 +613,8 @@ mod tests {
             dsurexmod: None,
             dheadphonmod: None,
             adconvtyp: None,
+            audio_production: None,
+            audio_production_ch2: None,
             bits_consumed: 0,
         }
     }
@@ -642,6 +644,8 @@ mod tests {
             dsurexmod: None,
             dheadphonmod: None,
             adconvtyp: None,
+            audio_production: None,
+            audio_production_ch2: None,
             bits_consumed: 0,
         }
     }

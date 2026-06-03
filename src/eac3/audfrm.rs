@@ -634,6 +634,8 @@ mod tests {
             dheadphonmod: None,
             adconvtyp: None,
             adconvtyp_ch2: None,
+            audio_production: None,
+            audio_production_ch2: None,
             frame_bytes: 768,
             bits_consumed: 0,
         }
