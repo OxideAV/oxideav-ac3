@@ -615,6 +615,9 @@ mod tests {
             adconvtyp: None,
             audio_production: None,
             audio_production_ch2: None,
+            timecod1: None,
+            timecod2: None,
+            timecode_presence: crate::bsi::TimeCodePresence::NotPresent,
             bits_consumed: 0,
         }
     }
@@ -646,6 +649,9 @@ mod tests {
             adconvtyp: None,
             audio_production: None,
             audio_production_ch2: None,
+            timecod1: None,
+            timecod2: None,
+            timecode_presence: crate::bsi::TimeCodePresence::NotPresent,
             bits_consumed: 0,
         }
     }

@@ -1858,6 +1858,9 @@ fn build_ac3_bsi_shim(bsi: &Eac3Bsi) -> Ac3Bsi {
         adconvtyp: None,
         audio_production: None,
         audio_production_ch2: None,
+        timecod1: None,
+        timecod2: None,
+        timecode_presence: crate::bsi::TimeCodePresence::NotPresent,
         bits_consumed: 0,
     }
 }

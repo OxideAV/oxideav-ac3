@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Base-syntax timecode typed surface — `timecod1` / `timecod2` /
+  `timecode_presence` (§5.4.2.26-28 / Table 5.13)** (round 219 / r219).
+  The two 14-bit timecode fields the BSI parser used to consume-and-
+  discard now surface as `Option<TimeCode1>` / `Option<TimeCode2>` on
+  the base AC-3 `Bsi` (gated on `bsid != 6` — Annex D §1 reuses these
+  wire slots for the `xbsi*e` blocks so the timecode is definitionally
+  absent on `bsid == 6` streams). `TimeCode1` exposes `hours()` (5-bit),
+  `minutes()` (6-bit), and `eight_second_increments()` (3-bit) plus
+  `seconds_in_day()` and `is_spec_valid()` for spec-range checks
+  (§5.4.2.27 documents `hours ≤ 23` / `minutes ≤ 59`); `TimeCode2`
+  exposes `seconds()` (3-bit), `frames()` (5-bit), and
+  `frame_fractions()` (6-bit) plus `is_spec_valid()` (frames ≤ 29 at
+  the §5.4.2.26 30 fps reference). A new `TimeCodePresence` enum
+  records the `(timecod2e, timecod1e)` pair per Table 5.13
+  (`NotPresent` / `FirstHalfOnly` / `SecondHalfOnly` / `BothHalves`)
+  so a chain consumer can pick playback strategy without re-decoding
+  the flags. Per Annex D §1 / §3.2 the timecode "does not affect the
+  decoding process in legacy decoders" — the AC-3 PCM path is
+  unchanged. Encoders still emit `timecod1e == 0` and `timecod2e == 0`
+  per the long-standing default so encoder output is byte-identical;
+  the only behaviour change is decoder-side parsing. Covered by 10
+  new `bsi::tests`: `TimeCode1` and `TimeCode2` field-decomposition
+  walks (including out-of-range codepoint passthrough), `is_spec_valid`
+  range checks for both halves, the Table 5.13 `from_flags`
+  round-trip, `parse()` surfacing both halves on a base-syntax frame,
+  the `FirstHalfOnly` and `SecondHalfOnly` partial-presence rows, the
+  `NotPresent` all-zero case, and the Annex D `bsid == 6` short-circuit
+  that keeps `timecod1` / `timecod2` at `None` even when the wire bits
+  carrying `xbsi*e` are set.
 - **Audio production information typed surface — `mixlevel` + `roomtyp`
   (§5.4.2.13-15 / Table 5.12 + §E.2.3.1.x)** (round 214 / r214). The
   two `audprodie == 1` payload fields the BSI parser used to consume-

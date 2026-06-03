@@ -109,6 +109,31 @@ pub struct Bsi {
     /// [`Bsi::audio_production`] but routed to the Ch2 reproduction
     /// chain.
     pub audio_production_ch2: Option<AudioProductionInfo>,
+    /// §5.4.2.27 low-resolution timecode half. `Some` only when the
+    /// base syntax is in use (`bsid != 6` — the alternate Annex D
+    /// syntax reuses these wire bits for the `xbsi1` block) AND the
+    /// encoder set `timecod1e == 1` in the bitstream. Covers hours +
+    /// minutes + 8-second increments per §5.4.2.27; combine with
+    /// [`Self::timecod2`] for a full ~521 µs-resolution offset.
+    ///
+    /// Per Annex D §1 / §3.2 the timecode "does not affect the
+    /// decoding process in legacy decoders"; surfacing it lets a chain
+    /// consumer recover a playback offset for editorial workflows that
+    /// pre-date out-of-band timecode.
+    pub timecod1: Option<TimeCode1>,
+    /// §5.4.2.28 high-resolution timecode half. `Some` only when the
+    /// base syntax is in use (`bsid != 6`) AND the encoder set
+    /// `timecod2e == 1`. Covers residual seconds + frames +
+    /// fractional-frames per §5.4.2.28; can stand alone (sync to
+    /// out-of-band wall-clock) or pair with [`Self::timecod1`] for the
+    /// full 28-bit code.
+    pub timecod2: Option<TimeCode2>,
+    /// §5.4.2.26 Table 5.13 presence pattern. Always present —
+    /// [`TimeCodePresence::NotPresent`] when both flags are clear (or
+    /// when the alternate Annex D syntax is in use, in which case the
+    /// `timecod*e` slots carry `xbsi*e` instead and the timecode is
+    /// definitionally absent).
+    pub timecode_presence: TimeCodePresence,
     /// Absolute bit position (in bits, measured from the first byte of
     /// `bsi()` input) where the BSI ended. Callers use this to skip
     /// straight to the audio-block area.
@@ -538,6 +563,199 @@ impl AudioProductionInfo {
     }
 }
 
+/// §5.4.2.27 base-syntax `timecod1` field — the **low-resolution** half
+/// of the 28-bit SMPTE-style time code. Surfaced on
+/// [`Bsi::timecod1`] only when the base syntax is in use (`bsid != 6`,
+/// equivalently when the alternate Annex D syntax is *not* selected)
+/// AND the encoder set `timecod1e == 1`.
+///
+/// The 14 wire bits split per §5.4.2.27 as `H H H H H . M M M M M M .
+/// S S S` (MSB-first):
+///
+/// * 5-bit `hours` field — valid range `0..=23` (§5.4.2.27 says values
+///   24..=31 are illegal but spec-compliant decoders should still
+///   reproduce audio; the parser accepts the raw codepoint and lets
+///   the caller decide).
+/// * 6-bit `minutes` field — valid range `0..=59`.
+/// * 3-bit `eight_second_increments` field — valid range `0..=7`,
+///   each step representing 8 seconds (i.e. `0, 8, 16, 24, 32, 40,
+///   48, 56` seconds within the current minute).
+///
+/// The combined resolution is 8 seconds and the addressable range is
+/// 24 hours (`24 × 3600 = 86 400 s`). The high-resolution remainder
+/// lives in [`TimeCode2`].
+///
+/// Per §5.4.2.26 and Annex D §1 these slots have "never been applied
+/// for their originally anticipated purpose" — modern delivery uses
+/// out-of-band timecode (e.g. PTP, SMPTE 12M MTC) — but legacy AC-3
+/// streams may still carry them, and a careful consumer can recover a
+/// frame-accurate playback offset for editorial workflows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeCode1 {
+    raw: u16,
+}
+
+impl TimeCode1 {
+    /// Wrap the 14-bit wire value verbatim. Only the low 14 bits of
+    /// `raw` are consulted; the parser hands the field in already
+    /// masked.
+    pub fn from_raw(raw: u16) -> Self {
+        Self { raw: raw & 0x3FFF }
+    }
+
+    /// Underlying 14-bit wire value — `HHHHH MMMMMM SSS` packed
+    /// MSB-first.
+    pub fn raw(self) -> u16 {
+        self.raw
+    }
+
+    /// 5-bit `hours` field, in `0..=31` (spec-valid range `0..=23`).
+    pub fn hours(self) -> u8 {
+        ((self.raw >> 9) & 0x1F) as u8
+    }
+
+    /// 6-bit `minutes` field, in `0..=63` (spec-valid range `0..=59`).
+    pub fn minutes(self) -> u8 {
+        ((self.raw >> 3) & 0x3F) as u8
+    }
+
+    /// 3-bit `eight_second_increments` field, in `0..=7`. Each step
+    /// represents 8 seconds within the current minute.
+    pub fn eight_second_increments(self) -> u8 {
+        (self.raw & 0x7) as u8
+    }
+
+    /// Total whole-second offset within the 24-hour day represented by
+    /// this half — `hours·3600 + minutes·60 + eight_second_increments·8`.
+    /// Maxes at `23·3600 + 59·60 + 7·8 = 86 336 s` for spec-valid input;
+    /// the raw 5+6+3 bit ranges can push the result up to `122 296 s`
+    /// when the encoder emits out-of-range values (the parser still
+    /// passes those through verbatim).
+    pub fn seconds_in_day(self) -> u32 {
+        (self.hours() as u32) * 3600
+            + (self.minutes() as u32) * 60
+            + (self.eight_second_increments() as u32) * 8
+    }
+
+    /// `true` when every field is inside its spec-documented range
+    /// (`hours ≤ 23`, `minutes ≤ 59`). The `eight_second_increments`
+    /// field cannot overflow its spec range (its 3-bit width caps it at
+    /// 7). Use this to flag malformed encoders without rejecting the
+    /// stream — per §5.4.2.27 a decoder need not act on the timecode.
+    pub fn is_spec_valid(self) -> bool {
+        self.hours() <= 23 && self.minutes() <= 59
+    }
+}
+
+/// §5.4.2.28 base-syntax `timecod2` field — the **high-resolution**
+/// half of the 28-bit SMPTE-style time code. Surfaced on
+/// [`Bsi::timecod2`] only when the base syntax is in use (`bsid != 6`)
+/// AND the encoder set `timecod2e == 1`.
+///
+/// The 14 wire bits split per §5.4.2.28 as `S S S . F F F F F . f f f
+/// f f f` (MSB-first):
+///
+/// * 3-bit `seconds` field — valid range `0..=7`, the residual whole
+///   seconds beyond the [`TimeCode1::eight_second_increments`]
+///   quantum (i.e. `tc1.eight_second_increments·8 + tc2.seconds`
+///   recovers the absolute second-within-minute).
+/// * 5-bit `frames` field — valid range `0..=29` (assumes a 30 fps
+///   reference per §5.4.2.26 "one frame = 1/30th of a second"; the
+///   parser accepts codepoints up to 31).
+/// * 6-bit `frame_fractions` field — valid range `0..=63`, each step
+///   representing 1/64 of a frame.
+///
+/// The combined resolution is `1 / (30 × 64) ≈ 521 µs` and the
+/// addressable range covers 8 seconds (the quantum of
+/// [`TimeCode1::eight_second_increments`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeCode2 {
+    raw: u16,
+}
+
+impl TimeCode2 {
+    /// Wrap the 14-bit wire value verbatim. Only the low 14 bits of
+    /// `raw` are consulted.
+    pub fn from_raw(raw: u16) -> Self {
+        Self { raw: raw & 0x3FFF }
+    }
+
+    /// Underlying 14-bit wire value — `SSS FFFFF ffffff` packed
+    /// MSB-first.
+    pub fn raw(self) -> u16 {
+        self.raw
+    }
+
+    /// 3-bit `seconds` field, in `0..=7`. Combine with
+    /// [`TimeCode1::eight_second_increments`] for the absolute
+    /// second-within-minute (`tc1.eight_second_increments · 8 +
+    /// tc2.seconds`).
+    pub fn seconds(self) -> u8 {
+        ((self.raw >> 11) & 0x7) as u8
+    }
+
+    /// 5-bit `frames` field, in `0..=31` (spec-valid range `0..=29`
+    /// for the 30 fps reference assumed by §5.4.2.26).
+    pub fn frames(self) -> u8 {
+        ((self.raw >> 6) & 0x1F) as u8
+    }
+
+    /// 6-bit `frame_fractions` field, in `0..=63`. Each step represents
+    /// 1/64 of a frame; at the 30 fps reference that is `≈ 521 µs`.
+    pub fn frame_fractions(self) -> u8 {
+        (self.raw & 0x3F) as u8
+    }
+
+    /// `true` when the `frames` field is inside its spec-documented
+    /// 30 fps range (`≤ 29`). The 3-bit `seconds` and 6-bit
+    /// `frame_fractions` fields cannot exceed their spec ranges.
+    pub fn is_spec_valid(self) -> bool {
+        self.frames() <= 29
+    }
+}
+
+/// §5.4.2.26 Table 5.13 presence pattern for the
+/// `timecod2e, timecod1e` pair. A receiver typically inspects
+/// [`Bsi::timecode_presence`] before deciding whether to consult
+/// [`Bsi::timecod1`] / [`Bsi::timecod2`].
+///
+/// Wire codes per Table 5.13:
+///
+/// * `(timecod2e=0, timecod1e=0)` → [`Self::NotPresent`]
+/// * `(timecod2e=0, timecod1e=1)` → [`Self::FirstHalfOnly`]
+/// * `(timecod2e=1, timecod1e=0)` → [`Self::SecondHalfOnly`]
+/// * `(timecod2e=1, timecod1e=1)` → [`Self::BothHalves`]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeCodePresence {
+    /// Neither half present — `timecod2e=0, timecod1e=0`.
+    NotPresent,
+    /// First (low-resolution) half only — `timecod2e=0, timecod1e=1`.
+    /// Resolves coarse playback offset to 8-second granularity.
+    FirstHalfOnly,
+    /// Second (high-resolution) half only — `timecod2e=1, timecod1e=0`.
+    /// Resolves to ≈ 521 µs but only within the implicit `0..=8 s`
+    /// quantum — typically paired with out-of-band sync to pin the
+    /// minute / hour position.
+    SecondHalfOnly,
+    /// Both halves present — `timecod2e=1, timecod1e=1`. Full 28-bit
+    /// SMPTE-style timecode addressing 24 h at ≈ 521 µs resolution.
+    BothHalves,
+}
+
+impl TimeCodePresence {
+    /// Resolve the `(timecod2e, timecod1e)` pair into a presence
+    /// pattern per Table 5.13. Only the low bit of each input is
+    /// consulted.
+    pub fn from_flags(timecod2e: bool, timecod1e: bool) -> Self {
+        match (timecod2e, timecod1e) {
+            (false, false) => TimeCodePresence::NotPresent,
+            (false, true) => TimeCodePresence::FirstHalfOnly,
+            (true, false) => TimeCodePresence::SecondHalfOnly,
+            (true, true) => TimeCodePresence::BothHalves,
+        }
+    }
+}
+
 /// Annex D §2.3.1.3-6 alternate-syntax mix-level codewords. Each is a
 /// 3-bit value; Tables D2.3 / D2.4 / D2.5 / D2.6 map them to linear
 /// gains via [`annex_d_lt_rt_clev`] / [`annex_d_lt_rt_slev`] /
@@ -707,7 +925,16 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
     // `xbsi1e/xbsi2e` and is identified by `bsid == 6` (§2.1).
     // Both shapes occupy the same fixed 30 bits maximum so the
     // surrounding parse is unchanged.
-    let (annex_d_mix_levels, dmixmod, dsurexmod, dheadphonmod, adconvtyp) = if bsid == 6 {
+    let (
+        annex_d_mix_levels,
+        dmixmod,
+        dsurexmod,
+        dheadphonmod,
+        adconvtyp,
+        timecod1,
+        timecod2,
+        timecode_presence,
+    ) = if bsid == 6 {
         // Annex D xbsi1 block.
         let xbsi1e = br.read_u32(1)? != 0;
         let (mix, dmm) = if xbsi1e {
@@ -747,18 +974,37 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         } else {
             (None, None, None)
         };
-        (mix, dmm, dsex, dhpm, adcv)
+        // Annex D syntax replaces both `timecod*` slots with
+        // `xbsi*e` blocks — by definition the timecode is absent.
+        (
+            mix,
+            dmm,
+            dsex,
+            dhpm,
+            adcv,
+            None,
+            None,
+            TimeCodePresence::NotPresent,
+        )
     } else {
-        // §5.3.2 base syntax — timecod1/timecod2 (never surfaced).
+        // §5.3.2 base syntax — timecod1/timecod2 surfaced as typed
+        // [`TimeCode1`] / [`TimeCode2`] when the encoder set the
+        // respective `timecod*e` flag. Both halves are independently
+        // gated per §5.4.2.26 Table 5.13.
         let timecod1e = br.read_u32(1)? != 0;
-        if timecod1e {
-            let _t1 = br.read_u32(14)?;
-        }
+        let tc1 = if timecod1e {
+            Some(TimeCode1::from_raw(br.read_u32(14)? as u16))
+        } else {
+            None
+        };
         let timecod2e = br.read_u32(1)? != 0;
-        if timecod2e {
-            let _t2 = br.read_u32(14)?;
-        }
-        (None, 0xFFu8, None, None, None)
+        let tc2 = if timecod2e {
+            Some(TimeCode2::from_raw(br.read_u32(14)? as u16))
+        } else {
+            None
+        };
+        let presence = TimeCodePresence::from_flags(timecod2e, timecod1e);
+        (None, 0xFFu8, None, None, None, tc1, tc2, presence)
     };
 
     // addbsi — up to 64 bytes of trailing info we can safely skip.
@@ -801,6 +1047,9 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         adconvtyp,
         audio_production,
         audio_production_ch2,
+        timecod1,
+        timecod2,
+        timecode_presence,
         bits_consumed,
     })
 }
@@ -1840,6 +2089,320 @@ mod tests {
         assert_eq!(ap2.mixlevel, 0);
         assert_eq!(ap2.peak_mix_level_db_spl(), 80);
         assert_eq!(ap2.roomtyp, RoomType::NotIndicated);
+    }
+
+    // ---------------------------------------------------------------
+    // Time code (`timecod1` / `timecod2`) — §5.4.2.26-28 / Table 5.13.
+    // ---------------------------------------------------------------
+
+    /// [`TimeCode1`] splits its 14 wire bits as 5+6+3 (hours, minutes,
+    /// 8-second increments). Walk a few hand-packed codepoints and
+    /// verify each accessor lifts the right slice.
+    #[test]
+    #[allow(clippy::unusual_byte_groupings)]
+    fn timecode1_field_decomposition_matches_spec() {
+        // (raw14, hours, minutes, eight_second_increments)
+        let cases: [(u16, u8, u8, u8); 6] = [
+            // All zeroes → 00:00:00.
+            (0b00000_000000_000, 0, 0, 0),
+            // Maximum spec-valid: 23 h, 59 m, 56 s (7×8).
+            (0b10111_111011_111, 23, 59, 7),
+            // Minimal hour bump: 01:00:00.
+            (0b00001_000000_000, 1, 0, 0),
+            // Minute boundary: 00:59:00.
+            (0b00000_111011_000, 0, 59, 0),
+            // Eight-second boundary at 00:00:48 (8×6).
+            (0b00000_000000_110, 0, 0, 6),
+            // Out-of-range hour codepoint (24..=31) per §5.4.2.27 — the
+            // wire layout reserves these values; the parser still
+            // surfaces them so a careful consumer can decide.
+            (0b11111_111111_111, 31, 63, 7),
+        ];
+        for (raw, h, m, s8) in cases {
+            let tc = TimeCode1::from_raw(raw);
+            assert_eq!(tc.raw(), raw & 0x3FFF, "raw mask, raw={raw:#018b}");
+            assert_eq!(tc.hours(), h, "hours, raw={raw:#018b}");
+            assert_eq!(tc.minutes(), m, "minutes, raw={raw:#018b}");
+            assert_eq!(
+                tc.eight_second_increments(),
+                s8,
+                "8-second increments, raw={raw:#018b}"
+            );
+            // seconds_in_day = h·3600 + m·60 + s8·8.
+            let want_secs = (h as u32) * 3600 + (m as u32) * 60 + (s8 as u32) * 8;
+            assert_eq!(tc.seconds_in_day(), want_secs);
+        }
+    }
+
+    /// `TimeCode1::is_spec_valid()` flags out-of-range hours / minutes.
+    /// The eight-second-increment field cannot escape its 3-bit
+    /// 0..=7 range.
+    #[test]
+    #[allow(clippy::unusual_byte_groupings)]
+    fn timecode1_spec_valid_checks_hours_and_minutes() {
+        // 23:59:56 is the maximum valid combination.
+        assert!(TimeCode1::from_raw(0b10111_111011_111).is_spec_valid());
+        // hours = 24 (reserved).
+        assert!(!TimeCode1::from_raw(0b11000_111011_111).is_spec_valid());
+        // minutes = 60 (reserved).
+        assert!(!TimeCode1::from_raw(0b10111_111100_111).is_spec_valid());
+        // hours = 0, minutes = 0, s8 = 0 is also valid.
+        assert!(TimeCode1::from_raw(0).is_spec_valid());
+    }
+
+    /// [`TimeCode2`] splits its 14 wire bits as 3+5+6 (seconds, frames,
+    /// frame fractions).
+    #[test]
+    #[allow(clippy::unusual_byte_groupings)]
+    fn timecode2_field_decomposition_matches_spec() {
+        // (raw14, seconds, frames, frame_fractions)
+        let cases: [(u16, u8, u8, u8); 5] = [
+            // All zeroes.
+            (0b000_00000_000000, 0, 0, 0),
+            // Maximum spec-valid: s=7, f=29, ff=63.
+            (0b111_11101_111111, 7, 29, 63),
+            // Seconds boundary: s=7, f=0, ff=0.
+            (0b111_00000_000000, 7, 0, 0),
+            // Frames boundary at 30 fps (frames=29 is the max valid).
+            (0b000_11101_000000, 0, 29, 0),
+            // Out-of-range frames (30, 31) per §5.4.2.28 — codepoints
+            // beyond the 30 fps reference; pass-through for caller
+            // inspection.
+            (0b000_11111_111111, 0, 31, 63),
+        ];
+        for (raw, s, f, ff) in cases {
+            let tc = TimeCode2::from_raw(raw);
+            assert_eq!(tc.raw(), raw & 0x3FFF, "raw mask, raw={raw:#018b}");
+            assert_eq!(tc.seconds(), s, "seconds, raw={raw:#018b}");
+            assert_eq!(tc.frames(), f, "frames, raw={raw:#018b}");
+            assert_eq!(tc.frame_fractions(), ff, "frame fractions, raw={raw:#018b}");
+        }
+    }
+
+    /// `TimeCode2::is_spec_valid()` rejects out-of-range frame
+    /// codepoints (≥ 30 at the 30 fps reference assumed by §5.4.2.26).
+    #[test]
+    #[allow(clippy::unusual_byte_groupings)]
+    fn timecode2_spec_valid_checks_frames() {
+        assert!(TimeCode2::from_raw(0b111_11101_111111).is_spec_valid()); // f=29
+        assert!(!TimeCode2::from_raw(0b000_11110_000000).is_spec_valid()); // f=30
+        assert!(!TimeCode2::from_raw(0b000_11111_000000).is_spec_valid()); // f=31
+        assert!(TimeCode2::from_raw(0).is_spec_valid()); // all zero is valid
+    }
+
+    /// Table 5.13 — the `(timecod2e, timecod1e)` pair maps to a
+    /// presence-pattern enum. Walk every codepoint.
+    #[test]
+    fn timecode_presence_table_5_13_round_trip() {
+        use TimeCodePresence::*;
+        let rows: [(bool, bool, TimeCodePresence); 4] = [
+            (false, false, NotPresent),
+            (false, true, FirstHalfOnly),
+            (true, false, SecondHalfOnly),
+            (true, true, BothHalves),
+        ];
+        for (tc2e, tc1e, want) in rows {
+            let got = TimeCodePresence::from_flags(tc2e, tc1e);
+            assert_eq!(
+                got, want,
+                "(timecod2e={tc2e}, timecod1e={tc1e}): want {want:?}, got {got:?}"
+            );
+        }
+    }
+
+    /// `parse()` surfaces `timecod1` / `timecod2` independently when
+    /// each `timecod*e` flag is set. Build a 1/0 mono BSI carrying
+    /// `(h=12, m=34, s8=5, s=3, f=15, ff=42)` and verify the parser
+    /// routes both halves into the typed surface plus
+    /// `timecode_presence == BothHalves`.
+    #[test]
+    fn parse_surfaces_both_timecode_halves() {
+        // tc1 raw = h(5)·512 + m(6)·8 + s8(3) packed MSB-first as
+        //         (12 << 9) | (34 << 3) | 5 = 0x18 << 9 | 0x22 << 3 | 5
+        //         = 0b01100_100010_101
+        // tc2 raw = s(3)·2048 + f(5)·64 + ff(6) packed MSB-first as
+        //         (3 << 11) | (15 << 6) | 42
+        //         = 0b011_01111_101010
+        let tc1_raw: u32 = (12u32 << 9) | (34u32 << 3) | 5u32;
+        let tc2_raw: u32 = (3u32 << 11) | (15u32 << 6) | 42u32;
+        let bits: [(u8, u32); 15] = [
+            (5, 8),  // bsid (base syntax)
+            (3, 0),  // bsmod
+            (3, 1),  // acmod = 1 (1/0 mono, no cmix / surmix / dsurmod)
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (1, 0),  // copyrightb
+            (1, 0),  // origbs
+            (1, 1),  // timecod1e
+            (14, tc1_raw),
+            (1, 1), // timecod2e
+            (14, tc2_raw),
+            (1, 0), // addbsie
+        ];
+        let bytes = pack_bits(&bits);
+        let bsi = parse(&bytes).unwrap();
+        assert_eq!(bsi.bsid, 8);
+        assert_eq!(bsi.acmod, 1);
+        assert_eq!(bsi.timecode_presence, TimeCodePresence::BothHalves);
+        let tc1 = bsi.timecod1.expect("timecod1e=1 should surface tc1");
+        assert_eq!(tc1.hours(), 12);
+        assert_eq!(tc1.minutes(), 34);
+        assert_eq!(tc1.eight_second_increments(), 5);
+        assert_eq!(tc1.raw(), tc1_raw as u16);
+        assert_eq!(tc1.seconds_in_day(), 12 * 3600 + 34 * 60 + 5 * 8);
+        assert!(tc1.is_spec_valid());
+        let tc2 = bsi.timecod2.expect("timecod2e=1 should surface tc2");
+        assert_eq!(tc2.seconds(), 3);
+        assert_eq!(tc2.frames(), 15);
+        assert_eq!(tc2.frame_fractions(), 42);
+        assert_eq!(tc2.raw(), tc2_raw as u16);
+        assert!(tc2.is_spec_valid());
+    }
+
+    /// Only the first half present per Table 5.13 row
+    /// `(timecod2e=0, timecod1e=1)`. `parse()` should surface
+    /// `timecod1` and leave `timecod2 == None` with
+    /// `timecode_presence == FirstHalfOnly`.
+    #[test]
+    fn parse_surfaces_only_first_timecode_half_when_only_timecod1e() {
+        let tc1_raw: u32 = (1u32 << 9) | (2u32 << 3) | 3u32; // 01:02:24
+        let bits: [(u8, u32); 14] = [
+            (5, 8),  // bsid
+            (3, 0),  // bsmod
+            (3, 1),  // acmod = 1
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (1, 0),  // copyrightb
+            (1, 0),  // origbs
+            (1, 1),  // timecod1e=1
+            (14, tc1_raw),
+            (1, 0), // timecod2e=0
+            (1, 0), // addbsie=0
+        ];
+        let bytes = pack_bits(&bits);
+        let bsi = parse(&bytes).unwrap();
+        assert_eq!(bsi.timecode_presence, TimeCodePresence::FirstHalfOnly);
+        let tc1 = bsi.timecod1.expect("tc1 should surface");
+        assert_eq!(tc1.hours(), 1);
+        assert_eq!(tc1.minutes(), 2);
+        assert_eq!(tc1.eight_second_increments(), 3);
+        assert!(bsi.timecod2.is_none(), "tc2 should not surface");
+    }
+
+    /// Only the second half present per Table 5.13 row
+    /// `(timecod2e=1, timecod1e=0)`. `parse()` should leave
+    /// `timecod1 == None` and surface `timecod2`.
+    #[test]
+    fn parse_surfaces_only_second_timecode_half_when_only_timecod2e() {
+        let tc2_raw: u32 = (4u32 << 11) | (10u32 << 6) | 20u32;
+        let bits: [(u8, u32); 14] = [
+            (5, 8),  // bsid
+            (3, 0),  // bsmod
+            (3, 1),  // acmod = 1
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (1, 0),  // copyrightb
+            (1, 0),  // origbs
+            (1, 0),  // timecod1e=0
+            (1, 1),  // timecod2e=1
+            (14, tc2_raw),
+            (1, 0), // addbsie=0
+        ];
+        let bytes = pack_bits(&bits);
+        let bsi = parse(&bytes).unwrap();
+        assert_eq!(bsi.timecode_presence, TimeCodePresence::SecondHalfOnly);
+        assert!(bsi.timecod1.is_none(), "tc1 should not surface");
+        let tc2 = bsi.timecod2.expect("tc2 should surface");
+        assert_eq!(tc2.seconds(), 4);
+        assert_eq!(tc2.frames(), 10);
+        assert_eq!(tc2.frame_fractions(), 20);
+    }
+
+    /// `(timecod2e=0, timecod1e=0)` per Table 5.13 leaves both halves
+    /// at `None` and `timecode_presence == NotPresent`. Reuses the
+    /// minimal 2/0 stereo fixture which has both flags clear.
+    #[test]
+    fn parse_leaves_timecode_none_when_both_flags_zero() {
+        let bits: [(u8, u32); 14] = [
+            (5, 8),
+            (3, 0),
+            (3, 2),
+            (2, 0),
+            (1, 0),
+            (5, 27),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0), // timecod1e=0
+            (1, 0), // timecod2e=0
+            (1, 0), // addbsie=0
+        ];
+        let bytes = pack_bits(&bits);
+        let bsi = parse(&bytes).unwrap();
+        assert!(bsi.timecod1.is_none());
+        assert!(bsi.timecod2.is_none());
+        assert_eq!(bsi.timecode_presence, TimeCodePresence::NotPresent);
+    }
+
+    /// `bsid == 6` activates the Annex D alternate bit stream syntax;
+    /// the `timecod*e` slots carry `xbsi*e` instead so the timecode is
+    /// definitionally absent regardless of how the slots were set.
+    /// Verify the parser leaves the timecode surface untouched on an
+    /// `xbsi1e == 1` stream (the Annex D mix-levels fixture).
+    #[test]
+    fn parse_leaves_timecode_none_on_annex_d_bsid_6() {
+        // Reuse the Annex D xbsi1 fixture from
+        // `parses_annex_d_bsid_6_xbsi1_mix_levels` — xbsi1e=1 sets the
+        // bits that under the base syntax would mean "timecode present".
+        let bits: &[(u8, u32)] = &[
+            (5, 6),
+            (3, 0),
+            (3, 7),
+            (2, 0),
+            (2, 0),
+            (1, 1),
+            (5, 27),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 1),    // xbsi1e=1 (would be timecod1e=1 under base syntax)
+            (2, 0b01), // dmixmod
+            (3, 0b011),
+            (3, 0b100),
+            (3, 0b100),
+            (3, 0b101),
+            (1, 0), // xbsi2e=0
+            (1, 0), // addbsie=0
+        ];
+        let bytes = pack_bits(bits);
+        let bsi = parse(&bytes).unwrap();
+        assert_eq!(bsi.bsid, 6);
+        assert!(
+            bsi.annex_d_mix_levels.is_some(),
+            "Annex D mix-levels surfaced"
+        );
+        assert!(
+            bsi.timecod1.is_none(),
+            "Annex D syntax must NOT surface timecod1"
+        );
+        assert!(
+            bsi.timecod2.is_none(),
+            "Annex D syntax must NOT surface timecod2"
+        );
+        assert_eq!(bsi.timecode_presence, TimeCodePresence::NotPresent);
     }
 
     /// `bsid == 6` with `xbsi2e == 0` keeps the three Annex D fields at

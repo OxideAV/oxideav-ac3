@@ -115,6 +115,40 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       new `eac3::bsi::tests::no_infomdate_yields_no_audio_production`
       and extended assertions on two pre-existing `infomdate` tests
       that already exercised `audprodie == 1` (3/2 indep + 1+1).
+      **Round 219** lifts the base-syntax timecode fields from parse-
+      and-discard to a typed surface: `Bsi::timecod1: Option<TimeCode1>`
+      + `Bsi::timecod2: Option<TimeCode2>` +
+      `Bsi::timecode_presence: TimeCodePresence` decode the
+      §5.4.2.26-28 / Table 5.13 timecode pair when the base syntax is
+      in use (`bsid != 6` — Annex D §1 reuses these wire bits for the
+      `xbsi*e` blocks so the timecode is definitionally absent on
+      `bsid == 6` streams). `TimeCode1` exposes the 5-bit `hours()`,
+      6-bit `minutes()`, and 3-bit `eight_second_increments()` halves
+      of the low-resolution 14-bit field (range 0..=86 336 s within
+      the 24-hour day at 8-second granularity per §5.4.2.27);
+      `TimeCode2` exposes the 3-bit `seconds()`, 5-bit `frames()`, and
+      6-bit `frame_fractions()` halves of the high-resolution 14-bit
+      field (≈ 521 µs resolution at the §5.4.2.26 30 fps reference).
+      Both types carry a `is_spec_valid()` predicate that flags
+      out-of-range codepoints (hours > 23, minutes > 59, frames > 29)
+      without rejecting the stream — per Annex D §3.2 the timecode
+      "does not affect the decoding process in legacy decoders" so the
+      parser passes the raw codepoint through verbatim. The
+      `TimeCodePresence` enum (`NotPresent` / `FirstHalfOnly` /
+      `SecondHalfOnly` / `BothHalves`) records the
+      `(timecod2e, timecod1e)` pair per Table 5.13 so a chain consumer
+      can pick playback strategy without re-decoding the flags.
+      Encoders still emit `timecod1e == 0` / `timecod2e == 0` for every
+      syncframe so encoder output is byte-identical; the only behaviour
+      change is decoder-side parsing. Covered by 10 new `bsi::tests`
+      (`TimeCode1` and `TimeCode2` field decomposition including
+      out-of-range pass-through, `is_spec_valid` range checks for both
+      halves, the Table 5.13 `from_flags` round-trip, `parse()`
+      surfacing both halves on base-syntax frames, the `FirstHalfOnly`
+      and `SecondHalfOnly` partial-presence rows, the `NotPresent`
+      all-zero case, and the Annex D `bsid == 6` short-circuit that
+      keeps `timecod1` / `timecod2` at `None` even when the wire bits
+      carrying `xbsi*e` are set). 196 lib tests, all green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)
