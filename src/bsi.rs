@@ -26,8 +26,8 @@ pub const MAX_BSID_BASE: u8 = 10;
 
 /// Parsed BSI — just the fields a decoder actually needs. Optional
 /// service-metadata (compression gain, language code, timecodes,
-/// `addbsi`) is consumed but not surfaced since the decoder doesn't
-/// apply any of it.
+/// `addbsi`) is also surfaced for chain consumers but does not drive
+/// the decoder PCM path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bsi {
     /// bsid — bit stream identification. Spec mandates decoders built
@@ -156,6 +156,15 @@ pub struct Bsi {
     /// consumer enforce a distribution / archive policy without
     /// re-parsing the BSI.
     pub copyright_info: CopyrightInfo,
+    /// §5.4.2.29-31 additional bit-stream information payload. `Some`
+    /// when the encoder set `addbsie == 1`; `None` when `addbsie == 0`.
+    /// The decoder per §5.4.2.30 "is not required to interpret this
+    /// information, and thus shall skip over this number of bytes" —
+    /// surfacing the payload bytes lets a chain consumer recover an
+    /// encoder-private metadata block (Dolby reserved-payload routing,
+    /// OAMD packetisation, encoder watermark) without re-parsing the
+    /// BSI. See [`AdditionalBitStreamInfo`].
+    pub addbsi: Option<AdditionalBitStreamInfo>,
     /// Absolute bit position (in bits, measured from the first byte of
     /// `bsi()` input) where the BSI ended. Callers use this to skip
     /// straight to the audio-block area.
@@ -1029,6 +1038,108 @@ impl CopyrightInfo {
     }
 }
 
+/// §5.4.2.29-31 additional bit-stream information (`addbsi`) payload.
+///
+/// Carries between 1 and 64 bytes of encoder-defined trailing data,
+/// gated on `addbsie == 1`. The bit-stream syntax (§5.3.2 / Table 5.1)
+/// places the field right before the audio blocks at the end of
+/// `bit_stream_info()`; on Annex E (E-AC-3) streams the same field
+/// closes Table E1.2's BSI walk at the same logical position.
+///
+/// Per §5.4.2.30 — "the decoder is not required to interpret this
+/// information, and thus shall skip over this number of bytes" — the
+/// PCM decode is unchanged; surfacing the payload bytes lets a chain
+/// consumer reach an encoder-private metadata block without
+/// re-walking the BSI.
+///
+/// The wire format is:
+///
+/// ```text
+///   addbsie    1 bit     // 1 = field present
+///   if (addbsie) {
+///     addbsil  6 bits    // 0..=63 ⇒ 1..=64 payload bytes
+///     addbsi   (addbsil + 1) × 8 bits
+///   }
+/// ```
+///
+/// The payload bytes are stored verbatim in transmission order — bit 7
+/// of the first byte is the bit immediately after the `addbsil` field.
+/// The bit-stream cursor is not required to be byte-aligned at the
+/// start of `addbsi` (and in practice rarely is, since `addbsi` follows
+/// a 6-bit length field rather than padding); the bytes here are the
+/// MSB-first bit-stream view in 8-bit groups, matching the wire-order
+/// reads §5.4.2.31 prescribes.
+///
+/// The `addbsil` codepoint is preserved verbatim so a caller can
+/// distinguish between an empty payload (`addbsil == 0`, payload = `[0]`
+/// — a single byte) and a long payload at the codepoint endpoint
+/// (`addbsil == 63`, payload = 64 bytes). The length-byte relationship
+/// is `payload.len() == addbsil + 1`.
+///
+/// On the Annex E (E-AC-3) side the same payload is surfaced on
+/// `eac3::Bsi::addbsi` — see [`crate::eac3::bsi::Bsi`] — using the same
+/// type. The base + Annex E syntax tables (§5.3.2 / Table E1.2) carry
+/// `addbsie + addbsil + addbsi` verbatim, so a single typed surface
+/// covers both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdditionalBitStreamInfo {
+    addbsil: u8,
+    payload: Vec<u8>,
+}
+
+impl AdditionalBitStreamInfo {
+    /// Build an [`AdditionalBitStreamInfo`] from the raw 6-bit
+    /// `addbsil` codepoint + the (addbsil + 1)-byte payload. Returns
+    /// `None` when `addbsil >= 64` (the wire field is 6 bits, so any
+    /// caller-supplied value above `63` is outside the codepoint range)
+    /// or when `payload.len() != addbsil as usize + 1` (the spec is
+    /// strict about the length-byte relationship — a violation here
+    /// would not round-trip back through the bit-stream parser).
+    pub fn from_addbsil_and_payload(addbsil: u8, payload: Vec<u8>) -> Option<Self> {
+        if addbsil > 63 {
+            return None;
+        }
+        if payload.len() != addbsil as usize + 1 {
+            return None;
+        }
+        Some(Self { addbsil, payload })
+    }
+
+    /// Raw 6-bit `addbsil` codepoint (§5.4.2.30). Range `0..=63`,
+    /// indicating `1..=64` payload bytes (the codepoint is the byte
+    /// count *minus one*).
+    pub fn addbsil(&self) -> u8 {
+        self.addbsil
+    }
+
+    /// Number of payload bytes — `addbsil + 1`. Always within `1..=64`
+    /// per the §5.4.2.30 codepoint range.
+    pub fn len(&self) -> usize {
+        self.addbsil as usize + 1
+    }
+
+    /// Convenience: `false` always per the spec — the field is at
+    /// least 1 byte whenever it exists. Provided for Clippy
+    /// `len_without_is_empty` and for caller idiomatic checks.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Borrowed view of the payload bytes in wire order (bit 7 of byte
+    /// 0 is the bit immediately after `addbsil`).
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Total wire-field width in bits — `7 + 8 × (addbsil + 1)`. Useful
+    /// for callers that need to mirror the BSI verbatim back into a
+    /// bit-stream writer (6 bits for `addbsil` + 8 × payload bytes +
+    /// 1 bit for the `addbsie` flag that gates the block).
+    pub fn wire_bits(&self) -> u32 {
+        7 + 8 * (self.addbsil as u32 + 1)
+    }
+}
+
 /// Annex D §2.3.1.3-6 alternate-syntax mix-level codewords. Each is a
 /// 3-bit value; Tables D2.3 / D2.4 / D2.5 / D2.6 map them to linear
 /// gains via [`annex_d_lt_rt_clev`] / [`annex_d_lt_rt_slev`] /
@@ -1288,13 +1399,29 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         (None, 0xFFu8, None, None, None, tc1, tc2, presence)
     };
 
-    // addbsi — up to 64 bytes of trailing info we can safely skip.
+    // addbsi — §5.4.2.29-31 trailer of 1..=64 encoder-defined bytes.
+    // The decoder PCM path does not consult these bits ("the decoder is
+    // not required to interpret this information") so the payload is
+    // surfaced verbatim for chain consumers (encoder-private metadata,
+    // OAMD packetisation, distribution-tagging) and the cursor is
+    // advanced exactly `7 + 8 × (addbsil + 1)` bits.
     let addbsie = br.read_u32(1)? != 0;
-    if addbsie {
-        let addbsil = br.read_u32(6)?; // 0..=63, meaning 1..=64 bytes
-        let nbits = (addbsil + 1) * 8;
-        br.skip(nbits)?;
-    }
+    let addbsi = if addbsie {
+        let addbsil = br.read_u32(6)? as u8; // 0..=63, meaning 1..=64 bytes
+        let nbytes = addbsil as usize + 1;
+        let mut payload = Vec::with_capacity(nbytes);
+        for _ in 0..nbytes {
+            payload.push(br.read_u32(8)? as u8);
+        }
+        // `from_addbsil_and_payload` returns `Some` here unconditionally
+        // — the 6-bit field cannot exceed 63 and the payload length is
+        // built to match `addbsil + 1` exactly — but route through the
+        // safe constructor so the invariant is checked rather than
+        // asserted.
+        AdditionalBitStreamInfo::from_addbsil_and_payload(addbsil, payload)
+    } else {
+        None
+    };
 
     let bits_consumed = br.bit_position();
 
@@ -1333,6 +1460,7 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         timecod2,
         timecode_presence,
         copyright_info,
+        addbsi,
         bits_consumed,
     })
 }
@@ -3094,6 +3222,225 @@ mod tests {
         assert_eq!(b.acmod, 0);
         assert!(b.copyright_info.is_copyright_protected());
         assert!(b.copyright_info.is_original_bitstream());
+    }
+
+    // -----------------------------------------------------------------
+    // AdditionalBitStreamInfo (§5.4.2.29-31)
+    // -----------------------------------------------------------------
+
+    /// `from_addbsil_and_payload` rejects `addbsil > 63` (the wire field
+    /// is 6 bits) and rejects a payload-length mismatch — these would
+    /// not round-trip back through the bit-stream parser.
+    #[test]
+    fn additional_bsi_constructor_rejects_invalid_inputs() {
+        assert!(AdditionalBitStreamInfo::from_addbsil_and_payload(64, vec![0u8; 65]).is_none());
+        assert!(AdditionalBitStreamInfo::from_addbsil_and_payload(255, vec![0u8; 1]).is_none());
+        // Length mismatch — addbsil=0 means 1 byte, payload has 2.
+        assert!(AdditionalBitStreamInfo::from_addbsil_and_payload(0, vec![0u8, 0u8]).is_none());
+        // Length mismatch — addbsil=3 means 4 bytes, payload has 3.
+        assert!(
+            AdditionalBitStreamInfo::from_addbsil_and_payload(3, vec![0u8, 0u8, 0u8]).is_none()
+        );
+    }
+
+    /// Minimum-length payload: `addbsil == 0` ⇒ payload is 1 byte;
+    /// surface exposes `len() == 1`, `is_empty() == false`,
+    /// `wire_bits() == 7 + 8 == 15`.
+    #[test]
+    fn additional_bsi_min_length_payload() {
+        let info = AdditionalBitStreamInfo::from_addbsil_and_payload(0, vec![0xA5]).unwrap();
+        assert_eq!(info.addbsil(), 0);
+        assert_eq!(info.len(), 1);
+        assert!(!info.is_empty());
+        assert_eq!(info.payload(), &[0xA5]);
+        assert_eq!(info.wire_bits(), 15);
+    }
+
+    /// Maximum-length payload: `addbsil == 63` ⇒ payload is 64 bytes;
+    /// surface exposes `len() == 64`, `wire_bits() == 7 + 8 × 64 ==
+    /// 519`. Payload is preserved verbatim.
+    #[test]
+    fn additional_bsi_max_length_payload() {
+        let payload: Vec<u8> = (0..64).collect();
+        let info = AdditionalBitStreamInfo::from_addbsil_and_payload(63, payload.clone()).unwrap();
+        assert_eq!(info.addbsil(), 63);
+        assert_eq!(info.len(), 64);
+        assert_eq!(info.payload(), payload.as_slice());
+        assert_eq!(info.wire_bits(), 7 + 8 * 64);
+    }
+
+    /// Round-trip through `parse()` on a synthetic 1/0 mono BSI where
+    /// the encoder set `addbsie == 1` with a 1-byte payload (the
+    /// minimum). Confirms the parser recovers the payload byte
+    /// verbatim and that `addbsil == 0 ⇒ len() == 1`.
+    #[test]
+    fn parses_addbsi_single_byte_payload() {
+        // 1/0 mono, no optional service metadata, addbsie=1,
+        // addbsil=0 (⇒ 1 payload byte), payload = 0b1011_0100.
+        let bits: &[(u8, u32)] = &[
+            (5, 8),    // bsid
+            (3, 0),    // bsmod
+            (3, 1),    // acmod (1/0 mono)
+            (1, 0),    // lfeon
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 0),    // langcode
+            (1, 0),    // audprodie
+            (1, 0),    // copyrightb
+            (1, 1),    // origbs
+            (1, 0),    // timecod1e
+            (1, 0),    // timecod2e
+            (1, 1),    // addbsie
+            (6, 0),    // addbsil (0 ⇒ 1 byte payload)
+            (8, 0xB4), // addbsi payload
+        ];
+        let bytes = pack_bits(bits);
+        let b = parse(&bytes).unwrap();
+        let info = b.addbsi.expect("addbsie == 1 surfaces a payload");
+        assert_eq!(info.addbsil(), 0);
+        assert_eq!(info.len(), 1);
+        assert_eq!(info.payload(), &[0xB4]);
+    }
+
+    /// Round-trip through `parse()` on a synthetic 1/0 mono BSI where
+    /// the encoder set `addbsie == 1` with the maximum-length 64-byte
+    /// payload. Confirms the parser walks all 64 bytes correctly and
+    /// `bits_consumed` advances by `7 + 8 × 64 == 519` over the BSI
+    /// tail block.
+    #[test]
+    fn parses_addbsi_max_length_payload() {
+        let total_prefix_bits: u32 = 5 + 3 + 3 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1;
+        let mut bits: Vec<(u8, u32)> = vec![
+            (5, 8),  // bsid
+            (3, 0),  // bsmod
+            (3, 1),  // acmod
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (1, 0),  // copyrightb
+            (1, 1),  // origbs
+            (1, 0),  // timecod1e
+            (1, 0),  // timecod2e
+            (1, 1),  // addbsie
+            (6, 63), // addbsil = 63 ⇒ 64 payload bytes
+        ];
+        // 64 distinct payload bytes — easy to detect any cursor slippage.
+        for k in 0..64u32 {
+            bits.push((8, k ^ 0x55));
+        }
+        let bytes = pack_bits(&bits);
+        let b = parse(&bytes).unwrap();
+        let info = b.addbsi.expect("addbsie == 1 surfaces a payload");
+        assert_eq!(info.addbsil(), 63);
+        assert_eq!(info.len(), 64);
+        let expected: Vec<u8> = (0u32..64).map(|k| (k ^ 0x55) as u8).collect();
+        assert_eq!(info.payload(), expected.as_slice());
+        let expected_bits = total_prefix_bits as u64 + 6 + 8 * 64;
+        assert_eq!(b.bits_consumed, expected_bits);
+    }
+
+    /// `addbsie == 0` yields `addbsi == None` and the parser stops
+    /// after the flag bit — `bits_consumed` should match the
+    /// pre-addbsi byte count + 1 bit.
+    #[test]
+    fn parses_addbsi_absent_when_addbsie_zero() {
+        // 1/0 mono, no optional fields, addbsie = 0.
+        let bits: &[(u8, u32)] = &[
+            (5, 8),  // bsid
+            (3, 0),  // bsmod
+            (3, 1),  // acmod
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (1, 0),  // copyrightb
+            (1, 1),  // origbs
+            (1, 0),  // timecod1e
+            (1, 0),  // timecod2e
+            (1, 0),  // addbsie = 0
+        ];
+        let bytes = pack_bits(bits);
+        let b = parse(&bytes).unwrap();
+        assert!(b.addbsi.is_none());
+        let expected_bits: u64 = 5 + 3 + 3 + 1 + 5 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1;
+        assert_eq!(b.bits_consumed, expected_bits);
+    }
+
+    /// Annex D `bsid == 6` shares the addbsi position with the base
+    /// syntax — only the `timecod*e` slots flip to `xbsi*e` upstream.
+    /// Confirm the addbsi surface still decodes independently of the
+    /// `bsid == 6` switch.
+    #[test]
+    fn parses_addbsi_on_annex_d_bsid_6() {
+        // bsid=6, acmod=2 (2/0). xbsi1e=0, xbsi2e=0. addbsie=1 with a
+        // 2-byte payload (addbsil=1).
+        let bits: &[(u8, u32)] = &[
+            (5, 6),  // bsid
+            (3, 0),  // bsmod
+            (3, 2),  // acmod (2/0 stereo)
+            (2, 0),  // dsurmod
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (1, 0),  // copyrightb
+            (1, 1),  // origbs
+            (1, 0),  // xbsi1e
+            (1, 0),  // xbsi2e
+            (1, 1),  // addbsie
+            (6, 1),  // addbsil = 1 ⇒ 2 payload bytes
+            (8, 0xCA),
+            (8, 0xFE),
+        ];
+        let bytes = pack_bits(bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.bsid, 6);
+        let info = b.addbsi.expect("addbsie == 1 surfaces a payload");
+        assert_eq!(info.addbsil(), 1);
+        assert_eq!(info.len(), 2);
+        assert_eq!(info.payload(), &[0xCA, 0xFE]);
+    }
+
+    /// 1+1 dual-mono (`acmod == 0`) routes through the Ch2 service-
+    /// metadata block before reaching the addbsi position. Confirm the
+    /// addbsi surface still decodes correctly downstream of the longer
+    /// Ch2 chain.
+    #[test]
+    fn parses_addbsi_on_1plus1_dual_mono() {
+        let bits: &[(u8, u32)] = &[
+            (5, 8),  // bsid
+            (3, 0),  // bsmod
+            (3, 0),  // acmod=0 (1+1)
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            // Ch2 service-metadata block
+            (5, 27), // dialnorm2
+            (1, 0),  // compr2e
+            (1, 0),  // langcod2e
+            (1, 0),  // audprodi2e
+            (1, 0),  // copyrightb
+            (1, 1),  // origbs
+            (1, 0),  // timecod1e
+            (1, 0),  // timecod2e
+            (1, 1),  // addbsie
+            (6, 2),  // addbsil = 2 ⇒ 3 payload bytes
+            (8, 0xDE),
+            (8, 0xAD),
+            (8, 0xBE),
+        ];
+        let bytes = pack_bits(bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.acmod, 0);
+        let info = b.addbsi.expect("addbsie == 1 surfaces a payload");
+        assert_eq!(info.addbsil(), 2);
+        assert_eq!(info.payload(), &[0xDE, 0xAD, 0xBE]);
     }
 
     /// Annex D `bsid == 6` keeps the same `copyrightb` / `origbs`

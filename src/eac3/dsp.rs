@@ -1869,6 +1869,10 @@ fn build_ac3_bsi_shim(bsi: &Eac3Bsi) -> Ac3Bsi {
         copyright_info: bsi
             .copyright_info
             .unwrap_or(crate::bsi::CopyrightInfo::from_bits(false, false)),
+        // Forward the Annex E `addbsi` payload (or leave `None` when the
+        // upstream substream did not carry one) so downstream callers
+        // that route through the shim still observe the chain hint.
+        addbsi: bsi.addbsi.clone(),
         bits_consumed: 0,
     }
 }
@@ -2065,6 +2069,7 @@ mod aht_regs_tests {
             audio_production: None,
             audio_production_ch2: None,
             copyright_info: None,
+            addbsi: None,
             frame_bytes: 768,
             bits_consumed: 0,
         }

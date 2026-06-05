@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Additional bit-stream information typed surface — `AdditionalBitStreamInfo`
+  over `addbsi` (§5.4.2.29-31 / §5.3.2 / Table E1.2)** (round 240 / r240).
+  The variable-length BSI trailer the base + Annex E parsers used to
+  consume-and-discard now surfaces as `Bsi::addbsi:
+  Option<AdditionalBitStreamInfo>` on both the base AC-3 `Bsi` and the
+  Annex E `Bsi` (Table E1.2 closes its BSI walk with `addbsie +
+  addbsil + addbsi` exactly as §5.3.2 does — single typed surface for
+  both shapes). `AdditionalBitStreamInfo` exposes `addbsil() -> u8`
+  (raw 6-bit codepoint, 0..=63), `len() -> usize` (`addbsil + 1`,
+  always within 1..=64 per §5.4.2.30), `is_empty() -> bool` (always
+  `false` per spec — the field is at least 1 byte whenever present),
+  `payload() -> &[u8]` (borrowed view of the wire-order bytes), and
+  `wire_bits() -> u32` (`7 + 8 × (addbsil + 1)` — total span of the
+  trailer block including the `addbsie` flag, for callers that need
+  to mirror the BSI verbatim into a bit-stream writer). The
+  `from_addbsil_and_payload` constructor rejects out-of-range
+  `addbsil` (> 63) and any payload-length mismatch so callers cannot
+  construct an instance that would not round-trip through the parser.
+  Per §5.4.2.30 — "the decoder is not required to interpret this
+  information, and thus shall skip over this number of bytes" — the
+  PCM decode is unchanged; surfacing the payload bytes lets a chain
+  consumer reach an encoder-private metadata block (encoder
+  watermark, distribution-tagging, OAMD packetisation, downstream
+  routing hint) without re-walking the BSI. Encoders still emit
+  `addbsie == 0` for every syncframe so encoder output is
+  byte-identical; the only behaviour change is decoder-side parsing.
+  Covered by 7 new `bsi::tests` (constructor-validity rejection
+  cases, minimum-length 1-byte payload, maximum-length 64-byte
+  payload, `parse()` round-trip on a 1-byte payload with cursor
+  check, `parse()` round-trip on the 64-byte endpoint with
+  `bits_consumed` cursor check, Annex D `bsid == 6` round-trip
+  confirming the trailer position is unaffected by the alt-syntax
+  switch, and a 1+1 dual-mono `acmod == 0` round-trip past the Ch2
+  service-metadata block) plus 4 new `eac3::bsi::tests` (encoder-
+  default `addbsie == 0` short-circuit on E-AC-3, 1-byte payload,
+  64-byte endpoint payload, dependent-substream walk with
+  `strmtyp == 1`).
 - **Dialogue-normalization typed surface — `DialNorm` over `dialnorm` /
   `dialnorm2` (§5.4.2.8 / §5.4.2.16 / §7.6)** (round 234 / r234). The
   5-bit `dialnorm` codepoint the BSI parser has long surfaced as a

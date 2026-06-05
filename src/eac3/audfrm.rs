@@ -638,6 +638,7 @@ mod tests {
             audio_production: None,
             audio_production_ch2: None,
             copyright_info: None,
+            addbsi: None,
             frame_bytes: 768,
             bits_consumed: 0,
         }

@@ -216,7 +216,47 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       `acmod != 0` short-circuit) plus 4 new `eac3::bsi::tests`
       (stereo indep surface, 1+1 Ch2 surface, Annex E reserved
       codepoint remap, and the non-1+1 short-circuit). 218 lib
-      tests, all green.
+      tests, all green. **Round 240** lifts the §5.4.2.29-31
+      `addbsi` trailer (the variable-length additional bit-stream
+      information block that closes both `bit_stream_info()` in the
+      base syntax and Table E1.2's BSI walk on Annex E) from
+      parse-and-discard to a typed `Bsi::addbsi:
+      Option<AdditionalBitStreamInfo>` surface, mirrored across
+      base AC-3 and Annex E (`eac3::Bsi::addbsi` reuses the same
+      type — Table E1.2 carries `addbsie + addbsil + addbsi`
+      verbatim from §5.3.2). The `AdditionalBitStreamInfo` struct
+      exposes `addbsil() -> u8` (raw 6-bit codepoint, 0..=63),
+      `len() -> usize` (`addbsil + 1`, always within 1..=64 per
+      §5.4.2.30), `payload() -> &[u8]` (the wire-order bytes the
+      encoder placed in the trailer), and `wire_bits() -> u32`
+      (`7 + 8 × (addbsil + 1)` — total span of the trailer block
+      including the `addbsie` flag, for callers that need to
+      mirror the BSI verbatim back into a bit-stream writer). The
+      `from_addbsil_and_payload` constructor enforces the
+      §5.4.2.30 length-byte relationship (rejects out-of-range
+      `addbsil` and payload-length mismatches) so callers cannot
+      construct an instance that would not round-trip. Per
+      §5.4.2.30 the decoder "is not required to interpret this
+      information, and thus shall skip over this number of bytes"
+      so the PCM path is unchanged; surfacing the payload bytes
+      lets a chain consumer reach an encoder-private metadata
+      block (encoder watermark, distribution-tagging, OAMD
+      packetisation, downstream routing hint) without re-walking
+      the BSI. Encoders still emit `addbsie == 0` for every
+      syncframe so encoder output is byte-identical; the only
+      behaviour change is decoder-side parsing. Covered by 7 new
+      `bsi::tests` (constructor-validity rejection cases, minimum-
+      length 1-byte payload, maximum-length 64-byte payload,
+      `parse()` round-trip on a 1-byte payload with cursor check,
+      `parse()` round-trip on the 64-byte endpoint with
+      `bits_consumed` cursor check, Annex D `bsid == 6` round-trip
+      confirming the trailer position is unaffected by the
+      alt-syntax switch, and a 1+1 dual-mono `acmod == 0`
+      round-trip past the Ch2 service-metadata block) plus 4 new
+      `eac3::bsi::tests` (encoder-default `addbsie == 0`
+      short-circuit on E-AC-3, 1-byte payload, 64-byte endpoint
+      payload, dependent-substream walk with `strmtyp == 1`).
+      230 lib tests, all green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)

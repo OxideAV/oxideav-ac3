@@ -55,8 +55,8 @@ use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
 use crate::bsi::{
-    AdConverterType, AnnexDMixLevels, AudioProductionInfo, CompressionGain, CopyrightInfo,
-    DialNorm, DolbyHeadphoneMode, DolbySurroundExMode, RoomType,
+    AdConverterType, AdditionalBitStreamInfo, AnnexDMixLevels, AudioProductionInfo,
+    CompressionGain, CopyrightInfo, DialNorm, DolbyHeadphoneMode, DolbySurroundExMode, RoomType,
 };
 use crate::tables::acmod_nfchans;
 
@@ -238,6 +238,13 @@ pub struct Bsi {
     /// without re-parsing the BSI. See [`crate::bsi::CopyrightInfo`]
     /// for the typed surface.
     pub copyright_info: Option<CopyrightInfo>,
+    /// §5.4.2.29-31 additional bit-stream information payload reused
+    /// verbatim by Annex E (Table E1.2 closes the BSI walk with
+    /// `addbsie + addbsil + addbsi` exactly as base AC-3 does at
+    /// §5.3.2). `Some` when `addbsie == 1`; `None` when the encoder
+    /// did not emit the trailer. Same semantics as
+    /// [`crate::bsi::Bsi::addbsi`] — see [`AdditionalBitStreamInfo`].
+    pub addbsi: Option<AdditionalBitStreamInfo>,
     /// Frame size in bytes — `(frmsiz + 1) * 2`. Cached so the
     /// dispatcher can range-check the packet without re-doing
     /// arithmetic.
@@ -440,13 +447,24 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         (None, None, None, None, None, None, None)
     };
 
-    // addbsi — opt-in trailer of up to 64 bytes.
+    // addbsi — §5.4.2.29-31 trailer of 1..=64 encoder-defined bytes
+    // (Table E1.2 reuses base AC-3's syntax). Per §5.4.2.30 the
+    // decoder PCM path does not consult the payload, but it is
+    // surfaced verbatim for chain consumers (encoder-private
+    // metadata, OAMD packetisation) and the cursor is advanced
+    // exactly `7 + 8 × (addbsil + 1)` bits.
     let addbsie = br.read_u32(1)? != 0;
-    if addbsie {
-        let addbsil = br.read_u32(6)?;
-        let nbits = (addbsil + 1) * 8;
-        br.skip(nbits)?;
-    }
+    let addbsi = if addbsie {
+        let addbsil = br.read_u32(6)? as u8;
+        let nbytes = addbsil as usize + 1;
+        let mut payload = Vec::with_capacity(nbytes);
+        for _ in 0..nbytes {
+            payload.push(br.read_u32(8)? as u8);
+        }
+        AdditionalBitStreamInfo::from_addbsil_and_payload(addbsil, payload)
+    } else {
+        None
+    };
 
     let bits_consumed = br.bit_position() - start_bits;
 
@@ -479,6 +497,7 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         audio_production,
         audio_production_ch2,
         copyright_info,
+        addbsi,
         frame_bytes,
         bits_consumed,
     })
@@ -1691,6 +1710,136 @@ mod tests {
             .expect("dialnorm_ch2 surfaced");
         assert_eq!(typed.codepoint(), 31);
         assert_eq!(typed.db(), -31);
+    }
+
+    // -----------------------------------------------------------------
+    // AdditionalBitStreamInfo (Annex E reuse of §5.4.2.29-31)
+    // -----------------------------------------------------------------
+
+    /// Encoder-default `addbsie == 0` leaves `addbsi == None` on the
+    /// Annex E surface — mirrors the base-AC-3 short-circuit.
+    #[test]
+    fn no_addbsie_yields_no_addbsi_eac3() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),
+            (3, 0),
+            (11, 383),
+            (2, 0),
+            (2, 3),
+            (3, 2),
+            (1, 0),
+            (5, 16),
+            (5, 27),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert!(bsi.addbsi.is_none());
+    }
+
+    /// Annex E independent substream with `addbsie == 1` and a 1-byte
+    /// payload (the minimum). Confirms the parser walks the addbsi
+    /// trailer correctly on E-AC-3 streams.
+    #[test]
+    fn parses_addbsi_single_byte_payload_eac3() {
+        let bits: &[(u32, u32)] = &[
+            (2, 0),    // strmtyp
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod
+            (3, 2),    // acmod = 2/0
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 0),    // mixmdate
+            (1, 0),    // infomdate
+            (1, 1),    // addbsie
+            (6, 0),    // addbsil = 0 → 1 byte
+            (8, 0x5A), // payload
+        ];
+        let (buf, total) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        let info = bsi.addbsi.expect("addbsie == 1 surfaces a payload");
+        assert_eq!(info.addbsil(), 0);
+        assert_eq!(info.len(), 1);
+        assert_eq!(info.payload(), &[0x5A]);
+        assert_eq!(bsi.bits_consumed, total);
+    }
+
+    /// Annex E independent substream with the maximum-length 64-byte
+    /// addbsi payload — confirms the parser walks all 519 trailer
+    /// bits without slipping.
+    #[test]
+    fn parses_addbsi_max_length_payload_eac3() {
+        let mut bits: Vec<(u32, u32)> = vec![
+            (2, 0),
+            (3, 0),
+            (11, 383),
+            (2, 0),
+            (2, 3),
+            (3, 2),
+            (1, 0),
+            (5, 16),
+            (5, 27),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 1),  // addbsie
+            (6, 63), // addbsil = 63 → 64 bytes
+        ];
+        for k in 0..64u32 {
+            bits.push((8, (k * 7) ^ 0xA5));
+        }
+        let (buf, total) = pack_msb(&bits);
+        let bsi = parse(&buf).unwrap();
+        let info = bsi.addbsi.expect("addbsie == 1 surfaces a payload");
+        assert_eq!(info.addbsil(), 63);
+        assert_eq!(info.len(), 64);
+        let expected: Vec<u8> = (0u32..64).map(|k| ((k * 7) ^ 0xA5) as u8).collect();
+        assert_eq!(info.payload(), expected.as_slice());
+        assert_eq!(bsi.bits_consumed, total);
+        // Annex E wire_bits sanity: the trailer block alone spans
+        // 1 (addbsie) + 6 (addbsil) + 64 × 8 (payload) = 519 bits.
+        assert_eq!(info.wire_bits(), 7 + 8 * 64);
+    }
+
+    /// Dependent-substream Annex E (`strmtyp == Dependent` with
+    /// `chanmape == 0`) followed by a 4-byte addbsi payload — confirms
+    /// the addbsi cursor is unaffected by the upstream dependent-
+    /// substream branch.
+    #[test]
+    fn parses_addbsi_on_dependent_substream_eac3() {
+        let bits: &[(u32, u32)] = &[
+            (2, 1),    // strmtyp = Dependent
+            (3, 0),    // substreamid
+            (11, 383), // frmsiz
+            (2, 0),    // fscod
+            (2, 3),    // numblkscod
+            (3, 7),    // acmod = 3/2 5.0 (no LFE)
+            (1, 0),    // lfeon
+            (5, 16),   // bsid
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 0),    // chanmape (dependent-only flag)
+            (1, 0),    // mixmdate
+            (1, 0),    // infomdate
+            (1, 1),    // addbsie
+            (6, 3),    // addbsil = 3 → 4 bytes
+            (8, 0xDE),
+            (8, 0xAD),
+            (8, 0xBE),
+            (8, 0xEF),
+        ];
+        let (buf, _) = pack_msb(bits);
+        let bsi = parse(&buf).unwrap();
+        assert_eq!(bsi.strmtyp, StreamType::Dependent);
+        let info = bsi.addbsi.expect("addbsie == 1 surfaces a payload");
+        assert_eq!(info.payload(), &[0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     /// Non-1+1 Annex E streams (`acmod != 0`) never carry `dialnorm2`
