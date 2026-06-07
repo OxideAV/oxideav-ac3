@@ -128,6 +128,28 @@ pub struct Bsi {
     /// present; `None` otherwise. `Standard` = generic 24-bit PCM
     /// converter; `Hdcd` = HDCD-encoded source.
     pub adconvtyp: Option<AdConverterType>,
+    /// §5.4.2.11-12 deprecated 8-bit `langcod` slot, surfaced as a
+    /// typed [`LanguageCode`]. `Some` only when the encoder set
+    /// `langcode == 1` in the bitstream; `None` when `langcode == 0`
+    /// (no `langcod` word follows). Per §5.4.2.12 the slot is an
+    /// "8 bit reserved value that shall be set to `0xFF` if present"
+    /// — the original 1995 mapping to a table-lookup language id was
+    /// removed in 2001, and modern delivery systems carry the ISO
+    /// 639-2 language code in the signaling layer instead. Surfacing
+    /// the raw byte plus the spec-mandated `is_spec_reserved_value()`
+    /// predicate lets a probe / archive tool flag legacy streams that
+    /// still carry a non-`0xFF` deprecated value without re-parsing
+    /// the BSI. The decoder PCM path is unchanged — the word does not
+    /// affect audio reproduction.
+    pub language_code: Option<LanguageCode>,
+    /// §5.4.2.19-20 Ch2 deprecated `langcod2` slot, surfaced as a
+    /// typed [`LanguageCode`]. `Some` only when `acmod == 0` (1+1
+    /// dual-mono) AND the encoder set `langcod2e == 1`; `None`
+    /// otherwise. Same semantics as [`Self::language_code`] but
+    /// routed to the Ch2 reproduction chain — the §5.4.2.20 spec
+    /// note reads "See lancod, Section 5.4.2.12 above" so the
+    /// wire-conformance check is identical.
+    pub language_code_ch2: Option<LanguageCode>,
     /// §5.4.2.13-15 audio production information for the main channel
     /// (Ch1 in a 1+1 dual-mono stream). `Some` only when `audprodie ==
     /// 1` in the bitstream; `None` otherwise. Carries the `mixlevel`
@@ -255,6 +277,25 @@ impl Bsi {
     /// other portions of the audio reproduction equipment".
     pub fn dolby_surround_mode(&self) -> Option<DolbySurroundMode> {
         self.dolby_surround_mode
+    }
+
+    /// Typed view over [`Bsi::language_code`] — the §5.4.2.11-12
+    /// deprecated 8-bit `langcod` slot. `Some` only when the encoder
+    /// set `langcode == 1` in the bitstream; `None` when
+    /// `langcode == 0` (no `langcod` word follows). Per §5.4.2.12 the
+    /// slot is an "8 bit reserved value that shall be set to `0xFF`
+    /// if present" — use [`LanguageCode::is_spec_reserved_value`] to
+    /// flag legacy streams that still carry a non-`0xFF` value.
+    pub fn language_code(&self) -> Option<LanguageCode> {
+        self.language_code
+    }
+
+    /// Typed view over [`Bsi::language_code_ch2`] — the §5.4.2.19-20
+    /// Ch2 `langcod2` slot in 1+1 dual-mono streams. `Some` only when
+    /// `acmod == 0` AND `langcod2e == 1`; `None` otherwise. Same
+    /// per-§5.4.2.20 semantics as [`Self::language_code`].
+    pub fn language_code_ch2(&self) -> Option<LanguageCode> {
+        self.language_code_ch2
     }
 }
 
@@ -970,6 +1011,65 @@ impl RoomType {
     }
 }
 
+/// §5.4.2.11-12 deprecated language-code word — the optional 8-bit
+/// `langcod` slot that follows `langcode == 1` in the §5.3.2 base
+/// AC-3 BSI syntax (and its Ch2 `langcod2` mirror at §5.4.2.19-20 in
+/// 1+1 dual-mono streams).
+///
+/// The original 1995 A/52 specification defined `langcod` as an 8-bit
+/// table-lookup index into a language identifier table; the 2001
+/// revision retired the table-lookup semantics. Per the current
+/// §5.4.2.12 wire-conformance rule the slot "is an 8 bit reserved
+/// value that shall be set to `0xFF` if present" — modern delivery
+/// systems carry the ISO 639-2 language code in the signaling layer,
+/// and the in-stream slot is kept only for bitstream-format
+/// backwards-compatibility.
+///
+/// A typed surface over the raw byte lets a probe / archive tool flag
+/// legacy streams that still carry a non-`0xFF` value (and may
+/// therefore be addressable to the obsolete 1995 lookup table) — via
+/// [`Self::is_spec_reserved_value`] — without re-parsing the BSI.
+/// The AC-3 decoder ignores this word; the slot exists in the BSI
+/// surface only as an informational hint.
+///
+/// Per §5.4.2.12 the field only exists when `langcode == 1`; the
+/// typed surface lives behind `Bsi::language_code:
+/// Option<LanguageCode>` so the absence (`langcode == 0`) case
+/// short-circuits to `None`. The Ch2 mirror at §5.4.2.20 reads "See
+/// lancod, Section 5.4.2.12 above" so the same type backs both
+/// slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LanguageCode {
+    raw: u8,
+}
+
+impl LanguageCode {
+    /// Wrap the 8-bit wire byte verbatim. No remap or rejection —
+    /// every value `0x00..=0xFF` is representable, and the
+    /// spec-conformance check is exposed separately as
+    /// [`Self::is_spec_reserved_value`].
+    pub fn from_raw(raw: u8) -> Self {
+        LanguageCode { raw }
+    }
+
+    /// Raw 8-bit code as it appeared on the wire. For a
+    /// spec-conforming stream this is always `0xFF`; legacy 1995-era
+    /// streams may carry a different value pointing into the retired
+    /// language-id table.
+    pub fn raw(self) -> u8 {
+        self.raw
+    }
+
+    /// `true` when the carried byte equals the §5.4.2.12 mandated
+    /// reserved value (`0xFF`). For a spec-conforming stream this
+    /// predicate is always `true` when the slot is present; a probe
+    /// tool can branch on `false` to surface a non-conforming legacy
+    /// stream to a chain-of-custody log.
+    pub fn is_spec_reserved_value(self) -> bool {
+        self.raw == 0xFF
+    }
+}
+
 /// §5.4.2.13-15 audio production information block — the
 /// `audprodie==1` payload (and its Ch2 `audprodi2e==1` mirror in 1+1
 /// dual-mono streams). Carries a peak mixing-level hint and the
@@ -1475,19 +1575,23 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
     // Optional service metadata (§5.4.2.9 ff). `compr` is surfaced
     // (Table 7.30); `audprodie` carries the §5.4.2.13-15 mixing-room
     // hints and is surfaced as a typed [`AudioProductionInfo`]. The
-    // `langcode` codepoint is per §5.4.2.12 a reserved 0xFF and stays
-    // discarded — modern delivery uses the ISO 639-2 language code
-    // in the signaling layer.
+    // §5.4.2.11-12 `langcod` slot — once a table-lookup language id,
+    // now a wire-conformance reserved `0xFF` per the 2001 revision —
+    // is surfaced as a typed [`LanguageCode`] so a probe / archive
+    // tool can flag legacy non-conforming streams without re-parsing
+    // the BSI.
     let compre = br.read_u32(1)? != 0;
     let compr = if compre {
         Some(CompressionGain::from_byte(br.read_u32(8)? as u8))
     } else {
         None
     };
-    let langcode = br.read_u32(1)? != 0;
-    if langcode {
-        let _langcod = br.read_u32(8)?;
-    }
+    let langcode_flag = br.read_u32(1)? != 0;
+    let language_code = if langcode_flag {
+        Some(LanguageCode::from_raw(br.read_u32(8)? as u8))
+    } else {
+        None
+    };
     let audprodie = br.read_u32(1)? != 0;
     let audio_production = if audprodie {
         let mixlevel = br.read_u32(5)? as u8;
@@ -1501,7 +1605,7 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
     };
 
     // 1+1 mode (dual mono) carries a second copy of the metadata for Ch2.
-    let (dialnorm_ch2, compr_ch2, audio_production_ch2) = if acmod == 0 {
+    let (dialnorm_ch2, compr_ch2, language_code_ch2, audio_production_ch2) = if acmod == 0 {
         // §5.4.2.16 — dialnorm2 has the same meaning as dialnorm; the
         // `0` codepoint is reserved and remaps to `31` per §5.4.2.8.
         let dialnorm2_raw = br.read_u32(5)? as u8;
@@ -1516,10 +1620,14 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         } else {
             None
         };
+        // §5.4.2.19-20 Ch2 `langcod2` slot — same reserved-`0xFF`
+        // wire-conformance semantics as the Ch1 `langcod`.
         let langcod2e = br.read_u32(1)? != 0;
-        if langcod2e {
-            let _langcod2 = br.read_u32(8)?;
-        }
+        let lc2 = if langcod2e {
+            Some(LanguageCode::from_raw(br.read_u32(8)? as u8))
+        } else {
+            None
+        };
         let audprodi2e = br.read_u32(1)? != 0;
         let ap2 = if audprodi2e {
             let mixlevel2 = br.read_u32(5)? as u8;
@@ -1531,9 +1639,9 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         } else {
             None
         };
-        (Some(dialnorm2), c2, ap2)
+        (Some(dialnorm2), c2, lc2, ap2)
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
 
     let copyrightb = br.read_u32(1)? != 0;
@@ -1684,6 +1792,8 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         dmixmod_preference,
         compr,
         compr_ch2,
+        language_code,
+        language_code_ch2,
         dsurexmod,
         dheadphonmod,
         adconvtyp,
@@ -3969,5 +4079,214 @@ mod tests {
         assert_eq!(b.bsid, 6);
         assert_eq!(b.dmixmod, 0xFF);
         assert!(b.dmixmod_preference.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // Language code (`langcod` / `langcod2`) — §5.4.2.11-12 / 19-20.
+    // ---------------------------------------------------------------
+
+    /// [`LanguageCode::from_raw`] is a verbatim wrapper — every byte
+    /// `0x00..=0xFF` is representable, and `raw()` returns the same
+    /// value back.
+    #[test]
+    fn language_code_from_raw_round_trips_every_byte() {
+        for raw in 0u8..=255 {
+            let lc = LanguageCode::from_raw(raw);
+            assert_eq!(lc.raw(), raw, "raw={raw:#04x}");
+        }
+    }
+
+    /// Per §5.4.2.12 the spec-mandated wire value is `0xFF`. The
+    /// `is_spec_reserved_value` predicate must hold only for that
+    /// byte and reject everything else.
+    #[test]
+    fn language_code_is_spec_reserved_only_for_0xff() {
+        for raw in 0u8..=255 {
+            let lc = LanguageCode::from_raw(raw);
+            let want = raw == 0xFF;
+            assert_eq!(
+                lc.is_spec_reserved_value(),
+                want,
+                "raw={raw:#04x} should be spec_reserved={want}"
+            );
+        }
+    }
+
+    /// `parse()` surfaces `langcode == 1` into a typed
+    /// [`LanguageCode`] with the 8-bit `langcod` byte taken verbatim
+    /// from the wire. Build a 1/0 mono BSI (`acmod=1`) with
+    /// `langcode=1`, `langcod=0xFF` (spec-conforming), and verify the
+    /// typed surface holds and `is_spec_reserved_value` matches.
+    #[test]
+    fn parse_surfaces_language_code_when_langcode_flag_set() {
+        let bits: [(u8, u32); 16] = [
+            (5, 8),    // bsid
+            (3, 0),    // bsmod
+            (3, 1),    // acmod = 1/0 mono → no cmix/surmix/dsurmod
+            (1, 0),    // lfeon
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 1),    // langcode = 1
+            (8, 0xFF), // langcod = 0xFF (spec-conforming)
+            (1, 0),    // audprodie = 0
+            (1, 0),    // copyrightb
+            (1, 0),    // origbs
+            (1, 0),    // timecod1e
+            (1, 0),    // timecod2e
+            (1, 0),    // addbsie
+            (1, 0),    // pad
+            (1, 0),    // pad
+        ];
+        let bytes = pack_bits(&bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.acmod, 1);
+        let lc = b
+            .language_code
+            .expect("langcode=1 should surface language_code");
+        assert_eq!(lc.raw(), 0xFF);
+        assert!(lc.is_spec_reserved_value());
+        // Same value reachable via the typed accessor.
+        assert_eq!(b.language_code(), Some(lc));
+        // Not 1+1 dual-mono → no Ch2 mirror.
+        assert!(b.language_code_ch2.is_none());
+        assert!(b.language_code_ch2().is_none());
+    }
+
+    /// `parse()` surfaces a non-`0xFF` `langcod` legacy-encoded byte
+    /// verbatim and `is_spec_reserved_value` reports `false` so a
+    /// probe / archive tool can flag the stream. Build a 1/0 mono
+    /// BSI with `langcode=1`, `langcod=0x42` (a 1995-era table-lookup
+    /// codepoint).
+    #[test]
+    fn parse_surfaces_non_reserved_language_code_byte() {
+        let bits: [(u8, u32); 16] = [
+            (5, 8),    // bsid
+            (3, 0),    // bsmod
+            (3, 1),    // acmod = 1/0 mono
+            (1, 0),    // lfeon
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 1),    // langcode = 1
+            (8, 0x42), // langcod = legacy codepoint
+            (1, 0),    // audprodie
+            (1, 0),    // copyrightb
+            (1, 0),    // origbs
+            (1, 0),    // timecod1e
+            (1, 0),    // timecod2e
+            (1, 0),    // addbsie
+            (1, 0),    // pad
+            (1, 0),    // pad
+        ];
+        let bytes = pack_bits(&bits);
+        let b = parse(&bytes).unwrap();
+        let lc = b
+            .language_code
+            .expect("langcode=1 should surface language_code");
+        assert_eq!(lc.raw(), 0x42);
+        assert!(!lc.is_spec_reserved_value());
+    }
+
+    /// `langcode == 0` leaves [`Bsi::language_code`] as `None` — no
+    /// `langcod` byte follows on the wire. Use a minimal 2/0 stereo
+    /// shape (the same fixture used by
+    /// `parses_minimal_2_0_stereo_bsi`).
+    #[test]
+    fn parse_leaves_language_code_none_when_langcode_flag_clear() {
+        let bits: [(u8, u32); 14] = [
+            (5, 0b01000),
+            (3, 0b000),
+            (3, 0b010),
+            (2, 0b00),
+            (1, 0),
+            (5, 27),
+            (1, 0), // compre
+            (1, 0), // langcode = 0 → no langcod byte
+            (1, 0), // audprodie
+            (1, 0), // copyrightb
+            (1, 0), // origbs
+            (1, 0),
+            (1, 0),
+            (1, 0),
+        ];
+        let bytes = pack_bits(&bits);
+        let b = parse(&bytes).unwrap();
+        assert!(b.language_code.is_none());
+        assert!(b.language_code_ch2.is_none());
+        assert!(b.language_code().is_none());
+        assert!(b.language_code_ch2().is_none());
+    }
+
+    /// 1+1 dual-mono (`acmod == 0`) emits an independent `langcod2e`
+    /// flag and (when set) the Ch2 `langcod2` byte. Build a 1+1
+    /// stream with `langcode=1` / `langcod=0xFF` and
+    /// `langcod2e=1` / `langcod2=0xFF`, and verify both typed
+    /// surfaces hold.
+    #[test]
+    fn parse_surfaces_language_code_ch2_in_1_plus_1() {
+        let bits: &[(u8, u32)] = &[
+            (5, 8),    // bsid
+            (3, 0),    // bsmod
+            (3, 0),    // acmod = 0 (1+1 dual mono) — no cmix/surmix/dsurmod
+            (1, 0),    // lfeon
+            (5, 27),   // dialnorm (Ch1)
+            (1, 0),    // compre
+            (1, 1),    // langcode = 1
+            (8, 0xFF), // langcod = 0xFF
+            (1, 0),    // audprodie = 0
+            (5, 27),   // dialnorm2 (Ch2)
+            (1, 0),    // compr2e
+            (1, 1),    // langcod2e = 1
+            (8, 0xFF), // langcod2 = 0xFF
+            (1, 0),    // audprodi2e
+            (1, 0),    // copyrightb
+            (1, 0),    // origbs
+            (1, 0),    // timecod1e
+            (1, 0),    // timecod2e
+            (1, 0),    // addbsie
+        ];
+        let bytes = pack_bits(bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.acmod, 0);
+        let lc1 = b
+            .language_code
+            .expect("langcode=1 should surface language_code");
+        assert_eq!(lc1.raw(), 0xFF);
+        assert!(lc1.is_spec_reserved_value());
+        let lc2 = b
+            .language_code_ch2
+            .expect("langcod2e=1 should surface language_code_ch2");
+        assert_eq!(lc2.raw(), 0xFF);
+        assert!(lc2.is_spec_reserved_value());
+    }
+
+    /// In a 1+1 dual-mono stream with `langcode=0` / `langcod2e=0`,
+    /// both typed surfaces stay `None`. Confirms the per-channel
+    /// gates are independent of each other.
+    #[test]
+    fn parse_leaves_language_code_ch2_none_when_langcod2e_clear() {
+        let bits: &[(u8, u32)] = &[
+            (5, 8),  // bsid
+            (3, 0),  // bsmod
+            (3, 0),  // acmod = 0 (1+1)
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (5, 27), // dialnorm2
+            (1, 0),  // compr2e
+            (1, 0),  // langcod2e
+            (1, 0),  // audprodi2e
+            (1, 0),  // copyrightb
+            (1, 0),  // origbs
+            (1, 0),  // timecod1e
+            (1, 0),  // timecod2e
+            (1, 0),  // addbsie
+        ];
+        let bytes = pack_bits(bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.acmod, 0);
+        assert!(b.language_code.is_none());
+        assert!(b.language_code_ch2.is_none());
     }
 }

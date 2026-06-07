@@ -293,6 +293,8 @@ fn matrix_mapping_for_3_2_matches_spec() {
         dmixmod_preference: None,
         compr: None,
         compr_ch2: None,
+        language_code: None,
+        language_code_ch2: None,
         dsurexmod: None,
         dheadphonmod: None,
         adconvtyp: None,

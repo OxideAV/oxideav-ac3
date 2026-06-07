@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Deprecated language-code typed surface — `LanguageCode` over
+  `langcod` / `langcod2` (§5.4.2.11-12 / §5.4.2.19-20)** (round 249
+  / r249). The §5.4.2.11-12 deprecated 8-bit `langcod` slot (and its
+  §5.4.2.19-20 Ch2 `langcod2` mirror in 1+1 dual-mono streams) — long
+  parsed-and-discarded by the base AC-3 BSI parser — now surfaces as
+  two new typed `Bsi::language_code: Option<LanguageCode>` /
+  `Bsi::language_code_ch2: Option<LanguageCode>` fields. Per the
+  current §5.4.2.12 wire-conformance rule the slot "is an 8 bit
+  reserved value that shall be set to `0xFF` if present" — the
+  original 1995 8-bit table-lookup language-id semantics were retired
+  in the 2001 revision, and modern delivery systems carry the
+  ISO 639-2 language code in the signaling layer instead. The
+  `LanguageCode` newtype wraps the raw byte verbatim and exposes
+  `from_raw(u8)` / `raw() -> u8` plus an `is_spec_reserved_value()
+  -> bool` predicate that flags whether the carried byte equals the
+  `0xFF` wire-conformance value, so a probe / archive tool can route
+  legacy non-conforming streams (carrying a 1995-era table-lookup
+  codepoint) to a chain-of-custody log without re-parsing the BSI.
+  `Some` only when the flag bit is set: on Ch1 when `langcode == 1`,
+  on Ch2 when `acmod == 0` AND `langcod2e == 1`; `None` otherwise.
+  The slot is base-AC-3 only — the Annex E (E-AC-3) BSI does not
+  carry a `langcod` field — so the Annex E → base-AC-3 shim in
+  `eac3::dsp::build_ac3_bsi_shim` hands the base helpers `None`
+  unconditionally for both Ch1 and Ch2 surfaces, and the typed view
+  stays on the base BSI struct. The decoder PCM path is unchanged —
+  the word does not affect audio reproduction per §5.4.2.12 — and
+  encoders still emit `langcode == 0` for every syncframe so encoder
+  output is byte-identical; the only behaviour change is decoder-side
+  parsing. Covered by 7 new `bsi::tests` (every-byte round-trip on
+  `from_raw`, the `is_spec_reserved_value` predicate's `0xFF`-only
+  acceptance, §5.3.2 base-syntax `parse()` round-trip with a
+  spec-conforming `0xFF` byte, a non-conforming legacy `0x42` byte,
+  the `langcode == 0` short-circuit, the 1+1 dual-mono Ch2 mirror
+  with `langcod2e == 1`, and the per-channel-gate independence on
+  `langcod2e == 0`).
 - **Dolby Surround mode typed surface — `DolbySurroundMode` over
   base-syntax `dsurmod` (§5.4.2.6 / Table 5.11 / Annex E §E.2.3.1.x)**
   (round 246 / r246). The 2-bit `dsurmod` codepoint that the base

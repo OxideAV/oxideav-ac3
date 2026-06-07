@@ -1866,6 +1866,11 @@ fn build_ac3_bsi_shim(bsi: &Eac3Bsi) -> Ac3Bsi {
         dmixmod_preference: bsi.dmixmod_preference,
         compr: bsi.compr,
         compr_ch2: bsi.compr_ch2,
+        // Annex E does not carry a §5.4.2.11-12 `langcod` slot — the
+        // E-AC-3 BSI does not have a deprecated language-code field —
+        // so the shim hands the base helpers `None` unconditionally.
+        language_code: None,
+        language_code_ch2: None,
         dsurexmod: None,
         dheadphonmod: None,
         adconvtyp: None,
