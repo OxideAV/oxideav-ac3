@@ -595,6 +595,18 @@ mod tests {
 
     fn fake_bsi(acmod: u8, cmixlev: u8, surmixlev: u8, lfeon: bool) -> Bsi {
         let nfchans = crate::tables::acmod_nfchans(acmod);
+        // Mirror the typed surfaces from the raw codepoints so the
+        // fixture exercises both views; `0xFF` collapses to `None`.
+        let center_mix = if cmixlev == 0xFF {
+            None
+        } else {
+            Some(crate::bsi::CenterMixLevel::from_code(cmixlev))
+        };
+        let surround_mix = if surmixlev == 0xFF {
+            None
+        } else {
+            Some(crate::bsi::SurroundMixLevel::from_code(surmixlev))
+        };
         Bsi {
             bsid: 8,
             bsmod: 0,
@@ -605,7 +617,9 @@ mod tests {
             dialnorm: 27,
             dialnorm_ch2: None,
             cmixlev,
+            center_mix,
             surmixlev,
+            surround_mix,
             dsurmod: 0xFF,
             dolby_surround_mode: None,
             annex_d_mix_levels: None,
@@ -647,7 +661,9 @@ mod tests {
             dialnorm: 27,
             dialnorm_ch2: None,
             cmixlev: 0xFF,
+            center_mix: None,
             surmixlev: 0xFF,
+            surround_mix: None,
             dsurmod: 0xFF,
             dolby_surround_mode: None,
             annex_d_mix_levels: Some(mix),

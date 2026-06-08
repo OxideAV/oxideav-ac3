@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Base §5.4.2.4-5 mix-level typed surfaces — `CenterMixLevel`
+  (Table 5.9) + `SurroundMixLevel` (Table 5.10)** (round 259 / r259).
+  The 2-bit `cmixlev` codeword that the §5.3.2 guard emits when the
+  stream has 3 front channels (`acmod ∈ {3, 5, 7}`) and the 2-bit
+  `surmixlev` codeword that the guard emits when the stream has a
+  surround channel (`acmod ∈ {4, 5, 6, 7}`) — long parsed into raw
+  `u8` fields (`Bsi::cmixlev` / `Bsi::surmixlev`) with the `0xFF`
+  "absent" sentinel — now surface as new typed `Bsi::center_mix:
+  Option<CenterMixLevel>` and `Bsi::surround_mix:
+  Option<SurroundMixLevel>` fields. The `CenterMixLevel` enum
+  carries the four Table 5.9 codepoints verbatim (`Minus3Db` =
+  0.707, `Minus4Point5Db` = 0.595, `Minus6Db` = 0.500, `Reserved`);
+  the `SurroundMixLevel` enum carries the four Table 5.10
+  codepoints (`Minus3Db` = 0.707, `Minus6Db` = 0.500, `Mute` =
+  0.000, `Reserved`). Both expose `from_code(u8)` / `raw() -> u8`
+  round-trip plus `coefficient() -> Option<f32>` (returns the
+  spec-documented linear attenuation; `None` for the reserved
+  codepoint) and `coefficient_with_reserved_fallback() -> f32`
+  (applies the §5.4.2.4-5 "intermediate value may be used"
+  substitution so a §7.8 downmix consumer can pick the
+  per-codepoint gain in a single call).
+  `SurroundMixLevel::is_mute()` lets a downmix router short-circuit
+  the surround mix-in step when the encoder picked the `'10'` mute
+  codepoint. `Some` only when the wire codeword is present; `None`
+  for every other channel mode, mirroring the raw `0xFF` sentinel
+  that the existing `Bsi::cmixlev` / `Bsi::surmixlev` fields keep
+  for bit-stream round-trip. The Annex E (E-AC-3) BSI never carries
+  these 2-bit slots — Annex E replaces them with the refined 3-bit
+  `ltrtcmixlev` / `lorocmixlev` / `ltrtsurmixlev` / `lorosurmixlev`
+  codewords inside the `mixmdata` block (§E.2.3.1.3-6) — so the
+  typed surface stays on the base AC-3 `Bsi`; the
+  `eac3::dsp::build_ac3_bsi_shim` hands the base helpers `None`
+  unconditionally. The decoder PCM path is unchanged
+  (`downmix::Downmix::from_bsi` continues to consult the raw fields
+  + table-lookup) and encoder output is byte-identical; the new
+  typed surfaces let chain consumers (a downstream LtRt / LoRo
+  auto-router, a metadata probe) pick the per-codepoint coefficient
+  without re-walking Table 5.9 / 5.10 or consulting the magic
+  `0xFF` sentinel. Covered by 6 new `bsi::tests`. 264 lib tests,
+  all green.
 - **Annex D xbsi2 reserved-trailer typed surface — `ExtraBsi2` over
   `xbsi2` + `encinfo` (§2.3.1.11-12 / Annex D Table D2.1)** (round
   254 / r254). The 8-bit reserved-for-future-assignment `xbsi2` slot

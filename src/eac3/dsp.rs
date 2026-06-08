@@ -1847,8 +1847,18 @@ fn build_ac3_bsi_shim(bsi: &Eac3Bsi) -> Ac3Bsi {
         nchans: bsi.nchans,
         dialnorm: bsi.dialnorm,
         dialnorm_ch2: bsi.dialnorm_ch2,
+        // Annex E (E-AC-3) removes the base §5.4.2.4-5 2-bit
+        // `cmixlev` / `surmixlev` slots in favour of the refined
+        // 3-bit `ltrtcmixlev` / `lorocmixlev` / `ltrtsurmixlev` /
+        // `lorosurmixlev` codewords carried in the `mixmdata` block.
+        // The shim therefore hands the base helpers the "absent"
+        // sentinel `0xFF` plus the `None` typed surface unconditionally;
+        // any consumer that wants the refined coefficients should consult
+        // the Annex E `annex_d_mix_levels` instead.
         cmixlev: 0xFF,
+        center_mix: None,
         surmixlev: 0xFF,
+        surround_mix: None,
         dsurmod: 0xFF,
         // Forward the Annex E informational-metadata Dolby Surround mode
         // (§E.2.3.1.x reusing §5.4.2.6 / Table 5.11) when present so the

@@ -62,8 +62,42 @@ pub struct Bsi {
     /// Center mix-level coefficient code (cmixlev) for acmod with 3
     /// front channels; 0xFF when absent.
     pub cmixlev: u8,
+    /// §5.4.2.4 center mix level (Table 5.9), surfaced as a typed
+    /// [`CenterMixLevel`]. `Some` only when the encoder emitted the
+    /// 2-bit codeword — i.e. the stream has 3 front channels
+    /// (`(acmod & 0x1) != 0 && acmod != 0x1`, equivalently `acmod ∈ {3,
+    /// 5, 7}`); `None` for every other channel mode where the wire
+    /// field is definitionally absent. Equivalent to the typed view of
+    /// [`Bsi::cmixlev`] where the `0xFF` "absent" sentinel becomes
+    /// `None`; the raw `cmixlev` field stays authoritative for
+    /// bit-stream round-trip and the typed surface is a thin
+    /// convenience over it. Lets a §7.8 downmix consumer pick the
+    /// per-codepoint center-channel attenuation (0.707 / 0.595 / 0.500)
+    /// without re-walking Table 5.9, and the spec's reserved-code
+    /// fallback ("the decoder should still reproduce audio. The
+    /// intermediate value of cmixlev (-4.5 dB) may be used in this
+    /// case") is exposed as
+    /// [`CenterMixLevel::coefficient_with_reserved_fallback`].
+    pub center_mix: Option<CenterMixLevel>,
     /// Surround mix-level coefficient code (surmixlev); 0xFF when absent.
     pub surmixlev: u8,
+    /// §5.4.2.5 surround mix level (Table 5.10), surfaced as a typed
+    /// [`SurroundMixLevel`]. `Some` only when the encoder emitted the
+    /// 2-bit codeword — i.e. the stream has a surround channel
+    /// (`(acmod & 0x4) != 0`, equivalently `acmod ∈ {4, 5, 6, 7}`);
+    /// `None` for every other channel mode where the wire field is
+    /// definitionally absent. Equivalent to the typed view of
+    /// [`Bsi::surmixlev`] where the `0xFF` "absent" sentinel becomes
+    /// `None`; the raw `surmixlev` field stays authoritative for
+    /// bit-stream round-trip and the typed surface is a thin
+    /// convenience over it. Lets a §7.8 downmix consumer pick the
+    /// per-codepoint surround-channel attenuation (0.707 / 0.500 / 0)
+    /// without re-walking Table 5.10, and the spec's reserved-code
+    /// fallback ("the decoder should still reproduce audio. The
+    /// intermediate value of surmixlev (-6 dB) may be used in this
+    /// case") is exposed as
+    /// [`SurroundMixLevel::coefficient_with_reserved_fallback`].
+    pub surround_mix: Option<SurroundMixLevel>,
     /// Dolby-Surround flag for 2/0 stereo streams; 0xFF when absent.
     pub dsurmod: u8,
     /// §5.4.2.6 Dolby Surround mode (Table 5.11), surfaced as a typed
@@ -286,6 +320,29 @@ impl Bsi {
     /// other portions of the audio reproduction equipment".
     pub fn dolby_surround_mode(&self) -> Option<DolbySurroundMode> {
         self.dolby_surround_mode
+    }
+
+    /// Typed view over [`Bsi::center_mix`] — the §5.4.2.4 center mix
+    /// level (Table 5.9). `Some` only when the stream has 3 front
+    /// channels (`acmod ∈ {3, 5, 7}`); `None` otherwise. A §7.8
+    /// downmix consumer can use the returned
+    /// [`CenterMixLevel::coefficient_with_reserved_fallback`] to pick
+    /// the per-codepoint center-channel attenuation without re-walking
+    /// Table 5.9 or consulting the raw [`Bsi::cmixlev`] sentinel.
+    pub fn center_mix(&self) -> Option<CenterMixLevel> {
+        self.center_mix
+    }
+
+    /// Typed view over [`Bsi::surround_mix`] — the §5.4.2.5 surround
+    /// mix level (Table 5.10). `Some` only when the stream has a
+    /// surround channel (`acmod ∈ {4, 5, 6, 7}`); `None` otherwise. A
+    /// §7.8 downmix consumer can use the returned
+    /// [`SurroundMixLevel::coefficient_with_reserved_fallback`] to pick
+    /// the per-codepoint surround-channel attenuation without
+    /// re-walking Table 5.10 or consulting the raw [`Bsi::surmixlev`]
+    /// sentinel.
+    pub fn surround_mix(&self) -> Option<SurroundMixLevel> {
+        self.surround_mix
     }
 
     /// Typed view over [`Bsi::language_code`] — the §5.4.2.11-12
@@ -838,6 +895,209 @@ impl DolbySurroundMode {
     /// receiver can use this predicate to arm its matrix decoder.
     pub fn is_dolby_surround_encoded(self) -> bool {
         matches!(self, DolbySurroundMode::Encoded)
+    }
+}
+
+/// §5.4.2.4 center mix level (Table 5.9). A 2-bit codeword carried
+/// only when the stream has 3 front channels (`acmod ∈ {3, 5, 7}`)
+/// that picks the nominal down-mix attenuation applied to the centre
+/// channel when it is folded into the left / right channels by a
+/// stereo downmix.
+///
+/// Surfaced on [`Bsi::center_mix`] when the wire codeword is present;
+/// `None` for every other channel layout because the 2-bit slot is
+/// not on the wire there (§5.3.2 only emits the codeword inside the
+/// `(acmod & 0x1) != 0 && acmod != 0x1` guard).
+///
+/// Per §5.4.2.4: "If `cmixlev` is set to the reserved code, decoders
+/// should still reproduce audio. The intermediate value of `cmixlev`
+/// (-4.5 dB) may be used in this case." That fallback is applied by
+/// [`Self::coefficient_with_reserved_fallback`] — callers who want
+/// to detect "encoder explicitly emitted the reserved code" should
+/// match on the [`Reserved`](Self::Reserved) variant directly.
+///
+/// Annex E (E-AC-3) removes this 2-bit slot in favour of the refined
+/// 3-bit `ltrtcmixlev` / `lorocmixlev` codewords (Tables D2.3 /
+/// D2.5), so this enum is base-AC-3 only and is not mirrored on the
+/// Annex E `Bsi`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CenterMixLevel {
+    /// `'00'` — 0.707 (≈ -3.0 dB).
+    Minus3Db,
+    /// `'01'` — 0.595 (≈ -4.5 dB). Per §5.4.2.4 this intermediate
+    /// value is also the spec's recommended fallback when the
+    /// [`Reserved`](Self::Reserved) codepoint is received.
+    Minus4Point5Db,
+    /// `'10'` — 0.500 (≈ -6.0 dB).
+    Minus6Db,
+    /// `'11'` — reserved. Per §5.4.2.4 the decoder must still
+    /// reproduce audio and may treat this codepoint as equivalent to
+    /// [`Minus4Point5Db`](Self::Minus4Point5Db);
+    /// [`Self::coefficient_with_reserved_fallback`] applies that
+    /// substitution.
+    Reserved,
+}
+
+impl CenterMixLevel {
+    /// Decode the 2-bit wire value verbatim per Table 5.9.
+    pub fn from_code(code: u8) -> Self {
+        match code & 0x3 {
+            0 => CenterMixLevel::Minus3Db,
+            1 => CenterMixLevel::Minus4Point5Db,
+            2 => CenterMixLevel::Minus6Db,
+            _ => CenterMixLevel::Reserved,
+        }
+    }
+
+    /// Raw 2-bit code as it appeared on the wire.
+    pub fn raw(self) -> u8 {
+        match self {
+            CenterMixLevel::Minus3Db => 0,
+            CenterMixLevel::Minus4Point5Db => 1,
+            CenterMixLevel::Minus6Db => 2,
+            CenterMixLevel::Reserved => 3,
+        }
+    }
+
+    /// Linear attenuation coefficient per Table 5.9 — `0.707` for
+    /// `'00'`, `0.595` for `'01'`, `0.500` for `'10'`, and `None` for
+    /// the `'11'` reserved codepoint (the spec leaves the choice to
+    /// the decoder; see
+    /// [`Self::coefficient_with_reserved_fallback`] for the standard
+    /// "intermediate value" substitution).
+    pub fn coefficient(self) -> Option<f32> {
+        match self {
+            CenterMixLevel::Minus3Db => Some(0.707),
+            CenterMixLevel::Minus4Point5Db => Some(0.595),
+            CenterMixLevel::Minus6Db => Some(0.500),
+            CenterMixLevel::Reserved => None,
+        }
+    }
+
+    /// Linear attenuation coefficient with the §5.4.2.4 reserved-code
+    /// substitution applied — for the [`Reserved`](Self::Reserved)
+    /// codepoint, returns the intermediate value `0.595` (-4.5 dB) so
+    /// a downmix consumer can pick the centre-channel gain in a
+    /// single call.
+    pub fn coefficient_with_reserved_fallback(self) -> f32 {
+        match self {
+            CenterMixLevel::Minus3Db => 0.707,
+            CenterMixLevel::Minus4Point5Db | CenterMixLevel::Reserved => 0.595,
+            CenterMixLevel::Minus6Db => 0.500,
+        }
+    }
+
+    /// `true` only for [`Reserved`](Self::Reserved) — lets a probe
+    /// tool flag streams that picked the reserved codepoint without
+    /// re-walking Table 5.9.
+    pub fn is_reserved(self) -> bool {
+        matches!(self, CenterMixLevel::Reserved)
+    }
+}
+
+/// §5.4.2.5 surround mix level (Table 5.10). A 2-bit codeword carried
+/// only when the stream has a surround channel (`acmod ∈ {4, 5, 6,
+/// 7}`) that picks the nominal down-mix attenuation applied to the
+/// surround channel(s) when they are folded into the left / right
+/// channels by a stereo downmix.
+///
+/// Surfaced on [`Bsi::surround_mix`] when the wire codeword is
+/// present; `None` for every other channel layout because the 2-bit
+/// slot is not on the wire there (§5.3.2 only emits the codeword
+/// inside the `(acmod & 0x4) != 0` guard).
+///
+/// Per §5.4.2.5: "If `surmixlev` is set to the reserved code, the
+/// decoder should still reproduce audio. The intermediate value of
+/// `surmixlev` (-6 dB) may be used in this case." That fallback is
+/// applied by [`Self::coefficient_with_reserved_fallback`] — callers
+/// who want to detect "encoder explicitly emitted the reserved code"
+/// should match on the [`Reserved`](Self::Reserved) variant
+/// directly.
+///
+/// Annex E (E-AC-3) removes this 2-bit slot in favour of the refined
+/// 3-bit `ltrtsurmixlev` / `lorosurmixlev` codewords (Tables D2.4 /
+/// D2.6), so this enum is base-AC-3 only and is not mirrored on the
+/// Annex E `Bsi`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurroundMixLevel {
+    /// `'00'` — 0.707 (≈ -3.0 dB).
+    Minus3Db,
+    /// `'01'` — 0.500 (≈ -6.0 dB). Per §5.4.2.5 this intermediate
+    /// value is also the spec's recommended fallback when the
+    /// [`Reserved`](Self::Reserved) codepoint is received.
+    Minus6Db,
+    /// `'10'` — 0 (surround channels muted in the downmix).
+    Mute,
+    /// `'11'` — reserved. Per §5.4.2.5 the decoder must still
+    /// reproduce audio and may treat this codepoint as equivalent to
+    /// [`Minus6Db`](Self::Minus6Db);
+    /// [`Self::coefficient_with_reserved_fallback`] applies that
+    /// substitution.
+    Reserved,
+}
+
+impl SurroundMixLevel {
+    /// Decode the 2-bit wire value verbatim per Table 5.10.
+    pub fn from_code(code: u8) -> Self {
+        match code & 0x3 {
+            0 => SurroundMixLevel::Minus3Db,
+            1 => SurroundMixLevel::Minus6Db,
+            2 => SurroundMixLevel::Mute,
+            _ => SurroundMixLevel::Reserved,
+        }
+    }
+
+    /// Raw 2-bit code as it appeared on the wire.
+    pub fn raw(self) -> u8 {
+        match self {
+            SurroundMixLevel::Minus3Db => 0,
+            SurroundMixLevel::Minus6Db => 1,
+            SurroundMixLevel::Mute => 2,
+            SurroundMixLevel::Reserved => 3,
+        }
+    }
+
+    /// Linear attenuation coefficient per Table 5.10 — `0.707` for
+    /// `'00'`, `0.500` for `'01'`, `0.000` for `'10'`, and `None` for
+    /// the `'11'` reserved codepoint (the spec leaves the choice to
+    /// the decoder; see
+    /// [`Self::coefficient_with_reserved_fallback`] for the standard
+    /// "intermediate value" substitution).
+    pub fn coefficient(self) -> Option<f32> {
+        match self {
+            SurroundMixLevel::Minus3Db => Some(0.707),
+            SurroundMixLevel::Minus6Db => Some(0.500),
+            SurroundMixLevel::Mute => Some(0.000),
+            SurroundMixLevel::Reserved => None,
+        }
+    }
+
+    /// Linear attenuation coefficient with the §5.4.2.5 reserved-code
+    /// substitution applied — for the [`Reserved`](Self::Reserved)
+    /// codepoint, returns the intermediate value `0.500` (-6 dB) so
+    /// a downmix consumer can pick the surround-channel gain in a
+    /// single call.
+    pub fn coefficient_with_reserved_fallback(self) -> f32 {
+        match self {
+            SurroundMixLevel::Minus3Db => 0.707,
+            SurroundMixLevel::Minus6Db | SurroundMixLevel::Reserved => 0.500,
+            SurroundMixLevel::Mute => 0.000,
+        }
+    }
+
+    /// `true` only for [`Reserved`](Self::Reserved) — lets a probe
+    /// tool flag streams that picked the reserved codepoint without
+    /// re-walking Table 5.10.
+    pub fn is_reserved(self) -> bool {
+        matches!(self, SurroundMixLevel::Reserved)
+    }
+
+    /// `true` only for [`Mute`](Self::Mute) — surround channels are
+    /// dropped from the stereo downmix. Lets a downmix consumer
+    /// short-circuit the surround mix-in step without computing the
+    /// coefficient.
+    pub fn is_mute(self) -> bool {
+        matches!(self, SurroundMixLevel::Mute)
     }
 }
 
@@ -1634,17 +1894,19 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
     // cmixlev — only present when there are 3 front channels, i.e.
     // the two LSBs of acmod include '1' for centre *and* acmod!=1
     // (the spec's "if ((acmod & 0x1) && (acmod != 0x1))" guard).
-    let cmixlev = if (acmod & 0x1) != 0 && acmod != 0x1 {
-        br.read_u32(2)? as u8
+    let (cmixlev, center_mix) = if (acmod & 0x1) != 0 && acmod != 0x1 {
+        let raw = br.read_u32(2)? as u8;
+        (raw, Some(CenterMixLevel::from_code(raw)))
     } else {
-        0xFF
+        (0xFF, None)
     };
 
     // surmixlev — present when a surround channel exists (acmod & 0x4).
-    let surmixlev = if (acmod & 0x4) != 0 {
-        br.read_u32(2)? as u8
+    let (surmixlev, surround_mix) = if (acmod & 0x4) != 0 {
+        let raw = br.read_u32(2)? as u8;
+        (raw, Some(SurroundMixLevel::from_code(raw)))
     } else {
-        0xFF
+        (0xFF, None)
     };
 
     // dsurmod — present only in 2/0 mode (acmod == 0x2).
@@ -1882,7 +2144,9 @@ pub fn parse(data: &[u8]) -> Result<Bsi> {
         dialnorm,
         dialnorm_ch2,
         cmixlev,
+        center_mix,
         surmixlev,
+        surround_mix,
         dsurmod,
         dolby_surround_mode,
         annex_d_mix_levels,
@@ -4542,5 +4806,222 @@ mod tests {
         assert_eq!(b.acmod, 0);
         assert!(b.language_code.is_none());
         assert!(b.language_code_ch2.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // CenterMixLevel / SurroundMixLevel — §5.4.2.4-5 typed surfaces.
+    // ---------------------------------------------------------------
+
+    /// Every Table 5.9 codepoint round-trips through `from_code` /
+    /// `raw` and resolves to its spec-documented linear coefficient.
+    /// The reserved codepoint returns `None` from `coefficient()` and
+    /// the spec's intermediate-value substitution from
+    /// `coefficient_with_reserved_fallback`.
+    #[test]
+    fn center_mix_level_table_5_9_round_trip() {
+        let cases: [(u8, CenterMixLevel, Option<f32>, f32); 4] = [
+            (0b00, CenterMixLevel::Minus3Db, Some(0.707), 0.707),
+            (0b01, CenterMixLevel::Minus4Point5Db, Some(0.595), 0.595),
+            (0b10, CenterMixLevel::Minus6Db, Some(0.500), 0.500),
+            (0b11, CenterMixLevel::Reserved, None, 0.595),
+        ];
+        for (raw, want_variant, want_coef, want_fallback) in cases {
+            let v = CenterMixLevel::from_code(raw);
+            assert_eq!(v, want_variant, "raw {raw:02b}");
+            assert_eq!(v.raw(), raw, "raw round-trip {raw:02b}");
+            assert_eq!(v.coefficient(), want_coef);
+            assert!(
+                (v.coefficient_with_reserved_fallback() - want_fallback).abs() < 1e-6,
+                "fallback for {raw:02b}: {} vs {want_fallback}",
+                v.coefficient_with_reserved_fallback()
+            );
+            assert_eq!(v.is_reserved(), raw == 0b11);
+        }
+        // `from_code` truncates anything outside the 2-bit codespace
+        // to its low 2 bits — `0xFF & 0x3 == 0b11` is reserved.
+        assert_eq!(CenterMixLevel::from_code(0xFF), CenterMixLevel::Reserved);
+    }
+
+    /// Every Table 5.10 codepoint round-trips through `from_code` /
+    /// `raw` and resolves to its spec-documented linear coefficient.
+    /// The reserved codepoint returns `None` from `coefficient()` and
+    /// the spec's intermediate-value substitution from
+    /// `coefficient_with_reserved_fallback`. The mute codepoint
+    /// `'10'` collapses to coefficient `0.0` and is flagged by
+    /// `is_mute()`.
+    #[test]
+    fn surround_mix_level_table_5_10_round_trip() {
+        let cases: [(u8, SurroundMixLevel, Option<f32>, f32); 4] = [
+            (0b00, SurroundMixLevel::Minus3Db, Some(0.707), 0.707),
+            (0b01, SurroundMixLevel::Minus6Db, Some(0.500), 0.500),
+            (0b10, SurroundMixLevel::Mute, Some(0.000), 0.000),
+            (0b11, SurroundMixLevel::Reserved, None, 0.500),
+        ];
+        for (raw, want_variant, want_coef, want_fallback) in cases {
+            let v = SurroundMixLevel::from_code(raw);
+            assert_eq!(v, want_variant, "raw {raw:02b}");
+            assert_eq!(v.raw(), raw, "raw round-trip {raw:02b}");
+            assert_eq!(v.coefficient(), want_coef);
+            assert!(
+                (v.coefficient_with_reserved_fallback() - want_fallback).abs() < 1e-6,
+                "fallback for {raw:02b}: {} vs {want_fallback}",
+                v.coefficient_with_reserved_fallback()
+            );
+            assert_eq!(v.is_reserved(), raw == 0b11);
+            assert_eq!(v.is_mute(), raw == 0b10);
+        }
+        // 2-bit truncation: low 2 bits of `0xFF` are `0b11` (reserved).
+        assert_eq!(
+            SurroundMixLevel::from_code(0xFF),
+            SurroundMixLevel::Reserved
+        );
+    }
+
+    /// A 3/2 (acmod=7) syncframe carries both `cmixlev` (3 front
+    /// channels gate satisfied) and `surmixlev` (surround gate
+    /// satisfied), so both typed surfaces become `Some` after
+    /// `parse()` and match the raw codepoint round-trip.
+    #[test]
+    fn parse_surfaces_center_and_surround_mix_on_3_2() {
+        // Exercise the non-default codepoints to prove the bit
+        // positions are correct: cmixlev = 0b10 (-6 dB),
+        // surmixlev = 0b01 (-6 dB).
+        let bits: &[(u8, u32)] = &[
+            (5, 8),    // bsid
+            (3, 0),    // bsmod
+            (3, 7),    // acmod = 3/2
+            (2, 0b10), // cmixlev = -6 dB (0.500)
+            (2, 0b01), // surmixlev = -6 dB (0.500)
+            // dsurmod absent (acmod != 2)
+            (1, 1),  // lfeon
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (1, 0),  // copyrightb
+            (1, 0),  // origbs
+            (1, 0),  // timecod1e
+            (1, 0),  // timecod2e
+            (1, 0),  // addbsie
+        ];
+        let bytes = pack_bits(bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.acmod, 7);
+        assert_eq!(b.cmixlev, 0b10);
+        assert_eq!(b.surmixlev, 0b01);
+        let center = b.center_mix.expect("3/2 carries cmixlev");
+        assert_eq!(center, CenterMixLevel::Minus6Db);
+        assert_eq!(center.raw(), 0b10);
+        assert_eq!(center.coefficient(), Some(0.500));
+        // Accessor view matches the field view.
+        assert_eq!(b.center_mix(), Some(CenterMixLevel::Minus6Db));
+        let surround = b.surround_mix.expect("3/2 carries surmixlev");
+        assert_eq!(surround, SurroundMixLevel::Minus6Db);
+        assert_eq!(surround.raw(), 0b01);
+        assert_eq!(surround.coefficient(), Some(0.500));
+        assert_eq!(b.surround_mix(), Some(SurroundMixLevel::Minus6Db));
+    }
+
+    /// A 2/0 stereo (acmod=2) syncframe carries neither `cmixlev` nor
+    /// `surmixlev` — the §5.3.2 guards skip both 2-bit slots — so both
+    /// typed surfaces stay `None` and the raw fields keep the
+    /// "absent" sentinel `0xFF`. This is the same fixture as
+    /// `parses_minimal_2_0_stereo_bsi` extended with the typed
+    /// assertions.
+    #[test]
+    fn parse_center_and_surround_mix_none_when_acmod_2_0() {
+        let bits: [(u8, u32); 14] = [
+            (5, 0b01000),
+            (3, 0b000),
+            (3, 0b010), // acmod = 2/0
+            (2, 0b00),  // dsurmod
+            (1, 0),
+            (5, 27),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+            (1, 0),
+        ];
+        let bytes = pack_bits(&bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.acmod, 2);
+        assert_eq!(b.cmixlev, 0xFF);
+        assert_eq!(b.surmixlev, 0xFF);
+        assert!(b.center_mix.is_none());
+        assert!(b.surround_mix.is_none());
+        assert!(b.center_mix().is_none());
+        assert!(b.surround_mix().is_none());
+    }
+
+    /// A 1/0 mono (acmod=1) syncframe carries neither slot. The
+    /// `(acmod & 0x1) != 0 && acmod != 0x1` cmixlev guard rejects
+    /// `acmod==1` and the `(acmod & 0x4) != 0` surmixlev guard
+    /// rejects it too — so both typed surfaces stay `None`.
+    #[test]
+    fn parse_center_and_surround_mix_none_when_acmod_1_0_mono() {
+        let bits: &[(u8, u32)] = &[
+            (5, 8),
+            (3, 0),
+            (3, 1), // acmod = 1/0 mono
+            // no cmixlev, no surmixlev, no dsurmod
+            (1, 0),  // lfeon
+            (5, 27), // dialnorm
+            (1, 0),  // compre
+            (1, 0),  // langcode
+            (1, 0),  // audprodie
+            (1, 0),  // copyrightb
+            (1, 0),  // origbs
+            (1, 0),  // timecod1e
+            (1, 0),  // timecod2e
+            (1, 0),  // addbsie
+        ];
+        let bytes = pack_bits(bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.acmod, 1);
+        assert_eq!(b.cmixlev, 0xFF);
+        assert_eq!(b.surmixlev, 0xFF);
+        assert!(b.center_mix.is_none());
+        assert!(b.surround_mix.is_none());
+    }
+
+    /// A 2/2 (acmod=6) syncframe is the asymmetric case — the
+    /// `cmixlev` guard fails (no centre channel, `acmod & 0x1 == 0`)
+    /// but the `surmixlev` guard passes (surround present,
+    /// `acmod & 0x4 != 0`). Confirms each typed surface is gated
+    /// independently and the surround codeword is decoded
+    /// correctly.
+    #[test]
+    fn parse_surfaces_only_surround_mix_on_2_2() {
+        let bits: &[(u8, u32)] = &[
+            (5, 8),
+            (3, 0),
+            (3, 6), // acmod = 2/2 (L, R, Ls, Rs)
+            // cmixlev absent (acmod & 0x1 == 0)
+            (2, 0b10), // surmixlev = Mute
+            (1, 0),    // lfeon
+            (5, 27),   // dialnorm
+            (1, 0),    // compre
+            (1, 0),    // langcode
+            (1, 0),    // audprodie
+            (1, 0),    // copyrightb
+            (1, 0),    // origbs
+            (1, 0),    // timecod1e
+            (1, 0),    // timecod2e
+            (1, 0),    // addbsie
+        ];
+        let bytes = pack_bits(bits);
+        let b = parse(&bytes).unwrap();
+        assert_eq!(b.acmod, 6);
+        assert_eq!(b.cmixlev, 0xFF);
+        assert_eq!(b.surmixlev, 0b10);
+        assert!(b.center_mix.is_none());
+        let surround = b.surround_mix.expect("2/2 carries surmixlev");
+        assert_eq!(surround, SurroundMixLevel::Mute);
+        assert!(surround.is_mute());
+        assert_eq!(surround.coefficient(), Some(0.0));
     }
 }

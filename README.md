@@ -419,7 +419,56 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       `encinfo == 0` cross-checked against the sibling `dheadphonmod`
       / `adconvtyp` typed fields on a 2/0 frame, and the
       `xbsi2e == 0` short-circuit on a `bsid == 6` frame).
-      258 lib tests, all green.
+      258 lib tests, all green. **Round 259** lifts the §5.4.2.4
+      `cmixlev` (Table 5.9) + §5.4.2.5 `surmixlev` (Table 5.10) 2-bit
+      mix-level codewords from parse-into-`u8` to typed
+      `Bsi::center_mix: Option<CenterMixLevel>` /
+      `Bsi::surround_mix: Option<SurroundMixLevel>` surfaces. The
+      `CenterMixLevel` enum carries the four Table 5.9 codepoints
+      verbatim (`Minus3Db` = 0.707, `Minus4Point5Db` = 0.595,
+      `Minus6Db` = 0.500, `Reserved`); the `SurroundMixLevel` enum
+      carries the four Table 5.10 codepoints (`Minus3Db` = 0.707,
+      `Minus6Db` = 0.500, `Mute` = 0.000, `Reserved`). Both expose
+      `from_code(u8)` / `raw() -> u8` round-trip plus
+      `coefficient() -> Option<f32>` (returns the spec-documented
+      linear attenuation; `None` for the reserved codepoint) and
+      `coefficient_with_reserved_fallback() -> f32` (applies the
+      §5.4.2.4-5 "intermediate value may be used" substitution so a
+      §7.8 downmix consumer can pick the per-codepoint gain in a
+      single call). `SurroundMixLevel::is_mute()` lets a downmix
+      router short-circuit the surround mix-in step when the encoder
+      picked the `'10'` mute codepoint. `Some` only when the
+      §5.3.2 guards emit the codeword on the wire — `center_mix`
+      requires 3 front channels (`acmod ∈ {3, 5, 7}`), `surround_mix`
+      requires a surround channel (`acmod ∈ {4, 5, 6, 7}`); both
+      stay `None` for every other channel mode, mirroring the raw
+      `0xFF` "absent" sentinel that the existing `Bsi::cmixlev` /
+      `Bsi::surmixlev` fields keep for bit-stream round-trip. The
+      Annex E (E-AC-3) BSI never carries these 2-bit slots — Annex E
+      replaces them with the refined 3-bit `ltrtcmixlev` /
+      `lorocmixlev` / `ltrtsurmixlev` / `lorosurmixlev` codewords
+      inside the `mixmdata` block (§E.2.3.1.3-6) — so the typed
+      surface stays on the base AC-3 `Bsi`; the
+      `eac3::dsp::build_ac3_bsi_shim` hands the base helpers `None`
+      unconditionally. The decoder PCM path is unchanged — the
+      existing `downmix::Downmix::from_bsi` consumer continues to
+      read `bsi.cmixlev` / `bsi.surmixlev` and index the
+      `CENTER_MIX_LEVEL` / `SURROUND_MIX_LEVEL` tables — and
+      encoders still emit `cmixlev == 0b01` / `surmixlev == 0b01`
+      for every syncframe so encoder output is byte-identical. The
+      only behaviour change is decoder-side parsing: the new typed
+      surfaces let chain consumers (a downstream LtRt / LoRo
+      auto-router, a metadata probe) pick the per-codepoint
+      coefficient without re-walking Table 5.9 / 5.10 or consulting
+      the magic `0xFF` sentinel. Covered by 6 new `bsi::tests`
+      (every Table 5.9 codepoint × `from_code` / `raw` / `coefficient`
+      / fallback / `is_reserved` round-trip including the 2-bit
+      truncation of `0xFF`; the same coverage for Table 5.10 plus
+      `is_mute`; `parse()` surfacing on a 3/2 frame with non-default
+      codepoints; the 2/0 stereo case keeping both surfaces `None`;
+      the 1/0 mono case keeping both surfaces `None`; and the 2/2
+      asymmetric case where only `surround_mix` surfaces).
+      264 lib tests, all green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)
