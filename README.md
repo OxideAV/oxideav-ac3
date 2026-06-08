@@ -468,7 +468,47 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       codepoints; the 2/0 stereo case keeping both surfaces `None`;
       the 1/0 mono case keeping both surfaces `None`; and the 2/2
       asymmetric case where only `surround_mix` surfaces).
-      264 lib tests, all green.
+      264 lib tests, all green. **Round 263** lifts the
+      §5.4.1.3 `fscod` sample-rate code (Table 5.6) from raw `u8` to
+      a typed `SyncInfo::sample_rate_code() -> SampleRateCode`
+      accessor. `SampleRateCode` is a four-variant enum carrying the
+      three valid sampling-rate codepoints (`FortyEightKHz` /
+      `FortyFourPointOneKHz` / `ThirtyTwoKHz`) and a `Reserved`
+      variant for the spec-reserved `'11'` codepoint that mandates a
+      decoder mute. The enum exposes `from_code(u8)` / `raw() -> u8`
+      verbatim round-trip (with the upper bits of `code` ignored so a
+      caller does not need to mask first), `hertz() -> Option<u32>` /
+      `kilohertz() -> Option<u32>` for the spec rate lookups, an
+      `is_reserved()` predicate for probe / re-emit tooling, and an
+      `hth_row_index() -> Option<usize>` accessor that routes a typed
+      sample-rate code straight into the §7.15 hearing-threshold table
+      row in [`tables::HTH`] without re-walking Table 5.6. The raw
+      `SyncInfo::fscod: u8` and pre-resolved `SyncInfo::sample_rate:
+      u32` fields stay public and authoritative; the new typed
+      surface is a thin convenience over them. `parse()` itself still
+      rejects the reserved `'11'` codepoint at frame boundary per
+      §5.4.1.3 ("If the reserved code is indicated, the decoder
+      should not attempt to decode audio and should mute") so a
+      `SyncInfo` obtained from `parse()` never reports `Reserved` —
+      the variant is preserved for chain consumers that construct a
+      `SyncInfo` by hand (e.g. resynthesising one from
+      container-stored metadata where the upstream demuxer may not
+      have validated `fscod`). The Annex E (E-AC-3) BSI overloads the
+      `'11'` codepoint as a reduced-rate indicator that triggers a
+      follow-on `fscod2` codeword (§E.2.3.1.4-5), so this enum's
+      `Reserved` variant corresponds to the base AC-3 decoder-mute
+      semantics only; the typed surface is not mirrored on the Annex
+      E `Bsi`. The decoder PCM path is unchanged and encoder output
+      is byte-identical; the only behaviour change is the added
+      accessor. Covered by 7 new `syncinfo::tests` (all four Table
+      5.6 codepoints' `from_code` / `raw` round-trip; the upper-bit
+      truncation of `from_code` arguments; `hertz()` + `kilohertz()`
+      Table 5.6 lookups for the three valid codepoints and `None` for
+      reserved; `is_reserved` only-true-for-`'11'`; `hth_row_index`
+      matching the Table 7.15 row order; the `parse()` → typed
+      surface agreement on 48 / 44.1 / 32 kHz frames; and the
+      hand-built reserved-fscod surfacing path). 271 lib tests, all
+      green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)

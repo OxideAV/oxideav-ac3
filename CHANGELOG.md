@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Base §5.4.1.3 sample-rate code typed surface — `SampleRateCode`
+  (Table 5.6)** (round 263 / r263). The 2-bit `fscod` field that
+  every AC-3 syncframe carries — long parsed into a raw `u8` and a
+  separate pre-resolved `SyncInfo::sample_rate: u32` field — now
+  also surfaces as a typed
+  `SyncInfo::sample_rate_code() -> SampleRateCode` accessor.
+  `SampleRateCode` is a four-variant enum carrying the three valid
+  sampling-rate codepoints (`FortyEightKHz` = `'00'` /
+  `FortyFourPointOneKHz` = `'01'` / `ThirtyTwoKHz` = `'10'`) and a
+  `Reserved` variant for the spec-reserved `'11'` codepoint that
+  mandates a decoder mute per §5.4.1.3. The enum exposes
+  `from_code(u8)` / `raw() -> u8` verbatim round-trip (with the
+  upper bits of `code` ignored so a caller does not need to mask
+  first), `hertz() -> Option<u32>` and `kilohertz() -> Option<u32>`
+  for the spec rate lookups (the Table 5.6 / Annex D handbook
+  tables phrase the rate both ways), `is_reserved()` for probe /
+  re-emit tooling, and `hth_row_index() -> Option<usize>` that
+  routes a typed sample-rate code straight into the §7.15 hearing-
+  threshold table row in `tables::HTH` without re-walking Table
+  5.6. The raw `SyncInfo::fscod: u8` and pre-resolved
+  `SyncInfo::sample_rate: u32` fields stay public and
+  authoritative; the new typed surface is a thin convenience over
+  them. `parse()` itself still rejects the reserved `'11'`
+  codepoint at frame boundary per §5.4.1.3 ("If the reserved code
+  is indicated, the decoder should not attempt to decode audio and
+  should mute") so a `SyncInfo` obtained from `parse()` never
+  reports `Reserved` — the variant is preserved for chain consumers
+  that construct a `SyncInfo` by hand (e.g. resynthesising one
+  from container-stored metadata where the upstream demuxer may
+  not have validated `fscod`). The Annex E (E-AC-3) BSI overloads
+  the `'11'` codepoint as a reduced-rate indicator that triggers a
+  follow-on `fscod2` codeword (§E.2.3.1.4-5), so this enum's
+  `Reserved` variant corresponds to the base AC-3 decoder-mute
+  semantics only; the typed surface is not mirrored on the Annex E
+  `Bsi`. The decoder PCM path is unchanged and encoder output is
+  byte-identical; the only behaviour change is the added accessor.
+  Covered by 7 new `syncinfo::tests`. 271 lib tests, all green.
+
 - **Base §5.4.2.4-5 mix-level typed surfaces — `CenterMixLevel`
   (Table 5.9) + `SurroundMixLevel` (Table 5.10)** (round 259 / r259).
   The 2-bit `cmixlev` codeword that the §5.3.2 guard emits when the
