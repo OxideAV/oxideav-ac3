@@ -16,7 +16,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::tables::{frame_length_bytes, sample_rate_hz};
+use crate::tables::{frame_length_bytes, nominal_bitrate_kbps, sample_rate_hz, FRAME_SIZE_TABLE};
 
 /// The 16-bit AC-3 syncword (§5.4.1.1).
 pub const SYNCWORD: u16 = 0x0B77;
@@ -54,6 +54,24 @@ impl SyncInfo {
     /// without re-walking Table 5.6.
     pub fn sample_rate_code(&self) -> SampleRateCode {
         SampleRateCode::from_code(self.fscod)
+    }
+
+    /// Typed view over [`Self::frmsizecod`] per §5.4.1.4 / Table 5.18.
+    /// The returned [`FrameSizeCode`] decodes the 6-bit `frmsizecod`
+    /// field into one of the 38 valid frame-size codepoints
+    /// (`0..=37`) or [`FrameSizeCode::Reserved`] for the `38..=63`
+    /// codepoints that have no Table 5.18 row.
+    ///
+    /// [`parse`] already rejects an out-of-range `frmsizecod` at frame
+    /// boundary — a [`SyncInfo`] handed back from [`parse`] therefore
+    /// always reports a non-reserved [`FrameSizeCode`]. The accessor
+    /// remains a thin wrapper over [`Self::frmsizecod`] for chain
+    /// consumers that construct a [`SyncInfo`] by hand (e.g.
+    /// resynthesising one from container-stored metadata) and want the
+    /// typed surface — the nominal bit-rate and per-rate word count —
+    /// without re-walking Table 5.18.
+    pub fn frame_size_code(&self) -> FrameSizeCode {
+        FrameSizeCode::from_code(self.frmsizecod)
     }
 }
 
@@ -175,6 +193,119 @@ impl SampleRateCode {
             SampleRateCode::ThirtyTwoKHz => Some(2),
             SampleRateCode::Reserved => None,
         }
+    }
+}
+
+/// §5.4.1.4 frame-size code (Table 5.18). A 6-bit codeword carried in
+/// every AC-3 syncframe that — together with the [`SampleRateCode`] —
+/// selects the number of 16-bit words in the syncframe before the next
+/// syncword. Per §5.4.1.4: "The frame size code is used along with the
+/// sample rate code to determine the number of (2-byte) words before
+/// the next syncword."
+///
+/// Table 5.18 defines 38 valid codepoints (`frmsizecod = 0..=37`); the
+/// remaining `38..=63` codepoints have no table row and are surfaced as
+/// [`FrameSizeCode::Reserved`]. Each nominal bit-rate occupies two
+/// neighbouring codepoints (the even/odd pair) because a 44.1 kHz
+/// encoding must alternate frame sizes to hit the declared bit-rate on
+/// average — both sizes appear in Table 5.18.
+///
+/// Surfaced via [`SyncInfo::frame_size_code`]. Callers that just want
+/// the byte length the demuxer must consume can keep reading the
+/// pre-resolved [`SyncInfo::frame_length`] field; the typed enum is for
+/// chain consumers that branch on the nominal bit-rate
+/// ([`Self::nominal_bitrate_kbps`]) or need the raw per-rate word count
+/// ([`Self::words`]) without re-walking Table 5.18.
+///
+/// [`parse`] rejects an out-of-range `frmsizecod` at frame boundary by
+/// returning [`oxideav_core::Error::Invalid`], so a [`SyncInfo`]
+/// obtained from [`parse`] never reports [`Self::Reserved`]; the
+/// variant is preserved so a chain consumer constructing a [`SyncInfo`]
+/// from container-stored metadata (where the upstream demuxer may not
+/// have validated `frmsizecod`) can detect the reserved range without
+/// re-walking Table 5.18.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameSizeCode {
+    /// A valid Table 5.18 codepoint (`frmsizecod = 0..=37`).
+    Valid(u8),
+    /// A `frmsizecod` in the `38..=63` range — no Table 5.18 row. Per
+    /// §5.4.1.4 only `0..=37` are defined; [`parse`] rejects this range
+    /// at frame boundary so a [`SyncInfo`] from [`parse`] never carries
+    /// it.
+    Reserved,
+}
+
+impl FrameSizeCode {
+    /// Decode the 6-bit wire value verbatim per Table 5.18. The low 6
+    /// bits of `code` are consulted; the upper 2 bits are ignored so a
+    /// caller that passes byte 4 of the syncinfo (which packs `fscod`
+    /// in the top two bits) does not need to mask first. A masked value
+    /// of `0..=37` maps to [`Self::Valid`]; `38..=63` maps to
+    /// [`Self::Reserved`].
+    pub fn from_code(code: u8) -> Self {
+        let frmsizecod = code & 0x3F;
+        if (frmsizecod as usize) < FRAME_SIZE_TABLE.len() {
+            FrameSizeCode::Valid(frmsizecod)
+        } else {
+            FrameSizeCode::Reserved
+        }
+    }
+
+    /// Raw 6-bit code as it appeared on the wire — the round-trip
+    /// inverse of [`Self::from_code`] for the valid range. Returns the
+    /// stored codepoint for [`Self::Valid`]; for [`Self::Reserved`]
+    /// there is no single wire value (the variant collapses the whole
+    /// `38..=63` range) so this returns `None`.
+    pub fn raw(self) -> Option<u8> {
+        match self {
+            FrameSizeCode::Valid(c) => Some(c),
+            FrameSizeCode::Reserved => None,
+        }
+    }
+
+    /// `true` only for [`Self::Reserved`] — lets a probe / re-emit tool
+    /// flag streams that carry a `frmsizecod` in the undefined
+    /// `38..=63` range without re-walking Table 5.18.
+    pub fn is_reserved(self) -> bool {
+        matches!(self, FrameSizeCode::Reserved)
+    }
+
+    /// Nominal bit rate in **kbps** per Table 5.18, or `None` for the
+    /// reserved range. The two neighbouring codepoints that share a
+    /// bit-rate (e.g. `frmsizecod = 0` and `1` both = 32 kbps) return
+    /// the same value.
+    pub fn nominal_bitrate_kbps(self) -> Option<u32> {
+        match self {
+            FrameSizeCode::Valid(c) => nominal_bitrate_kbps(c),
+            FrameSizeCode::Reserved => None,
+        }
+    }
+
+    /// The Table 5.18 syncframe length in **16-bit words** for the given
+    /// [`SampleRateCode`], or `None` if either this code or the rate
+    /// code is reserved. The byte length consumed by the demuxer is
+    /// twice this value (the table is denominated in 2-byte words per
+    /// §5.4.1.4).
+    pub fn words(self, rate: SampleRateCode) -> Option<u32> {
+        let c = match self {
+            FrameSizeCode::Valid(c) => c as usize,
+            FrameSizeCode::Reserved => return None,
+        };
+        let (_, w32, w44, w48) = FRAME_SIZE_TABLE[c];
+        match rate {
+            SampleRateCode::FortyEightKHz => Some(w48),
+            SampleRateCode::FortyFourPointOneKHz => Some(w44),
+            SampleRateCode::ThirtyTwoKHz => Some(w32),
+            SampleRateCode::Reserved => None,
+        }
+    }
+
+    /// The Table 5.18 syncframe length in **bytes** for the given
+    /// [`SampleRateCode`] (`2 ×` [`Self::words`]), or `None` if either
+    /// code is reserved. This matches the pre-resolved
+    /// [`SyncInfo::frame_length`] field for any frame [`parse`] accepts.
+    pub fn frame_length_bytes(self, rate: SampleRateCode) -> Option<u32> {
+        self.words(rate).map(|w| w * 2)
     }
 }
 
@@ -406,5 +537,134 @@ mod tests {
         assert!(src.is_reserved());
         assert_eq!(src.hertz(), None);
         assert_eq!(src.hth_row_index(), None);
+    }
+
+    /// Every valid Table 5.18 codepoint (`0..=37`) round-trips through
+    /// `FrameSizeCode::Valid` and `raw()` returns the original code; the
+    /// `38..=63` reserved range collapses to `FrameSizeCode::Reserved`
+    /// with `raw() == None`.
+    #[test]
+    fn frame_size_code_round_trip_valid_and_reserved() {
+        for code in 0u8..=37 {
+            let fsc = FrameSizeCode::from_code(code);
+            assert_eq!(fsc, FrameSizeCode::Valid(code), "code {code}");
+            assert_eq!(fsc.raw(), Some(code), "raw() round-trip for {code}");
+            assert!(!fsc.is_reserved(), "code {code} should not be reserved");
+        }
+        for code in 38u8..=63 {
+            let fsc = FrameSizeCode::from_code(code);
+            assert_eq!(fsc, FrameSizeCode::Reserved, "code {code}");
+            assert_eq!(fsc.raw(), None, "reserved raw() for {code}");
+            assert!(fsc.is_reserved(), "code {code} should be reserved");
+        }
+    }
+
+    /// `from_code` masks off the upper 2 bits so a caller can pass byte
+    /// 4 of the syncinfo (which packs `fscod` in bits 7..6) without
+    /// masking first: `frmsizecod = 20` with `fscod = '00'` in the top
+    /// bits, vs the same `20` with `fscod = '11'` (byte = 0xD4), both
+    /// decode to `Valid(20)`.
+    #[test]
+    fn frame_size_code_ignores_upper_two_bits() {
+        assert_eq!(FrameSizeCode::from_code(20), FrameSizeCode::Valid(20));
+        // 0b11_010100 = fscod '11' packed over frmsizecod = 20.
+        assert_eq!(FrameSizeCode::from_code(0xD4), FrameSizeCode::Valid(20));
+        // 0b11_111111 = fscod '11' over frmsizecod = 63 (reserved).
+        assert_eq!(FrameSizeCode::from_code(0xFF), FrameSizeCode::Reserved);
+    }
+
+    /// `nominal_bitrate_kbps` returns the Table 5.18 nominal rate for a
+    /// valid code (and the two-codepoints-per-rate pairing), `None` for
+    /// the reserved range.
+    #[test]
+    fn frame_size_code_nominal_bitrate() {
+        // frmsizecod 0 and 1 both = 32 kbps; 20 and 21 both = 192 kbps;
+        // 36 and 37 both = 640 kbps (the Table 5.18 endpoints).
+        assert_eq!(FrameSizeCode::Valid(0).nominal_bitrate_kbps(), Some(32));
+        assert_eq!(FrameSizeCode::Valid(1).nominal_bitrate_kbps(), Some(32));
+        assert_eq!(FrameSizeCode::Valid(20).nominal_bitrate_kbps(), Some(192));
+        assert_eq!(FrameSizeCode::Valid(21).nominal_bitrate_kbps(), Some(192));
+        assert_eq!(FrameSizeCode::Valid(37).nominal_bitrate_kbps(), Some(640));
+        assert_eq!(FrameSizeCode::Reserved.nominal_bitrate_kbps(), None);
+    }
+
+    /// `words` / `frame_length_bytes` return the per-rate Table 5.18
+    /// values for a valid code and `None` when either this code or the
+    /// rate code is reserved.
+    #[test]
+    fn frame_size_code_words_and_bytes_per_rate() {
+        // frmsizecod = 20 (192 kbps): 576 words @ 32 kHz, 417 @ 44.1,
+        // 384 @ 48 — verbatim from Table 5.18.
+        let fsc = FrameSizeCode::Valid(20);
+        assert_eq!(fsc.words(SampleRateCode::ThirtyTwoKHz), Some(576));
+        assert_eq!(fsc.words(SampleRateCode::FortyFourPointOneKHz), Some(417));
+        assert_eq!(fsc.words(SampleRateCode::FortyEightKHz), Some(384));
+        assert_eq!(
+            fsc.frame_length_bytes(SampleRateCode::FortyEightKHz),
+            Some(768)
+        );
+        // Reserved rate → None even on a valid frame-size code.
+        assert_eq!(fsc.words(SampleRateCode::Reserved), None);
+        assert_eq!(fsc.frame_length_bytes(SampleRateCode::Reserved), None);
+        // Reserved frame-size code → None on every rate.
+        assert_eq!(
+            FrameSizeCode::Reserved.words(SampleRateCode::FortyEightKHz),
+            None
+        );
+        assert_eq!(
+            FrameSizeCode::Reserved.frame_length_bytes(SampleRateCode::FortyEightKHz),
+            None
+        );
+    }
+
+    /// `SyncInfo::frame_size_code()` agrees with the pre-resolved
+    /// `frame_length` field on every frame `parse` accepts — the typed
+    /// surface's `frame_length_bytes(rate)` matches `si.frame_length`.
+    #[test]
+    fn syncinfo_frame_size_code_matches_resolved_length() {
+        // fscod=0 (48 kHz) / frmsizecod=20 → 768 bytes.
+        let buf = [0x0B, 0x77, 0xAB, 0xCD, 20];
+        let si = parse(&buf).unwrap();
+        let fsc = si.frame_size_code();
+        assert_eq!(fsc, FrameSizeCode::Valid(20));
+        assert_eq!(fsc.raw(), Some(si.frmsizecod));
+        assert!(!fsc.is_reserved());
+        assert_eq!(
+            fsc.frame_length_bytes(si.sample_rate_code()),
+            Some(si.frame_length)
+        );
+        assert_eq!(fsc.nominal_bitrate_kbps(), Some(192));
+
+        // fscod=2 (32 kHz) / frmsizecod=0 → 96 words = 192 bytes.
+        let buf = [0x0B, 0x77, 0, 0, 0x80];
+        let si = parse(&buf).unwrap();
+        let fsc = si.frame_size_code();
+        assert_eq!(fsc, FrameSizeCode::Valid(0));
+        assert_eq!(
+            fsc.frame_length_bytes(si.sample_rate_code()),
+            Some(si.frame_length)
+        );
+    }
+
+    /// A caller constructing a `SyncInfo` by hand with an out-of-range
+    /// `frmsizecod = 40` still gets the `FrameSizeCode::Reserved` typed
+    /// surface — `parse` itself never lets a reserved frmsizecod
+    /// through, but the typed accessor on a hand-built `SyncInfo` flags
+    /// it.
+    #[test]
+    fn syncinfo_frame_size_code_surfaces_reserved_for_hand_built() {
+        let si = SyncInfo {
+            crc1: 0,
+            fscod: 0,
+            frmsizecod: 40,
+            sample_rate: 48_000,
+            frame_length: 0,
+        };
+        let fsc = si.frame_size_code();
+        assert_eq!(fsc, FrameSizeCode::Reserved);
+        assert!(fsc.is_reserved());
+        assert_eq!(fsc.raw(), None);
+        assert_eq!(fsc.nominal_bitrate_kbps(), None);
+        assert_eq!(fsc.frame_length_bytes(SampleRateCode::FortyEightKHz), None);
     }
 }

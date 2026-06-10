@@ -508,7 +508,39 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       matching the Table 7.15 row order; the `parse()` → typed
       surface agreement on 48 / 44.1 / 32 kHz frames; and the
       hand-built reserved-fscod surfacing path). 271 lib tests, all
-      green.
+      green. **Round 271** lifts the §5.4.1.4 `frmsizecod` frame-size
+      code (Table 5.18) — the other half of syncinfo byte 4 — from raw
+      `u8` to a typed `SyncInfo::frame_size_code() -> FrameSizeCode`
+      accessor, mirroring the r263 `SampleRateCode` surface.
+      `FrameSizeCode` is a two-variant enum: `Valid(u8)` carries one of
+      the 38 Table 5.18 codepoints (`frmsizecod = 0..=37`) and
+      `Reserved` collapses the `38..=63` range with no Table 5.18 row.
+      Per §5.4.1.4 the code "is used along with the sample rate code to
+      determine the number of (2-byte) words before the next syncword."
+      The enum exposes `from_code(u8)` (masks the upper 2 bits so a
+      caller can pass syncinfo byte 4 verbatim — `fscod` lives in
+      bits 7..6), `raw() -> Option<u8>` (`None` for the reserved range),
+      `is_reserved()`, `nominal_bitrate_kbps() -> Option<u32>` (the two
+      neighbouring codepoints per rate return the same value),
+      `words(SampleRateCode) -> Option<u32>` for the per-rate 16-bit-word
+      count, and `frame_length_bytes(SampleRateCode) -> Option<u32>`
+      (`2 ×` words) which matches the pre-resolved `SyncInfo::frame_length`
+      field for any frame `parse()` accepts. The raw
+      `SyncInfo::frmsizecod` and pre-resolved `SyncInfo::frame_length`
+      fields stay public and authoritative; the typed surface is a thin
+      convenience over them. `parse()` still rejects an out-of-range
+      `frmsizecod` at frame boundary so a `SyncInfo` from `parse()` never
+      reports `Reserved` — the variant is preserved for chain consumers
+      that hand-build a `SyncInfo` from container-stored metadata. The
+      decoder PCM path is unchanged and encoder output is byte-identical;
+      the only behaviour change is the added accessor. Covered by 6 new
+      `syncinfo::tests` (the full `0..=37` valid + `38..=63` reserved
+      round-trip, the upper-2-bit masking, the `nominal_bitrate_kbps`
+      pairing at the 32 / 192 / 640 kbps rows, the per-rate `words` /
+      `frame_length_bytes` Table 5.18 lookups plus reserved-rate /
+      reserved-code `None` short-circuits, the `parse()` → typed surface
+      agreement on 48 / 32 kHz frames, and the hand-built
+      reserved-frmsizecod surfacing path). 277 lib tests, all green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)

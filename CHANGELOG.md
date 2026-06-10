@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Base §5.4.1.4 frame-size code typed surface — `FrameSizeCode`
+  (Table 5.18)** (round 271 / r271). The 6-bit `frmsizecod` field that
+  every AC-3 syncframe carries — long parsed into a raw `u8` and a
+  separate pre-resolved `SyncInfo::frame_length: u32` byte length — now
+  also surfaces as a typed `SyncInfo::frame_size_code() -> FrameSizeCode`
+  accessor, mirroring the r263 `SampleRateCode` surface over `fscod`
+  (the other half of syncinfo byte 4). `FrameSizeCode` is a two-variant
+  enum: `Valid(u8)` carries one of the 38 Table 5.18 codepoints
+  (`frmsizecod = 0..=37`) and `Reserved` collapses the `38..=63` range
+  that has no Table 5.18 row. Per §5.4.1.4 the frame size code "is used
+  along with the sample rate code to determine the number of (2-byte)
+  words before the next syncword." The enum exposes `from_code(u8)`
+  (masks off the upper 2 bits so a caller can pass syncinfo byte 4
+  verbatim — `fscod` lives in bits 7..6) / `raw() -> Option<u8>`
+  (round-trip inverse; `None` for the reserved range which has no single
+  wire value), `is_reserved()` for probe / re-emit tooling,
+  `nominal_bitrate_kbps() -> Option<u32>` for the Table 5.18 nominal
+  bit-rate (the two neighbouring codepoints per rate return the same
+  value — 44.1 kHz alternates frame sizes to hit the declared rate on
+  average), `words(SampleRateCode) -> Option<u32>` for the per-rate
+  16-bit-word count, and `frame_length_bytes(SampleRateCode) ->
+  Option<u32>` (`2 ×` words) which matches the pre-resolved
+  `SyncInfo::frame_length` field for any frame `parse` accepts. The raw
+  `SyncInfo::frmsizecod: u8` and pre-resolved `SyncInfo::frame_length:
+  u32` fields stay public and authoritative; the new typed surface is a
+  thin convenience over them. `parse()` itself still rejects an
+  out-of-range `frmsizecod` at frame boundary per §5.4.1.4 / Table 5.18,
+  so a `SyncInfo` obtained from `parse()` never reports `Reserved` — the
+  variant is preserved for chain consumers that construct a `SyncInfo`
+  by hand (e.g. resynthesising one from container-stored metadata where
+  the upstream demuxer may not have validated `frmsizecod`). The decoder
+  PCM path is unchanged and encoder output is byte-identical; the only
+  behaviour change is the added accessor. Covered by 6 new
+  `syncinfo::tests` (the full `0..=37` valid + `38..=63` reserved
+  round-trip on `from_code` / `raw` / `is_reserved`, the upper-2-bit
+  masking, the `nominal_bitrate_kbps` pairing at the 32 / 192 / 640 kbps
+  rows, the per-rate `words` / `frame_length_bytes` Table 5.18 lookups
+  plus reserved-rate and reserved-code `None` short-circuits, the
+  `parse()` → typed surface agreement on 48 / 32 kHz frames, and the
+  hand-built reserved-frmsizecod surfacing path). 277 lib tests, all
+  green.
+
 - **Base §5.4.1.3 sample-rate code typed surface — `SampleRateCode`
   (Table 5.6)** (round 263 / r263). The 2-bit `fscod` field that
   every AC-3 syncframe carries — long parsed into a raw `u8` and a
