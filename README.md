@@ -681,6 +681,38 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       now (parsing is a pure tested layer, not yet wired into the
       audblk walk). 6 new `eac3::ecpl::tests` (315 → 321 lib tests),
       all green.
+
+      **Round 306** lifts the third layer onto the geometry + syntax:
+      the §E.3.5.5.2 / §E.3.5.5.3 **parameter processing** that turns
+      the decoded `ecplamp` / `ecplangle` / `ecplchaos` index triples
+      into per-bin amplitude and angle arrays. `eac3::ecpl` grows the
+      three lookup tables — `ECPL_AMP_EXP_TAB` / `ECPL_AMP_MANT_TAB`
+      (Table E3.10), `ECPL_ANGLE_TAB` (Table E3.11, codes 0-31 →
+      `0..0.96875`, codes 32-63 → `-1.0..-0.03125`), `ECPL_CHAOS_TAB`
+      (Table E3.12, the eighths `-k/7`) — plus the processing
+      functions. `ampbnd()` converts a 5-bit amplitude index to a
+      linear gain `(ecplampmanttab/32) >> ecplampexptab` (index 0 →
+      0 dB, index 30 → ≈ -45.01 dB, index 31 → minus-∞ dB → 0).
+      `process_band_amplitudes()` applies the §E.3.5.5.2 chaos
+      modification `ampbnd *= 1 + 0.38·chaos` (skipped for the first
+      coupled channel and for transient channels, where chaos is 0).
+      `expand_bands_to_bins()` fans the per-band values out to the
+      per-bin `ampbin[]` using the `ecplbndstrc[]` merge structure.
+      `angle_value()` / `chaos_value()` decode the angle/chaos indices
+      (forced to 0 on the first coupled channel per §E.3.5.5.3), and
+      `interpolate_bin_angles()` implements the `ecplangleintrp == 1`
+      linear-interpolation path (band-centre slope, the lower-half-of-
+      first-band downward walk, and the closing last-band pass, with
+      the spec's `±1.0` wrap guards). These are pure tabulated
+      arithmetic over the decoded indices — no multi-block state. The
+      two remaining deferred pieces of §E.3.5.5 are the §E.3.5.5.1
+      prev/curr/next IMDCT + overlap-add + FFT that produces the
+      non-aliased complex coupling channel and the §E.3.5.5.4 per-bin
+      complex product + `rand[]` de-correlation arrays (both stateful
+      across blocks; the latter needs an init-time RNG). The decoder's
+      `ecplinu == 1` synthesis-stage reject is unchanged — this layer
+      is pure + tested but not yet wired into the audblk walk. 7 new
+      `eac3::ecpl::tests` (321 → 328 lib tests), all green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)

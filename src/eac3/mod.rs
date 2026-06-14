@@ -34,7 +34,12 @@
 //!   (§E.2.3.3.16-19 + §E.3.5.2): the Table E3.8 begin/end sub-band
 //!   derivations, Table E3.9 `ecplsubbndtab[]`, Table E2.14 default
 //!   banding, the §E.2.3.3.19 `necplbnd` band count, and the
-//!   §E.3.5.5.1 per-band bin counts. Pure geometry — no synthesis.
+//!   §E.3.5.5.1 per-band bin counts; the §E.2.3.3.16-26 bitstream-syntax
+//!   parse; and the §E.3.5.5.2 / §E.3.5.5.3 parameter-processing layer
+//!   (Table E3.10-E3.12 amplitude / angle / chaos decode, the chaos
+//!   amplitude modification, per-band→per-bin expansion, the
+//!   angle-interpolation path). The §E.3.5.5.1 FFT channel processing +
+//!   §E.3.5.5.4 complex synthesis are still deferred.
 //! * **[`dsp`]** — per-frame DSP: §7.4 decouple, AHT mantissa cache,
 //!   §3.6 spectral extension (translate → noise-blend → coordinate
 //!   scale + §3.6.4.2.3 SPXATTEN border notch), §3.7.2 transient
@@ -54,11 +59,14 @@
 //!
 //! * **Enhanced coupling** (`ecplinu == 1`, §E.1.3.3.7-26) is
 //!   rejected as `Unsupported` at the synthesis stage. The band
-//!   *geometry* (§E.2.3.3.16-19: begin/end sub-bands, default banding,
-//!   `necplbnd`, per-band bin counts) is spec-derived and unit-tested
-//!   in [`ecpl`]; the remaining gap is the §E.3.5.5 amplitude / angle /
-//!   chaos parameter decode + complex coordinate synthesis. Standard
-//!   coupling is fully in.
+//!   *geometry* (§E.2.3.3.16-19), the §E.2.3.3.16-26 bitstream-syntax
+//!   parse, and the §E.3.5.5.2 / §E.3.5.5.3 amplitude / angle / chaos
+//!   parameter processing (index→value decode, chaos amplitude
+//!   modification, per-band→per-bin expansion, angle interpolation) are
+//!   all spec-derived and unit-tested in [`ecpl`]; the remaining gap is
+//!   the §E.3.5.5.1 FFT channel processing + §E.3.5.5.4 complex
+//!   coordinate synthesis (multi-block stateful, init-time `rand[]`).
+//!   Standard coupling is fully in.
 //! * **Cross-frame transient pre-noise reference** (§E.3.7.1) is
 //!   clamped to the current frame; intra-frame transients (§E.3.7.2)
 //!   are fully synthesised.

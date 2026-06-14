@@ -39,9 +39,24 @@
 //! §E.2.3.3.16-19 strategy fields and [`parse_coords`] reads the
 //! §E.2.3.3.20-26 per-band amplitude / angle / chaos coordinates. These
 //! advance the bit cursor exactly per the reference syntax so an
-//! enhanced-coupling block can be walked without desync — the §E.3.5.5
-//! coordinate reconstruction that turns the decoded indices into complex
-//! gains is still a separate, deferred step.
+//! enhanced-coupling block can be walked without desync.
+//!
+//! Round 306 adds the **§E.3.5.5.2 / §E.3.5.5.3 parameter-processing**
+//! layer: [`ampbnd`] / [`angle_value`] / [`chaos_value`] decode the
+//! Table E3.10-E3.12 index triples, [`process_band_amplitudes`] applies
+//! the §E.3.5.5.2 chaos amplitude modification, [`expand_bands_to_bins`]
+//! fans the per-band values out to per-bin `ampbin[]`, and
+//! [`interpolate_bin_angles`] implements the `ecplangleintrp == 1`
+//! linear-interpolation path (§E.3.5.5.3). These turn the decoded index
+//! triples into the per-bin amplitude / angle arrays the synthesis
+//! consumes — pure tabulated arithmetic with no multi-block state.
+//!
+//! The two remaining deferred pieces of §E.3.5.5 are the
+//! §E.3.5.5.1 prev/curr/next IMDCT + overlap-add + FFT that produces the
+//! non-aliased complex coupling channel, and the §E.3.5.5.4 per-bin
+//! complex product + `rand[]` de-correlation arrays — both stateful
+//! across blocks (and the latter needs an init-time RNG), so they stay
+//! out of this pure layer.
 //!
 //! **Spec note (erratum):** the default-banding table is captioned
 //! "Table E2.14" in the document's table-of-contents (and list of
@@ -442,6 +457,306 @@ pub fn parse_coords(
     })
 }
 
+// ===========================================================================
+// §E.3.5.5.2 / §E.3.5.5.3 — enhanced-coupling parameter processing
+// ===========================================================================
+//
+// This layer turns the decoded per-band index triples (`ecplamp` /
+// `ecplangle` / `ecplchaos` carried in [`EcplChannelParams`]) into the
+// per-*bin* amplitude and angle arrays the §E.3.5.5.4 complex-product
+// synthesis consumes. It is pure tabulated arithmetic over the active
+// band geometry — no multi-block state, no FFT.
+//
+// The two remaining (deferred) pieces of §E.3.5.5 are:
+//   * §E.3.5.5.1 — the prev/curr/next IMDCT + overlap-add + FFT that
+//     produces the non-aliased complex coupling channel `Z[k]`, and
+//   * §E.3.5.5.4 — the per-bin complex product + the `rand[]`
+//     de-correlation arrays.
+// Both are stateful across blocks (and need an init-time RNG for the
+// `rand_notrans` array), so they stay out of this pure layer.
+
+/// Table E3.10 — `ecplampexptab[]`. The binary exponent (right-shift
+/// count) applied to the mantissa for each 5-bit `ecplamp` index. Index
+/// 31 (minus-infinity dB) has no exponent and is handled specially in
+/// [`ampbnd`]; its slot here is `0` and never read on that path.
+pub const ECPL_AMP_EXP_TAB: [u8; 32] = [
+    0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 0,
+];
+
+/// Table E3.10 — `ecplampmanttab[]`. The 6-bit mantissa for each 5-bit
+/// `ecplamp` index (the `/32` in [`ampbnd`] applies the implicit binary
+/// point). Index 31 is `0x00` (minus-infinity dB → amplitude 0).
+pub const ECPL_AMP_MANT_TAB: [u8; 32] = [
+    0x20, 0x1b, 0x17, 0x13, 0x10, 0x1b, 0x17, 0x13, 0x10, 0x1b, 0x17, 0x13, 0x10, 0x1b, 0x17, 0x13,
+    0x10, 0x1b, 0x17, 0x13, 0x10, 0x1b, 0x17, 0x13, 0x10, 0x1b, 0x17, 0x13, 0x10, 0x1b, 0x17, 0x00,
+];
+
+/// Table E3.11 — `ecplangletab[]`. The band phase angle (in the spec's
+/// normalised `-1.0 ..= 1.0` units, representing `-pi ..= pi`) for each
+/// 6-bit `ecplangle` index. Codes 0..=31 are the non-negative angles
+/// `0.0, 0.03125, … 0.96875`; codes 32..=63 are the negative angles
+/// `-1.0, -0.96875, … -0.03125`.
+pub const ECPL_ANGLE_TAB: [f32; 64] = {
+    let mut t = [0.0f32; 64];
+    let mut i = 0;
+    while i < 32 {
+        t[i] = i as f32 / 32.0;
+        i += 1;
+    }
+    let mut i = 32;
+    while i < 64 {
+        t[i] = -1.0 + (i - 32) as f32 / 32.0;
+        i += 1;
+    }
+    t
+};
+
+/// Table E3.12 — `ecplchaostab[]`. The chaos scaling factor (in
+/// `0.0 ..= -1.0`) for each 3-bit `ecplchaos` index. The values are the
+/// eighths `-k/7` for `k = 0..=7`.
+pub const ECPL_CHAOS_TAB: [f32; 8] = [
+    0.0, -0.142857, -0.285714, -0.428571, -0.571429, -0.714286, -0.857143, -1.0,
+];
+
+/// §E.3.5.5.2 — the band amplitude `ampbnd[ch][bnd]` for a single 5-bit
+/// `ecplamp` index, *before* the chaos modification.
+///
+/// ```text
+/// if (ecplamp == 31)  ampbnd = 0
+/// else                ampbnd = (ecplampmanttab[ecplamp] / 32) >> ecplampexptab[ecplamp]
+/// ```
+///
+/// The spec's `>> exp` is a fixed-point right shift, i.e. division by
+/// `2^exp`; we evaluate it in floating point as `(mant / 32) / 2^exp`.
+/// Index 0 (`mant = 0x20`, `exp = 0`) yields `1.0` (0 dB); index 30
+/// (`mant = 0x17`, `exp = 7`) yields `≈ 0.005615` (≈ -45.01 dB); index
+/// 31 yields `0.0` (minus-infinity dB).
+#[inline]
+pub fn ampbnd(ecplamp: u8) -> f32 {
+    let idx = (ecplamp & 0x1f) as usize;
+    if idx == 31 {
+        return 0.0;
+    }
+    let mant = ECPL_AMP_MANT_TAB[idx] as f32 / 32.0;
+    let exp = ECPL_AMP_EXP_TAB[idx] as i32;
+    mant / 2f32.powi(exp)
+}
+
+/// §E.3.5.5.2 — the chaos value `chaos[ch][bnd]` for a single 3-bit
+/// `ecplchaos` index. The first coupled channel always reads `0.0`
+/// regardless of the index (its chaos/angle are spec-fixed to zero).
+#[inline]
+pub fn chaos_value(ecplchaos: u8, is_first_coupled: bool) -> f32 {
+    if is_first_coupled {
+        0.0
+    } else {
+        ECPL_CHAOS_TAB[(ecplchaos & 0x07) as usize]
+    }
+}
+
+/// §E.3.5.5.3 — the band angle `angle[ch][bnd]` for a single 6-bit
+/// `ecplangle` index. The first coupled channel always reads `0.0`.
+#[inline]
+pub fn angle_value(ecplangle: u8, is_first_coupled: bool) -> f32 {
+    if is_first_coupled {
+        0.0
+    } else {
+        ECPL_ANGLE_TAB[(ecplangle & 0x3f) as usize]
+    }
+}
+
+/// §E.3.5.5.2 — the fully-processed per-band amplitudes for one channel,
+/// including the chaos modification.
+///
+/// For each band, [`ampbnd`] converts the `ecplamp` index to a linear
+/// gain, then the chaos modification
+///
+/// ```text
+/// if (ecpltrans == 0 && ch != firstchincpl)
+///     ampbnd[bnd] *= 1 + 0.38 * chaos[bnd]
+/// ```
+///
+/// scales it (note `chaos` is `<= 0`, so this *reduces* the amplitude of
+/// non-transient, non-first coupled channels). `is_first_coupled` carries
+/// the `ch == firstchincpl` test; `trans` carries `ecpltrans[ch]`.
+///
+/// Returns a vector of length `necplbnd` (the length of `params.amp`).
+pub fn process_band_amplitudes(params: &EcplChannelParams, is_first_coupled: bool) -> Vec<f32> {
+    let mut out = Vec::with_capacity(params.amp.len());
+    for (bnd, &amp_idx) in params.amp.iter().enumerate() {
+        let mut a = ampbnd(amp_idx);
+        // The chaos modification applies only to non-first coupled
+        // channels with no transient. `chaos`/`angle` are only present
+        // for those channels (param2e), so a missing entry means 0.
+        if !params.trans && !is_first_coupled {
+            let chaos_idx = params.chaos.get(bnd).copied().unwrap_or(0);
+            let chaos = chaos_value(chaos_idx, is_first_coupled);
+            a *= 1.0 + 0.38 * chaos;
+        }
+        out.push(a);
+    }
+    out
+}
+
+/// §E.3.5.5.2 — expand per-band values to per-sub-band then per-bin.
+///
+/// `band_vals` holds one value per enhanced-coupling *band*; this fans
+/// each band's value out across every transform-coefficient bin it spans,
+/// using the merge structure `bndstrc[]` to walk the same band boundaries
+/// the parse used. The returned vector is indexed by *bin offset from
+/// `begin_bin`* (i.e. element `0` is transform coefficient
+/// `ecplsubbndtab[begin_subbnd]`), with length
+/// `end_bin(end) - begin_bin(begin)`.
+///
+/// This is the §E.3.5.5.2 `ampbin[ch][bin]` reconstruction; the same
+/// fan-out applies to the no-interpolation angle path (§E.3.5.5.3) and to
+/// the per-bin chaos / random expansion.
+pub fn expand_bands_to_bins(
+    begin: usize,
+    end: usize,
+    bndstrc: &[bool; N_ECPL_SUBBND],
+    band_vals: &[f32],
+) -> Vec<f32> {
+    let total = end_bin(end).saturating_sub(begin_bin(begin));
+    let mut out = Vec::with_capacity(total);
+    // `bnd` tracks the current band index into `band_vals`. The first
+    // active sub-band always opens band 0 (its merge bit is never sent).
+    let mut bnd: isize = -1;
+    for sbnd in begin..end.min(N_ECPL_SUBBND) {
+        if !bndstrc[sbnd] {
+            bnd += 1;
+        }
+        let val = if bnd >= 0 {
+            band_vals.get(bnd as usize).copied().unwrap_or(0.0)
+        } else {
+            // Defensive: a leading merge bit (spec guarantees the first
+            // active sub-band starts a band, so this is malformed input).
+            band_vals.first().copied().unwrap_or(0.0)
+        };
+        let nbins = ECPL_SUBBND_TAB[sbnd + 1] - ECPL_SUBBND_TAB[sbnd];
+        for _ in 0..nbins {
+            out.push(val);
+        }
+    }
+    out
+}
+
+/// §E.3.5.5.3 — per-bin angle reconstruction with linear interpolation
+/// between band centres (the `ecplangleintrp == 1` path).
+///
+/// `band_angles` holds one angle per band (the [`angle_value`] outputs);
+/// `nbins_per_bnd` holds the bin count of each band (from
+/// [`band_bin_counts`]). The result is one angle per bin across the
+/// active region, length `sum(nbins_per_bnd)`. Angles wrap into the
+/// `-1.0 ..= 1.0` interval after each interpolation step, exactly as the
+/// reference pseudo-code's `while` guards do.
+///
+/// The single-band case (`nbands < 2`) has no inter-band slope, so the
+/// one band's angle is simply fanned across all its bins.
+pub fn interpolate_bin_angles(band_angles: &[f32], nbins_per_bnd: &[usize]) -> Vec<f32> {
+    let nbands = band_angles.len().min(nbins_per_bnd.len());
+    let total: usize = nbins_per_bnd.iter().take(nbands).sum();
+    let mut out = vec![0.0f32; total];
+    if nbands == 0 {
+        return out;
+    }
+    if nbands == 1 {
+        for slot in out.iter_mut() {
+            *slot = band_angles[0];
+        }
+        return out;
+    }
+
+    let mut bin: usize = 0;
+    for bnd in 1..nbands {
+        let nbins_prev = nbins_per_bnd[bnd - 1];
+        let nbins_curr = nbins_per_bnd[bnd];
+        let angle_prev = band_angles[bnd - 1];
+        let mut angle_curr = band_angles[bnd];
+        // Unwrap the current band angle to within one step of the prev.
+        while (angle_curr - angle_prev) > 1.0 {
+            angle_curr -= 2.0;
+        }
+        while (angle_prev - angle_curr) > 1.0 {
+            angle_curr += 2.0;
+        }
+        let slope = (angle_curr - angle_prev) / ((nbins_curr + nbins_prev) as f32 / 2.0);
+
+        // Lower half of the first band (walks downward from the centre).
+        if bnd == 1 && nbins_prev > 1 {
+            let (mut y, mut down_bin): (f32, usize);
+            if nbins_prev % 2 == 0 {
+                y = angle_prev - slope / 2.0;
+                down_bin = nbins_prev / 2 - 1;
+            } else {
+                y = angle_prev - slope;
+                down_bin = (nbins_prev - 3) / 2;
+            }
+            let count = down_bin + 1;
+            for _ in 0..count {
+                let ytmp = y;
+                while y > 1.0 {
+                    y -= 2.0;
+                }
+                while y < -1.0 {
+                    y += 2.0;
+                }
+                out[down_bin] = y;
+                down_bin = down_bin.saturating_sub(1);
+                y = ytmp - slope;
+            }
+            bin = count;
+        }
+
+        let (mut y, count): (f32, usize) = if nbins_prev % 2 == 0 {
+            (angle_prev + slope / 2.0, nbins_curr / 2 + nbins_prev / 2)
+        } else {
+            (angle_prev, nbins_curr / 2 + nbins_prev.div_ceil(2))
+        };
+        for _ in 0..count {
+            let ytmp = y;
+            while y > 1.0 {
+                y -= 2.0;
+            }
+            while y < -1.0 {
+                y += 2.0;
+            }
+            if bin < total {
+                out[bin] = y;
+                bin += 1;
+            }
+            y = ytmp + slope;
+        }
+
+        // Finish the last band when this is the final iteration. The
+        // reference carries `y`/`slope` out of the loop and runs one
+        // closing pass; we mirror that by detecting the last band here.
+        if bnd == nbands - 1 {
+            let last_count = if nbins_curr % 2 == 0 {
+                nbins_curr / 2
+            } else {
+                nbins_curr / 2 + 1
+            };
+            for _ in 0..last_count {
+                let ytmp = y;
+                while y > 1.0 {
+                    y -= 2.0;
+                }
+                while y < -1.0 {
+                    y += 2.0;
+                }
+                if bin < total {
+                    out[bin] = y;
+                    bin += 1;
+                }
+                y = ytmp + slope;
+            }
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,5 +1101,144 @@ mod tests {
         assert!(c.channels[2].param2e);
         // 1 + 5 + (5 + 6 + 3 + 1) = 21 bits.
         assert_eq!(br.bit_position(), 21);
+    }
+
+    // ---- §E.3.5.5.2 / §E.3.5.5.3 parameter processing ----
+
+    fn db(linear: f32) -> f32 {
+        20.0 * linear.log10()
+    }
+
+    #[test]
+    fn ampbnd_endpoints_table_e3_10() {
+        // Index 0: mant 0x20 (=32) / 32 = 1.0, exp 0 → 0 dB.
+        assert!((ampbnd(0) - 1.0).abs() < 1e-6);
+        assert!(db(ampbnd(0)).abs() < 1e-4);
+        // Index 31: minus-infinity dB → amplitude 0.
+        assert_eq!(ampbnd(31), 0.0);
+        // Index 30: mant 0x17 (=23)/32 = 0.71875, exp 7 → /128 ≈ 0.005615
+        // → ≈ -45.01 dB (the spec's documented lowest finite gain).
+        let a30 = ampbnd(30);
+        assert!((a30 - (23.0 / 32.0) / 128.0).abs() < 1e-7);
+        assert!((db(a30) - (-45.01)).abs() < 0.05);
+        // Monotone non-increasing across the finite range 0..=30.
+        for i in 1..=30u8 {
+            assert!(
+                ampbnd(i) <= ampbnd(i - 1) + 1e-7,
+                "amp[{i}] not <= amp[{}]",
+                i - 1
+            );
+        }
+        // Each exponent step (every 4 indices) approximately halves the
+        // mantissa-1.0 anchor: index 4 (mant 0x10/32 = 0.5, exp 0) and
+        // index 8 (mant 0x10/32, exp 1 → 0.25).
+        assert!((ampbnd(4) - 0.5).abs() < 1e-6);
+        assert!((ampbnd(8) - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn angle_and_chaos_tables() {
+        // Table E3.11: code 0 → 0.0; code 32 → -1.0; code 63 → -0.03125.
+        assert_eq!(ECPL_ANGLE_TAB[0], 0.0);
+        assert!((ECPL_ANGLE_TAB[31] - 0.96875).abs() < 1e-6);
+        assert!((ECPL_ANGLE_TAB[32] - (-1.0)).abs() < 1e-6);
+        assert!((ECPL_ANGLE_TAB[63] - (-0.03125)).abs() < 1e-6);
+        // Table E3.12: eighths -k/7.
+        assert_eq!(ECPL_CHAOS_TAB[0], 0.0);
+        assert!((ECPL_CHAOS_TAB[7] - (-1.0)).abs() < 1e-6);
+        assert!((ECPL_CHAOS_TAB[3] - (-3.0 / 7.0)).abs() < 1e-5);
+        // First-coupled channel forces angle/chaos to 0 regardless of code.
+        assert_eq!(angle_value(40, true), 0.0);
+        assert_eq!(chaos_value(5, true), 0.0);
+        assert!((angle_value(40, false) - (-0.75)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn chaos_modification_reduces_amplitude() {
+        // A non-first, non-transient channel with chaos applied: the
+        // §E.3.5.5.2 modification `*= 1 + 0.38*chaos` with chaos <= 0
+        // reduces the gain.
+        let params = EcplChannelParams {
+            param1e: true,
+            param2e: true,
+            amp: vec![0, 4],   // gains 1.0, 0.5
+            chaos: vec![7, 0], // chaos -1.0, 0.0
+            angle: vec![0, 0],
+            trans: false,
+        };
+        let amps = process_band_amplitudes(&params, false);
+        // band 0: 1.0 * (1 + 0.38 * -1.0) = 0.62.
+        assert!((amps[0] - 0.62).abs() < 1e-6);
+        // band 1: 0.5 * (1 + 0.38 * 0.0) = 0.5.
+        assert!((amps[1] - 0.5).abs() < 1e-6);
+
+        // Same params but transient present → no chaos modification.
+        let mut tp = params.clone();
+        tp.trans = true;
+        let amps_t = process_band_amplitudes(&tp, false);
+        assert!((amps_t[0] - 1.0).abs() < 1e-6);
+
+        // First coupled channel → no chaos modification even without
+        // transient (its chaos is fixed to 0).
+        let amps_first = process_band_amplitudes(&params, true);
+        assert!((amps_first[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn expand_bands_to_bins_fans_out_per_subband() {
+        // begin sub-band 0, end sub-band 2: sub-bands 0 (6 bins) and 1
+        // (6 bins). No merge → two bands of 6 bins each. begin_bin = 13,
+        // end_bin = ECPL_SUBBND_TAB[2] = 25 → 12 bins total.
+        let bndstrc = [false; N_ECPL_SUBBND];
+        let out = expand_bands_to_bins(0, 2, &bndstrc, &[2.0, 5.0]);
+        assert_eq!(out.len(), 12);
+        assert!(out[..6].iter().all(|&v| (v - 2.0).abs() < 1e-9));
+        assert!(out[6..].iter().all(|&v| (v - 5.0).abs() < 1e-9));
+
+        // Merge sub-band 1 into 0 → single band of 12 bins, one value.
+        let mut merged = [false; N_ECPL_SUBBND];
+        merged[1] = true;
+        let out2 = expand_bands_to_bins(0, 2, &merged, &[3.0]);
+        assert_eq!(out2.len(), 12);
+        assert!(out2.iter().all(|&v| (v - 3.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn interpolate_single_band_is_constant() {
+        // One band → angle fanned across all bins, no slope.
+        let out = interpolate_bin_angles(&[0.25], &[6]);
+        assert_eq!(out.len(), 6);
+        assert!(out.iter().all(|&v| (v - 0.25).abs() < 1e-9));
+    }
+
+    #[test]
+    fn interpolate_two_bands_wraps_and_fills() {
+        // Two equal-size bands; verify output length == sum of bin counts
+        // and every angle stays within the wrapped -1.0 ..= 1.0 interval.
+        let band_angles = [0.0, 0.5];
+        let nbins = [6usize, 6usize];
+        let out = interpolate_bin_angles(&band_angles, &nbins);
+        assert_eq!(out.len(), 12);
+        for &v in &out {
+            assert!((-1.0..=1.0).contains(&v), "angle {v} out of range");
+        }
+        // The interpolation walks from below the first band centre up
+        // through the second; values should be (weakly) increasing in the
+        // interior where no wrap occurs.
+        // First band centre region near 0.0, last band region near 0.5.
+        assert!(out[0] < out[out.len() - 1] + 1e-6);
+    }
+
+    #[test]
+    fn interpolate_wrap_across_pi() {
+        // angle_prev = 0.9, angle_curr = -0.9: the raw difference is
+        // -1.8 but the spec unwraps (-0.9 + 2.0 = 1.1) so the slope is
+        // small + positive, crossing the +1/-1 boundary which the wrap
+        // guards fold back. Output must stay in range.
+        let out = interpolate_bin_angles(&[0.9, -0.9], &[6, 6]);
+        assert_eq!(out.len(), 12);
+        for &v in &out {
+            assert!((-1.0..=1.0).contains(&v), "wrapped angle {v} out of range");
+        }
     }
 }

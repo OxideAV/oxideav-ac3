@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **E-AC-3 enhanced-coupling parameter processing — `eac3::ecpl`**
+  (round 306 / r306). Adds the §E.3.5.5.2 / §E.3.5.5.3 layer that
+  turns the decoded `ecplamp` / `ecplangle` / `ecplchaos` index
+  triples into per-bin amplitude and angle arrays. Tables E3.10
+  (`ECPL_AMP_EXP_TAB` / `ECPL_AMP_MANT_TAB`), E3.11 (`ECPL_ANGLE_TAB`)
+  and E3.12 (`ECPL_CHAOS_TAB`); `ampbnd()` (5-bit index → linear gain
+  `(mant/32) >> exp`; index 31 → minus-∞ dB → 0);
+  `process_band_amplitudes()` (the §E.3.5.5.2 chaos amplitude
+  modification `*= 1 + 0.38·chaos`, skipped for first-coupled /
+  transient channels); `expand_bands_to_bins()` (per-band → per-bin
+  `ampbin[]` fan-out via the `ecplbndstrc[]` merge structure);
+  `angle_value()` / `chaos_value()` (index decode, forced to 0 on the
+  first coupled channel); and `interpolate_bin_angles()` (the
+  `ecplangleintrp == 1` band-centre linear-interpolation path with the
+  spec's `±1.0` wrap guards). Pure tabulated arithmetic, no multi-block
+  state. The §E.3.5.5.1 FFT channel processing + §E.3.5.5.4 complex
+  synthesis (+ `rand[]` de-correlation) remain deferred; the decoder's
+  `ecplinu == 1` reject is unchanged. 7 new `eac3::ecpl::tests`
+  (321 → 328 lib tests).
 - **E-AC-3 enhanced-coupling bitstream-syntax parse — `eac3::ecpl`**
   (round 300 / r300). Adds the syntax layer on top of the r293
   geometry: `parse_strategy()` reads the §E.2.3.3.16-19 strategy
