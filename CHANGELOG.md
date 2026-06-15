@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.8...v0.0.9) - 2026-06-15
+
+### Other
+
+- enhanced-coupling complex synthesis (§E.3.5.5.3 closing + §E.3.5.5.4)
+- eac3 round 306 (r306): enhanced-coupling parameter processing (eac3::ecpl, §E.3.5.5.2-3)
+- eac3 round 300 (r300): enhanced-coupling bitstream-syntax parse (eac3::ecpl, §E.2.3.3.16-26)
+- eac3 round 293 (r293): enhanced-coupling band geometry (eac3::ecpl, §E.2.3.3.16-19 + §E.3.5.2)
+- ac3 round 288 (r288): typed PremixCompression surface for premixcmpsel / drcsrc / premixcmpscl (§E.2.3.1.19-21 / Table E2.7)
+- ac3 round 281 (r281): typed PanInfo surface for panmean / paninfo / panmean2 / paninfo2 (§E.2.3.1.53-58 / §E.3.10.8)
+- ac3 round 278 (r278): typed ProgramScaleFactor surface for pgmscl / pgmscl2 / extpgmscl (§E.2.3.1.12-17 / §E.3.10.1-2)
+- ac3 round 274 (r274): ChannelLocation Table E2.5 classification + re-emit surface (§E.2.3.1.8)
+- ac3 round 271 (r271): typed FrameSizeCode surface over frmsizecod (§5.4.1.4 / Table 5.18)
+- ac3 round 263 (r263): typed SampleRateCode surface for fscod (§5.4.1.3 / Table 5.6)
+- ac3 round 259 (r259): typed CenterMixLevel / SurroundMixLevel surfaces for cmixlev / surmixlev (§5.4.2.4-5 / Tables 5.9-5.10)
+- ac3 round 254 (r254): typed ExtraBsi2 surface for xbsi2 / encinfo (§2.3.1.11-12 / Annex D Table D2.1)
+- ac3 round 249 (r249): typed LanguageCode surface for langcod / langcod2 (§5.4.2.11-12 / §5.4.2.19-20)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- ac3 round 246 (r246): typed DolbySurroundMode surface for dsurmod (§5.4.2.6 / Table 5.11 / Annex E §E.2.3.1.x)
+- ac3 round 243 wording cleanup — paraphrase 'no slot' rationale to spec-action phrasing
+- ac3 round 243 (r243): typed StereoDownmixPreference surface for dmixmod (§2.3.1.2 / Table D2.2 / Annex E §E.1.2.2)
+- ac3 round 240 (r240): typed AdditionalBitStreamInfo surface for addbsi (§5.4.2.29-31 / §5.3.2 / Table E1.2)
+- ac3 round 234 (r234): typed DialNorm surface for dialnorm / dialnorm2 (§5.4.2.8 / §5.4.2.16 / §7.6)
+- ac3 round 226 (r226): typed CopyrightInfo surface for copyrightb / origbs (§5.4.2.24-25 / §E.2.3.1.62)
+- ac3 round 219 (r219): typed TimeCode1 / TimeCode2 / TimeCodePresence surface for base-syntax timecode (§5.4.2.26-28 / Table 5.13)
+- ac3 round 214 (r214): typed AudioProductionInfo surface for mixlevel/roomtyp (§5.4.2.13-15 / Table 5.12 / §E.2.3.1.x)
+- ac3 round 208 (r208): typed xbsi2 / infomdata Dolby Surround EX / Dolby Headphone / A/D converter (Tables D2.7-D2.9 / §E.2.3.1.x)
+- ac3 round 202 (r202): typed CompressionGain surface for compr / compr2 (Table 7.30 / §7.7.2.2)
+- eac3 round 196 (r196): dependent-substream chanmap routing (Table E2.5)
+- ac3 round 193 (r193): typed BitStreamMode accessor for Table 5.7
+
 ### Added
 
 - **E-AC-3 enhanced-coupling complex synthesis — `eac3::ecpl`**
