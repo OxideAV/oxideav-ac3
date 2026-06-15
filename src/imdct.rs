@@ -325,6 +325,79 @@ pub fn imdct_256_pair_fft(x: &[f32; 256], out: &mut [f32; 512]) {
     }
 }
 
+/// In-place iterative radix-2 decimation-in-time **forward** FFT of `buf`
+/// with the `exp(-j·2πkn/N)` kernel (the analysis convention).
+///
+/// `buf.len()` must be a power of two. This is the conjugate-twiddle twin
+/// of [`ifft_r2_dit`]: identical butterfly structure, but the per-stage
+/// twiddle advances by `exp(-j·θ)` instead of `exp(+j·θ)`, so the output
+/// is `X[k] = Σ_n x[n]·(cos(2πkn/N) − j·sin(2πkn/N))` (unnormalised). The
+/// caller applies any `1/N` scaling.
+fn fft_r2_dit(buf: &mut [C]) {
+    let n = buf.len();
+    assert!(n.is_power_of_two());
+    let log2n = n.trailing_zeros();
+
+    for i in 0..n {
+        let j = bit_reverse(i, log2n);
+        if j > i {
+            buf.swap(i, j);
+        }
+    }
+
+    let mut half = 1usize;
+    while half < n {
+        let step = half * 2;
+        // Forward FFT twiddle: exp(-j·2π/step) = exp(-j·π/half).
+        let theta = -PI / half as f32;
+        let wpr = theta.cos();
+        let wpi = theta.sin();
+        let mut k = 0usize;
+        while k < n {
+            let mut wr = 1.0f32;
+            let mut wi = 0.0f32;
+            for j in 0..half {
+                let a = buf[k + j];
+                let b = buf[k + j + half];
+                let tr = wr * b.0 - wi * b.1;
+                let ti = wr * b.1 + wi * b.0;
+                buf[k + j + half] = (a.0 - tr, a.1 - ti);
+                buf[k + j] = (a.0 + tr, a.1 + ti);
+                let nwr = wr * wpr - wi * wpi;
+                let nwi = wr * wpi + wi * wpr;
+                wr = nwr;
+                wi = nwi;
+            }
+            k += step;
+        }
+        half = step;
+    }
+}
+
+/// §E.3.5.5.1 step 5 — the normalised forward DFT
+/// `Z[k] = (1/N)·Σ_n (re[n] + j·im[n])·(cos(2πkn/N) − j·sin(2πkn/N))`
+/// for `N = 512`, returned as parallel real/imag arrays of length `N`.
+///
+/// `re` / `im` are the length-512 complex input samples
+/// (`pcm_real[n]` / `pcm_imag[n]` from the enhanced-coupling step 4); the
+/// output `Z[k]` (`k = 0 .. N−1`) is the complex carrier the §E.3.5.5.4
+/// per-channel synthesis multiplies against. This is the only DFT in the
+/// crate that is normalised by `1/N` (the IMDCT path deliberately omits
+/// normalisation to fold AC-3's overlap-add factor of 2), matching the
+/// spec's explicit `(1/N)·Σ` here.
+pub fn dft_512_forward(re: &[f32; 512], im: &[f32; 512]) -> ([f32; 512], [f32; 512]) {
+    let mut buf: Vec<C> = (0..512).map(|n| (re[n], im[n])).collect();
+    fft_r2_dit(&mut buf);
+    let mut zr = [0.0f32; 512];
+    let mut zi = [0.0f32; 512];
+    let inv_n = 1.0 / 512.0;
+    for k in 0..512 {
+        zr[k] = buf[k].0 * inv_n;
+        zi[k] = buf[k].1 * inv_n;
+    }
+    (zr, zi)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +453,39 @@ mod tests {
             let (er, ei) = (arg.cos(), arg.sin());
             assert!((buf[i].0 - er).abs() < 1e-5, "re @ {i}");
             assert!((buf[i].1 - ei).abs() < 1e-5, "im @ {i}");
+        }
+    }
+
+    /// §E.3.5.5.1 step-5 forward DFT against a direct O(N²) reference on a
+    /// deterministic complex input. The reference is the literal spec
+    /// kernel `(1/N)·Σ_n (re+j·im)·(cos − j·sin)`.
+    #[test]
+    fn dft_512_forward_matches_direct_reference() {
+        let mut re = [0.0f32; 512];
+        let mut im = [0.0f32; 512];
+        let mut s: u32 = 0x0BAD_F00D;
+        for n in 0..512 {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            re[n] = (s as i32 as f32) / (i32::MAX as f32);
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            im[n] = (s as i32 as f32) / (i32::MAX as f32);
+        }
+        let (zr, zi) = dft_512_forward(&re, &im);
+        let inv_n = 1.0f32 / 512.0;
+        for &k in &[0usize, 1, 5, 128, 256, 511] {
+            let mut rr = 0.0f32;
+            let mut ri = 0.0f32;
+            for n in 0..512 {
+                let arg = 2.0 * PI * k as f32 * n as f32 / 512.0;
+                let (c, si) = (arg.cos(), arg.sin());
+                // (re + j·im)·(c − j·si)
+                rr += re[n] * c + im[n] * si;
+                ri += im[n] * c - re[n] * si;
+            }
+            rr *= inv_n;
+            ri *= inv_n;
+            assert!((zr[k] - rr).abs() < 2e-4, "Zr[{k}]: fft={} ref={rr}", zr[k]);
+            assert!((zi[k] - ri).abs() < 2e-4, "Zi[{k}]: fft={} ref={ri}", zi[k]);
         }
     }
 

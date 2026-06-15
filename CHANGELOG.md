@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- eac3 round 314 (r314): enhanced-coupling §E.3.5.5.1 carrier reconstruction — windowed prev/curr/next 512-sample IMDCT + overlap-add + normalised forward DFT producing the non-aliased complex coupling channel `Z[k]` (eac3::ecpl::reconstruct_carrier); adds a forward 512-point DFT (imdct::dft_512_forward). Pure tested layer; decoder-level cross-block integration deferred.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.8...v0.0.9) - 2026-06-15
 
 ### Other

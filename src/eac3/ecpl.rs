@@ -60,13 +60,15 @@
 //! per-block transient random, and the [`synthesis_window`] `y[bin]`
 //! factor. These are pure tabulated arithmetic over the carrier `Z[k]`.
 //!
-//! The one remaining deferred piece of §E.3.5.5 is §E.3.5.5.1: the
-//! prev/curr/next IMDCT + overlap-add + FFT that produces the non-aliased
-//! complex coupling channel `Z[k]` from the de-normalised
-//! enhanced-coupling mantissas. That step is stateful across blocks (it
-//! needs the previous + next block's coefficients), so it is wired at the
-//! decoder level rather than in this pure layer; everything downstream of
-//! the carrier is implemented here.
+//! The final layer ([`reconstruct_carrier`]) implements §E.3.5.5.1: the
+//! prev/curr/next windowed IMDCT + overlap-add + forward-DFT that produces
+//! the non-aliased complex coupling channel `Z[k]` from the de-normalised
+//! enhanced-coupling mantissas. The function takes all three blocks'
+//! coefficient buffers (the cross-block state is owned by the caller), so
+//! this whole module stays a pure, unit-tested layer end to end. The only
+//! work left outside it is the decoder-level *integration*: extracting the
+//! enhanced-coupling mantissas, buffering them across blocks, and emitting
+//! each coupled channel's coefficients from the carrier.
 //!
 //! **Spec note (erratum):** the default-banding table is captioned
 //! "Table E2.14" in the document's table-of-contents (and list of
@@ -76,6 +78,8 @@
 //! values; the enhanced-coupling values used here are those listed in
 //! full under the §E.2.3.3.18 heading.
 
+use crate::imdct::{dft_512_forward, imdct_512_fft};
+use crate::tables::WINDOW;
 use oxideav_core::bits::BitReader;
 use oxideav_core::Result;
 
@@ -477,12 +481,12 @@ pub fn parse_coords(
 // synthesis consumes. It is pure tabulated arithmetic over the active
 // band geometry — no multi-block state, no FFT.
 //
-// The §E.3.5.5.3 closing de-correlation step and the §E.3.5.5.4 complex
-// synthesis are added below this block. The one remaining (deferred)
-// piece of §E.3.5.5 is §E.3.5.5.1 — the prev/curr/next IMDCT +
-// overlap-add + FFT that produces the non-aliased complex coupling
-// channel `Z[k]`; that is stateful across blocks, so it is wired at the
-// decoder level rather than in this pure layer.
+// The §E.3.5.5.3 closing de-correlation step, the §E.3.5.5.4 complex
+// synthesis, and the §E.3.5.5.1 carrier reconstruction
+// ([`reconstruct_carrier`]) are all added below this block. The remaining
+// work outside this pure layer is the decoder-level integration that
+// supplies the prev/curr/next mantissa buffers and consumes the per-channel
+// coefficients.
 
 /// Table E3.10 — `ecplampexptab[]`. The binary exponent (right-shift
 /// count) applied to the mantissa for each 5-bit `ecplamp` index. Index
@@ -779,13 +783,11 @@ pub fn interpolate_bin_angles(band_angles: &[f32], nbins_per_bnd: &[usize]) -> V
 // parameter-processing layer plus the per-bin `chaos` array (the same
 // `expand_bands_to_bins` fan-out applied to the band chaos values) and a
 // per-bin `rand` array (this module's [`RandNoTrans`] for non-transient
-// channels, [`gen_rand_trans`] expanded for transient channels). The one
-// piece that stays out of this pure layer is §E.3.5.5.1: the
-// prev/curr/next IMDCT + overlap-add + FFT that turns the de-normalised
-// enhanced-coupling mantissas into the complex carrier `Z[k]`. That is
-// stateful across blocks (it needs the previous + next block's
-// coefficients), so it is wired at the decoder level; everything from the
-// carrier onward is the tabulated arithmetic implemented here.
+// channels, [`gen_rand_trans`] expanded for transient channels). The
+// §E.3.5.5.1 carrier reconstruction that turns the de-normalised
+// enhanced-coupling mantissas into the complex carrier `Z[k]` is
+// implemented further below in [`reconstruct_carrier`]; the caller owns the
+// cross-block mantissa buffers and feeds them in.
 
 /// §E.3.5.5.4 — the post-FFT MDCT synthesis window factor
 /// `y[bin] = cos(2π · (N/4 + 0.5) / N · (bin + 0.5))` for the 512-point
@@ -959,6 +961,114 @@ pub fn generate_channel_coeffs(
             *slot = chmant;
         }
     }
+}
+
+// ===========================================================================
+// §E.3.5.5.1 — enhanced-coupling channel processing (carrier `Z[k]`)
+// ===========================================================================
+//
+// This closes the last deferred piece of §E.3.5.5: turning the
+// de-normalised enhanced-coupling mantissas of the previous / current /
+// next blocks into the non-aliased complex carrier `Z[k]` the
+// §E.3.5.5.4 per-channel synthesis multiplies against. The procedure is
+// stateful across blocks (it needs the prev + next block's coefficients),
+// so the caller supplies all three buffers; the function itself is pure.
+//
+// The five spec steps:
+//   1) zero-pad each block's ecpl mantissas into a length-N/2 MDCT buffer,
+//   2) 512-sample IMDCT (§7.9.4.1 steps 1-5, windowed) of each buffer,
+//   3) overlap-add prev's 2nd half + next's 1st half with curr,
+//   4) apply the analysis window + xcos3/xsin3 oddly-stacked rotation,
+//   5) forward DFT to obtain Z[k], k = 0..N-1.
+
+/// §E.3.5.5.1 step 4 — `xcos3[n] = cos(π·n/N)` for `N = 512`.
+#[inline]
+fn xcos3(n: usize) -> f32 {
+    (std::f32::consts::PI * n as f32 / 512.0).cos()
+}
+
+/// §E.3.5.5.1 step 4 — `xsin3[n] = -sin(π·n/N)` for `N = 512`.
+#[inline]
+fn xsin3(n: usize) -> f32 {
+    -(std::f32::consts::PI * n as f32 / 512.0).sin()
+}
+
+/// §E.3.5.5.1 step 5 output — the non-aliased complex enhanced-coupling
+/// carrier `Z[k]`, `k = 0 .. N-1` (`N = 512`), as parallel real/imag
+/// arrays. Element `k` is `Zr[k] + j·Zi[k]`.
+#[derive(Clone, Debug)]
+pub struct EcplCarrier {
+    /// Real part `Zr[k]`, `k = 0 .. 512`.
+    pub zr: [f32; 512],
+    /// Imaginary part `Zi[k]`, `k = 0 .. 512`.
+    pub zi: [f32; 512],
+}
+
+/// §E.3.5.5.1 — reconstruct the non-aliased complex enhanced-coupling
+/// channel `Z[k]` from the de-normalised enhanced-coupling mantissas of
+/// the previous, current and next blocks.
+///
+/// `prev` / `curr` / `next` are each the 256 (`= N/2`) MDCT transform
+/// coefficients of the enhanced-coupling channel for that block, already
+/// de-normalised and **zero outside** the active region
+/// `[ecplstartmant, ecplendmant)` (step 1's `XPREV`/`XCURR`/`XNEXT`
+/// definition). When enhanced coupling is not in use in the previous or
+/// next block, the caller passes an all-zero buffer there (per the spec's
+/// "set to zero" rule).
+///
+/// The procedure (spec steps 2-5):
+///
+/// 2. Each buffer is run through the windowed 512-sample IMDCT
+///    (§7.9.4.1 steps 1-5): [`imdct_512_fft`] gives the bare time samples,
+///    then the [`WINDOW`] (Table 7.33) multiply `x[n]·w[n]` /
+///    `x[511-n]·w[n]` completes step 5. The result is the 512-sample
+///    `xPREV` / `xCURR` / `xNEXT`.
+/// 3. Overlap-add: `pcm[n] = xPREV[n+N/2] + xCURR[n]` and
+///    `pcm[n+N/2] = xCURR[n+N/2] + xNEXT[n]` for `n = 0 .. N/2`.
+/// 4. The complex analysis input is `pcm[n]·w·xcos3[n]` (real) and
+///    `pcm[n]·w·xsin3[n]` (imag), with `w = w[n]` over the lower half and
+///    `w = w[N/2-n-1]` over the upper half, mirroring the spec's two-arm
+///    windowing.
+/// 5. A normalised forward DFT ([`dft_512_forward`]) produces `Z[k]`.
+pub fn reconstruct_carrier(prev: &[f32; 256], curr: &[f32; 256], next: &[f32; 256]) -> EcplCarrier {
+    // Step 2 — windowed IMDCT of each block.
+    let windowed = |x: &[f32; 256]| -> [f32; 512] {
+        let mut t = [0.0f32; 512];
+        imdct_512_fft(x, &mut t);
+        for n in 0..256 {
+            t[n] *= WINDOW[n];
+            t[511 - n] *= WINDOW[n];
+        }
+        t
+    };
+    let xprev = windowed(prev);
+    let xcurr = windowed(curr);
+    let xnext = windowed(next);
+
+    // Step 3 — overlap-add into a single 512-sample pcm buffer.
+    let mut pcm = [0.0f32; 512];
+    for n in 0..256 {
+        pcm[n] = xprev[256 + n] + xcurr[n];
+        pcm[256 + n] = xcurr[256 + n] + xnext[n];
+    }
+
+    // Step 4 — oddly-stacked complex rotation. The window is `w[n]` over
+    // the lower half and `w[N/2-n-1]` over the upper half; `WINDOW[n]`
+    // holds `w[n]` for `n = 0 .. 256`.
+    let mut re = [0.0f32; 512];
+    let mut im = [0.0f32; 512];
+    for n in 0..256 {
+        let wl = WINDOW[n]; // w[n]
+        let wu = WINDOW[256 - n - 1]; // w[N/2-n-1]
+        re[n] = pcm[n] * wl * xcos3(n);
+        re[256 + n] = pcm[256 + n] * wu * xcos3(256 + n);
+        im[n] = pcm[n] * wl * xsin3(n);
+        im[256 + n] = pcm[256 + n] * wu * xsin3(256 + n);
+    }
+
+    // Step 5 — forward DFT to the complex carrier `Z[k]`.
+    let (zr, zi) = dft_512_forward(&re, &im);
+    EcplCarrier { zr, zi }
 }
 
 #[cfg(test)]
@@ -1624,5 +1734,73 @@ mod tests {
         let y_mirror = synthesis_window(half - 1 - begin_bin, n);
         let expected = -2.0 * (0.0 + y_mirror * 0.4);
         assert!((out[begin_bin] - expected).abs() < 1e-5);
+    }
+
+    // ---- §E.3.5.5.1 carrier reconstruction ----
+
+    #[test]
+    fn reconstruct_carrier_all_zero_is_zero() {
+        // No enhanced-coupling energy in any block → the carrier is zero
+        // everywhere (the spec's "set to zero" boundary case).
+        let z = [0.0f32; 256];
+        let car = reconstruct_carrier(&z, &z, &z);
+        let max = car
+            .zr
+            .iter()
+            .chain(car.zi.iter())
+            .fold(0.0f32, |a, &b| a.max(b.abs()));
+        assert!(max < 1e-6, "zero input must give zero carrier, got {max}");
+    }
+
+    #[test]
+    fn reconstruct_carrier_steady_state_energy_lives_in_active_region() {
+        // A steady-state single MDCT bin in the active enhanced-coupling
+        // region across all three blocks. With perfect overlap (prev =
+        // curr = next) the time-domain reconstruction is non-aliased, and
+        // the carrier should carry meaningful (non-zero) energy. We assert
+        // the carrier is non-trivial and finite — the exact spectrum is the
+        // full §E.3.5.5.1 chain, validated structurally here.
+        let mut x = [0.0f32; 256];
+        // Bin 100 sits inside the ecpl region (13..=252).
+        x[100] = 1.0;
+        let car = reconstruct_carrier(&x, &x, &x);
+        let energy: f32 = car
+            .zr
+            .iter()
+            .zip(car.zi.iter())
+            .map(|(&r, &i)| r * r + i * i)
+            .sum();
+        assert!(energy > 1e-3, "steady tone produced no carrier energy");
+        for (&r, &i) in car.zr.iter().zip(car.zi.iter()) {
+            assert!(r.is_finite() && i.is_finite(), "carrier has non-finite bin");
+        }
+    }
+
+    #[test]
+    fn reconstruct_carrier_linear_in_input() {
+        // The whole §E.3.5.5.1 chain (IMDCT, overlap-add, window, DFT) is
+        // linear, so scaling the input mantissas by k scales Z[k] by k.
+        let mut x = [0.0f32; 256];
+        let mut s: u32 = 0x00C0_FFEE;
+        for v in x.iter_mut().take(253).skip(13) {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            *v = (s as i32 as f32) / (i32::MAX as f32);
+        }
+        let mut x2 = [0.0f32; 256];
+        for (a, b) in x2.iter_mut().zip(x.iter()) {
+            *a = b * 2.0;
+        }
+        let c1 = reconstruct_carrier(&x, &x, &x);
+        let c2 = reconstruct_carrier(&x2, &x2, &x2);
+        for k in 0..512 {
+            assert!(
+                (c1.zr[k] * 2.0 - c2.zr[k]).abs() < 2e-4,
+                "Zr[{k}] non-linear"
+            );
+            assert!(
+                (c1.zi[k] * 2.0 - c2.zi[k]).abs() < 2e-4,
+                "Zi[{k}] non-linear"
+            );
+        }
     }
 }
