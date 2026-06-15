@@ -69,14 +69,18 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   Adaptive Hybrid Transform on fbw / LFE / coupling channels, §3.6
   spectral extension with the §3.6.4.2.3 SPXATTEN border notch, and
   §3.7.2 transient pre-noise processing. Enhanced coupling
-  (`ecplinu == 1`) geometry, syntax, parameter processing
-  (§E.2.3.3 / §E.3.5.5), and the §E.3.5.5.1 multi-block IMDCT +
-  overlap-add + forward-DFT carrier reconstruction (the non-aliased
-  complex coupling channel `Z[k]`) are implemented as a pure tested
-  layer; the remaining piece is the decoder-level integration
-  (cross-block enhanced-coupling mantissa buffering + per-channel
-  coefficient emission), so the decoder still rejects `ecplinu == 1`
-  at the audblk stage rather than emit incorrect PCM.
+  (`ecplinu == 1`, §E.2.3.3.16-26 / §E.3.5.5) decodes end-to-end: the
+  audblk parser reads the strategy + per-channel amplitude/angle/chaos
+  coordinates, decodes the enhanced-coupling channel through the shared
+  exponent / bit-allocation / mantissa path, and a deferred second pass
+  reconstructs the non-aliased complex carrier `Z[k]` from the
+  previous / current / next blocks (§E.3.5.5.1), processes the per-bin
+  amplitudes + de-correlated angles, and emits each coupled channel's
+  transform coefficients via the §E.3.5.5.4 complex product — replacing
+  the standard §7.4 decouple. Frame-edge neighbours use zero carriers
+  (the §E.3.5.5.1 "set to zero" rule); threading the adjacent frames'
+  edge coefficients across the two boundary blocks, and the 2/0
+  ecpl + rematrix band-count interaction, are follow-ups.
 - Encoder — independent + dependent substream pairs for 1.0 / 2.0 / 5.1
   / 7.1 layouts, with adaptive / frame-based exponent strategies. SPX
   and AHT are out of scope on the encoder side.

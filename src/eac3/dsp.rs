@@ -87,10 +87,18 @@
 //!   channel) — all wired through to the existing [`Ac3State`] slots
 //!   so [`audblk::dsp_block`] runs the §7.4 decouple step unchanged.
 //!
-//! `ecplinu == 1` (enhanced coupling) is rejected as `Unsupported` —
-//! none of the validator-encoded fixtures in the corpus exercise
-//! that path; standard coupling covers all four 5.1 / low-rate
-//! fixtures (eac3-5.1-48000-384kbps, eac3-5.1-side-768kbps,
+//! `ecplinu == 1` (enhanced coupling, §E.3.5.5) decodes through a
+//! deferred two-pass path: the per-block loop parses the strategy +
+//! coordinates and decodes the enhanced-coupling channel into the
+//! `MAX_FBW` slot (pinning the coupling region at the ecpl bins), then
+//! [`run_deferred_ecpl_dsp`] reconstructs the §E.3.5.5.1 carrier from
+//! prev/curr/next blocks and emits each coupled channel's coefficients
+//! via [`super::ecpl::synthesize_block`] before the §7.4 decouple is
+//! skipped. None of the validator-encoded corpus fixtures exercise the
+//! ecpl path (ffmpeg's eac3 encoder emits only standard coupling), so
+//! the synthesis is covered by [`super::ecpl`] unit tests; standard
+//! coupling covers all four 5.1 / low-rate fixtures
+//! (eac3-5.1-48000-384kbps, eac3-5.1-side-768kbps,
 //! eac3-low-rate-stereo-64kbps, eac3-from-ac3-bitstream-recombination).
 //!
 //! Other newly-handled fields:
@@ -139,7 +147,8 @@
 //! * `dbaflde  == 1` — delta-bit-allocation may appear per block.
 //! * `skipflde == 1` — skip-field may appear per block.
 //! * `snroffststr == 0` — single frame-level (csnroffst, fsnroffst).
-//! * Standard coupling (round 5); enhanced coupling still rejected.
+//! * Standard coupling (round 5) + enhanced coupling (§E.3.5.5,
+//!   deferred two-pass synthesis).
 //! * No spectral extension (`spxinu == 0` always).
 //! * No AHT (`ahte == 0` — gated upstream in audfrm parser).
 //! * Transient pre-noise processing (`transproce == 1`) is decoded via
@@ -304,6 +313,41 @@ pub fn decode_indep_audblks(
     // syncframe; the first block in which a channel is in SPX carries an
     // implicit `spxcoe[ch] = 1`.
     let mut firstspxcos: [bool; MAX_FBW] = [true; MAX_FBW];
+
+    // ---- §E.3.5.5 enhanced-coupling per-frame state ----
+    //
+    // `ecpl_in_use` tracks whether the active coupling strategy is the
+    // enhanced (`ecplinu == 1`) variant; it persists across `cplstre == 0`
+    // reuse blocks exactly like the standard-coupling strategy fields.
+    // `ecpl_strategy` holds the band geometry; `ecpl_coords` the per-block
+    // amplitude/angle/chaos triples. `ecpl_prev_bndstrc` carries the
+    // previous block's banding so a `ecplbndstrce == 0` block reuses it
+    // (default on the first ecpl block of the frame, §E.2.3.3.18).
+    //
+    // When any block uses enhanced coupling the per-block DSP is deferred:
+    // each block's de-normalised ecpl-channel coefficients are snapshotted
+    // into `ecpl_blocks[blk]` and the per-channel synthesis (§E.3.5.5.1
+    // carrier from prev/curr/next + §E.3.5.5.4 product) runs in a second
+    // pass after the block loop, because the §E.3.5.5.1 carrier needs the
+    // *next* block's coefficients which are not yet decoded mid-loop.
+    let mut ecpl_in_use = false;
+    let mut ecpl_strategy: Option<super::ecpl::EcplStrategy> = None;
+    let mut ecpl_coords: Option<super::ecpl::EcplCoords> = None;
+    let mut ecpl_prev_bndstrc = super::ecpl::DEFAULT_ECPL_BNDSTRC;
+    // Per-block deferred-synthesis snapshots; `Some` only for ecpl blocks.
+    let mut ecpl_blocks: Vec<Option<super::ecpl::EcplBlock>> = vec![None; num_blocks];
+    // Whether the frame used enhanced coupling in any block — once true,
+    // ALL remaining blocks defer their DSP so the overlap-add delay line
+    // renders in order across the second pass.
+    let mut frame_has_ecpl = false;
+    // Absolute block index where deferral began (= first ecpl block). The
+    // deferred pass maps snapshot index `i` to block `first_deferred_blk + i`.
+    let mut first_deferred_blk = 0usize;
+    // Per-deferred-block full channel-state snapshots + the decouple-skip
+    // flag (true for ecpl blocks). Only populated once `frame_has_ecpl`.
+    let mut deferred_channels: Vec<[crate::audblk::ChannelState; crate::audblk::MAX_CHANNELS]> =
+        Vec::new();
+    let mut deferred_skip_decouple: Vec<bool> = Vec::new();
 
     // §7.2.2.6 — clear leftover coupling state at the top of every
     // frame so a previous frame's `cpl_in_use` doesn't leak forward
@@ -576,101 +620,122 @@ pub fn decode_indep_audblks(
                 // §E.1.3.3.6 ecplinu — enhanced coupling flag.
                 let ecplinu = br.read_u32(1)? != 0;
                 if ecplinu {
-                    // Enhanced-coupling geometry (§E.2.3.3.16-19), syntax,
-                    // parameter processing (§E.3.5.5.2-4), and the
-                    // §E.3.5.5.1 carrier reconstruction (`Z[k]`) are all
-                    // implemented + unit-tested in [`super::ecpl`]. The
-                    // remaining work is the decoder-level integration:
-                    // buffering the enhanced-coupling mantissas across the
-                    // previous / current / next blocks and emitting each
-                    // coupled channel's coefficients from the carrier. Until
-                    // that lands we reject here rather than emit wrong PCM.
-                    return Err(Error::unsupported(
-                        "eac3 audblk: ecplinu == 1 (enhanced coupling) — \
-                         §E.3.5.5 pure synthesis layer complete \
-                         (see eac3::ecpl), decoder-level cross-block \
-                         mantissa integration deferred",
-                    ));
-                }
-                // §E.1.3.3.7 chincpl[ch] — implicit 1 for both channels
-                // in 2/0; explicit per-fbw-channel bit otherwise.
-                if bsi.acmod == 0x2 {
-                    state.channels[0].in_coupling = true;
-                    state.channels[1].in_coupling = true;
+                    // §E.2.3.3.16-19 enhanced-coupling strategy. The
+                    // §E.3.5.5 carrier synthesis runs on the deferred path
+                    // after the block loop; here we parse the strategy
+                    // fields and pin the coupling region
+                    // [cpl_begf_mant, cpl_endf_mant) at the ecpl region so
+                    // the shared exponent / bit-allocation / mantissa
+                    // machinery decodes the enhanced-coupling channel into
+                    // the `MAX_FBW` slot exactly like standard coupling.
+                    let spx_begf_for_ecpl = state.spx_begin_subbnd.saturating_sub(2).min(7);
+                    let strat = super::ecpl::parse_strategy(
+                        br,
+                        state.spx_in_use,
+                        spx_begf_for_ecpl,
+                        &ecpl_prev_bndstrc,
+                    )?;
+                    ecpl_prev_bndstrc = strat.bndstrc;
+                    ecpl_in_use = true;
+                    state.cpl_begf_mant = strat.begin_bin();
+                    state.cpl_endf_mant = strat.end_bin();
+                    // §E.1.3.3.7 chincpl[ch] — implicit 1 for both channels
+                    // in 2/0; explicit per-fbw-channel bit otherwise.
+                    if bsi.acmod == 0x2 {
+                        state.channels[0].in_coupling = true;
+                        state.channels[1].in_coupling = true;
+                    } else {
+                        for ch in 0..nfchans {
+                            let v = br.read_u32(1)? != 0;
+                            state.channels[ch].in_coupling = v;
+                        }
+                    }
+                    state.cpl_in_use = true;
+                    state.cpl_nsubbnd = strat.end_subbnd - strat.begin_subbnd;
+                    state.cpl_nbnd = strat.necplbnd;
+                    ecpl_strategy = Some(strat);
                 } else {
-                    for ch in 0..nfchans {
-                        let v = br.read_u32(1)? != 0;
-                        state.channels[ch].in_coupling = v;
+                    // §E.1.3.3.7 chincpl[ch] — implicit 1 for both channels
+                    // in 2/0; explicit per-fbw-channel bit otherwise.
+                    if bsi.acmod == 0x2 {
+                        state.channels[0].in_coupling = true;
+                        state.channels[1].in_coupling = true;
+                    } else {
+                        for ch in 0..nfchans {
+                            let v = br.read_u32(1)? != 0;
+                            state.channels[ch].in_coupling = v;
+                        }
                     }
-                }
-                // §E.1.3.3.8 phsflginu — only in 2/0.
-                state.phsflginu = if bsi.acmod == 0x2 {
-                    br.read_u32(1)? != 0
-                } else {
-                    false
-                };
-                // §E.1.3.3.9 cplbegf (4 bits).
-                state.cpl_begf = br.read_u32(4)? as u8;
-                // §E.1.3.3.10 cplendf. Read 4 bits only when SPX is OFF;
-                // when SPX is in use the spec derives cplendf from the
-                // SPX begin so the coupled region ends one bin below the
-                // SPX region (spxbegf < 6 → cplendf = spxbegf − 2, else
-                // spxbegf·2 − 7 — both equal spx_begin_subbnd − 4).
-                state.cpl_endf = if state.spx_in_use {
-                    (state.spx_begin_subbnd as i32 - 4).max(0) as u8
-                } else {
-                    br.read_u32(4)? as u8
-                };
-                // §5.4.3.12 spec envelope: the upper sub-band index is
-                // `cplendf + 2`, so `ncplsubnd = 3 + cplendf - cplbegf
-                // >= 1` is the actual validity test (equivalently
-                // `cplbegf <= cplendf + 2`). The earlier "cplbegf >
-                // cplendf" rejection mirrored the AC-3 round-7 bug —
-                // valid corpus bitstreams use narrow configs like
-                // `(cplbegf=11, cplendf=10)` for high-bandwidth
-                // multichannel frames. Use signed arithmetic so the
-                // `3 + cplendf - cplbegf` term can't underflow.
-                let ncplsubnd_signed = 3i32 + state.cpl_endf as i32 - state.cpl_begf as i32;
-                if ncplsubnd_signed < 1 {
-                    return Err(Error::invalid(
-                        "eac3 audblk: cplbegf > cplendf+2 — malformed coupling range",
-                    ));
-                }
-                state.cpl_nsubbnd = ncplsubnd_signed as usize;
-                // §E.1.3.3.11 cplbndstrce — gates the cplbndstrc[]
-                // array. When 0, all subbands stay un-merged (i.e.
-                // cplbndstrc[bnd] = 0 for every band).
-                let cplbndstrce = br.read_u32(1)? != 0;
-                state.cpl_bndstrc[0] = false;
-                if cplbndstrce {
-                    for bnd in 1..state.cpl_nsubbnd.min(18) {
-                        let v = br.read_u32(1)? != 0;
-                        state.cpl_bndstrc[bnd] = v;
+                    // §E.1.3.3.8 phsflginu — only in 2/0.
+                    state.phsflginu = if bsi.acmod == 0x2 {
+                        br.read_u32(1)? != 0
+                    } else {
+                        false
+                    };
+                    // §E.1.3.3.9 cplbegf (4 bits).
+                    state.cpl_begf = br.read_u32(4)? as u8;
+                    // §E.1.3.3.10 cplendf. Read 4 bits only when SPX is OFF;
+                    // when SPX is in use the spec derives cplendf from the
+                    // SPX begin so the coupled region ends one bin below the
+                    // SPX region (spxbegf < 6 → cplendf = spxbegf − 2, else
+                    // spxbegf·2 − 7 — both equal spx_begin_subbnd − 4).
+                    state.cpl_endf = if state.spx_in_use {
+                        (state.spx_begin_subbnd as i32 - 4).max(0) as u8
+                    } else {
+                        br.read_u32(4)? as u8
+                    };
+                    // §5.4.3.12 spec envelope: the upper sub-band index is
+                    // `cplendf + 2`, so `ncplsubnd = 3 + cplendf - cplbegf
+                    // >= 1` is the actual validity test (equivalently
+                    // `cplbegf <= cplendf + 2`). The earlier "cplbegf >
+                    // cplendf" rejection mirrored the AC-3 round-7 bug —
+                    // valid corpus bitstreams use narrow configs like
+                    // `(cplbegf=11, cplendf=10)` for high-bandwidth
+                    // multichannel frames. Use signed arithmetic so the
+                    // `3 + cplendf - cplbegf` term can't underflow.
+                    let ncplsubnd_signed = 3i32 + state.cpl_endf as i32 - state.cpl_begf as i32;
+                    if ncplsubnd_signed < 1 {
+                        return Err(Error::invalid(
+                            "eac3 audblk: cplbegf > cplendf+2 — malformed coupling range",
+                        ));
                     }
-                    // Any remaining (in case nsubbnd capped at 18) stay
-                    // at the default 0.
-                    for bnd in state.cpl_nsubbnd.min(18)..18 {
-                        state.cpl_bndstrc[bnd] = false;
+                    state.cpl_nsubbnd = ncplsubnd_signed as usize;
+                    // §E.1.3.3.11 cplbndstrce — gates the cplbndstrc[]
+                    // array. When 0, all subbands stay un-merged (i.e.
+                    // cplbndstrc[bnd] = 0 for every band).
+                    let cplbndstrce = br.read_u32(1)? != 0;
+                    state.cpl_bndstrc[0] = false;
+                    if cplbndstrce {
+                        for bnd in 1..state.cpl_nsubbnd.min(18) {
+                            let v = br.read_u32(1)? != 0;
+                            state.cpl_bndstrc[bnd] = v;
+                        }
+                        // Any remaining (in case nsubbnd capped at 18) stay
+                        // at the default 0.
+                        for bnd in state.cpl_nsubbnd.min(18)..18 {
+                            state.cpl_bndstrc[bnd] = false;
+                        }
+                    } else {
+                        for bnd in 1..18 {
+                            state.cpl_bndstrc[bnd] = false;
+                        }
                     }
-                } else {
-                    for bnd in 1..18 {
-                        state.cpl_bndstrc[bnd] = false;
+                    // Mantissa-domain coupling range: bins [37+12·begf,
+                    // 37+12·(endf+3)) per §7.4.2.
+                    state.cpl_begf_mant = 37 + 12 * state.cpl_begf as usize;
+                    state.cpl_endf_mant = 37 + 12 * (state.cpl_endf as usize + 3);
+                    // Derive ncplbnd by merging sub-bands whose
+                    // cplbndstrc=1 (same algorithm as base AC-3).
+                    let mut n = state.cpl_nsubbnd;
+                    for bnd in 1..state.cpl_nsubbnd {
+                        if state.cpl_bndstrc[bnd] {
+                            n -= 1;
+                        }
                     }
-                }
-                // Mantissa-domain coupling range: bins [37+12·begf,
-                // 37+12·(endf+3)) per §7.4.2.
-                state.cpl_begf_mant = 37 + 12 * state.cpl_begf as usize;
-                state.cpl_endf_mant = 37 + 12 * (state.cpl_endf as usize + 3);
-                // Derive ncplbnd by merging sub-bands whose
-                // cplbndstrc=1 (same algorithm as base AC-3).
-                let mut n = state.cpl_nsubbnd;
-                for bnd in 1..state.cpl_nsubbnd {
-                    if state.cpl_bndstrc[bnd] {
-                        n -= 1;
-                    }
-                }
-                state.cpl_nbnd = n;
-                state.cpl_in_use = true;
+                    state.cpl_nbnd = n;
+                    state.cpl_in_use = true;
+                    ecpl_in_use = false;
+                } // end standard-coupling (ecplinu == 0) strategy parse
             } else {
                 // !cplinu[blk] — clear all per-channel coupling flags
                 // and reset the per-frame state-init markers per
@@ -683,6 +748,8 @@ pub fn decode_indep_audblks(
                 firstcplleak = true;
                 state.phsflginu = false;
                 state.cpl_in_use = false;
+                ecpl_in_use = false;
+                ecpl_strategy = None;
             }
         }
         // When !cplstre[blk], every persistent coupling-strategy field
@@ -695,8 +762,25 @@ pub fn decode_indep_audblks(
 
         // ---- coupling coordinates (Table E1.4) ----
         let mut any_cplcoe_this_block = false;
-        if cplinu {
-            // ecplinu == 0 path (we already rejected ecplinu == 1).
+        if cplinu && ecpl_in_use {
+            // §E.2.3.3.20-26 enhanced-coupling coordinate block. The
+            // per-channel amplitude / angle / chaos triples are read by
+            // [`super::ecpl::parse_coords`] (which advances the bit cursor
+            // exactly per the reference syntax); the result is stashed for
+            // the deferred §E.3.5.5 synthesis after the block loop.
+            let chincpl: Vec<bool> = (0..nfchans)
+                .map(|ch| state.channels[ch].in_coupling)
+                .collect();
+            let coords = super::ecpl::parse_coords(
+                br,
+                nfchans,
+                &chincpl,
+                &mut firstcplcos[..nfchans],
+                state.cpl_nbnd,
+            )?;
+            ecpl_coords = Some(coords);
+        } else if cplinu {
+            // ecplinu == 0 path (standard coupling coordinates).
             for ch in 0..nfchans {
                 if state.channels[ch].in_coupling {
                     // §E.1.3.3.13 cplcoe[ch] — implicit 1 on the very
@@ -1214,20 +1298,95 @@ pub fn decode_indep_audblks(
         }
 
         // ---- DSP (decouple+rematrix+dynrng+IMDCT+overlap-add) ----
-        audblk::dsp_block(state, &si, &ac3_bsi);
-
-        // Write block PCM into `out`.
-        let base = blk * SAMPLES_PER_BLOCK * nchans;
-        for n in 0..SAMPLES_PER_BLOCK {
-            for ch in 0..nfchans {
-                let s = state.channels[ch].coeffs[n];
-                out[base + n * nchans + ch] = s;
+        //
+        // Enhanced coupling (§E.3.5.5) defers per-channel synthesis + DSP
+        // to a second pass: the §E.3.5.5.1 carrier for block `blk` needs
+        // the *next* block's enhanced-coupling coefficients, which are not
+        // decoded until the next loop iteration. When ecpl is active for
+        // this block we snapshot the de-normalised ecpl-channel
+        // coefficients (the carrier source) + strategy + coords + the
+        // coupled-channel set, plus the full per-channel state needed to
+        // run DSP later, and skip the immediate `dsp_block` + PCM emit.
+        if ecpl_in_use {
+            if !frame_has_ecpl {
+                // First ecpl block of the frame — remember where deferral
+                // begins so the second pass maps `deferred_channels[i]` back
+                // to the right absolute block (and PCM offset). Real
+                // encoders enable enhanced coupling from block 0; the rare
+                // mid-frame onset is handled by deferring only from here on
+                // (blocks before this already emitted via the immediate
+                // path, with their delay lines correctly advanced on
+                // `state`).
+                first_deferred_blk = blk;
             }
-            if lfeon {
-                let s = state.channels[MAX_FBW + 1].coeffs[n];
-                out[base + n * nchans + nfchans] = s;
+            frame_has_ecpl = true;
+            if let Some(strat) = &ecpl_strategy {
+                let mut chincpl = [false; super::ecpl::ECPL_MAX_FBW];
+                for (ch, slot) in chincpl.iter_mut().enumerate().take(nfchans) {
+                    *slot = state.channels[ch].in_coupling;
+                }
+                let mut mant = [0.0f32; 256];
+                let start = state.cpl_begf_mant.min(256);
+                let end_c = state.cpl_endf_mant.min(256);
+                mant[start..end_c].copy_from_slice(&state.channels[MAX_FBW].coeffs[start..end_c]);
+                ecpl_blocks[blk] = Some(super::ecpl::EcplBlock {
+                    mant,
+                    strategy: strat.clone(),
+                    coords: ecpl_coords.clone().unwrap_or_default(),
+                    chincpl,
+                });
             }
         }
+        if frame_has_ecpl {
+            // Snapshot the full per-channel state for the deferred DSP pass
+            // so blocks render in order with a correct overlap-add delay
+            // line (mixing ecpl + non-ecpl blocks within one frame stays
+            // correct). The `delay` field is intentionally re-threaded in
+            // pass 2, not from the snapshot.
+            deferred_channels.push(state.channels.clone());
+            deferred_skip_decouple.push(ecpl_in_use);
+        } else {
+            audblk::dsp_block(state, &si, &ac3_bsi);
+
+            // Write block PCM into `out`.
+            let base = blk * SAMPLES_PER_BLOCK * nchans;
+            for n in 0..SAMPLES_PER_BLOCK {
+                for ch in 0..nfchans {
+                    let s = state.channels[ch].coeffs[n];
+                    out[base + n * nchans + ch] = s;
+                }
+                if lfeon {
+                    let s = state.channels[MAX_FBW + 1].coeffs[n];
+                    out[base + n * nchans + nfchans] = s;
+                }
+            }
+        }
+    }
+
+    // ---- Deferred enhanced-coupling DSP pass (§E.3.5.5) ----
+    //
+    // Runs only when the frame used enhanced coupling. For each block in
+    // order: reconstruct the carrier from prev/curr/next ecpl coefficients
+    // (zero buffers at the frame edges per §E.3.5.5.1), synthesise each
+    // coupled channel's transform coefficients into the snapshot's
+    // `coeffs`, then run `dsp_block` (with decouple skipped on ecpl blocks
+    // because the coefficients are already per-channel) and emit PCM. The
+    // overlap-add delay line is threaded through `state.channels[ch].delay`
+    // across the pass exactly as the single-pass loop would have.
+    if frame_has_ecpl {
+        run_deferred_ecpl_dsp(
+            state,
+            &si,
+            &ac3_bsi,
+            first_deferred_blk,
+            &ecpl_blocks,
+            &deferred_channels,
+            &deferred_skip_decouple,
+            nfchans,
+            nchans,
+            lfeon,
+            out,
+        );
     }
 
     // ---- Transient pre-noise processing (§E.3.7.2) ----
@@ -1253,6 +1412,130 @@ pub fn decode_indep_audblks(
         }
     }
     Ok(())
+}
+
+/// §E.3.5.5 — the deferred enhanced-coupling DSP second pass.
+///
+/// Re-renders every audio block of a frame that used enhanced coupling, in
+/// order, so the §E.3.5.5.1 carrier reconstruction can consult the *next*
+/// block's enhanced-coupling coefficients (unavailable mid-decode). For
+/// each block:
+///
+/// 1. The block's snapshot channel-state is restored into `state.channels`,
+///    preserving the evolving overlap-add `delay` lines (carried from the
+///    previous block's DSP, not from the snapshot).
+/// 2. For an enhanced-coupling block, [`super::ecpl::synthesize_block`]
+///    reconstructs the carrier from the previous / current / next block's
+///    de-normalised coefficients (zero buffers at the frame edges, per the
+///    §E.3.5.5.1 "set to zero" rule) and writes each coupled channel's
+///    transform coefficients; `skip_decouple` is set so `dsp_block` does
+///    not run the standard §7.4 scalar decouple over them.
+/// 3. `dsp_block` runs the remaining stages (rematrix / SPX / dynrng /
+///    IMDCT / overlap-add) and the PCM is emitted to `out`.
+///
+/// Cross-frame neighbours (the block before block 0 and after the last
+/// block) are treated as zero here; threading the adjacent frames' edge
+/// coefficients is a documented follow-up (the §E.3.5.5.1 edge rule only
+/// affects the two boundary blocks of each frame).
+#[allow(clippy::too_many_arguments)]
+fn run_deferred_ecpl_dsp(
+    state: &mut Ac3State,
+    si: &SyncInfo,
+    ac3_bsi: &Ac3Bsi,
+    first_deferred_blk: usize,
+    ecpl_blocks: &[Option<super::ecpl::EcplBlock>],
+    deferred_channels: &[[crate::audblk::ChannelState; crate::audblk::MAX_CHANNELS]],
+    deferred_skip_decouple: &[bool],
+    nfchans: usize,
+    nchans: usize,
+    lfeon: bool,
+    out: &mut [f32],
+) {
+    let n_deferred = deferred_channels.len();
+    // Zero neighbour for frame-edge blocks (§E.3.5.5.1 "set to zero").
+    let zero_block = super::ecpl::EcplBlock {
+        mant: [0.0; 256],
+        strategy: super::ecpl::EcplStrategy {
+            begin_subbnd: 0,
+            end_subbnd: 0,
+            bndstrc: [false; super::ecpl::N_ECPL_SUBBND],
+            necplbnd: 0,
+        },
+        coords: super::ecpl::EcplCoords::default(),
+        chincpl: [false; super::ecpl::ECPL_MAX_FBW],
+    };
+
+    for i in 0..n_deferred {
+        // Snapshot index `i` maps to absolute block `abs_blk`.
+        let abs_blk = first_deferred_blk + i;
+        // Restore this block's parsed state. For the first deferred block
+        // the snapshot's own `delay` is the correct starting overlap-add
+        // tail (captured before this block's DSP ran). For later blocks the
+        // live delay produced by the previous block's `dsp_block` is the
+        // correct one — carry it over the snapshot's stale value.
+        let carry_delay: [[f32; SAMPLES_PER_BLOCK]; crate::audblk::MAX_CHANNELS] =
+            std::array::from_fn(|ch| state.channels[ch].delay);
+        state.channels = deferred_channels[i].clone();
+        if i > 0 {
+            for ch in 0..crate::audblk::MAX_CHANNELS {
+                state.channels[ch].delay = carry_delay[ch];
+            }
+        }
+        state.blkidx = abs_blk;
+
+        let skip = deferred_skip_decouple[i];
+        state.skip_decouple = skip;
+        if skip {
+            if let Some(curr) = &ecpl_blocks[abs_blk] {
+                let prev = if abs_blk > 0 {
+                    ecpl_blocks[abs_blk - 1].as_ref().unwrap_or(&zero_block)
+                } else {
+                    &zero_block
+                };
+                let next = if abs_blk + 1 < ecpl_blocks.len() {
+                    ecpl_blocks[abs_blk + 1].as_ref().unwrap_or(&zero_block)
+                } else {
+                    &zero_block
+                };
+                // Per-channel transform-coefficient buffers; pre-seed with
+                // the already-decoded independent (low-frequency) region so
+                // synthesis only overwrites the enhanced-coupling bins.
+                let mut chcoef: Vec<[f32; 256]> = (0..super::ecpl::ECPL_MAX_FBW)
+                    .map(|ch| {
+                        let mut b = [0.0f32; 256];
+                        if ch < nfchans {
+                            b.copy_from_slice(&state.channels[ch].coeffs);
+                        }
+                        b
+                    })
+                    .collect();
+                super::ecpl::synthesize_block(
+                    &mut state.ecpl_state,
+                    prev,
+                    curr,
+                    next,
+                    &mut chcoef,
+                    512,
+                );
+                for ch in 0..nfchans {
+                    state.channels[ch].coeffs.copy_from_slice(&chcoef[ch]);
+                }
+            }
+        }
+
+        audblk::dsp_block(state, si, ac3_bsi);
+        state.skip_decouple = false;
+
+        let base = abs_blk * SAMPLES_PER_BLOCK * nchans;
+        for n in 0..SAMPLES_PER_BLOCK {
+            for ch in 0..nfchans {
+                out[base + n * nchans + ch] = state.channels[ch].coeffs[n];
+            }
+            if lfeon {
+                out[base + n * nchans + nfchans] = state.channels[MAX_FBW + 1].coeffs[n];
+            }
+        }
+    }
 }
 
 /// Transient pre-noise time-scaling synthesis for one full-bandwidth

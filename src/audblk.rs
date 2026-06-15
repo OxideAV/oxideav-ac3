@@ -308,6 +308,23 @@ pub struct Ac3State {
     /// (e.g. `AC3_TRACE_FRAME=14`). Incremented at the top of every
     /// `decode_frame` call. Not part of the spec — diagnostic only.
     pub frame_counter: u64,
+
+    /// E-AC-3 enhanced coupling (§E.3.5.5): when set, the §7.4 standard
+    /// decouple step in [`dsp_block`] is skipped because each coupled
+    /// channel's transform coefficients in `channels[ch].coeffs` were
+    /// already reconstructed from the enhanced-coupling carrier `Z[k]`
+    /// (the §E.3.5.5.4 complex product) by the E-AC-3 dsp layer before
+    /// `dsp_block` runs. Base AC-3 and standard E-AC-3 coupling leave
+    /// this `false` so the normal decouple applies.
+    pub skip_decouple: bool,
+
+    /// E-AC-3 enhanced-coupling cross-frame synthesis state (§E.3.5.5.3
+    /// random de-correlation sources). The non-transient random arrays are
+    /// "generated once … and the same for every block of every frame", and
+    /// the transient random generator advances across blocks/frames — both
+    /// lifetimes outlive a single syncframe, so the state lives here. Base
+    /// AC-3 and standard E-AC-3 coupling never touch it.
+    pub ecpl_state: crate::eac3::ecpl::EcplState,
 }
 
 impl Default for Ac3State {
@@ -365,6 +382,8 @@ impl Ac3State {
             // Arbitrary fixed value keeps decodes byte-reproducible.
             dither_lfsr_state: 0x1234,
             frame_counter: 0,
+            skip_decouple: false,
+            ecpl_state: crate::eac3::ecpl::EcplState::new(),
         }
     }
 }
@@ -2009,7 +2028,14 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
     let acmod = bsi.acmod;
 
     // --- Decoupling (§7.4) ---
-    if state.cpl_in_use {
+    // Enhanced coupling (§E.3.5.5) reconstructs each coupled channel's
+    // transform coefficients from the complex carrier `Z[k]` (the
+    // §E.3.5.5.4 product) *before* `dsp_block` is called, so `coeffs[bin]`
+    // already holds the per-channel result. The standard scalar decouple
+    // (`cpl_coord · cplchan`) must NOT run in that case — it would
+    // overwrite the carrier-derived coefficients. `skip_decouple` carries
+    // that gate; base AC-3 and standard E-AC-3 coupling leave it `false`.
+    if state.cpl_in_use && !state.skip_decouple {
         let cpl_ch = MAX_FBW;
         let start = state.cpl_begf_mant;
         let end = state.cpl_endf_mant;

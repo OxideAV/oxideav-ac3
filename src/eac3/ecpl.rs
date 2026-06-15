@@ -28,11 +28,12 @@
 //!   population: how many transform coefficients each enhanced coupling
 //!   band spans.
 //!
-//! It deliberately does **not** perform any synthesis: amplitude /
-//! angle / chaos parameter decode (Tables E3.10-E3.12) and the complex
-//! coordinate reconstruction (§E.3.5.5) are a separate step still under
-//! construction. Keeping the geometry isolated and unit-tested gives the
-//! synthesis step a verified foundation.
+//! The geometry layer is kept isolated and unit-tested so the synthesis
+//! steps that build on it (parameter processing, carrier reconstruction,
+//! per-channel coefficient generation) start from a verified foundation.
+//! The full §E.3.5.5 per-block synthesis is orchestrated by
+//! [`synthesize_block`]; the cross-block random sources live on
+//! [`EcplState`].
 //!
 //! As of round 300 the module also carries the **bitstream-syntax** layer
 //! that sits on top of the geometry: [`parse_strategy`] reads the
@@ -65,10 +66,16 @@
 //! the non-aliased complex coupling channel `Z[k]` from the de-normalised
 //! enhanced-coupling mantissas. The function takes all three blocks'
 //! coefficient buffers (the cross-block state is owned by the caller), so
-//! this whole module stays a pure, unit-tested layer end to end. The only
-//! work left outside it is the decoder-level *integration*: extracting the
-//! enhanced-coupling mantissas, buffering them across blocks, and emitting
-//! each coupled channel's coefficients from the carrier.
+//! this whole module stays a pure, unit-tested layer end to end.
+//!
+//! The decoder-level *integration* is provided by [`synthesize_block`]
+//! plus the cross-block [`EcplState`] (the §E.3.5.5.3 random
+//! de-correlation sources): given the previous / current / next blocks'
+//! de-normalised enhanced-coupling coefficients ([`EcplBlock`]), it runs
+//! the full §E.3.5.5 "for each block" procedure and writes each coupled
+//! channel's transform coefficients. The E-AC-3 dsp layer
+//! (`super::dsp`) owns the bitstream extraction + per-block buffering and
+//! calls into it.
 //!
 //! **Spec note (erratum):** the default-banding table is captioned
 //! "Table E2.14" in the document's table-of-contents (and list of
@@ -1071,6 +1078,211 @@ pub fn reconstruct_carrier(prev: &[f32; 256], curr: &[f32; 256], next: &[f32; 25
     EcplCarrier { zr, zi }
 }
 
+// ===========================================================================
+// §E.3.5.5 — decoder-level enhanced-coupling synthesis orchestration
+// ===========================================================================
+//
+// The pieces above are pure per-step primitives. This layer stitches them
+// into the full §E.3.5.5 "for each block" procedure the decoder runs once
+// the enhanced-coupling channel mantissas/exponents have been decoded and
+// de-normalised:
+//
+//   1. Process the enhanced-coupling channel → carrier `Z[k]`
+//      ([`reconstruct_carrier`], from prev/curr/next mantissa buffers).
+//   2. Prepare per-bin amplitudes for each coupled channel
+//      ([`process_band_amplitudes`] → [`expand_bands_to_bins`]).
+//   3. Prepare per-bin angles for each coupled channel ([`angle_value`] →
+//      either [`expand_bands_to_bins`] or [`interpolate_bin_angles`], then
+//      [`apply_decorrelation`] with the chaos × random term).
+//   4. Generate each coupled channel's transform coefficients from the
+//      carrier, amplitudes and angles ([`generate_channel_coeffs`]).
+//
+// The §E.3.5.5.1 carrier needs the *previous*, *current* and *next*
+// block's enhanced-coupling mantissas; the decoder owns those buffers and
+// passes all three in. The de-correlation random sources have cross-block
+// lifetime (the non-transient array is generated once; the transient LFSR
+// advances every block), so they live on the persistent [`EcplState`].
+
+/// Maximum number of full-bandwidth channels that can be in coupling.
+/// Matches the AC-3 `MAX_FBW` (5 fbw channels in 3/2 mode).
+pub const ECPL_MAX_FBW: usize = 5;
+
+/// Cross-block enhanced-coupling synthesis state. Persisted on the decoder
+/// for the lifetime of a stream so the §E.3.5.5.3 random de-correlation
+/// sources keep their spec-required lifetimes:
+///
+/// * `rand_notrans[ch]` — the non-transient random array, "generated once
+///   (for example during decoder initialization) and … the same for every
+///   block of every frame" (§E.3.5.5.3). Built lazily the first time a
+///   channel needs it and then reused.
+/// * `trans_lfsr` — the transient random generator state; the transient
+///   values "must be new for each block", so this LFSR threads across
+///   blocks/frames advancing the sequence.
+#[derive(Clone, Debug, Default)]
+pub struct EcplState {
+    rand_notrans: [Option<RandNoTrans>; ECPL_MAX_FBW],
+    trans_lfsr: u32,
+}
+
+impl EcplState {
+    /// Fresh state (no random arrays generated yet, transient LFSR seeded).
+    pub fn new() -> Self {
+        Self {
+            rand_notrans: Default::default(),
+            // Non-zero seed required for the xorshift transient generator.
+            trans_lfsr: 0x2545_F491,
+        }
+    }
+
+    /// The cached non-transient random array for channel `ch`, building it
+    /// on first use (§E.3.5.5.3 "generated once"). `n` is the transform
+    /// size (512).
+    fn rand_notrans(&mut self, ch: usize, n: usize) -> &RandNoTrans {
+        if self.rand_notrans[ch].is_none() {
+            self.rand_notrans[ch] = Some(RandNoTrans::new(ch, n));
+        }
+        self.rand_notrans[ch].as_ref().unwrap()
+    }
+}
+
+/// One block's decoded enhanced-coupling inputs for [`synthesize_block`].
+///
+/// `mant` holds the de-normalised enhanced-coupling channel transform
+/// coefficients for this block, indexed by absolute bin `0 .. N/2`, zero
+/// outside the active region `[ecplstartmant, ecplendmant)` (the §E.3.5.5.1
+/// step-1 `XCURR` definition). `strategy` and `coords` are the decoded
+/// geometry + per-channel parameters. `chincpl[ch]` flags the coupled
+/// channels.
+#[derive(Clone, Debug)]
+pub struct EcplBlock {
+    /// De-normalised ecpl-channel MDCT coefficients, length `N/2 = 256`.
+    pub mant: [f32; 256],
+    /// Active strategy (band geometry) for this block.
+    pub strategy: EcplStrategy,
+    /// Per-channel decoded coordinates (angle-interp flag + per-band
+    /// amplitude/angle/chaos triples).
+    pub coords: EcplCoords,
+    /// Whether each fbw channel is in coupling this block.
+    pub chincpl: [bool; ECPL_MAX_FBW],
+}
+
+/// §E.3.5.5 — synthesise the individual-channel transform coefficients for
+/// one block of enhanced coupling, writing each coupled channel's result
+/// into `out[ch]`.
+///
+/// `prev` / `curr` / `next` are the three blocks' de-normalised
+/// enhanced-coupling mantissa buffers; pass an all-zero `mant` (e.g. an
+/// [`EcplBlock`] whose `mant` is `[0.0; 256]`) for a neighbour where
+/// enhanced coupling is not in use, per the §E.3.5.5.1 "set to zero" rule.
+/// The synthesis applies to `curr`'s strategy/coords; `prev`/`next` are
+/// consulted only for their mantissa buffers (the carrier needs the
+/// neighbouring spectra to suppress time-domain aliasing).
+///
+/// `out[ch]` is the absolute-bin coefficient buffer for fbw channel `ch`
+/// (length `N/2 = 256`); only bins in the active region
+/// `[begin_bin, end_bin)` are written, so the caller pre-fills the
+/// independently-coded low region. `n` is the transform size (512).
+///
+/// The first coupled channel (`firstchincpl`) has angle/chaos fixed to `0`
+/// (§E.3.5.5.2-3), so its synthesis is the pure carrier scaled by its
+/// per-bin amplitude.
+pub fn synthesize_block(
+    state: &mut EcplState,
+    prev: &EcplBlock,
+    curr: &EcplBlock,
+    next: &EcplBlock,
+    out: &mut [[f32; 256]],
+    n: usize,
+) {
+    // Step 1-5 — reconstruct the non-aliased complex carrier `Z[k]`.
+    let carrier = reconstruct_carrier(&prev.mant, &curr.mant, &next.mant);
+
+    let strat = &curr.strategy;
+    let begin = strat.begin_subbnd;
+    let end = strat.end_subbnd;
+    let begin_bin_abs = strat.begin_bin();
+    let nbins_per_bnd = strat.band_bin_counts();
+
+    // The first coupled channel anchors the angle/chaos = 0 rule.
+    let firstchincpl = (0..ECPL_MAX_FBW).find(|&ch| curr.chincpl[ch]);
+
+    for ch in 0..ECPL_MAX_FBW {
+        if !curr.chincpl[ch] {
+            continue;
+        }
+        let is_first = Some(ch) == firstchincpl;
+        let params = curr.coords.channels.get(ch);
+
+        // Step 2 — per-bin amplitudes. Missing params (a channel whose
+        // coordinates were not re-sent this block) would normally reuse the
+        // prior block's values; the decoder threads the persisted params in
+        // via `coords`, so an empty `amp` means "all bands zero".
+        let band_amps = match params {
+            Some(p) if !p.amp.is_empty() => process_band_amplitudes(p, is_first),
+            _ => vec![0.0; nbins_per_bnd.len()],
+        };
+        let ampbin = expand_bands_to_bins(begin, end, &strat.bndstrc, &band_amps);
+
+        // Step 3 — per-bin angles. The first coupled channel and any channel
+        // without param2e have all-zero band angles.
+        let band_angles: Vec<f32> = if is_first {
+            vec![0.0; nbins_per_bnd.len()]
+        } else {
+            match params {
+                Some(p) if !p.angle.is_empty() => {
+                    p.angle.iter().map(|&a| angle_value(a, false)).collect()
+                }
+                _ => vec![0.0; nbins_per_bnd.len()],
+            }
+        };
+        let mut bin_angle = if curr.coords.angleintrp {
+            interpolate_bin_angles(&band_angles, &nbins_per_bnd)
+        } else {
+            expand_bands_to_bins(begin, end, &strat.bndstrc, &band_angles)
+        };
+
+        // Step 3 (closing) — chaos × random de-correlation. The first
+        // coupled channel has chaos 0 (no de-correlation); other channels
+        // fan their per-band chaos to bins, pick the transient/non-transient
+        // random source, and add the term.
+        if !is_first {
+            let trans = params.map(|p| p.trans).unwrap_or(false);
+            let band_chaos: Vec<f32> = match params {
+                Some(p) if !p.chaos.is_empty() => {
+                    p.chaos.iter().map(|&c| chaos_value(c, false)).collect()
+                }
+                _ => vec![0.0; nbins_per_bnd.len()],
+            };
+            let chaos_bin = expand_bands_to_bins(begin, end, &strat.bndstrc, &band_chaos);
+            let rand_bin: Vec<f32> = if trans {
+                // Transient: one fresh random value per band, fanned to bins.
+                let band_rand = gen_rand_trans(&mut state.trans_lfsr, nbins_per_bnd.len());
+                expand_bands_to_bins(begin, end, &strat.bndstrc, &band_rand)
+            } else {
+                // Non-transient: the init-once per-bin array, sliced to the
+                // active region.
+                let rnt = state.rand_notrans(ch, n);
+                (0..bin_angle.len())
+                    .map(|off| rnt.get(begin_bin_abs + off))
+                    .collect()
+            };
+            apply_decorrelation(&mut bin_angle, &chaos_bin, &rand_bin);
+        }
+
+        // Step 4 — generate this channel's transform coefficients from the
+        // carrier and the per-bin amplitude/angle arrays.
+        generate_channel_coeffs(
+            &carrier.zr,
+            &carrier.zi,
+            &ampbin,
+            &bin_angle,
+            begin_bin_abs,
+            n,
+            &mut out[ch],
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1802,5 +2014,131 @@ mod tests {
                 "Zi[{k}] non-linear"
             );
         }
+    }
+
+    // ---- §E.3.5.5 deferred-synthesis orchestration ----
+
+    /// Build a non-trivial single-block ecpl input over a small active
+    /// region (sub-bands 0..2 = bins 13..25) with `nfchans` coupled
+    /// channels, channel `0` first-coupled (amp index 0 → unit amplitude,
+    /// no angle/chaos), channel `1` carrying explicit angle/chaos.
+    fn sample_block(nfchans: usize) -> EcplBlock {
+        let begin = 0usize;
+        let end = 2usize; // sub-bands 0,1 → bins 13..25
+        let necpl = necplbnd(begin, end, &[false; N_ECPL_SUBBND]);
+        let strategy = EcplStrategy {
+            begin_subbnd: begin,
+            end_subbnd: end,
+            bndstrc: [false; N_ECPL_SUBBND],
+            necplbnd: necpl,
+        };
+        let mut chincpl = [false; ECPL_MAX_FBW];
+        let mut channels = vec![EcplChannelParams::default(); nfchans];
+        for ch in 0..nfchans {
+            chincpl[ch] = true;
+            let p = &mut channels[ch];
+            p.param1e = true;
+            p.amp = vec![0u8; necpl]; // index 0 → unit amplitude
+            if ch > 0 {
+                p.param2e = true;
+                p.angle = vec![4u8; necpl];
+                p.chaos = vec![1u8; necpl];
+            }
+        }
+        let mut mant = [0.0f32; 256];
+        let mut s: u32 = 0x1357_9BDF;
+        for v in mant.iter_mut().take(end_bin(end)).skip(begin_bin(begin)) {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            *v = (s as i32 as f32) / (i32::MAX as f32);
+        }
+        EcplBlock {
+            mant,
+            strategy,
+            coords: EcplCoords {
+                angleintrp: false,
+                channels,
+            },
+            chincpl,
+        }
+    }
+
+    #[test]
+    fn synthesize_block_zero_carrier_is_zero() {
+        let mut st = EcplState::new();
+        let blk = sample_block(2);
+        let zero = EcplBlock {
+            mant: [0.0; 256],
+            ..blk.clone()
+        };
+        let mut out = vec![[0.0f32; 256]; ECPL_MAX_FBW];
+        // prev = curr = next = zero mantissas → zero carrier → zero output.
+        synthesize_block(&mut st, &zero, &zero, &zero, &mut out, 512);
+        for ch in 0..2 {
+            for &v in out[ch].iter() {
+                assert!(v.abs() < 1e-6, "ch{ch} non-zero from zero carrier");
+            }
+        }
+    }
+
+    #[test]
+    fn synthesize_block_leaves_uncoupled_channel_region_untouched() {
+        let mut st = EcplState::new();
+        let blk = sample_block(2); // chans 0,1 coupled; chan 2 not
+        let mut out = vec![[0.0f32; 256]; ECPL_MAX_FBW];
+        // Pre-seed channel 2 (not coupled) with a marker in the active bins.
+        for bin in begin_bin(0)..end_bin(2) {
+            out[2][bin] = 42.0;
+        }
+        synthesize_block(&mut st, &blk, &blk, &blk, &mut out, 512);
+        for bin in begin_bin(0)..end_bin(2) {
+            assert_eq!(out[2][bin], 42.0, "uncoupled ch2 bin{bin} overwritten");
+        }
+        // Coupled channels DID get written somewhere in the region.
+        let any0 = (begin_bin(0)..end_bin(2)).any(|b| out[0][b].abs() > 1e-9);
+        assert!(any0, "first coupled channel produced no coefficients");
+    }
+
+    #[test]
+    fn synthesize_block_is_linear_in_carrier() {
+        // The whole synthesis chain is linear in the ecpl-channel mantissas
+        // (carrier reconstruction + complex product), so scaling all three
+        // neighbour buffers by k scales every output coefficient by k.
+        let mut st1 = EcplState::new();
+        let mut st2 = EcplState::new();
+        let blk = sample_block(2);
+        let blk2 = EcplBlock {
+            mant: std::array::from_fn(|i| blk.mant[i] * 3.0),
+            ..blk.clone()
+        };
+        let mut out1 = vec![[0.0f32; 256]; ECPL_MAX_FBW];
+        let mut out2 = vec![[0.0f32; 256]; ECPL_MAX_FBW];
+        synthesize_block(&mut st1, &blk, &blk, &blk, &mut out1, 512);
+        synthesize_block(&mut st2, &blk2, &blk2, &blk2, &mut out2, 512);
+        for ch in 0..2 {
+            for bin in begin_bin(0)..end_bin(2) {
+                assert!(
+                    (out1[ch][bin] * 3.0 - out2[ch][bin]).abs() < 1e-3,
+                    "ch{ch} bin{bin} not linear in carrier"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ecpl_state_rand_notrans_generated_once() {
+        // §E.3.5.5.3: the non-transient random array is generated once and
+        // stays identical across blocks. Two synthesis calls on a
+        // non-transient channel must reuse the same cached array.
+        let mut st = EcplState::new();
+        let _ = st.rand_notrans(1, 512);
+        let snapshot: Vec<f32> = (0..256).map(|b| st.rand_notrans(1, 512).get(b)).collect();
+        // A second access yields the identical sequence.
+        for (b, &want) in snapshot.iter().enumerate() {
+            assert_eq!(st.rand_notrans(1, 512).get(b), want);
+        }
+        // Distinct channels get distinct sequences (spec: unique per ch).
+        let ch1_first = st.rand_notrans(1, 512).get(0);
+        let ch2_first = st.rand_notrans(2, 512).get(0);
+        assert!(ch1_first != ch2_first, "channels share a random sequence");
     }
 }

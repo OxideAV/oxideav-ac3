@@ -57,16 +57,21 @@
 //!
 //! ## Known decoder gaps
 //!
-//! * **Enhanced coupling** (`ecplinu == 1`, §E.1.3.3.7-26) is
-//!   rejected as `Unsupported` at the synthesis stage. The band
-//!   *geometry* (§E.2.3.3.16-19), the §E.2.3.3.16-26 bitstream-syntax
-//!   parse, and the §E.3.5.5.2 / §E.3.5.5.3 amplitude / angle / chaos
-//!   parameter processing (index→value decode, chaos amplitude
-//!   modification, per-band→per-bin expansion, angle interpolation) are
-//!   all spec-derived and unit-tested in [`ecpl`]; the remaining gap is
-//!   the §E.3.5.5.1 FFT channel processing + §E.3.5.5.4 complex
-//!   coordinate synthesis (multi-block stateful, init-time `rand[]`).
-//!   Standard coupling is fully in.
+//! * **Enhanced coupling** (`ecplinu == 1`, §E.1.3.3.7-26 /
+//!   §E.2.3.3.16-26 / §E.3.5.5) decodes end-to-end. The audblk parser
+//!   reads the strategy + per-channel amplitude/angle/chaos coordinates
+//!   and decodes the enhanced-coupling channel through the shared
+//!   exponent / bit-allocation / mantissa path; a deferred second pass
+//!   (see [`dsp`]) reconstructs the §E.3.5.5.1 complex carrier `Z[k]`
+//!   from the previous / current / next blocks, processes the per-bin
+//!   amplitudes + de-correlated angles, and emits each coupled channel's
+//!   transform coefficients via the §E.3.5.5.4 complex product. The
+//!   per-step primitives + the [`ecpl::synthesize_block`] orchestration
+//!   are spec-derived and unit-tested in [`ecpl`]. Frame-edge neighbours
+//!   use zero carriers (the §E.3.5.5.1 "set to zero" rule); threading
+//!   the adjacent frames' edge coefficients across the two boundary
+//!   blocks, and the 2/0 ecpl + rematrix band-count interaction, are
+//!   follow-ups. Standard coupling is fully in.
 //! * **Cross-frame transient pre-noise reference** (§E.3.7.1) is
 //!   clamped to the current frame; intra-frame transients (§E.3.7.2)
 //!   are fully synthesised.
