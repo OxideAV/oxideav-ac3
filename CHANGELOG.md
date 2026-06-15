@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **E-AC-3 enhanced-coupling complex synthesis — `eac3::ecpl`**
+  (round 310 / r310). Adds the §E.3.5.5.3 closing de-correlation step and
+  the §E.3.5.5.4 channel transform-coefficient generation on top of the
+  r306 parameter-processing layer: `apply_decorrelation()` (the
+  `angle[bin] += chaos[bin]·rand[bin]` term with the single-step `±1.0`
+  fold), `generate_channel_coeffs()` (the per-bin complex coordinate
+  `ampbin·e^{jπ·angle}` multiplied into the reconstructed coupling carrier
+  `Z[k]` followed by the MDCT synthesis
+  `chmant = -2·(y[bin]·Zr_ch + y[N/2-1-bin]·Zi_ch)`), the
+  `synthesis_window()` factor `y[bin] = cos(2π·(N/4+0.5)/N·(bin+0.5))`,
+  and the two de-correlation random sources — `RandNoTrans` (the
+  init-once per-channel `[-1,1]`-uniform `rand_notrans[ch][bin]` array)
+  and `gen_rand_trans()` (the per-block transient `rand_trans[ch][bnd]`
+  band values). The generators are non-normative (the spec fixes only the
+  distribution / uniqueness / per-block-vs-once cadence) so a
+  deterministic xorshift keeps decodes reproducible, mirroring the
+  §E.3.6.4.2 SPX-noise precedent. Pure tabulated arithmetic over the
+  supplied carrier — no multi-block state. The §E.3.5.5.1 prev/curr/next
+  IMDCT + overlap-add + FFT that produces `Z[k]` remains deferred (it is
+  stateful across blocks); the decoder's `ecplinu == 1` reject is
+  unchanged. 8 new `eac3::ecpl::tests` (327 → 335 lib tests).
 - **E-AC-3 enhanced-coupling parameter processing — `eac3::ecpl`**
   (round 306 / r306). Adds the §E.3.5.5.2 / §E.3.5.5.3 layer that
   turns the decoded `ecplamp` / `ecplangle` / `ecplchaos` index

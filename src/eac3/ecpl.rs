@@ -51,12 +51,22 @@
 //! triples into the per-bin amplitude / angle arrays the synthesis
 //! consumes — pure tabulated arithmetic with no multi-block state.
 //!
-//! The two remaining deferred pieces of §E.3.5.5 are the
-//! §E.3.5.5.1 prev/curr/next IMDCT + overlap-add + FFT that produces the
-//! non-aliased complex coupling channel, and the §E.3.5.5.4 per-bin
-//! complex product + `rand[]` de-correlation arrays — both stateful
-//! across blocks (and the latter needs an init-time RNG), so they stay
-//! out of this pure layer.
+//! The next layer (added later) closes the §E.3.5.5.3 angle path with the
+//! chaos × random de-correlation term and implements the §E.3.5.5.4
+//! channel transform-coefficient generation (the per-bin complex product
+//! against the reconstructed coupling channel `Z[k]`):
+//! [`apply_decorrelation`], [`generate_channel_coeffs`], the
+//! [`RandNoTrans`] init-once non-transient random array, [`gen_rand_trans`]
+//! per-block transient random, and the [`synthesis_window`] `y[bin]`
+//! factor. These are pure tabulated arithmetic over the carrier `Z[k]`.
+//!
+//! The one remaining deferred piece of §E.3.5.5 is §E.3.5.5.1: the
+//! prev/curr/next IMDCT + overlap-add + FFT that produces the non-aliased
+//! complex coupling channel `Z[k]` from the de-normalised
+//! enhanced-coupling mantissas. That step is stateful across blocks (it
+//! needs the previous + next block's coefficients), so it is wired at the
+//! decoder level rather than in this pure layer; everything downstream of
+//! the carrier is implemented here.
 //!
 //! **Spec note (erratum):** the default-banding table is captioned
 //! "Table E2.14" in the document's table-of-contents (and list of
@@ -467,13 +477,12 @@ pub fn parse_coords(
 // synthesis consumes. It is pure tabulated arithmetic over the active
 // band geometry — no multi-block state, no FFT.
 //
-// The two remaining (deferred) pieces of §E.3.5.5 are:
-//   * §E.3.5.5.1 — the prev/curr/next IMDCT + overlap-add + FFT that
-//     produces the non-aliased complex coupling channel `Z[k]`, and
-//   * §E.3.5.5.4 — the per-bin complex product + the `rand[]`
-//     de-correlation arrays.
-// Both are stateful across blocks (and need an init-time RNG for the
-// `rand_notrans` array), so they stay out of this pure layer.
+// The §E.3.5.5.3 closing de-correlation step and the §E.3.5.5.4 complex
+// synthesis are added below this block. The one remaining (deferred)
+// piece of §E.3.5.5 is §E.3.5.5.1 — the prev/curr/next IMDCT +
+// overlap-add + FFT that produces the non-aliased complex coupling
+// channel `Z[k]`; that is stateful across blocks, so it is wired at the
+// decoder level rather than in this pure layer.
 
 /// Table E3.10 — `ecplampexptab[]`. The binary exponent (right-shift
 /// count) applied to the mantissa for each 5-bit `ecplamp` index. Index
@@ -755,6 +764,201 @@ pub fn interpolate_bin_angles(band_angles: &[f32], nbins_per_bnd: &[usize]) -> V
     }
 
     out
+}
+
+// ===========================================================================
+// §E.3.5.5.3 (closing) / §E.3.5.5.4 — de-correlation + complex synthesis
+// ===========================================================================
+//
+// This layer closes the §E.3.5.5.3 angle path (the chaos × random
+// de-correlation added to each bin angle) and implements the §E.3.5.5.4
+// channel transform-coefficient generation (the per-bin complex product
+// against the reconstructed enhanced-coupling channel `Z[k]`).
+//
+// It consumes the per-bin amplitude / angle arrays produced by the r306
+// parameter-processing layer plus the per-bin `chaos` array (the same
+// `expand_bands_to_bins` fan-out applied to the band chaos values) and a
+// per-bin `rand` array (this module's [`RandNoTrans`] for non-transient
+// channels, [`gen_rand_trans`] expanded for transient channels). The one
+// piece that stays out of this pure layer is §E.3.5.5.1: the
+// prev/curr/next IMDCT + overlap-add + FFT that turns the de-normalised
+// enhanced-coupling mantissas into the complex carrier `Z[k]`. That is
+// stateful across blocks (it needs the previous + next block's
+// coefficients), so it is wired at the decoder level; everything from the
+// carrier onward is the tabulated arithmetic implemented here.
+
+/// §E.3.5.5.4 — the post-FFT MDCT synthesis window factor
+/// `y[bin] = cos(2π · (N/4 + 0.5) / N · (bin + 0.5))` for the 512-point
+/// transform (`N = 512`). The final real coefficient combines `y[bin]`
+/// with the mirror `y[N/2 - 1 - bin]` per the spec's
+/// `chmant = -2·(y[bin]·Zr + y[N/2-1-bin]·Zi)`.
+#[inline]
+pub fn synthesis_window(bin: usize, n: usize) -> f32 {
+    let nf = n as f32;
+    let arg = 2.0 * std::f32::consts::PI * (nf / 4.0 + 0.5) / nf * (bin as f32 + 0.5);
+    arg.cos()
+}
+
+/// §E.3.5.5.3 (closing) — the de-correlation random sequence for a
+/// **non-transient** channel: `rand_notrans[ch][bin]`.
+///
+/// Per spec these values must be (a) uniformly distributed on `-1.0 ..=
+/// 1.0`, (b) unique for each bin and channel, and (c) generated **once**
+/// (e.g. at decoder init) and held constant for every block of every
+/// frame. The generator itself is non-normative ("a scaled array of
+/// random values"); a deterministic xorshift seeded per channel satisfies
+/// all three properties while keeping decodes reproducible.
+///
+/// The struct caches one full array of `N/2 = 256` values per channel so a
+/// repeated block lookup is a cheap index, matching the spec's
+/// "generated once" requirement.
+#[derive(Clone, Debug)]
+pub struct RandNoTrans {
+    /// One `[-1, 1]` value per transform-coefficient bin (`0 .. N/2`).
+    vals: Vec<f32>,
+}
+
+impl RandNoTrans {
+    /// Build the per-bin random array for one channel. `n` is the
+    /// transform size (512); the array holds `n / 2` values. `ch` seeds
+    /// the generator so each channel gets a distinct, stable sequence.
+    pub fn new(ch: usize, n: usize) -> Self {
+        let half = n / 2;
+        // Seed per channel; a non-zero seed is required for xorshift.
+        let mut lfsr: u32 = 0x9E37_79B9 ^ (ch as u32).wrapping_mul(0x0100_0193).wrapping_add(1);
+        if lfsr == 0 {
+            lfsr = 1;
+        }
+        let mut vals = Vec::with_capacity(half);
+        for _ in 0..half {
+            vals.push(uniform_pm1(&mut lfsr));
+        }
+        Self { vals }
+    }
+
+    /// The cached `rand_notrans` value for `bin` (0-based from
+    /// transform-coefficient 0). Out-of-range bins return `0.0`.
+    #[inline]
+    pub fn get(&self, bin: usize) -> f32 {
+        self.vals.get(bin).copied().unwrap_or(0.0)
+    }
+}
+
+/// §E.3.5.5.3 (closing) — the de-correlation random sequence for a
+/// **transient** channel: `rand_trans[ch][bnd]`, one fresh value per
+/// **band** generated for every block (the band values are afterward fanned
+/// out to bins by [`expand_bands_to_bins`], exactly like the chaos array).
+///
+/// Per spec these are uniform on `-1.0 ..= 1.0`, unique per band and
+/// channel, and **new for each block** (in contrast to the non-transient
+/// init-once array). The caller threads a mutable LFSR state so successive
+/// blocks advance the sequence; `nbands` band values are produced.
+pub fn gen_rand_trans(lfsr: &mut u32, nbands: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(nbands);
+    for _ in 0..nbands {
+        out.push(uniform_pm1(lfsr));
+    }
+    out
+}
+
+/// One xorshift step mapped to a uniform value on `[-1, 1]`. Shared by the
+/// non-transient and transient de-correlation generators.
+#[inline]
+fn uniform_pm1(lfsr: &mut u32) -> f32 {
+    let mut x = *lfsr;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    if x == 0 {
+        x = 1;
+    }
+    *lfsr = x;
+    (x as f32 / u32::MAX as f32) * 2.0 - 1.0
+}
+
+/// §E.3.5.5.3 (closing) — add the chaos-scaled random de-correlation term
+/// to each per-bin angle and re-wrap into `-1.0 ..= 1.0`.
+///
+/// ```text
+/// angle[ch][bin] += chaos[ch][bin] * rand[ch][bin];
+/// if (angle < -1.0)       angle += 2.0;
+/// else if (angle >= 1.0)  angle -= 2.0;
+/// ```
+///
+/// `angles`, `chaos`, and `rand` are all per-bin arrays of equal length
+/// (the `chaos` band values fanned out by [`expand_bands_to_bins`]; the
+/// `rand` array is either the [`RandNoTrans`] cache for a non-transient
+/// channel or the fanned-out [`gen_rand_trans`] band values for a transient
+/// channel). The wrap is the spec's single-step fold — `chaos` is
+/// `0.0 ..= -1.0` and `rand` is `-1.0 ..= 1.0`, so the product is within
+/// `±1.0` and one fold suffices.
+pub fn apply_decorrelation(angles: &mut [f32], chaos: &[f32], rand: &[f32]) {
+    for (bin, a) in angles.iter_mut().enumerate() {
+        let c = chaos.get(bin).copied().unwrap_or(0.0);
+        let r = rand.get(bin).copied().unwrap_or(0.0);
+        *a += c * r;
+        if *a < -1.0 {
+            *a += 2.0;
+        } else if *a >= 1.0 {
+            *a -= 2.0;
+        }
+    }
+}
+
+/// §E.3.5.5.4 — generate the individual-channel transform coefficients
+/// from the reconstructed enhanced-coupling channel.
+///
+/// For each bin in the active region the spec forms the complex product of
+/// the carrier `Z[bin] = Zr + j·Zi` with the per-channel coordinate
+/// `ampbin · e^{jπ·angle}`:
+///
+/// ```text
+/// Zr_ch = Zr·amp·cos(π·angle) − Zi·amp·sin(π·angle)
+/// Zi_ch = Zi·amp·cos(π·angle) + Zr·amp·sin(π·angle)
+/// chmant[bin] = -2 · ( y[bin]·Zr_ch + y[N/2-1-bin]·Zi_ch )
+/// ```
+///
+/// `zr` / `zi` are the per-bin real / imaginary parts of the carrier `Z`
+/// over `bin = 0 .. N/2` (the §E.3.5.5.1 FFT output, supplied by the
+/// caller); `ampbin` / `bin_angle` are the per-bin amplitude / angle
+/// arrays for this channel, indexed by *offset from `begin_bin`*. The
+/// result `chmant` is written at the absolute transform-coefficient index
+/// `begin_bin + offset`. `n` is the transform size (512).
+///
+/// Bins outside `[begin_bin, begin_bin + ampbin.len())` are left
+/// untouched, so the caller can pre-zero or pre-fill the low/independent
+/// region.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_channel_coeffs(
+    zr: &[f32],
+    zi: &[f32],
+    ampbin: &[f32],
+    bin_angle: &[f32],
+    begin_bin: usize,
+    n: usize,
+    out: &mut [f32],
+) {
+    let half = n / 2;
+    let span = ampbin.len().min(bin_angle.len());
+    for offset in 0..span {
+        let bin = begin_bin + offset;
+        if bin >= half {
+            break;
+        }
+        let amp = ampbin[offset];
+        let angle = bin_angle[offset];
+        let (s, c) = (std::f32::consts::PI * angle).sin_cos();
+        let zr_bin = zr.get(bin).copied().unwrap_or(0.0);
+        let zi_bin = zi.get(bin).copied().unwrap_or(0.0);
+        let zr_ch = zr_bin * amp * c - zi_bin * amp * s;
+        let zi_ch = zi_bin * amp * c + zr_bin * amp * s;
+        let y_bin = synthesis_window(bin, n);
+        let y_mirror = synthesis_window(half - 1 - bin, n);
+        let chmant = -2.0 * (y_bin * zr_ch + y_mirror * zi_ch);
+        if let Some(slot) = out.get_mut(bin) {
+            *slot = chmant;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1240,5 +1444,185 @@ mod tests {
         for &v in &out {
             assert!((-1.0..=1.0).contains(&v), "wrapped angle {v} out of range");
         }
+    }
+
+    // ---- §E.3.5.5.3 (closing) / §E.3.5.5.4 synthesis ----
+
+    #[test]
+    fn rand_notrans_properties() {
+        // Per spec: uniform on [-1, 1], unique per bin, generated once and
+        // stable across calls, and distinct between channels.
+        let n = 512;
+        let r0 = RandNoTrans::new(0, n);
+        let r0_again = RandNoTrans::new(0, n);
+        let r1 = RandNoTrans::new(1, n);
+        // 256 values for a 512-point transform.
+        for bin in 0..n / 2 {
+            let v = r0.get(bin);
+            assert!((-1.0..=1.0).contains(&v), "value {v} out of range");
+            // Stable across construction (the "generated once" requirement).
+            assert_eq!(v, r0_again.get(bin));
+        }
+        // Out-of-range → 0.0.
+        assert_eq!(r0.get(n / 2), 0.0);
+        // Channels differ (overwhelmingly likely with distinct seeds; check
+        // the first few bins differ between ch0 and ch1).
+        let differ = (0..8).any(|b| (r0.get(b) - r1.get(b)).abs() > 1e-9);
+        assert!(differ, "channel 0 and 1 random arrays are identical");
+        // Roughly zero-mean over the full array.
+        let mean: f32 = (0..n / 2).map(|b| r0.get(b)).sum::<f32>() / (n / 2) as f32;
+        assert!(mean.abs() < 0.15, "mean {mean} not near zero");
+    }
+
+    #[test]
+    fn rand_trans_advances_per_block() {
+        // Transient random: new values each block (the LFSR advances), each
+        // in [-1, 1]. Two consecutive draws of the same band count differ.
+        let mut lfsr = 0x1234_5678u32;
+        let blk0 = gen_rand_trans(&mut lfsr, 4);
+        let blk1 = gen_rand_trans(&mut lfsr, 4);
+        assert_eq!(blk0.len(), 4);
+        assert_eq!(blk1.len(), 4);
+        for &v in blk0.iter().chain(blk1.iter()) {
+            assert!((-1.0..=1.0).contains(&v), "value {v} out of range");
+        }
+        assert_ne!(blk0, blk1, "consecutive blocks produced identical noise");
+    }
+
+    #[test]
+    fn apply_decorrelation_wraps_single_step() {
+        // chaos in [0, -1], rand in [-1, 1] → product in [-1, 1]; a single
+        // fold keeps the result in [-1, 1).
+        let mut angles = vec![0.9, -0.9, 0.0];
+        let chaos = vec![-1.0, -1.0, -0.5];
+        let rand = vec![0.5, -0.5, 1.0];
+        apply_decorrelation(&mut angles, &chaos, &rand);
+        // 0.9 + (-1.0 * 0.5) = 0.4.
+        assert!((angles[0] - 0.4).abs() < 1e-6);
+        // -0.9 + (-1.0 * -0.5) = -0.4.
+        assert!((angles[1] - (-0.4)).abs() < 1e-6);
+        // 0.0 + (-0.5 * 1.0) = -0.5.
+        assert!((angles[2] - (-0.5)).abs() < 1e-6);
+        for &a in &angles {
+            assert!((-1.0..1.0).contains(&a), "angle {a} not wrapped");
+        }
+
+        // Force a positive overflow: 0.95 + (-1.0 * -0.5) = 1.45 → -0.55.
+        let mut a = vec![0.95];
+        apply_decorrelation(&mut a, &[-1.0], &[-0.5]);
+        assert!((a[0] - (-0.55)).abs() < 1e-6);
+        // Force a negative underflow: -0.95 + (-1.0 * 0.5) = -1.45 → 0.55.
+        let mut b = vec![-0.95];
+        apply_decorrelation(&mut b, &[-1.0], &[0.5]);
+        assert!((b[0] - 0.55).abs() < 1e-6);
+    }
+
+    #[test]
+    fn synthesis_window_mirror_symmetry() {
+        // y[bin] = cos(2π·(N/4+0.5)/N·(bin+0.5)). For N=512 the factor is
+        // bounded by 1, and the spec pairs y[bin] with y[N/2-1-bin].
+        let n = 512;
+        for bin in [0usize, 1, 64, 128, 255] {
+            let y = synthesis_window(bin, n);
+            assert!((-1.0..=1.0).contains(&y), "y[{bin}]={y} out of range");
+        }
+        // bin 0 of the 512-point window: cos(2π·128.5/512·0.5) =
+        // cos(π·128.5/512).
+        let expected0 = (std::f32::consts::PI * 128.5 / 512.0).cos();
+        assert!((synthesis_window(0, n) - expected0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn generate_channel_coeffs_unity_passthrough() {
+        // amp = 1, angle = 0 → coordinate is real unity → the channel
+        // coefficient is the spec's pure-carrier MDCT synthesis:
+        // chmant = -2·(y[bin]·Zr + y[N/2-1-bin]·Zi). Verify one bin.
+        let n = 512;
+        let half = n / 2;
+        let begin_bin = 13;
+        let span = 6;
+        // Carrier: distinctive per-bin real/imag.
+        let mut zr = vec![0.0f32; half];
+        let mut zi = vec![0.0f32; half];
+        for bin in begin_bin..begin_bin + span {
+            zr[bin] = (bin as f32) * 0.01;
+            zi[bin] = (bin as f32) * -0.02;
+        }
+        let ampbin = vec![1.0f32; span];
+        let bin_angle = vec![0.0f32; span];
+        let mut out = vec![0.0f32; half];
+        generate_channel_coeffs(&zr, &zi, &ampbin, &bin_angle, begin_bin, n, &mut out);
+
+        for offset in 0..span {
+            let bin = begin_bin + offset;
+            let y_bin = synthesis_window(bin, n);
+            let y_mirror = synthesis_window(half - 1 - bin, n);
+            // angle 0 → cos=1, sin=0 → Zr_ch=Zr, Zi_ch=Zi.
+            let expected = -2.0 * (y_bin * zr[bin] + y_mirror * zi[bin]);
+            assert!(
+                (out[bin] - expected).abs() < 1e-5,
+                "bin {bin}: {} != {expected}",
+                out[bin]
+            );
+        }
+        // Below the region untouched.
+        assert_eq!(out[begin_bin - 1], 0.0);
+        // Above the region untouched.
+        assert_eq!(out[begin_bin + span], 0.0);
+    }
+
+    #[test]
+    fn generate_channel_coeffs_amplitude_scales() {
+        // Halving amp halves the magnitude of the complex coordinate, and
+        // since the synthesis is linear in amp, the output halves too.
+        let n = 512;
+        let half = n / 2;
+        let begin_bin = 13;
+        let span = 4;
+        let mut zr = vec![0.0f32; half];
+        let mut zi = vec![0.0f32; half];
+        for bin in begin_bin..begin_bin + span {
+            zr[bin] = 0.3;
+            zi[bin] = 0.1;
+        }
+        let angle = vec![0.25f32; span]; // π/4
+        let mut full = vec![0.0f32; half];
+        generate_channel_coeffs(&zr, &zi, &vec![1.0; span], &angle, begin_bin, n, &mut full);
+        let mut halved = vec![0.0f32; half];
+        generate_channel_coeffs(
+            &zr,
+            &zi,
+            &vec![0.5; span],
+            &angle,
+            begin_bin,
+            n,
+            &mut halved,
+        );
+        for bin in begin_bin..begin_bin + span {
+            assert!(
+                (halved[bin] * 2.0 - full[bin]).abs() < 1e-5,
+                "bin {bin}: amplitude scaling not linear"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_channel_coeffs_angle_rotation() {
+        // A pure-real carrier with angle = 0.5 (π/2) rotates the coordinate
+        // to pure-imaginary: Zr_ch = -Zi·amp·sin, Zi_ch = Zr·amp·cos... at
+        // angle 0.5, cos(π·0.5)=0, sin(π·0.5)=1 → Zr_ch = -Zi, Zi_ch = Zr.
+        let n = 512;
+        let half = n / 2;
+        let begin_bin = 13;
+        let mut zr = vec![0.0f32; half];
+        let mut zi = vec![0.0f32; half];
+        zr[begin_bin] = 0.4;
+        zi[begin_bin] = 0.0;
+        let mut out = vec![0.0f32; half];
+        generate_channel_coeffs(&zr, &zi, &[1.0], &[0.5], begin_bin, n, &mut out);
+        // Zr_ch = 0.4·0 - 0·1 = 0; Zi_ch = 0·0 + 0.4·1 = 0.4.
+        let y_mirror = synthesis_window(half - 1 - begin_bin, n);
+        let expected = -2.0 * (0.0 + y_mirror * 0.4);
+        assert!((out[begin_bin] - expected).abs() < 1e-5);
     }
 }

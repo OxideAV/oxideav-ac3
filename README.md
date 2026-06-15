@@ -713,6 +713,44 @@ Early WIP. Implementation follows the A/52 spec incrementally:
       `ecplinu == 1` synthesis-stage reject is unchanged — this layer
       is pure + tested but not yet wired into the audblk walk. 7 new
       `eac3::ecpl::tests` (321 → 328 lib tests), all green.
+
+      **Round 310** lifts the fourth layer onto the geometry + syntax +
+      parameter processing: the §E.3.5.5.3 **closing de-correlation** step
+      and the §E.3.5.5.4 **channel transform-coefficient generation** —
+      the per-bin complex product that turns the reconstructed
+      enhanced-coupling carrier `Z[k]` into each coupled channel's
+      coefficients. `eac3::ecpl` grows `apply_decorrelation()` (the
+      §E.3.5.5.3 `angle[bin] += chaos[bin]·rand[bin]` term with the
+      single-step `±1.0` fold — `chaos ∈ [0,-1]` and `rand ∈ [-1,1]` keep
+      the product within `±1.0` so one fold suffices),
+      `generate_channel_coeffs()` (the §E.3.5.5.4 complex coordinate
+      `ampbin·e^{jπ·angle}` multiplied into `Z`, then the MDCT synthesis
+      `chmant = -2·(y[bin]·Zr_ch + y[N/2-1-bin]·Zi_ch)`), and the
+      `synthesis_window()` factor `y[bin] = cos(2π·(N/4+0.5)/N·(bin+0.5))`.
+      The two de-correlation random sources are also implemented per the
+      spec's distinct requirements: `RandNoTrans` caches an init-once
+      per-channel `[-1,1]`-uniform array (the §E.3.5.5.3 non-transient
+      `rand_notrans[ch][bin]` — "generated once … stay the same for every
+      block"), while `gen_rand_trans()` advances a per-block LFSR for the
+      transient `rand_trans[ch][bnd]` band values ("new values for each
+      block"); both generators are non-normative (the spec only fixes the
+      uniform distribution / uniqueness / per-block-vs-once cadence) so a
+      deterministic xorshift keeps decodes reproducible, mirroring the
+      §E.3.6.4.2 SPX-noise precedent. These remain pure tabulated
+      arithmetic over the supplied carrier — no multi-block state. The one
+      remaining deferred piece of §E.3.5.5 is §E.3.5.5.1: the
+      prev/curr/next IMDCT + overlap-add + FFT that produces `Z[k]` from
+      the de-normalised enhanced-coupling mantissas (stateful across
+      blocks, wired at the decoder level rather than in this pure layer).
+      The decoder's `ecplinu == 1` synthesis-stage reject is unchanged —
+      this layer is pure + tested but not yet wired into the audblk walk.
+      8 new `eac3::ecpl::tests` (`rand_notrans` distribution / uniqueness /
+      generate-once / per-channel-distinct properties, `rand_trans`
+      per-block advance, the de-correlation single-step wrap including both
+      overflow directions, the `synthesis_window` mirror symmetry, and
+      three `generate_channel_coeffs` checks — unity-coordinate
+      pure-carrier passthrough, amplitude-linearity, and the angle=π/2
+      real→imaginary rotation). 327 → 335 lib tests, all green.
 - [x] **§7.10.1 CRC verification API** (round 182). Opt-in
       decoder side: `decoder::verify_packet_crc(syncframe) ->
       CrcStatus` peeks the bsid byte to dispatch AC-3 (double CRC)
