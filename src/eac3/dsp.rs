@@ -628,7 +628,18 @@ pub fn decode_indep_audblks(
                     // the shared exponent / bit-allocation / mantissa
                     // machinery decodes the enhanced-coupling channel into
                     // the `MAX_FBW` slot exactly like standard coupling.
-                    let spx_begf_for_ecpl = state.spx_begin_subbnd.saturating_sub(2).min(7);
+                    // Recover the raw 3-bit `spxbegf` from the derived
+                    // `spx_begin_subbnd` (§E.2.3.3.5 inverse):
+                    //   spxbegf < 6 → spx_begin_subbnd = spxbegf + 2
+                    //   spxbegf ≥ 6 → spx_begin_subbnd = spxbegf*2 - 3
+                    // so the inverse splits at spx_begin_subbnd == 7.
+                    // `ecpl::end_subbnd` only consults `spxbegf` when SPX is
+                    // co-active (it bounds the ecpl region just below SPX).
+                    let spx_begf_for_ecpl = if state.spx_begin_subbnd <= 7 {
+                        state.spx_begin_subbnd.saturating_sub(2)
+                    } else {
+                        (state.spx_begin_subbnd + 3) / 2
+                    };
                     let strat = super::ecpl::parse_strategy(
                         br,
                         state.spx_in_use,
