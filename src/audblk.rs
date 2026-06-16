@@ -1145,20 +1145,58 @@ pub(crate) fn remat_band_count(cplinu: bool, cplbegf: u8) -> usize {
 }
 
 /// E-AC-3 number-of-rematrix-bands `nrematbd` per §E.3.3.2, which folds
-/// in spectral extension. When standard coupling is in use the count
-/// matches [`remat_band_count`]; when SPX is in use without coupling the
-/// count is `3` for `spxbegf < 2` else `4`; otherwise `4`. (Enhanced
-/// coupling is not yet decoded, so its branch is omitted.) `spx_in_use`
-/// and `spx_begin_subbnd` come from the SPX strategy block;
-/// `spxbegf < 2` is equivalent to `spx_begin_subbnd < 4`.
+/// in both spectral extension and enhanced coupling.
+///
+/// The §E.3.3.2 pseudo-code decision tree, transcribed verbatim:
+///
+/// ```text
+/// if (cplinu) {
+///     if (ecplinu) {                         // enhanced coupling
+///         if      (ecplbegf == 0) nrematbd = 0
+///         else if (ecplbegf == 1) nrematbd = 1
+///         else if (ecplbegf == 2) nrematbd = 2
+///         else if (ecplbegf <  5) nrematbd = 3
+///         else                    nrematbd = 4
+///     } else {                               // standard coupling
+///         if      (cplbegf == 0)  nrematbd = 2
+///         else if (cplbegf <  3)  nrematbd = 3
+///         else                    nrematbd = 4
+///     }
+/// } else if (spxinu) {
+///     if (spxbegf < 2) nrematbd = 3 else nrematbd = 4
+/// } else {
+///     nrematbd = 4
+/// }
+/// ```
+///
+/// The standard-coupling arm is identical to [`remat_band_count`]. The
+/// enhanced-coupling arm is new (an `ecplinu` 2/0 block uses `ecplbegf`,
+/// not `cplbegf`, to size the rematrix-flag field — and uniquely admits
+/// `nrematbd = 0`, suppressing the field entirely). `spx_in_use` /
+/// `spx_begin_subbnd` come from the SPX strategy block; `spxbegf < 2` is
+/// equivalent to `spx_begin_subbnd < 4`. `ecplbegf` is the raw 4-bit
+/// `ecplbegf` code carried on [`crate::eac3::ecpl::EcplStrategy`].
 pub(crate) fn remat_band_count_spx(
     cplinu: bool,
     cplbegf: u8,
+    ecpl_in_use: bool,
+    ecplbegf: u8,
     spx_in_use: bool,
     spx_begin_subbnd: usize,
 ) -> usize {
     if cplinu {
-        remat_band_count(true, cplbegf)
+        if ecpl_in_use {
+            // §E.3.3.2 enhanced-coupling arm — thresholds the raw ecplbegf.
+            match ecplbegf {
+                0 => 0,
+                1 => 1,
+                2 => 2,
+                3 | 4 => 3,
+                _ => 4,
+            }
+        } else {
+            remat_band_count(true, cplbegf)
+        }
     } else if spx_in_use {
         if spx_begin_subbnd < 4 {
             3
@@ -2367,6 +2405,47 @@ mod spx_tests {
         assert_eq!(spx_bandtable(9), 133);
         assert_eq!(spx_bandtable(16), 217);
         assert_eq!(spx_bandtable(17), 229);
+    }
+
+    /// §E.3.3.2 `nrematbd` decision tree — every arm of the spec
+    /// pseudo-code. The enhanced-coupling arm (`cplinu && ecplinu`) sizes
+    /// from the raw `ecplbegf` code and is the one that 2/0 ecpl frames
+    /// reach; the rest reproduce the SPX / standard-coupling / no-coupling
+    /// behaviour already exercised by the parse loop.
+    #[test]
+    fn nrematbd_e3_3_2_decision_tree() {
+        // No coupling, no SPX → always 4.
+        assert_eq!(remat_band_count_spx(false, 0, false, 0, false, 0), 4);
+        assert_eq!(remat_band_count_spx(false, 9, true, 7, false, 0), 4);
+
+        // SPX without coupling: 3 for spx_begin_subbnd < 4 (spxbegf < 2),
+        // else 4. ecpl flags are ignored when cplinu == false.
+        assert_eq!(remat_band_count_spx(false, 0, false, 0, true, 3), 3);
+        assert_eq!(remat_band_count_spx(false, 0, false, 0, true, 4), 4);
+        assert_eq!(remat_band_count_spx(false, 0, true, 9, true, 2), 3);
+
+        // Standard coupling (cplinu && !ecplinu): identical to
+        // `remat_band_count(true, cplbegf)`. The ecplbegf argument is
+        // ignored on this arm.
+        assert_eq!(remat_band_count_spx(true, 0, false, 9, false, 0), 2);
+        assert_eq!(remat_band_count_spx(true, 1, false, 9, false, 0), 3);
+        assert_eq!(remat_band_count_spx(true, 2, false, 9, false, 0), 3);
+        assert_eq!(remat_band_count_spx(true, 3, false, 9, false, 0), 4);
+        assert_eq!(remat_band_count_spx(true, 9, false, 9, false, 0), 4);
+
+        // Enhanced coupling (cplinu && ecplinu): thresholds the raw
+        // ecplbegf 0/1/2/<5/else → 0/1/2/3/4. cplbegf is ignored.
+        assert_eq!(remat_band_count_spx(true, 9, true, 0, false, 0), 0);
+        assert_eq!(remat_band_count_spx(true, 9, true, 1, false, 0), 1);
+        assert_eq!(remat_band_count_spx(true, 9, true, 2, false, 0), 2);
+        assert_eq!(remat_band_count_spx(true, 9, true, 3, false, 0), 3);
+        assert_eq!(remat_band_count_spx(true, 9, true, 4, false, 0), 3);
+        assert_eq!(remat_band_count_spx(true, 9, true, 5, false, 0), 4);
+        assert_eq!(remat_band_count_spx(true, 0, true, 15, false, 0), 4);
+        // SPX co-active with enhanced coupling: the cplinu arm wins (SPX
+        // only matters when coupling is off), so ecplbegf still drives it.
+        assert_eq!(remat_band_count_spx(true, 0, true, 0, true, 2), 0);
+        assert_eq!(remat_band_count_spx(true, 0, true, 5, true, 9), 4);
     }
 
     /// §E.3.6.3 spectral-extension coordinate decode. For exponent < 15

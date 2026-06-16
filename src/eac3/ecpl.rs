@@ -251,6 +251,11 @@ pub const MAX_ECPL_BND: usize = N_ECPL_SUBBND;
 /// `cplstre[blk]` is `0` (strategy reuse).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EcplStrategy {
+    /// Raw `ecplbegf` (§E.2.3.3.16) — the 4-bit begin-frequency code as
+    /// transmitted, before the [`begin_subbnd`] mapping. Retained because
+    /// the §E.3.3.2 `nrematbd` derivation thresholds the raw code directly
+    /// (0/1/2/<5), not the derived sub-band index.
+    pub ecplbegf: u8,
     /// `ecpl_begin_subbnd` — index of the first active sub-band
     /// (§E.2.3.3.16).
     pub begin_subbnd: usize,
@@ -339,6 +344,7 @@ pub fn parse_strategy(
 
     let necplbnd = necplbnd(begin, end, &bndstrc);
     Ok(EcplStrategy {
+        ecplbegf,
         begin_subbnd: begin,
         end_subbnd: end,
         bndstrc,
@@ -2027,6 +2033,7 @@ mod tests {
         let end = 2usize; // sub-bands 0,1 → bins 13..25
         let necpl = necplbnd(begin, end, &[false; N_ECPL_SUBBND]);
         let strategy = EcplStrategy {
+            ecplbegf: 0,
             begin_subbnd: begin,
             end_subbnd: end,
             bndstrc: [false; N_ECPL_SUBBND],

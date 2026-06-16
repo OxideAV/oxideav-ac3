@@ -79,8 +79,11 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   transform coefficients via the §E.3.5.5.4 complex product — replacing
   the standard §7.4 decouple. Frame-edge neighbours use zero carriers
   (the §E.3.5.5.1 "set to zero" rule); threading the adjacent frames'
-  edge coefficients across the two boundary blocks, and the 2/0
-  ecpl + rematrix band-count interaction, are follow-ups.
+  edge coefficients across the two boundary blocks is a follow-up. The
+  §E.3.3.2 `nrematbd` derivation now folds in enhanced coupling: a 2/0
+  `ecplinu` block sizes its rematrix-flag field from the raw `ecplbegf`
+  code (0/1/2/<5 → 0/1/2/3 bands, else 4) rather than `cplbegf`, keeping
+  the bit cursor aligned on enhanced-coupling 2/0 frames.
 - Encoder — independent + dependent substream pairs for 1.0 / 2.0 / 5.1
   / 7.1 layouts, with adaptive / frame-based exponent strategies. SPX
   and AHT are out of scope on the encoder side.

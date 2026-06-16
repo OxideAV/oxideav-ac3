@@ -849,13 +849,21 @@ pub fn decode_indep_audblks(
         if bsi.acmod == 0x2 {
             let rematstr = if blk == 0 { true } else { br.read_u32(1)? != 0 };
             if rematstr {
-                // §E.3.3.2 nrematbd — folds in spectral extension: when
-                // SPX is in use without coupling the band count drops to
-                // 3 for spxbegf < 2 (spx_begin_subbnd < 4). Using the
-                // base count here drifts the bit cursor on SPX frames.
+                // §E.3.3.2 nrematbd — folds in spectral extension AND
+                // enhanced coupling. When SPX is in use without coupling
+                // the band count drops to 3 for spxbegf < 2
+                // (spx_begin_subbnd < 4). When enhanced coupling is in use
+                // the count is sized from the raw `ecplbegf` (carried on
+                // the persistent `ecpl_strategy`, so a `cplstre == 0` reuse
+                // block keeps the prior strategy's begin code), NOT from
+                // `cpl_begf` (which the ecpl path never sets). Using the
+                // wrong arm drifts the bit cursor on ecpl / SPX 2/0 frames.
+                let ecplbegf = ecpl_strategy.as_ref().map_or(0, |s| s.ecplbegf);
                 let n_remat = crate::audblk::remat_band_count_spx(
                     cplinu,
                     state.cpl_begf,
+                    ecpl_in_use,
+                    ecplbegf,
                     state.spx_in_use,
                     state.spx_begin_subbnd,
                 );
@@ -1467,6 +1475,7 @@ fn run_deferred_ecpl_dsp(
     let zero_block = super::ecpl::EcplBlock {
         mant: [0.0; 256],
         strategy: super::ecpl::EcplStrategy {
+            ecplbegf: 0,
             begin_subbnd: 0,
             end_subbnd: 0,
             bndstrc: [false; super::ecpl::N_ECPL_SUBBND],
