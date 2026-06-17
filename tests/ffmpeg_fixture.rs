@@ -537,6 +537,139 @@ fn decoder_matches_ffmpeg_on_transient_fixture() {
     );
 }
 
+/// Regression gate for the v0.0.8 bug report: "railed bursts on complex
+/// input." Direct sample-count audit — if our decoder ever emits s16 at
+/// ±32767/±32768 while ffmpeg's reference decode of the same stream does
+/// not, this fails. Also checks peak levels track ffmpeg within a few LSBs
+/// once the round-14 lag alignment is applied (mis-aligned comparison was
+/// the actual source of the reported click/chirp artefacts).
+#[test]
+fn decoder_pcm_has_no_full_scale_samples_vs_ffmpeg() {
+    use std::process::Command;
+
+    let fixtures: &[(&str, &[u8])] = &[
+        ("sine", FIXTURE),
+        ("transient", TRANSIENT_FIXTURE),
+    ];
+
+    for &(label, ac3) in fixtures {
+        let tmp = std::env::temp_dir().join(format!("oxideav_ac3_rail_{label}.pcm"));
+        let src = if label == "transient" {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("transient_bursts_stereo.ac3")
+        } else {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("sine440_stereo.ac3")
+        };
+        let Ok(status) = Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&src)
+            .args(["-f", "s16le", "-acodec", "pcm_s16le", "-ac", "2"])
+            .arg(&tmp)
+            .status()
+        else {
+            eprintln!("ffmpeg unavailable — skipping rail gate ({label})");
+            continue;
+        };
+        if !status.success() {
+            eprintln!("ffmpeg failed — skipping rail gate ({label})");
+            continue;
+        }
+        let Ok(ref_pcm) = std::fs::read(&tmp) else {
+            continue;
+        };
+        let _ = std::fs::remove_file(&tmp);
+
+        let mut reg = CodecRegistry::new();
+        oxideav_ac3::register_codecs(&mut reg);
+        let params = CodecParameters::audio(CodecId::new("ac3"));
+        let mut dec = reg.first_decoder(&params).expect("make_decoder");
+        let mut our_pcm: Vec<u8> = Vec::with_capacity(ref_pcm.len());
+        let mut offset = 0;
+        let mut frame_idx: i64 = 0;
+        while offset < ac3.len() {
+            let si = syncinfo::parse(&ac3[offset..]).unwrap();
+            let flen = si.frame_length as usize;
+            let pkt = Packet::new(
+                0,
+                TimeBase::new(1, 48_000),
+                ac3[offset..offset + flen].to_vec(),
+            )
+            .with_pts(frame_idx * SAMPLES_PER_FRAME as i64);
+            dec.send_packet(&pkt).unwrap();
+            if let Ok(Frame::Audio(a)) = dec.receive_frame() {
+                our_pcm.extend_from_slice(&a.data[0]);
+            }
+            offset += flen;
+            frame_idx += 1;
+        }
+
+        let extract = |buf: &[u8]| -> Vec<i16> {
+            buf.chunks_exact(4)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect()
+        };
+        let our_l = extract(&our_pcm);
+        let ref_l = extract(&ref_pcm);
+        let skip = 768usize;
+        let usable = our_l.len().min(ref_l.len()).saturating_sub(skip);
+
+        let mut best_lag = 0i32;
+        let mut best_sse = f64::INFINITY;
+        for lag in -256i32..=256 {
+            let mut sse = 0.0f64;
+            let mut count = 0usize;
+            for i in 0..usable {
+                let a_idx = skip + i;
+                let b_idx = a_idx as i32 + lag;
+                if b_idx < 0 || (b_idx as usize) >= ref_l.len() {
+                    continue;
+                }
+                let d = our_l[a_idx] as f64 - ref_l[b_idx as usize] as f64;
+                sse += d * d;
+                count += 1;
+            }
+            if count > 0 && sse / (count as f64) < best_sse {
+                best_sse = sse / (count as f64);
+                best_lag = lag;
+            }
+        }
+
+        let rail = |s: &[i16]| {
+            s.iter()
+                .filter(|&&x| x == i16::MAX || x == i16::MIN)
+                .count()
+        };
+        let our_rail = rail(&our_l[skip..]);
+        let ref_rail = rail(&ref_l[skip..]);
+        assert_eq!(
+            our_rail, 0,
+            "{label}: decoder emitted {our_rail} full-scale samples"
+        );
+        assert_eq!(
+            ref_rail, 0,
+            "{label}: ffmpeg reference unexpectedly railed ({ref_rail})"
+        );
+
+        let peak = |s: &[i16]| s.iter().map(|x| x.abs()).max().unwrap_or(0);
+        let our_peak = peak(&our_l[skip..]);
+        let ref_peak = peak(&ref_l[skip..]);
+        let peak_diff = (our_peak - ref_peak).abs();
+        assert!(
+            peak_diff <= 4,
+            "{label}: peak mismatch ours={our_peak} ref={ref_peak} (lag={best_lag})"
+        );
+        eprintln!(
+            "{label}: rail=0, peak_diff={peak_diff}, lag={best_lag}, mse={:.4}",
+            best_sse
+        );
+    }
+}
+
 /// Generate a fresh 1/0 mono AC-3 stream via the `ffmpeg` binary (as a
 /// black box — we do not read its source) and verify our §5.4.3
 /// side-info parser survives 1-channel mode. Skips gracefully if
@@ -610,5 +743,96 @@ fn side_info_on_fresh_mono_ffmpeg_stream() {
     assert!(
         frames > 0,
         "no frames extracted from ffmpeg-generated mono ac3"
+    );
+}
+
+/// Regression for the v0.0.8 multitone @ 640 kbps bug: ffmpeg-encoded
+/// 4-tone stereo material must not rail our decoder to ±full-scale PCM.
+/// Our own encoder roundtrip is gated in `encoder::tests::
+/// four_tone_multitone_self_roundtrip_at_640k_has_no_pcm_rails`.
+#[test]
+fn ffmpeg_multitone_640k_decodes_without_pcm_rails() {
+    use std::process::Command;
+
+    let wav = std::env::temp_dir().join("oxideav_ac3_multitone.wav");
+    let ac3 = std::env::temp_dir().join("oxideav_ac3_multitone_640k.ac3");
+
+    let lavfi = "aevalsrc=0.15*(sin(2*PI*300*t)+sin(2*PI*900*t)+sin(2*PI*3000*t)+sin(2*PI*7000*t)):s=48000:d=4:c=stereo";
+    let Ok(st) = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            lavfi,
+        ])
+        .arg(&wav)
+        .status()
+    else {
+        eprintln!("ffmpeg unavailable — skipping multitone 640k rail gate");
+        return;
+    };
+    if !st.success() {
+        eprintln!("ffmpeg lavfi failed — skipping multitone 640k rail gate");
+        return;
+    }
+    let Ok(st) = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+        ])
+        .arg(&wav)
+        .args(["-c:a", "ac3", "-b:a", "640k"])
+        .arg(&ac3)
+        .status()
+    else {
+        eprintln!("ffmpeg unavailable — skipping multitone 640k rail gate");
+        return;
+    };
+    if !st.success() {
+        eprintln!("ffmpeg ac3 encode failed — skipping multitone 640k rail gate");
+        return;
+    }
+    let Ok(data) = std::fs::read(&ac3) else {
+        eprintln!("no encoded output — skipping");
+        return;
+    };
+    let _ = std::fs::remove_file(&wav);
+    let _ = std::fs::remove_file(&ac3);
+
+    let mut p = CodecParameters::audio(CodecId::new("ac3"));
+    p.channels = Some(2);
+    p.sample_rate = Some(48_000);
+    let mut dec = oxideav_ac3::decoder::make_decoder(&p).unwrap();
+    let tb = TimeBase::new(1, 48_000);
+    let (mut spikes, mut total, mut off) = (0u64, 0u64, 0usize);
+    while off + 5 <= data.len() {
+        let flen = syncinfo::parse(&data[off..]).unwrap().frame_length as usize;
+        if off + flen > data.len() {
+            break;
+        }
+        dec.send_packet(&Packet::new(0, tb, data[off..off + flen].to_vec()))
+            .unwrap();
+        if let Ok(Frame::Audio(af)) = dec.receive_frame() {
+            for c in af.data[0].chunks_exact(2) {
+                let s = i16::from_le_bytes([c[0], c[1]]);
+                total += 1;
+                if s.unsigned_abs() >= 32760 {
+                    spikes += 1;
+                }
+            }
+        }
+        off += flen;
+    }
+    assert!(
+        spikes == 0,
+        "ffmpeg multitone @ 640k: {spikes}/{total} full-scale samples ({:.2}%)",
+        100.0 * spikes as f64 / total.max(1) as f64
     );
 }

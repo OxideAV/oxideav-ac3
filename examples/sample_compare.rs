@@ -1,8 +1,6 @@
 //! Per-block PSNR + peak diff between our decoder's PCM and ffmpeg's
 //! reference decode of the same AC-3 stream. Used to localise residual
-//! drift on burst frames where the per-frame PSNR floor (currently
-//! ≈15 dB on `transient_bursts_stereo.ac3`) hides which sub-block is
-//! actually breaking.
+//! drift on burst frames.
 //!
 //! Usage: `sample_compare [<file.ac3>] [<first_frame>] [<last_frame>]`
 //!
@@ -72,10 +70,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let usable = our_l.len().min(ref_l.len()).saturating_sub(skip);
     let mut best_lag = 0i32;
     let mut best_sse = f64::INFINITY;
+    // Lag search across the full usable region — the round-14 fix in
+    // `tests/ffmpeg_fixture.rs`. A narrow pre-burst sine window picks a
+    // periodic false minimum and makes burst blocks look railed.
     for lag in -512i32..=512 {
         let mut sse = 0.0f64;
         let mut count = 0;
-        for i in 0..usable.min(2048) {
+        for i in 0..usable {
             let a_idx = (skip + i) as i32;
             let b_idx = a_idx + lag;
             if b_idx < 0 || (b_idx as usize) >= ref_l.len() {
