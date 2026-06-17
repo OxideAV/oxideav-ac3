@@ -411,7 +411,10 @@ mod ba_table_audit {
     #[test]
     fn floortab_t7_10() {
         // Spec address 7 is 0xf800 (signed 16-bit = -2048); we store -2048.
-        assert_eq!(FLOORTAB, [0x2f0, 0x2b0, 0x270, 0x230, 0x1f0, 0x170, 0x0f0, -2048]);
+        assert_eq!(
+            FLOORTAB,
+            [0x2f0, 0x2b0, 0x270, 0x230, 0x1f0, 0x170, 0x0f0, -2048]
+        );
     }
 
     #[test]

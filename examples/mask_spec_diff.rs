@@ -14,6 +14,7 @@
 //! the fault is upstream (PSD/exponents); disagreement localizes it here.
 //!
 //! Run: cargo run --example mask_spec_diff -- white 0 0
+#![allow(clippy::needless_range_loop)]
 use oxideav_ac3::audblk::{compare_channel_ba_ref, state_after_block};
 use oxideav_ac3::tables::{DBPBTAB, FASTDEC, FASTGAIN, HTH, MASKTAB, SLOWDEC, SLOWGAIN};
 use oxideav_ac3::{bsi, syncinfo};
@@ -119,7 +120,11 @@ fn spec_calc_mask_fbw(
         for seg in 0..deltnseg {
             band += deltoffst[seg] as usize;
             let raw = deltba[seg] as i32;
-            let delta = if raw >= 4 { (raw - 3) << 7 } else { (raw - 4) << 7 };
+            let delta = if raw >= 4 {
+                (raw - 3) << 7
+            } else {
+                (raw - 4) << 7
+            };
             for _ in 0..deltlen[seg] {
                 if band < 50 {
                     mask[band] += delta;
@@ -151,9 +156,17 @@ fn nth_frame(data: &[u8], index: usize) -> Option<(usize, usize)> {
 
 fn main() {
     let dir = std::env::var("TEMP").unwrap() + r"\oxideav_repro";
-    let stem = std::env::args().nth(1).unwrap_or_else(|| "white".to_string());
-    let frame_idx: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let blk: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let stem = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "white".to_string());
+    let frame_idx: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let blk: usize = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let path = format!("{dir}\\{stem}.ac3");
     let data = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
@@ -185,7 +198,9 @@ fn main() {
             continue;
         }
         let bndend = MASKTAB[end - 1] as usize + 1;
-        let bndpsd: Vec<i32> = (0..50).map(|b| state.channels[ch].bndpsd[b] as i32).collect();
+        let bndpsd: Vec<i32> = (0..50)
+            .map(|b| state.channels[ch].bndpsd[b] as i32)
+            .collect();
 
         let fgain = FASTGAIN[state.fgaincod[ch] as usize];
         let spec_mask = spec_calc_mask_fbw(
@@ -224,7 +239,10 @@ fn main() {
         } else {
             println!("  spec-vs-live mask: {} band(s) DIFFER:", diffs.len());
             for (band, live, spec) in diffs.iter().take(30) {
-                println!("    band {band:2}: live={live} spec={spec} delta={}", live - spec);
+                println!(
+                    "    band {band:2}: live={live} spec={spec} delta={}",
+                    live - spec
+                );
             }
         }
         println!(

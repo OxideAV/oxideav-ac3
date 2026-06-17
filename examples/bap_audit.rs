@@ -68,7 +68,9 @@ fn nth_frame(data: &[u8], index: usize) -> Option<(usize, usize)> {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: bap_audit <file.ac3> [frame]");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: bap_audit <file.ac3> [frame]");
     let frame_index: usize = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())
@@ -120,7 +122,10 @@ fn main() {
         let audits2 = audit_frame_blocks(&si2, &bsi2, frame2).unwrap();
         if let (Some(a_bad), Some(a_good)) = (audits.first(), audits2.first()) {
             println!();
-            println!("--- frame {frame_index} blk0 vs frame {} blk0 ---", frame_index + 1);
+            println!(
+                "--- frame {frame_index} blk0 vs frame {} blk0 ---",
+                frame_index + 1
+            );
             println!("end_mant: {:?} vs {:?}", a_bad.end_mant, a_good.end_mant);
             println!(
                 "mantissa: actual {} vs {} | pack {} vs {} | walk {} vs {}",
@@ -200,10 +205,7 @@ fn main() {
                 }
             }
         }
-        let best = ok_hits
-            .iter()
-            .min_by_key(|(d, _, _)| d.abs())
-            .unwrap();
+        let best = ok_hits.iter().min_by_key(|(d, _, _)| d.abs()).unwrap();
         println!(
             "nearest parse_ok hit: delta={:+} (bit {}) — positive delta => blk0 under-read by that many bits",
             best.0, best.2

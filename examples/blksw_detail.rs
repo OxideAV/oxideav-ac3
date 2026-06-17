@@ -3,7 +3,9 @@ use oxideav_ac3::audblk::parse_frame_side_info;
 use oxideav_ac3::{bsi, syncinfo};
 fn main() {
     let dir = std::env::var("TEMP").unwrap() + r"\oxideav_repro";
-    let stem = std::env::args().nth(1).unwrap_or_else(|| "white".to_string());
+    let stem = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "white".to_string());
     let data = std::fs::read(format!("{dir}\\{stem}.ac3")).unwrap();
     let mut off = 0usize;
     for f in 0..12 {
@@ -22,7 +24,10 @@ fn main() {
             .map(|(bi, sb)| {
                 format!(
                     "b{bi}[{}]",
-                    sb.blksw[..nf].iter().map(|&x| if x { 'S' } else { '.' }).collect::<String>()
+                    sb.blksw[..nf]
+                        .iter()
+                        .map(|&x| if x { 'S' } else { '.' })
+                        .collect::<String>()
                 )
             })
             .collect();

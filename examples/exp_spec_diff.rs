@@ -11,6 +11,7 @@
 //! fires here would be a silent divergence from ffmpeg.
 //!
 //! Run: cargo run --example exp_spec_diff -- white 0 0
+#![allow(clippy::needless_range_loop)]
 use oxideav_ac3::audblk::{peek_bits_post_bsi, state_after_block, trace_block_side_info};
 use oxideav_ac3::{bsi, syncinfo};
 
@@ -70,9 +71,17 @@ fn mark<'a>(marks: &'a [oxideav_ac3::audblk::SideInfoMark], label: &str) -> Opti
 
 fn main() {
     let dir = std::env::var("TEMP").unwrap() + r"\oxideav_repro";
-    let stem = std::env::args().nth(1).unwrap_or_else(|| "white".to_string());
-    let frame_idx: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let blk: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let stem = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "white".to_string());
+    let frame_idx: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let blk: usize = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let path = format!("{dir}\\{stem}.ac3");
     let data = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
@@ -90,9 +99,14 @@ fn main() {
     let start_label = "after_chbwcod";
     let end_labels = ["after_ch0_exponents", "after_ch1_exponents"];
 
-    println!("stream={stem}.ac3 frame={frame_idx} blk={blk} nfchans={nfchans} cplinu={}", state.cpl_in_use);
+    println!(
+        "stream={stem}.ac3 frame={frame_idx} blk={blk} nfchans={nfchans} cplinu={}",
+        state.cpl_in_use
+    );
     if state.cpl_in_use {
-        println!("NOTE: coupling in use — ch0 field start offset would include cpl exps; skipping.");
+        println!(
+            "NOTE: coupling in use — ch0 field start offset would include cpl exps; skipping."
+        );
         return;
     }
 
@@ -110,7 +124,11 @@ fn main() {
             .collect();
         // Infer grpsize from coverage: ngrps*3 differentials cover end-1 bins.
         let diffs = ngrps * 3;
-        let grpsize = if diffs == 0 { 1 } else { ((end - 1) + diffs - 1) / diffs };
+        let grpsize = if diffs == 0 {
+            1
+        } else {
+            (end - 1).div_ceil(diffs)
+        };
 
         let (exps, oor) = decode_exp_independent(absexp, &groups, grpsize, end);
 

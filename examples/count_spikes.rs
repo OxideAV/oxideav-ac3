@@ -2,10 +2,12 @@
 //!
 //! Usage: `cargo run --example count_spikes -- <file.ac3>`
 
-use oxideav_core::{CodecId, CodecParameters, Decoder, Frame, Packet, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: count_spikes <file.ac3>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: count_spikes <file.ac3>");
     let data = std::fs::read(&path).unwrap();
     let mut p = CodecParameters::audio(CodecId::new("ac3"));
     p.channels = Some(2);

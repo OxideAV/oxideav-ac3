@@ -5,7 +5,9 @@
 //!
 //! Default: compare frames 2 (bad) vs 3 (good), block 0.
 
-use oxideav_ac3::audblk::{peek_bits_post_bsi, trace_block_side_info, try_parse_next_block, SideInfoMark};
+use oxideav_ac3::audblk::{
+    peek_bits_post_bsi, trace_block_side_info, try_parse_next_block, SideInfoMark,
+};
 use oxideav_ac3::bsi;
 use oxideav_ac3::syncinfo;
 
@@ -57,9 +59,17 @@ fn diff_traces(a: &[SideInfoMark], b: &[SideInfoMark]) {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: side_info_trace <file.ac3> [a] [b]");
-    let fa: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(2);
-    let fb: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(3);
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: side_info_trace <file.ac3> [a] [b]");
+    let fa: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let fb: usize = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
     let data = std::fs::read(&path).unwrap();
 
     let frame_a = nth_frame(&data, fa).unwrap_or_else(|| panic!("frame {fa} missing"));
@@ -107,10 +117,7 @@ fn main() {
 
     println!();
     println!("--- blk1 parse probe (after blk0) ---");
-    for (fi, frame, si, bsi) in [
-        (fa, &frame_a, &si_a, &bsi_a),
-        (fb, &frame_b, &si_b, &bsi_b),
-    ] {
+    for (fi, frame, si, bsi) in [(fa, &frame_a, &si_a, &bsi_a), (fb, &frame_b, &si_b, &bsi_b)] {
         for delta in [0i32, 1, 36] {
             let (ok, end, err) = try_parse_next_block(si, bsi, frame, 0, delta);
             let base = trace_block_side_info(si, bsi, frame, 0)

@@ -10,14 +10,16 @@
 
 use oxideav_ac3::audblk::{count_mantissa_bits_walk, state_after_block, MAX_FBW};
 use oxideav_ac3::bsi;
-use oxideav_ac3::encoder::{count_mantissa_bits_encoder_pack, count_mantissa_stream_bits, mantissa_codes_from_decoder_state};
+use oxideav_ac3::encoder::{
+    count_mantissa_bits_encoder_pack, count_mantissa_stream_bits, mantissa_codes_from_decoder_state,
+};
 use oxideav_ac3::syncinfo;
 use oxideav_ac3::tables::QUANTIZATION_BITS;
 
 #[derive(Clone, Debug)]
 struct CodeEntry {
     idx: usize,
-  /// Oxideav fbw index (0..nfchans-1) or `MAX_FBW` (cpl) or `MAX_FBW+1` (lfe).
+    /// Oxideav fbw index (0..nfchans-1) or `MAX_FBW` (cpl) or `MAX_FBW+1` (lfe).
     ch: usize,
     ch_label: String,
     bin: usize,
@@ -167,11 +169,18 @@ fn main() {
     let path = std::env::args()
         .nth(1)
         .expect("usage: mantissa_code_order <file.ac3> [frame] [blk]");
-    let frame_index: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let blk: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let frame_index: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let blk: usize = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let data = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    let frame = nth_frame(&data, frame_index).unwrap_or_else(|| panic!("frame {frame_index} missing"));
+    let frame =
+        nth_frame(&data, frame_index).unwrap_or_else(|| panic!("frame {frame_index} missing"));
     let si = syncinfo::parse(&frame).unwrap();
     let bsi = bsi::parse(&frame[5..]).unwrap();
 
@@ -238,7 +247,7 @@ fn main() {
     };
 
     println!("--- code index (compare to ac3dec mantissa read order) ---");
-    println!("{:>5} {:>6} {:>4} {:>4}  {}", "idx", "ch", "bin", "bap", "notes");
+    println!("{:>5} {:>6} {:>4} {:>4}  notes", "idx", "ch", "bin", "bap");
     let mut group_id = 0u32;
     let mut emit_iter = emits.iter().peekable();
     for e in labeled.iter().take(limit) {
@@ -263,7 +272,10 @@ fn main() {
         );
     }
     if limit < labeled.len() {
-        println!("... {} more (set MANT_ORDER_FULL=1 for all)", labeled.len() - limit);
+        println!(
+            "... {} more (set MANT_ORDER_FULL=1 for all)",
+            labeled.len() - limit
+        );
     }
 
     println!();

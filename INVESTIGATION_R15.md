@@ -2,7 +2,7 @@
 
 **Status**: **resolved** (session 7). Root cause: **8 incorrect `LATAB`
 entries** in `src/tables.rs` (log-add table used by
-`integrate_band_psd`). Session-4 band-aid removed (session 5). Mantissa
+`integrate_band_psd`). Session-4 added a band-aid to production code but it was removed (session 5). Mantissa
 **decode order**, **group flush**, and **encoder pack schedule** are
 line-matched to `outside_src/libavcodec/ac3dec.c` / `ac3enc.c` — **not**
 the defect.

@@ -635,7 +635,9 @@ fn rerun_channel_bit_allocation(
 
 #[allow(dead_code)]
 fn copy_channel_bap(state: &mut Ac3State, trial: &Ac3State, ch: usize) {
-    state.channels[ch].bap.copy_from_slice(&trial.channels[ch].bap);
+    state.channels[ch]
+        .bap
+        .copy_from_slice(&trial.channels[ch].bap);
     state.snr_offset_ch[ch] = trial.snr_offset_ch[ch];
 }
 
@@ -718,7 +720,7 @@ fn score_ba_trial(
 /// Per-channel ±1 `fsnroffst` SNR retune when parsed BA under-reads mantissas
 /// vs the bitstream (threshold fsnroffst frames). Only adjusts BAP, not
 /// side-info storage.
-#[allow(dead_code)]
+#[allow(clippy::too_many_arguments, dead_code)]
 fn retune_per_channel_snr_if_needed(
     state: &mut Ac3State,
     si: &SyncInfo,
@@ -752,17 +754,11 @@ fn retune_per_channel_snr_if_needed(
             let mut trial = base.clone();
             trial.snr_offset_ch[ch] += delta << 2;
             rerun_channel_bit_allocation(&mut trial, ch, si, bit_alloc_stages);
-            let Some(score) = score_ba_trial(
-                &trial,
-                si,
-                bsi,
-                post_sync,
-                blk,
-                pre_mantissa_bit,
-            ) else {
+            let Some(score) = score_ba_trial(&trial, si, bsi, post_sync, blk, pre_mantissa_bit)
+            else {
                 continue;
             };
-            if best.as_ref().is_none_or(|(_, s, _)| score > *s) {
+            if best.as_ref().map_or(true, |(_, s, _)| score > *s) {
                 best = Some((trial, score, ch));
             }
         }
@@ -778,6 +774,7 @@ fn retune_per_channel_snr_if_needed(
 /// authoritative reference for bit-order. Consumes exactly as many
 /// bits as the spec prescribes, up to the end of the skip field; the
 /// tail-end mantissas are then parsed by [`unpack_mantissas`].
+#[allow(clippy::too_many_arguments, clippy::needless_option_as_deref)]
 pub(crate) fn parse_audblk_into(
     state: &mut Ac3State,
     si: &SyncInfo,
@@ -928,10 +925,7 @@ pub(crate) fn parse_audblk_into(
         trace.as_deref_mut(),
         "after_cpl",
         br,
-        Some(format!(
-            "cplstre={cplstre} cplinu={}",
-            state.cpl_in_use
-        )),
+        Some(format!("cplstre={cplstre} cplinu={}", state.cpl_in_use)),
     );
 
     // §5.4.3.14 cplcoe[ch], §5.4.3.15 mstrcplco[ch], §5.4.3.16 cplcoexp,
@@ -1035,9 +1029,7 @@ pub(crate) fn parse_audblk_into(
         trace.as_deref_mut(),
         "after_chbwcod",
         br,
-        Some(format!(
-            "chexpstr={chexpstr:?} chbwcod={chbwcod:?}"
-        )),
+        Some(format!("chexpstr={chexpstr:?} chbwcod={chbwcod:?}")),
     );
 
     // --- unpack coupling exponents ---
@@ -1569,10 +1561,7 @@ pub(crate) fn parse_audblk_into(
         trace.as_deref_mut(),
         "pre_mantissa",
         br,
-        Some(format!(
-            "fsnroffst={:?}",
-            &state.fsnroffst[..nfchans]
-        )),
+        Some(format!("fsnroffst={:?}", &state.fsnroffst[..nfchans])),
     );
     if let Some((oblk, ref bap)) = state.bap_override {
         if blk == oblk {
@@ -1761,7 +1750,12 @@ pub(crate) fn run_bit_allocation_staged(
             let e = state.channels[ch].exp[bin] as i32;
             state.channels[ch].psd[bin] = (3072 - (e << 7)) as i16;
         }
-        integrate_band_psd(&state.channels[ch].psd, start, end, &mut state.channels[ch].bndpsd);
+        integrate_band_psd(
+            &state.channels[ch].psd,
+            start,
+            end,
+            &mut state.channels[ch].bndpsd,
+        );
     }
 
     let mut mask = [0i32; 50];
@@ -1926,13 +1920,7 @@ pub(crate) fn run_bit_allocation_staged(
             };
             eprintln!(
                 "TRACE frame={} blk={} {} stage={} bndstrt={} bndend={} snroffset={:#x}",
-                state.frame_counter,
-                state.blkidx,
-                label,
-                stage,
-                bndstrt,
-                bndend,
-                snr_offset
+                state.frame_counter, state.blkidx, label, stage, bndstrt, bndend, snr_offset
             );
         }
     }
@@ -1950,8 +1938,7 @@ pub(crate) fn run_bit_allocation(
     fgaincod: u8,
     is_coupling: bool,
 ) {
-    let snroffset =
-        (((state.snroffst_coarse as i32 - 15) << 4) + fsnroffst as i32) << 2;
+    let snroffset = (((state.snroffst_coarse as i32 - 15) << 4) + fsnroffst as i32) << 2;
     run_bit_allocation_staged(
         state,
         ch,
@@ -1964,7 +1951,6 @@ pub(crate) fn run_bit_allocation(
         3,
     );
 }
-
 
 /// Recompute `bndpsd` from per-bin `psd` (diagnostic; matches [`integrate_band_psd`]).
 pub fn reintegrate_bndpsd(psd: &[i16], start: usize, end: usize) -> [i16; 50] {
@@ -2508,32 +2494,30 @@ pub fn count_mantissa_bits_walk(state: &Ac3State, bsi: &Bsi) -> u32 {
     let mut g2_left = 0u32;
     let mut g4_left = 0u32;
     let mut got_cplchan = false;
-    let mut charge = |bap: u8| {
-        match bap {
-            0 => {}
-            1 => {
-                if g1_left == 0 {
-                    total += 5;
-                    g1_left = 3;
-                }
-                g1_left -= 1;
+    let mut charge = |bap: u8| match bap {
+        0 => {}
+        1 => {
+            if g1_left == 0 {
+                total += 5;
+                g1_left = 3;
             }
-            2 => {
-                if g2_left == 0 {
-                    total += 7;
-                    g2_left = 3;
-                }
-                g2_left -= 1;
-            }
-            4 => {
-                if g4_left == 0 {
-                    total += 7;
-                    g4_left = 2;
-                }
-                g4_left -= 1;
-            }
-            b => total += crate::tables::QUANTIZATION_BITS[b as usize] as u32,
+            g1_left -= 1;
         }
+        2 => {
+            if g2_left == 0 {
+                total += 7;
+                g2_left = 3;
+            }
+            g2_left -= 1;
+        }
+        4 => {
+            if g4_left == 0 {
+                total += 7;
+                g4_left = 2;
+            }
+            g4_left -= 1;
+        }
+        b => total += crate::tables::QUANTIZATION_BITS[b as usize] as u32,
     };
     for ch in 0..nfchans {
         let end = state.channels[ch].end_mant;
@@ -2662,11 +2646,7 @@ pub fn search_encoder_snr_for_mant_budget(
 }
 
 /// Find lowest SNR search index whose walk count is >= `target_mant`.
-pub fn search_snr_for_mant_target(
-    state: &Ac3State,
-    bsi: &Bsi,
-    target_mant: u32,
-) -> (u32, u32) {
+pub fn search_snr_for_mant_target(state: &Ac3State, bsi: &Bsi, target_mant: u32) -> (u32, u32) {
     let mut lo = snr_search_index_from_offset(state.snr_offset_ch[0]);
     let mut hi = (lo + 64).min(1023);
     let mant_at = |idx: u32| -> u32 {
@@ -2690,11 +2670,7 @@ pub fn search_snr_for_mant_target(
 }
 
 /// Walk mantissa bit count after replacing fbw `bap[]` on a cloned block state.
-pub fn count_walk_with_bap(
-    state: &Ac3State,
-    bsi: &Bsi,
-    bap: &[[u8; N_COEFFS]; MAX_FBW],
-) -> u32 {
+pub fn count_walk_with_bap(state: &Ac3State, bsi: &Bsi, bap: &[[u8; N_COEFFS]; MAX_FBW]) -> u32 {
     let nfchans = bsi.nfchans as usize;
     let mut st = state.clone();
     for ch in 0..nfchans {
@@ -2710,7 +2686,7 @@ pub fn cluster_bap_diffs(diffs: &[(usize, u8, u8)]) -> Vec<(usize, usize, i32)> 
     let mut i = 0usize;
     while i < diffs.len() {
         let start = diffs[i].0;
-        let mut end = start;
+        let mut end;
         let mut naive_delta = 0i32;
         loop {
             let (bin, a, b) = diffs[i];
@@ -2756,9 +2732,7 @@ pub fn apply_cluster_patches(
 /// Copy fbw BAP arrays from one block audit into override form.
 pub fn bap_override_from_audit(audit: &BlockBitAudit, nfchans: usize) -> [[u8; N_COEFFS]; MAX_FBW] {
     let mut out = [[0u8; N_COEFFS]; MAX_FBW];
-    for ch in 0..nfchans {
-        out[ch] = audit.bap_ch[ch];
-    }
+    out[..nfchans].copy_from_slice(&audit.bap_ch[..nfchans]);
     out
 }
 
@@ -2868,7 +2842,9 @@ pub fn audit_frame_blocks(
         let mantissa_bits_pack = crate::encoder::count_mantissa_bits_encoder_pack(&state, bsi);
         let mantissa_bits_histo = mantissa_bits_from_histo(&combined);
         let side_info_bits = metrics.bit_pre_mantissa.saturating_sub(bit_block_start);
-        let mantissa_bits_actual = metrics.bit_block_end.saturating_sub(metrics.bit_pre_mantissa);
+        let mantissa_bits_actual = metrics
+            .bit_block_end
+            .saturating_sub(metrics.bit_pre_mantissa);
         out.push(BlockBitAudit {
             blk,
             parse_ok,
@@ -2941,7 +2917,11 @@ pub fn try_parse_next_block(
         state.blkidx = blk;
         let mut side = AudBlkSideInfo::default();
         if parse_audblk_into(&mut state, si, bsi, &mut br, &mut side, None, None, None).is_err() {
-            return (false, br.bit_position(), Some(format!("blk{blk} setup failed")));
+            return (
+                false,
+                br.bit_position(),
+                Some(format!("blk{blk} setup failed")),
+            );
         }
     }
     let base = br.bit_position();
@@ -3022,7 +3002,8 @@ pub fn probe_next_block_alignment(
         let mut st2 = state_snapshot.clone();
         st2.blkidx = next_blk;
         let mut side2 = AudBlkSideInfo::default();
-        let ok = parse_audblk_into(&mut st2, si, bsi, &mut br2, &mut side2, None, None, None).is_ok();
+        let ok =
+            parse_audblk_into(&mut st2, si, bsi, &mut br2, &mut side2, None, None, None).is_ok();
         hits.push((delta, ok, try_pos));
     }
     Ok(hits)
@@ -3259,8 +3240,7 @@ pub struct BinBaDetail {
 pub fn ba_globals(state: &Ac3State, ch: usize) -> BaGlobals {
     let floor = FLOORTAB[state.floorcod as usize];
     let fsnroffst = state.fsnroffst[ch];
-    let snroffset =
-        (((state.snroffst_coarse as i32 - 15) << 4) + fsnroffst as i32) << 2;
+    let snroffset = (((state.snroffst_coarse as i32 - 15) << 4) + fsnroffst as i32) << 2;
     BaGlobals {
         sdcycod: state.sdcycod,
         fdcycod: state.fdcycod,
@@ -3280,8 +3260,7 @@ pub fn ba_globals(state: &Ac3State, ch: usize) -> BaGlobals {
 pub fn bin_ba_detail(state: &Ac3State, ch: usize, bin: usize) -> BinBaDetail {
     let band = MASKTAB[bin] as usize;
     let floor = FLOORTAB[state.floorcod as usize];
-    let snroffset =
-        (((state.snroffst_coarse as i32 - 15) << 4) + state.fsnroffst[ch] as i32) << 2;
+    let snroffset = (((state.snroffst_coarse as i32 - 15) << 4) + state.fsnroffst[ch] as i32) << 2;
     let mut m = state.channels[ch].mask[band] as i32;
     m -= snroffset;
     m -= floor;
@@ -3330,8 +3309,7 @@ pub fn compare_channel_ba_ref(
     let end = state.channels[ch].end_mant;
     let fsnroffst = state.fsnroffst[ch];
     let floor = FLOORTAB[state.floorcod as usize];
-    let snroffset =
-        (((state.snroffst_coarse as i32 - 15) << 4) + fsnroffst as i32) << 2;
+    let snroffset = (((state.snroffst_coarse as i32 - 15) << 4) + fsnroffst as i32) << 2;
     let sr_shift = state.sr_shift;
     let sdecay = SLOWDEC[state.sdcycod as usize] >> sr_shift;
     let fdecay = FASTDEC[state.fdcycod as usize] >> sr_shift;
@@ -4488,8 +4466,14 @@ mod multitone_fixture_tests {
         let ch0_14 = full_frame_parses(&si, &bsi, &frame, Some([14, 13, 0, 0, 0]));
         // LATAB fix (session 6): parsed [13,13] now fully parses frame 2.
         // ch1=14 still parses; ch0=14 remains a false positive.
-        assert!(parsed, "parsed [13,13] should fully parse frame 2 after LATAB fix");
+        assert!(
+            parsed,
+            "parsed [13,13] should fully parse frame 2 after LATAB fix"
+        );
         assert!(ch1_14, "ch1=14 should fully parse frame 2");
-        assert!(!ch0_14, "ch0=14 false positive should not fully parse frame 2");
+        assert!(
+            !ch0_14,
+            "ch0=14 false positive should not fully parse frame 2"
+        );
     }
 }

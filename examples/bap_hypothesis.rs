@@ -6,13 +6,20 @@
 //! Usage:
 //!   cargo run --example bap_hypothesis -- [file.ac3]
 
+#![allow(
+    clippy::needless_borrow,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    unused_variables
+)]
+
 use oxideav_ac3::audblk::{
-    apply_cluster_patches, audit_frame_blocks, ba_globals, bap_override_from_audit,
-    bin_ba_detail, cluster_bap_diffs, compare_channel_ba_ref, count_mantissa_bits_walk,
-    count_walk_with_bap, diff_bap_bins, ffmpeg_encoder_mant_bits_from_histo, patch_bap_bins,
-    probe_blk1_after_fsnroffst, rerun_all_bap_unified_snr, search_encoder_snr_for_mant_budget,
-    search_snr_for_mant_target, snr_offset_from_search_index, snr_search_index_from_offset,
-    state_after_block, Ac3State, MAX_FBW, N_COEFFS,
+    apply_cluster_patches, audit_frame_blocks, ba_globals, bap_override_from_audit, bin_ba_detail,
+    cluster_bap_diffs, compare_channel_ba_ref, count_mantissa_bits_walk, count_walk_with_bap,
+    diff_bap_bins, ffmpeg_encoder_mant_bits_from_histo, patch_bap_bins, probe_blk1_after_fsnroffst,
+    rerun_all_bap_unified_snr, search_encoder_snr_for_mant_budget, search_snr_for_mant_target,
+    snr_offset_from_search_index, snr_search_index_from_offset, state_after_block, Ac3State,
+    MAX_FBW, N_COEFFS,
 };
 use oxideav_ac3::bsi::{self, Bsi};
 use oxideav_ac3::syncinfo;
@@ -99,8 +106,7 @@ fn decode_frame_with_bap(
                 let mut state = Ac3State::new();
                 state.bap_override = Some((blk, bap));
                 let mut raw = vec![0f32; 1536 * nchans];
-                oxideav_ac3::audblk::decode_frame(&mut state, &si, &bsi, frame, &mut raw)
-                    .ok()?;
+                oxideav_ac3::audblk::decode_frame(&mut state, &si, &bsi, frame, &mut raw).ok()?;
                 return Some(
                     raw.iter()
                         .map(|s| {
@@ -198,7 +204,11 @@ fn print_bin_ba_trace(
     }
 }
 
-fn full_frame_parses_with_bap(data: &[u8], frame_idx: usize, bap: [[u8; N_COEFFS]; MAX_FBW]) -> bool {
+fn full_frame_parses_with_bap(
+    data: &[u8],
+    frame_idx: usize,
+    bap: [[u8; N_COEFFS]; MAX_FBW],
+) -> bool {
     let (off, len) = match nth_frame(data, frame_idx) {
         Some(v) => v,
         None => return false,
@@ -287,8 +297,8 @@ fn build_cluster_units(
         .map(|(lo, hi, naive)| {
             let mut trial = base_bap;
             apply_cluster_patches(&mut trial, neighbor_bap, ch, &[(lo, hi)]);
-            let walk_delta =
-                count_walk_with_bap(st, bsi, &trial) as i32 - count_walk_with_bap(st, bsi, &base_bap) as i32;
+            let walk_delta = count_walk_with_bap(st, bsi, &trial) as i32
+                - count_walk_with_bap(st, bsi, &base_bap) as i32;
             ClusterUnit {
                 ch,
                 lo,
@@ -368,15 +378,7 @@ fn bisect_frame4_gap(data: &[u8]) {
     for u in &units {
         let mut bap = base_bap;
         apply_units(&mut bap, &neighbor_bap, std::slice::from_ref(u));
-        let s = score_patch(
-            data,
-            FI,
-            bap,
-            &ff,
-            &st,
-            &bsi_p,
-            &u.label(),
-        );
+        let s = score_patch(data, FI, bap, &ff, &st, &bsi_p, &u.label());
         println!(
             "{:<18} {:>7} {:>7} {:>7} {:>7} {:>8}",
             u.label(),
@@ -437,7 +439,10 @@ fn bisect_frame4_gap(data: &[u8]) {
             let w = count_walk_with_bap(&st, &bsi_p, &bap);
             if w >= budget {
                 let s = score_patch(data, FI, bap, &ff, &st, &bsi_p, "greedy-low-spikes+");
-                println!("greedy (lowest spikes per cluster), {} units:", picked.len());
+                println!(
+                    "greedy (lowest spikes per cluster), {} units:",
+                    picked.len()
+                );
                 print_score(&s, Some(budget));
                 print!("    ");
                 for p in &picked {
@@ -486,13 +491,12 @@ fn bisect_frame4_gap(data: &[u8]) {
     }
 
     // Triple search on top walkΔ clusters (cap n for runtime).
-    let mut top_units: Vec<ClusterUnit> = positive
-        .iter()
-        .take(18)
-        .map(|u| (*u).clone())
-        .collect();
+    let mut top_units: Vec<ClusterUnit> = positive.iter().take(18).map(|u| (*u).clone()).collect();
     top_units.sort_by_key(|u| -u.walk_delta);
-    println!("\n--- triple search (top {} positive clusters) ---", top_units.len());
+    println!(
+        "\n--- triple search (top {} positive clusters) ---",
+        top_units.len()
+    );
     let mut best_triples: Vec<(i32, PatchScore)> = Vec::new();
     for i in 0..top_units.len() {
         for j in (i + 1)..top_units.len() {
@@ -500,11 +504,18 @@ fn bisect_frame4_gap(data: &[u8]) {
                 let u1 = &top_units[i];
                 let u2 = &top_units[j];
                 let u3 = &top_units[k];
-                if clusters_conflict(u1, u2) || clusters_conflict(u1, u3) || clusters_conflict(u2, u3) {
+                if clusters_conflict(u1, u2)
+                    || clusters_conflict(u1, u3)
+                    || clusters_conflict(u2, u3)
+                {
                     continue;
                 }
                 let mut bap = base_bap;
-                apply_units(&mut bap, &neighbor_bap, &[u1.clone(), u2.clone(), u3.clone()]);
+                apply_units(
+                    &mut bap,
+                    &neighbor_bap,
+                    &[u1.clone(), u2.clone(), u3.clone()],
+                );
                 let walk = count_walk_with_bap(&st, &bsi_p, &bap);
                 if walk < budget.saturating_sub(2) || walk > budget + 6 {
                     continue;
@@ -532,10 +543,16 @@ fn bisect_frame4_gap(data: &[u8]) {
         .filter(|s| s.spikes == 0 && s.parse_ok && s.walk >= budget)
         .collect();
     // Re-score combos from best pairs/triples with 0 spikes
-    for (_, s, _) in best_pairs.iter().filter(|(_, s, _)| s.spikes == 0 && s.parse_ok) {
+    for (_, s, _) in best_pairs
+        .iter()
+        .filter(|(_, s, _)| s.spikes == 0 && s.parse_ok)
+    {
         zero_hits.push(s.clone());
     }
-    for (_, s) in best_triples.iter().filter(|(_, s)| s.spikes == 0 && s.parse_ok) {
+    for (_, s) in best_triples
+        .iter()
+        .filter(|(_, s)| s.spikes == 0 && s.parse_ok)
+    {
         zero_hits.push(s.clone());
     }
     zero_hits.sort_by_key(|s| (s.walk as i32 - budget as i32).abs());
@@ -575,7 +592,15 @@ fn bisect_frame4_gap(data: &[u8]) {
         println!("  ch{ch}: {} diffs f4 vs f2", d.len());
     }
     let combo_f2 = patch_a_plus_ch0_cluster(&ab[0], &a2[0], 116, 118, 2);
-    let s_f2patch = score_patch(data, FI, combo_f2, &ff, &st, &bsi_p, "f2-style A+ch0[116..118]");
+    let s_f2patch = score_patch(
+        data,
+        FI,
+        combo_f2,
+        &ff,
+        &st,
+        &bsi_p,
+        "f2-style A+ch0[116..118]",
+    );
     print_score(&s_f2patch, Some(budget));
 
     println!("\n--- winning cluster ch1[133..=156] per-bin BAP (f4 / f3 / Δbits) ---");
@@ -587,7 +612,7 @@ fn bisect_frame4_gap(data: &[u8]) {
         }
     }
 
-  bisect_frame_gap(data, 9, 8);
+    bisect_frame_gap(data, 9, 8);
 }
 
 /// Same bisect harness for another catastrophic frame / neighbor pair.
@@ -658,10 +683,26 @@ fn investigate_subtype_ab_ch1_hf(data: &[u8]) {
         fsnr14: usize,
     }
     let frames = [
-        FrameCtx { fi: 2, subtype: "A", fsnr14: 3 },
-        FrameCtx { fi: 7, subtype: "A", fsnr14: 8 },
-        FrameCtx { fi: 4, subtype: "B", fsnr14: 3 },
-        FrameCtx { fi: 9, subtype: "B", fsnr14: 8 },
+        FrameCtx {
+            fi: 2,
+            subtype: "A",
+            fsnr14: 3,
+        },
+        FrameCtx {
+            fi: 7,
+            subtype: "A",
+            fsnr14: 8,
+        },
+        FrameCtx {
+            fi: 4,
+            subtype: "B",
+            fsnr14: 3,
+        },
+        FrameCtx {
+            fi: 9,
+            subtype: "B",
+            fsnr14: 8,
+        },
     ];
 
     println!(
@@ -776,9 +817,7 @@ fn investigate_subtype_ab_ch1_hf(data: &[u8]) {
         let psd_minus_m = d.psd as i32 - d.m_snr;
         println!(
             "  f2 bin {bin}: bap={} addr={} psd-m={} (addr 31→bap9, addr 30→bap8)",
-            d.bap,
-            d.bap_addr,
-            psd_minus_m
+            d.bap, d.bap_addr, psd_minus_m
         );
     }
     let st4 = states.get(&4).unwrap();
@@ -787,12 +826,14 @@ fn investigate_subtype_ab_ch1_hf(data: &[u8]) {
         let psd_minus_m = d.psd as i32 - d.m_snr;
         println!(
             "  f4 bin {bin}: bap={} addr={} psd-m={}",
-            d.bap,
-            d.bap_addr,
-            psd_minus_m
+            d.bap, d.bap_addr, psd_minus_m
         );
     }
-    println!("  snroffset f2={:#x} f4={:#x}", g2.snroffset, ba_globals(st4, 1).snroffset);
+    println!(
+        "  snroffset f2={:#x} f4={:#x}",
+        g2.snroffset,
+        ba_globals(st4, 1).snroffset
+    );
 
     // Walk impact: patch only 152–156 on subtype A frames.
     println!("\n--- walk impact: patch ch1[152..=156] only (from fsnr=14 neighbor) ---");
@@ -895,7 +936,10 @@ fn investigate_subtype_ab_ch1_hf(data: &[u8]) {
             ch1_diffs.len(),
         );
         if !ch0_diffs.is_empty() {
-            println!("    ch0 BAP diffs (first 12): {:?}", &ch0_diffs[..ch0_diffs.len().min(12)]);
+            println!(
+                "    ch0 BAP diffs (first 12): {:?}",
+                &ch0_diffs[..ch0_diffs.len().min(12)]
+            );
         }
         if !ch1_diffs.is_empty() {
             println!("    ch1 BAP diffs: {:?}", &ch1_diffs);
@@ -915,15 +959,7 @@ fn investigate_subtype_ab_ch1_hf(data: &[u8]) {
         let ff = load_ffmpeg_pcm(fc.fi, 3072).expect("pcm");
         let mut bap = bap_override_from_audit(a, 2);
         apply_cluster_patches(&mut bap, nb, 1, &[(133, 156)]);
-        let s = score_patch(
-            data,
-            fc.fi,
-            bap,
-            &ff,
-            st,
-            &bsi_p,
-            "ch1[133..=156]",
-        );
+        let s = score_patch(data, fc.fi, bap, &ff, st, &bsi_p, "ch1[133..=156]");
         print_score(&s, inferred_blk0_mant_budget(data, fc.fi));
     }
 
@@ -1005,12 +1041,7 @@ fn subset_sum_bisect(
             walk_hits.push((mask, walk, owned));
         }
     }
-    walk_hits.sort_by_key(|(_, walk, units)| {
-        (
-            (*walk as i32 - budget as i32).abs(),
-            units.len(),
-        )
-    });
+    walk_hits.sort_by_key(|(_, walk, units)| ((*walk as i32 - budget as i32).abs(), units.len()));
     walk_hits.truncate(40);
 
     let mut best: Option<PatchScore> = None;
@@ -1071,9 +1102,12 @@ fn inferred_blk0_mant_budget(data: &[u8], frame_idx: usize) -> Option<u32> {
 }
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| format!("{}\\oxideav_repro\\multi.ac3", std::env::var("TEMP").unwrap()));
+    let path = std::env::args().nth(1).unwrap_or_else(|| {
+        format!(
+            "{}\\oxideav_repro\\multi.ac3",
+            std::env::var("TEMP").unwrap()
+        )
+    });
     let data = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
 
     println!("=== mantissa budget analysis (blk0) ===\n");
@@ -1147,21 +1181,34 @@ fn score_ch0_clusters(data: &[u8]) {
     let base_bap = patch_a_base(&a2[0]);
     let neighbor_bap = bap_override_from_audit(&a3[0], 2);
     let base_walk = count_walk_with_bap(&st2, &bsi2, &base_bap);
-    println!(
-        "patch A base: walk={base_walk} budget={budget:?} ch1 HF 133-151→bap9"
-    );
+    println!("patch A base: walk={base_walk} budget={budget:?} ch1 HF 133-151→bap9");
 
     let ch0_diffs = diff_bap_bins(&a2[0].bap_ch[0], &a3[0].bap_ch[0], 217);
     let clusters = cluster_bap_diffs(&ch0_diffs);
-    println!("\nch0: {} diffs in {} contiguous clusters:", ch0_diffs.len(), clusters.len());
-    println!("{:<22} {:>8} {:>8} {:>8} {:>7} {:>7} {:>8}", "cluster", "naiveΔ", "walkΔ", "walk", "parse", "spikes", "max_diff");
+    println!(
+        "\nch0: {} diffs in {} contiguous clusters:",
+        ch0_diffs.len(),
+        clusters.len()
+    );
+    println!(
+        "{:<22} {:>8} {:>8} {:>8} {:>7} {:>7} {:>8}",
+        "cluster", "naiveΔ", "walkΔ", "walk", "parse", "spikes", "max_diff"
+    );
     let mut cluster_scores: Vec<(usize, PatchScore)> = Vec::new();
     for (ci, (lo, hi, naive)) in clusters.iter().enumerate() {
         let mut bap = base_bap;
         apply_cluster_patches(&mut bap, &neighbor_bap, 0, &[(*lo, *hi)]);
         let walk = count_walk_with_bap(&st2, &bsi2, &bap);
         let walk_delta = walk as i32 - base_walk as i32;
-        let s = score_patch(data, 2, bap, &ff, &st2, &bsi2, &format!("A+ch0[{lo}..={hi}]"));
+        let s = score_patch(
+            data,
+            2,
+            bap,
+            &ff,
+            &st2,
+            &bsi2,
+            &format!("A+ch0[{lo}..={hi}]"),
+        );
         println!(
             "{:<22} {:>8} {:>8} {:>8} {:>7} {:>7} {:>8.4}",
             format!("[{lo}..={hi}]"),
@@ -1248,7 +1295,10 @@ fn print_bin_trace_and_multi(
 ) {
     println!("\n=== ch0 bin BAP trace (frame2 blk0 vs frame3 neighbor) ===");
     let key_bins: Vec<usize> = [57, 58, 59, 60, 116, 117, 118].into_iter().collect();
-    println!("{:<6} {:>6} {:>6} {:>6}", "bin", "f2_bap", "f3_bap", "Δbits");
+    println!(
+        "{:<6} {:>6} {:>6} {:>6}",
+        "bin", "f2_bap", "f3_bap", "Δbits"
+    );
     for &bin in &key_bins {
         let b2 = a2[0].bap_ch[0][bin];
         let b3 = a3[0].bap_ch[0][bin];
@@ -1438,7 +1488,8 @@ fn print_bin_trace_and_multi(
             &an[0].fsnroffst[..2]
         );
         print_score(&s, budget);
-        println!("    walk={walk} ch0_diffs={} ch1_diffs={}",
+        println!(
+            "    walk={walk} ch0_diffs={} ch1_diffs={}",
             diff_bap_bins(&ab[0].bap_ch[0], &an[0].bap_ch[0], 217).len(),
             diff_bap_bins(&ab[0].bap_ch[1], &an[0].bap_ch[1], 217).len(),
         );
@@ -1511,10 +1562,8 @@ fn run_pcm_hypothesis_tests(data: &[u8]) {
         let st = state_after_block(&si, &bsi_p, f, 0).unwrap();
         if let Some(budget) = inferred_blk0_mant_budget(&data, 2) {
             let (idx, _) = search_encoder_snr_for_mant_budget(&st, &bsi_p, budget);
-            let mut bap = bap_override_from_audit(
-                &audit_frame_blocks(&si, &bsi_p, f).unwrap()[0],
-                2,
-            );
+            let mut bap =
+                bap_override_from_audit(&audit_frame_blocks(&si, &bsi_p, f).unwrap()[0], 2);
             let mut st2 = st.clone();
             rerun_all_bap_unified_snr(&mut st2, &bsi_p, snr_offset_from_search_index(idx));
             for ch in 0..2 {

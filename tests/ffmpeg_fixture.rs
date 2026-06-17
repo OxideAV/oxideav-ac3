@@ -547,10 +547,7 @@ fn decoder_matches_ffmpeg_on_transient_fixture() {
 fn decoder_pcm_has_no_full_scale_samples_vs_ffmpeg() {
     use std::process::Command;
 
-    let fixtures: &[(&str, &[u8])] = &[
-        ("sine", FIXTURE),
-        ("transient", TRANSIENT_FIXTURE),
-    ];
+    let fixtures: &[(&str, &[u8])] = &[("sine", FIXTURE), ("transient", TRANSIENT_FIXTURE)];
 
     for &(label, ac3) in fixtures {
         let tmp = std::env::temp_dir().join(format!("oxideav_ac3_rail_{label}.pcm"));
@@ -780,13 +777,7 @@ fn ffmpeg_multitone_640k_decodes_without_pcm_rails() {
         return;
     }
     let Ok(st) = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-        ])
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
         .arg(&wav)
         .args(["-c:a", "ac3", "-b:a", "640k"])
         .arg(&ac3)

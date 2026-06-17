@@ -126,7 +126,14 @@ fn naive_bits_delta(from_bap: u8, to_bap: u8) -> i32 {
     to - from
 }
 
-fn walk_delta(state: &Ac3State, bsi: &bsi::Bsi, ch: usize, bin: usize, new_bap: u8, base: u32) -> i32 {
+fn walk_delta(
+    state: &Ac3State,
+    bsi: &bsi::Bsi,
+    ch: usize,
+    bin: usize,
+    new_bap: u8,
+    base: u32,
+) -> i32 {
     let mut st = state.clone();
     st.channels[ch].bap[bin] = new_bap;
     count_mantissa_bits_walk(&st, bsi) as i32 - base as i32
@@ -174,11 +181,7 @@ fn inferred_budget_structured(
     best
 }
 
-fn neighbor_bap_at(
-    neighbor_state: Option<&Ac3State>,
-    ch: usize,
-    bin: usize,
-) -> Option<u8> {
+fn neighbor_bap_at(neighbor_state: Option<&Ac3State>, ch: usize, bin: usize) -> Option<u8> {
     let st = neighbor_state?;
     if ch >= st.channels.len() || bin >= N_COEFFS {
         return None;
@@ -200,7 +203,8 @@ fn main() {
         .or_else(|| Some(frame_index + 1));
 
     let data = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    let frame = nth_frame(&data, frame_index).unwrap_or_else(|| panic!("frame {frame_index} missing"));
+    let frame =
+        nth_frame(&data, frame_index).unwrap_or_else(|| panic!("frame {frame_index} missing"));
     let si = syncinfo::parse(&frame).unwrap();
     let bsi = bsi::parse(&frame[5..]).unwrap();
     let audits = audit_frame_blocks(&si, &bsi, &frame).expect("audit");
@@ -250,9 +254,7 @@ fn main() {
     );
     if let Some((sb, sd)) = structured {
         let sg = sb as i32 - base_walk as i32;
-        println!(
-            "structured budget (side=15, blk1 mant==walk): {sb}  delta {sd:+}  gap: {sg:+}"
-        );
+        println!("structured budget (side=15, blk1 mant==walk): {sb}  delta {sd:+}  gap: {sg:+}");
     } else {
         println!("structured budget (side=15, blk1 mant==walk): (none in [-48,+48])");
     }
@@ -313,8 +315,8 @@ fn main() {
             println!("  (none — gap {g:+} may need multiple bins or is not a pure BAP walk issue)");
         } else {
             println!(
-                "{:>5} {:>6} {:>4} {:>4} {:>4} {:>4} {:>8} {:>8} {}",
-                "ord", "ch", "bin", "from", "to", "kind", "walkΔ", "naiveΔ", "note"
+                "{:>5} {:>6} {:>4} {:>4} {:>4} {:>4} {:>8} {:>8} note",
+                "ord", "ch", "bin", "from", "to", "kind", "walkΔ", "naiveΔ"
             );
             for h in &hits {
                 let note = if h.walk_delta != h.naive_delta {
@@ -371,7 +373,10 @@ fn main() {
     println!("--- decode-order bins where naiveΔ ≠ walkΔ for bap±1 (grouping-sensitive) ---");
     let mut grouping_sensitive = 0usize;
     for pos in &bins {
-        for (to_bap, label) in [(pos.bap.saturating_sub(1), "bap-1"), (pos.bap.saturating_add(1).min(15), "bap+1")] {
+        for (to_bap, label) in [
+            (pos.bap.saturating_sub(1), "bap-1"),
+            (pos.bap.saturating_add(1).min(15), "bap+1"),
+        ] {
             if label == "bap-1" && pos.bap == 0 {
                 continue;
             }
@@ -436,7 +441,11 @@ fn main() {
         );
         for h in &ndiffs {
             cum += h.walk_delta;
-            let mark = if gap == Some(h.walk_delta) { " ← closes gap" } else { "" };
+            let mark = if gap == Some(h.walk_delta) {
+                " ← closes gap"
+            } else {
+                ""
+            };
             println!(
                 "{:>5} {:>6} {:>4} {:>4} {:>4} {:>+8} {:>+8} {:>+8}{mark}",
                 h.order,

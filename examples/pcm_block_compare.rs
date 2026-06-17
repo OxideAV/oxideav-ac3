@@ -21,7 +21,9 @@ const INTERLEAVED_PER_FRAME: usize = INTERLEAVED_PER_BLK * BLOCKS; // 3072
 fn main() {
     let dir = std::env::var("TEMP").unwrap() + r"\oxideav_repro";
     // arg1 = stem (default "multi"): reads <stem>.ac3 and <stem>.pcm
-    let stem = std::env::args().nth(1).unwrap_or_else(|| "multi".to_string());
+    let stem = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "multi".to_string());
     let path = format!("{dir}\\{stem}.ac3");
     let refp = format!("{dir}\\{stem}.pcm");
     let data = std::fs::read(&path).unwrap_or_else(|_| panic!("read {path}"));
@@ -41,7 +43,9 @@ fn main() {
 
     let (mut off, mut frame) = (0usize, 0usize);
     while off + 5 <= data.len() && frame < 12 {
-        let n = oxideav_ac3::syncinfo::parse(&data[off..]).unwrap().frame_length as usize;
+        let n = oxideav_ac3::syncinfo::parse(&data[off..])
+            .unwrap()
+            .frame_length as usize;
         dec.send_packet(&Packet::new(0, tb, data[off..off + n].to_vec()))
             .unwrap();
         if let Ok(Frame::Audio(af)) = dec.receive_frame() {
@@ -67,7 +71,11 @@ fn main() {
                     }
                     maxd[ch] = maxd[ch].max(d);
                 }
-                let flag = if maxd[0].max(maxd[1]) > 0.1 { " <<<" } else { "" };
+                let flag = if maxd[0].max(maxd[1]) > 0.1 {
+                    " <<<"
+                } else {
+                    ""
+                };
                 println!(
                     "{frame:>5} {blk:>3} | {:>8.4} {:>8.4} | {:>4}/256 {:>4}/256 | {:>6} {:>6}{flag}",
                     maxd[0], maxd[1], bad[0], bad[1], rail[0], rail[1]

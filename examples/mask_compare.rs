@@ -114,8 +114,7 @@ fn main() {
     println!();
     println!("--- with stream state (frames 0..{}) ---", frame_idx);
     let data = std::fs::read(&path).unwrap();
-    let stream_base =
-        probe_blk1_after_fsnroffst_stream(&data, frame_idx, blk, None).unwrap();
+    let stream_base = probe_blk1_after_fsnroffst_stream(&data, frame_idx, blk, None).unwrap();
     println!(
         "baseline {:?} → mant={} blk1_ok={}",
         &stream_base.fsnroffst[..nfchans],
@@ -125,8 +124,7 @@ fn main() {
     for ch1_fsnr in 13u8..=15 {
         let mut fsnr = stream_base.fsnroffst;
         fsnr[1] = ch1_fsnr;
-        let r =
-            probe_blk1_after_fsnroffst_stream(&data, frame_idx, blk, Some(fsnr)).unwrap();
+        let r = probe_blk1_after_fsnroffst_stream(&data, frame_idx, blk, Some(fsnr)).unwrap();
         println!(
             "  ch1={ch1_fsnr} (stream) → mant={} blk1_ok={}",
             r.mantissa_bits, r.blk1_parse_ok

@@ -6,6 +6,8 @@
 //!
 //! Defaults: frame 0, sweep `[walk-50, walk+50]` from blk0 audit.
 
+#![allow(clippy::too_many_arguments)]
+
 use oxideav_ac3::audblk::{
     audit_frame_blocks, peek_bits_post_bsi, recount_block_mantissa_bits, state_after_block,
     try_parse_block_at, BLOCKS_PER_FRAME,
@@ -124,7 +126,7 @@ fn score_candidate(c: &Candidate, ref_unused: Option<u64>) -> i32 {
         }
     }
 
-  s
+    s
 }
 
 fn try_candidate(
@@ -232,8 +234,7 @@ fn main() {
         reference_unused_for_frame(&data, frame_index)
     };
 
-    let base_state =
-        state_after_block(&si, &bsi, &frame, 0).expect("state after blk0");
+    let base_state = state_after_block(&si, &bsi, &frame, 0).expect("state after blk0");
 
     println!("file: {path}");
     println!("frame: {frame_index}  frame_bits: {frame_bits}");
@@ -265,19 +266,19 @@ fn main() {
         })
         .collect();
 
-    candidates.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.mant_end.cmp(&b.mant_end)));
+    candidates.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.mant_end.cmp(&b.mant_end))
+    });
 
     println!("--- ranked candidates (top 25) ---");
     println!(
-        "{:>6} {:>6} {:>6} {:>5} {:>5} {:>6} {:>7} {:>7} {:>4} {}",
-        "score", "mant", "d_act", "d_wlk", "blk1@", "parsed", "unused", "side15", "cpl0", "notes"
+        "{:>6} {:>6} {:>6} {:>5} {:>5} {:>6} {:>7} {:>7} {:>4} notes",
+        "score", "mant", "d_act", "d_wlk", "blk1@", "parsed", "unused", "side15", "cpl0"
     );
     for c in candidates.iter().take(25) {
-        let side15 = c
-            .tail
-            .iter()
-            .filter(|t| t.side_info_bits == 15)
-            .count();
+        let side15 = c.tail.iter().filter(|t| t.side_info_bits == 15).count();
         let note = if c.mant_end == actual_mant {
             "← live decoder".to_string()
         } else if c.tail.first().is_some_and(|t| t.side_info_bits == 15)
@@ -331,9 +332,9 @@ fn main() {
     let strict_blk1: Vec<_> = candidates
         .iter()
         .filter(|c| {
-            c.tail.first().is_some_and(|t| {
-                t.side_info_bits == 15 && t.mant_actual == u64::from(t.mant_walk)
-            })
+            c.tail
+                .first()
+                .is_some_and(|t| t.side_info_bits == 15 && t.mant_actual == u64::from(t.mant_walk))
         })
         .collect();
     if !strict_blk1.is_empty() {
@@ -366,14 +367,15 @@ fn main() {
     let tight: Vec<_> = strict_blk1
         .iter()
         .filter(|c| {
-            c.blocks_parsed == BLOCKS_PER_FRAME - 1
-                && c.unused <= ref_unused.unwrap_or(500) + 200
+            c.blocks_parsed == BLOCKS_PER_FRAME - 1 && c.unused <= ref_unused.unwrap_or(500) + 200
         })
         .collect();
     println!();
     if tight.is_empty() {
         println!("no candidate in sweep achieves full tail + tight unused (±200 of ref).");
-        println!("→ likely no single mant_end fixes frame 0; investigate blk0 bap/unpack or state.");
+        println!(
+            "→ likely no single mant_end fixes frame 0; investigate blk0 bap/unpack or state."
+        );
     } else {
         println!("tight full-tail candidates: {}", tight.len());
     }

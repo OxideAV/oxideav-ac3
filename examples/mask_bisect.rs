@@ -30,7 +30,14 @@ fn nth_frame(data: &[u8], index: usize) -> Option<(usize, usize)> {
     None
 }
 
-fn load_frame(data: &[u8], index: usize) -> (oxideav_ac3::syncinfo::SyncInfo, oxideav_ac3::bsi::Bsi, Vec<u8>) {
+fn load_frame(
+    data: &[u8],
+    index: usize,
+) -> (
+    oxideav_ac3::syncinfo::SyncInfo,
+    oxideav_ac3::bsi::Bsi,
+    Vec<u8>,
+) {
     let (off, len) = nth_frame(data, index).unwrap_or_else(|| panic!("frame {index} missing"));
     let frame = data[off..off + len].to_vec();
     let si = syncinfo::parse(&frame).unwrap();
@@ -84,11 +91,25 @@ fn print_row(bad: &BinBaDetail, good: &BinBaDetail) {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: mask_bisect <file.ac3> [bad] [good]");
-    let frame_bad: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(2);
-    let frame_good: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(1);
-    let ch: usize = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(1);
-    let blk: usize = std::env::args().nth(5).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: mask_bisect <file.ac3> [bad] [good]");
+    let frame_bad: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let frame_good: usize = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let ch: usize = std::env::args()
+        .nth(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let blk: usize = std::env::args()
+        .nth(5)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let bin_lo: usize = 133;
     let bin_hi: usize = 151;
 
@@ -113,9 +134,7 @@ fn main() {
     let mut bits_lost = 0i32;
 
     println!();
-    println!(
-        "bin  band | exp      psd           | mask          m_snr         | addr    bap"
-    );
+    println!("bin  band | exp      psd           | mask          m_snr         | addr    bap");
     for bin in bin_lo..=bin_hi {
         let b = bin_ba_detail(&st_b, ch, bin);
         let g = bin_ba_detail(&st_g, ch, bin);
@@ -214,12 +233,14 @@ fn main() {
     }
     println!();
 
-  // fsnroffst sweep on bad frame to match bitstream mantissa budget (~3206).
+    // fsnroffst sweep on bad frame to match bitstream mantissa budget (~3206).
     const TARGET_MANT: u32 = 3206;
     let mut st_sweep = state_after_block(&si_b, &bsi_b, &frame_b, blk).expect("sweep parse");
     let base_fsnr = st_sweep.fsnroffst;
     println!();
-    println!("fsnroffst sweep on frame {frame_bad} blk{blk} (target mantissa bits ~{TARGET_MANT}):");
+    println!(
+        "fsnroffst sweep on frame {frame_bad} blk{blk} (target mantissa bits ~{TARGET_MANT}):"
+    );
     for f1 in 0..=15u8 {
         let mut fsnr = base_fsnr;
         fsnr[1] = f1;

@@ -7252,6 +7252,9 @@ mod tests {
             }
             off += flen;
         }
-        assert_eq!(spikes, 0, "{spikes}/{total} full-scale samples on self roundtrip");
+        assert_eq!(
+            spikes, 0,
+            "{spikes}/{total} full-scale samples on self roundtrip"
+        );
     }
 }

@@ -27,8 +27,13 @@ fn nth_frame(data: &[u8], index: usize) -> Option<Vec<u8>> {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: side_info_align <file.ac3> [frame]");
-    let fi: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: side_info_align <file.ac3> [frame]");
+    let fi: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let data = std::fs::read(&path).unwrap();
     let frame = nth_frame(&data, fi).unwrap_or_else(|| panic!("frame {fi} missing"));
     let si = syncinfo::parse(&frame).unwrap();
