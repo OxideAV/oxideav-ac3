@@ -3958,6 +3958,91 @@ fn grab_next_one(codes: &[(u8, u32)], consumed: &mut [bool], start: usize, targe
     0
 }
 
+/// Build mantissa `(bap, code)` pairs in decoder read order (non-zero
+/// bap bins only) — matches [`write_mantissa_stream`] input layout.
+pub fn mantissa_codes_from_decoder_state(
+    state: &crate::audblk::Ac3State,
+    bsi: &crate::bsi::Bsi,
+) -> Vec<(u8, u32)> {
+    use crate::audblk::MAX_FBW;
+    let nfchans = bsi.nfchans as usize;
+    let mut codes = Vec::new();
+    let mut got_cplchan = false;
+    for ch in 0..nfchans {
+        let end = state.channels[ch].end_mant;
+        for bin in 0..end {
+            let bap = state.channels[ch].bap[bin];
+            if bap != 0 {
+                codes.push((bap, 0));
+            }
+        }
+        if state.cpl_in_use && state.channels[ch].in_coupling && !got_cplchan {
+            let cplc = MAX_FBW;
+            for bin in state.cpl_begf_mant..state.cpl_endf_mant {
+                let bap = state.channels[cplc].bap[bin];
+                if bap != 0 {
+                    codes.push((bap, 0));
+                }
+            }
+            got_cplchan = true;
+        }
+    }
+    if bsi.lfeon {
+        let lfe_ch = MAX_FBW + 1;
+        for bin in 0..7 {
+            let bap = state.channels[lfe_ch].bap[bin];
+            if bap != 0 {
+                codes.push((bap, 0));
+            }
+        }
+    }
+    codes
+}
+
+/// Count bits [`write_mantissa_stream`] would emit for `codes` (ffmpeg
+/// encoder schedule with end-of-stream zero padding in grouped baps).
+pub fn count_mantissa_stream_bits(codes: &[(u8, u32)]) -> u32 {
+    let n = codes.len();
+    let mut consumed = vec![false; n];
+    let mut total = 0u32;
+    for i in 0..n {
+        if consumed[i] {
+            continue;
+        }
+        let (bap, mant) = codes[i];
+        match bap {
+            1 => {
+                let _m1 = mant;
+                let _ = grab_next_two(codes, &mut consumed, i, 1);
+                total += 5;
+            }
+            2 => {
+                let _ = grab_next_two(codes, &mut consumed, i, 2);
+                total += 7;
+            }
+            4 => {
+                let _ = grab_next_one(codes, &mut consumed, i, 4);
+                total += 7;
+            }
+            3 => total += 3,
+            5 => total += 4,
+            b if (6..=15).contains(&b) => {
+                total += QUANTIZATION_BITS[b as usize] as u32;
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+/// Encoder-pack mantissa bit count for a decoded block's `bap[]` layout.
+pub fn count_mantissa_bits_encoder_pack(
+    state: &crate::audblk::Ac3State,
+    bsi: &crate::bsi::Bsi,
+) -> u32 {
+    count_mantissa_stream_bits(&mantissa_codes_from_decoder_state(state, bsi))
+}
+
 /// Flush any pending mantissa-group accumulators: grouped-bap codes
 /// (bap=1/2/4) live in triples/pairs that are packed only when the
 /// group fills. If a block ends with 1 or 2 codes pending, the decoder
@@ -7084,5 +7169,89 @@ mod tests {
             "ffmpeg cross-decoded our per-block-snroffst stream: {} bytes",
             decoded_bytes.len()
         );
+    }
+
+    /// User-reported v0.0.8 repro: 4-tone multitone @ 640 kbps stereo 48 kHz.
+    /// Our encoder+decoder roundtrip must stay clean (no ±full-scale PCM).
+    /// ffmpeg-encoded streams of the same material are tracked separately in
+    /// `tests/ffmpeg_fixture.rs::ffmpeg_multitone_640k_decodes_without_pcm_rails`.
+    fn build_four_tone_multitone_pcm(sr: u32, dur_s: f32) -> (usize, Vec<u8>) {
+        use std::f32::consts::PI;
+        let nsamp = (sr as f32 * dur_s) as usize;
+        let freqs = [300.0f32, 900.0, 3000.0, 7000.0];
+        let amp = 0.15f32;
+        let mut bytes = Vec::with_capacity(nsamp * 4);
+        for n in 0..nsamp {
+            let t = n as f32 / sr as f32;
+            let mut s = 0.0f32;
+            for f in freqs {
+                s += (2.0 * PI * f * t).sin();
+            }
+            s *= amp;
+            let q = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            bytes.extend_from_slice(&q.to_le_bytes());
+            bytes.extend_from_slice(&q.to_le_bytes());
+        }
+        (nsamp, bytes)
+    }
+
+    #[test]
+    fn four_tone_multitone_self_roundtrip_at_640k_has_no_pcm_rails() {
+        use crate::syncinfo;
+        use oxideav_core::{Frame, Packet, TimeBase};
+
+        let sr = 48_000u32;
+        let dur = 4.0f32;
+        let (nsamp, bytes) = build_four_tone_multitone_pcm(sr, dur);
+
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(sr);
+        params.channels = Some(2);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(640_000);
+        let mut enc = make_encoder(&params).expect("make_encoder");
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: nsamp as u32,
+            pts: Some(0),
+            data: vec![bytes],
+        }))
+        .unwrap();
+        let _ = enc.flush();
+
+        let mut ac3 = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => ac3.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        assert!(!ac3.is_empty(), "encoder produced no AC-3 output");
+
+        let mut dec_params = CodecParameters::audio(CodecId::new("ac3"));
+        dec_params.channels = Some(2);
+        dec_params.sample_rate = Some(sr);
+        let mut dec = crate::decoder::make_decoder(&dec_params).expect("make_decoder");
+        let tb = TimeBase::new(1, sr as i64);
+        let mut off = 0usize;
+        let mut spikes = 0u64;
+        let mut total = 0u64;
+        while off + 5 <= ac3.len() {
+            let flen = syncinfo::parse(&ac3[off..]).unwrap().frame_length as usize;
+            assert!(off + flen <= ac3.len(), "truncated syncframe");
+            dec.send_packet(&Packet::new(0, tb, ac3[off..off + flen].to_vec()))
+                .unwrap();
+            if let Ok(Frame::Audio(af)) = dec.receive_frame() {
+                for c in af.data[0].chunks_exact(2) {
+                    let s = i16::from_le_bytes([c[0], c[1]]);
+                    total += 1;
+                    if s.unsigned_abs() >= 32760 {
+                        spikes += 1;
+                    }
+                }
+            }
+            off += flen;
+        }
+        assert_eq!(spikes, 0, "{spikes}/{total} full-scale samples on self roundtrip");
     }
 }

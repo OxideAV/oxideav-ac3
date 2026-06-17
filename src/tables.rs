@@ -215,11 +215,11 @@ pub const LATAB: [u16; 260] = [
     0x000d, 0x000d, 0x000d, 0x000d, 0x000c, 0x000c, 0x000c, 0x000c, 0x000b, 0x000b, 0x000b, 0x000b,
     0x000a, 0x000a, 0x000a, 0x000a, 0x000a, 0x0009, 0x0009, 0x0009, 0x0009, 0x0009, 0x0008, 0x0008,
     0x0008, 0x0008, 0x0008, 0x0008, 0x0007, 0x0007, 0x0007, 0x0007, 0x0007, 0x0007, 0x0006, 0x0006,
-    0x0006, 0x0006, 0x0006, 0x0006, 0x0006, 0x0005, 0x0005, 0x0005, 0x0005, 0x0005, 0x0005, 0x0005,
-    0x0004, 0x0004, 0x0004, 0x0004, 0x0004, 0x0004, 0x0004, 0x0004, 0x0004, 0x0004, 0x0003, 0x0003,
-    0x0003, 0x0003, 0x0003, 0x0003, 0x0003, 0x0003, 0x0003, 0x0003, 0x0003, 0x0003, 0x0003, 0x0003,
+    0x0006, 0x0006, 0x0006, 0x0006, 0x0006, 0x0006, 0x0005, 0x0005, 0x0005, 0x0005, 0x0005, 0x0005,
+    0x0005, 0x0005, 0x0004, 0x0004, 0x0004, 0x0004, 0x0004, 0x0004, 0x0004, 0x0004, 0x0004, 0x0004,
+    0x0004, 0x0003, 0x0003, 0x0003, 0x0003, 0x0003, 0x0003, 0x0003, 0x0003, 0x0003, 0x0003, 0x0003,
     0x0003, 0x0003, 0x0003, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002,
-    0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0001, 0x0001, 0x0001, 0x0001,
+    0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0002, 0x0001, 0x0001,
     0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001,
     0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001,
     0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
@@ -364,3 +364,218 @@ pub const CENTER_MIX_LEVEL: [f32; 4] = [0.707, 0.595, 0.500, 0.595];
 
 /// Table 5.10 — Surround Mix Level coefficients: surmixlev → slev.
 pub const SURROUND_MIX_LEVEL: [f32; 4] = [0.707, 0.500, 0.0, 0.500];
+
+// ===========================================================================
+// Bit-allocation table audit (ATSC A/52:2012 §7.2.3, Tables 7.6–7.16).
+//
+// Purpose (session 5 — independent table oracle): the white-noise frame-0
+// block-0 defect reproduces from a cold decoder running full stage-3 bit
+// allocation, so the divergence from ffmpeg must be a table value or a
+// subtle integer detail — both reachable without ffmpeg. This module checks
+// every BA table against the published spec values.
+//
+// Two confidence classes:
+//   * DERIVED — regenerated from a structural definition (BAP intervals,
+//     band→bin mapping). Zero transcription risk; a fully independent oracle.
+//   * TRANSCRIBED — the spec's printed hex, re-entered here from A/52
+//     §7.2.3. If a TRANSCRIBED assertion fails, confirm against a printed
+//     spec copy before "fixing" the table — the bug could be in the
+//     expectation, not the table.
+// ===========================================================================
+#[cfg(test)]
+mod ba_table_audit {
+    use super::*;
+
+    // ---- Small scalar tables (TRANSCRIBED, A/52 Tables 7.6–7.11) ----
+
+    #[test]
+    fn slowdec_t7_6() {
+        assert_eq!(SLOWDEC, [0x0f, 0x11, 0x13, 0x15]);
+    }
+
+    #[test]
+    fn fastdec_t7_7() {
+        assert_eq!(FASTDEC, [0x3f, 0x53, 0x67, 0x7b]);
+    }
+
+    #[test]
+    fn slowgain_t7_8() {
+        assert_eq!(SLOWGAIN, [0x540, 0x4d8, 0x478, 0x410]);
+    }
+
+    #[test]
+    fn dbpbtab_t7_9() {
+        assert_eq!(DBPBTAB, [0x000, 0x700, 0x900, 0xb00]);
+    }
+
+    #[test]
+    fn floortab_t7_10() {
+        // Spec address 7 is 0xf800 (signed 16-bit = -2048); we store -2048.
+        assert_eq!(FLOORTAB, [0x2f0, 0x2b0, 0x270, 0x230, 0x1f0, 0x170, 0x0f0, -2048]);
+    }
+
+    #[test]
+    fn fastgain_t7_11() {
+        assert_eq!(
+            FASTGAIN,
+            [0x080, 0x100, 0x180, 0x200, 0x280, 0x300, 0x380, 0x400]
+        );
+    }
+
+    // ---- Banding structure (TRANSCRIBED, A/52 Table 7.12) ----
+
+    #[test]
+    fn bndtab_t7_12() {
+        assert_eq!(
+            BNDTAB,
+            [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24, 25, 26, 27, 28, 31, 34, 37, 40, 43, 46, 49, 55, 61, 67, 73, 79, 85, 97,
+                109, 121, 133, 157, 181, 205, 229,
+            ]
+        );
+    }
+
+    #[test]
+    fn bndsz_t7_12() {
+        assert_eq!(
+            BNDSZ,
+            [
+                1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                3, 3, 3, 3, 3, 3, 3, 6, 6, 6, 6, 6, 6, 12, 12, 12, 12, 24, 24, 24, 24, 24,
+            ]
+        );
+    }
+
+    /// The 50 bands must tile bins 0..253 contiguously with no gap/overlap.
+    #[test]
+    fn banding_tiles_253_bins() {
+        let mut expected_start = 0u32;
+        for band in 0..50 {
+            assert_eq!(BNDTAB[band], expected_start, "band {band} start");
+            expected_start += BNDSZ[band];
+        }
+        assert_eq!(expected_start, 253, "bands must cover exactly bins 0..253");
+    }
+
+    // ---- DERIVED checks (zero transcription risk) ----
+
+    /// MASKTAB[bin] must equal the band that contains `bin` per BNDTAB/BNDSZ
+    /// (A/52 Table 7.13 is just this mapping). Regenerate and compare.
+    #[test]
+    fn masktab_t7_13_consistent_with_banding() {
+        let mut bin = 0usize;
+        for band in 0..50usize {
+            for _ in 0..BNDSZ[band] {
+                assert_eq!(
+                    MASKTAB[bin] as usize, band,
+                    "MASKTAB[{bin}] should be band {band}"
+                );
+                bin += 1;
+            }
+        }
+        assert_eq!(bin, 253);
+    }
+
+    /// BAPTAB (A/52 Table 7.16) regenerated from the spec's address intervals.
+    #[test]
+    fn baptab_t7_16_from_intervals() {
+        // (inclusive_lo, inclusive_hi, bap)
+        let intervals: &[(usize, usize, u8)] = &[
+            (0, 0, 0),
+            (1, 5, 1),
+            (6, 7, 2),
+            (8, 10, 3),
+            (11, 12, 4),
+            (13, 14, 5),
+            (15, 18, 6),
+            (19, 22, 7),
+            (23, 26, 8),
+            (27, 30, 9),
+            (31, 34, 10),
+            (35, 38, 11),
+            (39, 42, 12),
+            (43, 46, 13),
+            (47, 54, 14),
+            (55, 63, 15),
+        ];
+        let mut expected = [0u8; 64];
+        for &(lo, hi, bap) in intervals {
+            for a in lo..=hi {
+                expected[a] = bap;
+            }
+        }
+        assert_eq!(BAPTAB, expected);
+    }
+
+    // ---- Hearing threshold (TRANSCRIBED, A/52 Table 7.15) ----
+    //
+    // Highest-value table to audit: at the psd≈0 HF bins where the bug bites,
+    // mask collapses to HTH, so a single-LSB HTH error flips exactly one
+    // 0x1fe0 quantizer bucket (one bap step) and is invisible on every other
+    // signal. fscod=0 (48 kHz) is the row all four test signals use.
+
+    #[test]
+    fn hth_t7_15_fscod0_48k() {
+        assert_eq!(
+            HTH[0],
+            [
+                0x04d0, 0x04d0, 0x0440, 0x0400, 0x03e0, 0x03c0, 0x03b0, 0x03b0, 0x03a0, 0x03a0,
+                0x03a0, 0x03a0, 0x03a0, 0x0390, 0x0390, 0x0390, 0x0380, 0x0380, 0x0370, 0x0370,
+                0x0360, 0x0360, 0x0350, 0x0350, 0x0340, 0x0340, 0x0330, 0x0320, 0x0310, 0x0300,
+                0x02f0, 0x02f0, 0x02f0, 0x02f0, 0x0300, 0x0310, 0x0340, 0x0390, 0x03e0, 0x0420,
+                0x0460, 0x0490, 0x04a0, 0x0460, 0x0440, 0x0440, 0x0520, 0x0800, 0x0840, 0x0840,
+            ]
+        );
+    }
+
+    #[test]
+    fn hth_t7_15_fscod1_44k() {
+        assert_eq!(
+            HTH[1],
+            [
+                0x04f0, 0x04f0, 0x0460, 0x0410, 0x03e0, 0x03d0, 0x03c0, 0x03b0, 0x03b0, 0x03a0,
+                0x03a0, 0x03a0, 0x03a0, 0x03a0, 0x0390, 0x0390, 0x0390, 0x0380, 0x0380, 0x0380,
+                0x0370, 0x0370, 0x0360, 0x0360, 0x0350, 0x0340, 0x0340, 0x0340, 0x0310, 0x0310,
+                0x0300, 0x02f0, 0x02f0, 0x02f0, 0x0300, 0x0300, 0x0320, 0x0350, 0x0390, 0x03e0,
+                0x0420, 0x0450, 0x04a0, 0x0490, 0x0460, 0x0440, 0x0480, 0x0630, 0x0840, 0x0840,
+            ]
+        );
+    }
+
+    #[test]
+    fn hth_t7_15_fscod2_32k() {
+        assert_eq!(
+            HTH[2],
+            [
+                0x0580, 0x0580, 0x04b0, 0x0450, 0x0420, 0x03f0, 0x03e0, 0x03d0, 0x03c0, 0x03b0,
+                0x03b0, 0x03b0, 0x03a0, 0x03a0, 0x03a0, 0x03a0, 0x03a0, 0x03a0, 0x03a0, 0x03a0,
+                0x0390, 0x0390, 0x0390, 0x0390, 0x0380, 0x0380, 0x0380, 0x0370, 0x0360, 0x0350,
+                0x0340, 0x0330, 0x0320, 0x0310, 0x0300, 0x02f0, 0x02f0, 0x02f0, 0x0300, 0x0310,
+                0x0330, 0x0350, 0x03c0, 0x0410, 0x0470, 0x04a0, 0x0460, 0x0440, 0x0450, 0x04e0,
+            ]
+        );
+    }
+
+    // ---- Log-addition table (A/52 Table 7.14) ----
+    //
+    // 260 entries; not hand-transcribed (too error-prone to assert digit by
+    // digit). Instead check structural invariants a corruption would break,
+    // plus the published anchors.
+    #[test]
+    fn latab_t7_14_invariants() {
+        assert_eq!(LATAB.len(), 260);
+        assert_eq!(LATAB[0], 0x0040, "latab[0] anchor");
+        // Monotonic non-increasing (log-add weight shrinks as |a-b| grows).
+        for i in 1..LATAB.len() {
+            assert!(
+                LATAB[i] <= LATAB[i - 1],
+                "latab must be non-increasing at {i}: {} > {}",
+                LATAB[i],
+                LATAB[i - 1]
+            );
+        }
+        // Tail decays to zero.
+        assert_eq!(LATAB[259], 0x0000, "latab tail anchor");
+    }
+}
