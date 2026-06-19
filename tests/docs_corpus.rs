@@ -238,6 +238,10 @@ enum Tier {
     /// here; promote individual cases once they're shown to round-trip
     /// cleanly through both decoders.
     ReportOnly,
+    /// Logged AND gates CI on a minimum per-channel PSNR (dB). Used for
+    /// fixtures whose decode is known-good so a regression that drops
+    /// the PSNR below the floor fails the build.
+    MinPsnr(f64),
 }
 
 /// Per-channel diff numbers + aggregate match percentage and PSNR.
@@ -542,6 +546,12 @@ fn evaluate(case: &CorpusCase) {
                     case.name, ours.first_error
                 );
             }
+            Tier::MinPsnr(_) => {
+                panic!(
+                    "{}: MinPsnr requires successful decode; first_error={:?}",
+                    case.name, ours.first_error
+                );
+            }
             Tier::ReportOnly => return,
         }
     }
@@ -626,6 +636,16 @@ fn evaluate(case: &CorpusCase) {
         }
         Tier::ReportOnly => {
             // Logged; never gates CI.
+        }
+        Tier::MinPsnr(floor) => {
+            assert!(
+                psnr_min >= floor,
+                "{}: min PSNR {:.2} dB below floor {:.2} dB (max_abs_err={})",
+                case.name,
+                psnr_min,
+                floor,
+                max_err_overall,
+            );
         }
     }
 }
@@ -782,7 +802,9 @@ fn corpus_eac3_256_coeff_block() {
         channels: Some(2),
         sample_rate: Some(48_000),
         eac3: true,
-        tier: Tier::ReportOnly,
+        // Round 345: default-coupling-banding-structure (§E.2.3.3.15
+        // Table E2.12) fix lifted this fixture from 8.36 dB → 90.88 dB.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 
@@ -794,7 +816,9 @@ fn corpus_eac3_5_1_48000_384kbps() {
         channels: Some(6),
         sample_rate: Some(48_000),
         eac3: true,
-        tier: Tier::ReportOnly,
+        // Known-good multichannel decode (~90 dB); locked in as a
+        // regression guard.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 
@@ -818,7 +842,9 @@ fn corpus_eac3_from_ac3_bitstream_recombination() {
         channels: Some(2),
         sample_rate: Some(48_000),
         eac3: true,
-        tier: Tier::ReportOnly,
+        // Round 345: default-coupling-banding-structure fix lifted this
+        // fixture from 13.57 dB → 91.04 dB.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 
@@ -854,7 +880,9 @@ fn corpus_eac3_stereo_48000_192kbps() {
         channels: Some(2),
         sample_rate: Some(48_000),
         eac3: true,
-        tier: Tier::ReportOnly,
+        // Round 345: default-coupling-banding-structure fix lifted this
+        // fixture from 8.36 dB → 90.88 dB.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 
