@@ -41,8 +41,40 @@
 use std::fs;
 use std::path::PathBuf;
 
+use oxideav_ac3::eac3::bsi as eac3_bsi;
 use oxideav_ac3::syncinfo;
+use oxideav_core::bits::BitReader;
 use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Decoder, Frame, Packet, TimeBase};
+
+/// Derive the elementary-stream sample rate from the first decodable
+/// syncframe in `data`. AC-3 carries `fscod` in syncinfo (Table 5.6);
+/// E-AC-3 carries `(fscod, fscod2)` in its BSI (§E.2.3.1). Returns
+/// `None` if no frame parses (e.g. a corrupt stream). This replaces the
+/// previous hard-coded 48 kHz assumption, which mis-labelled every
+/// 32 kHz / 44.1 kHz fixture (e.g. `ac3-32000hz-stereo`).
+fn stream_sample_rate(data: &[u8]) -> Option<u32> {
+    let mut off = 0usize;
+    while off + 6 <= data.len() {
+        if data[off] != 0x0B || data[off + 1] != 0x77 {
+            off = syncinfo::find_syncword(data, off + 1)?;
+            continue;
+        }
+        // AC-3 path: syncinfo carries the rate directly.
+        if let Ok(si) = syncinfo::parse(&data[off..]) {
+            let bsid = data[off + 5] >> 3;
+            if bsid <= 10 {
+                return Some(si.sample_rate);
+            }
+        }
+        // E-AC-3 path: parse the BSI (starts at byte off+2).
+        let mut br = BitReader::new(&data[off + 2..]);
+        if let Ok(bsi) = eac3_bsi::parse_with(&mut br) {
+            return Some(bsi.sample_rate);
+        }
+        return None;
+    }
+    None
+}
 
 // ---------------------------------------------------------------------------
 // Fixture path resolution
@@ -348,7 +380,9 @@ fn decode_stream(input: &[u8]) -> DecodedPcm {
     let mut frames_ok = 0usize;
     let mut first_error: Option<String> = None;
     let mut channels: u16 = 0;
-    let mut sample_rate: u32 = 0;
+    // Derive the real elementary-stream sample rate from the first
+    // syncframe header (Table 5.6 / §E.2.3.1) instead of assuming 48 kHz.
+    let sample_rate: u32 = stream_sample_rate(input).unwrap_or(0);
 
     for (i, f) in frms.iter().enumerate() {
         let payload = input[f.start..f.start + f.len].to_vec();
@@ -373,7 +407,6 @@ fn decode_stream(input: &[u8]) -> DecodedPcm {
                     if let Some(c) = n.checked_div(per_ch) {
                         channels = c as u16;
                     }
-                    sample_rate = 48_000; // AC-3 max; we don't have a per-frame field
                 }
                 samples.reserve(n);
                 for chunk in plane.chunks_exact(2) {
