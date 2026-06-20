@@ -41,8 +41,40 @@
 use std::fs;
 use std::path::PathBuf;
 
+use oxideav_ac3::eac3::bsi as eac3_bsi;
 use oxideav_ac3::syncinfo;
+use oxideav_core::bits::BitReader;
 use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Decoder, Frame, Packet, TimeBase};
+
+/// Derive the elementary-stream sample rate from the first decodable
+/// syncframe in `data`. AC-3 carries `fscod` in syncinfo (Table 5.6);
+/// E-AC-3 carries `(fscod, fscod2)` in its BSI (§E.2.3.1). Returns
+/// `None` if no frame parses (e.g. a corrupt stream). This replaces the
+/// previous hard-coded 48 kHz assumption, which mis-labelled every
+/// 32 kHz / 44.1 kHz fixture (e.g. `ac3-32000hz-stereo`).
+fn stream_sample_rate(data: &[u8]) -> Option<u32> {
+    let mut off = 0usize;
+    while off + 6 <= data.len() {
+        if data[off] != 0x0B || data[off + 1] != 0x77 {
+            off = syncinfo::find_syncword(data, off + 1)?;
+            continue;
+        }
+        // AC-3 path: syncinfo carries the rate directly.
+        if let Ok(si) = syncinfo::parse(&data[off..]) {
+            let bsid = data[off + 5] >> 3;
+            if bsid <= 10 {
+                return Some(si.sample_rate);
+            }
+        }
+        // E-AC-3 path: parse the BSI (starts at byte off+2).
+        let mut br = BitReader::new(&data[off + 2..]);
+        if let Ok(bsi) = eac3_bsi::parse_with(&mut br) {
+            return Some(bsi.sample_rate);
+        }
+        return None;
+    }
+    None
+}
 
 // ---------------------------------------------------------------------------
 // Fixture path resolution
@@ -238,6 +270,10 @@ enum Tier {
     /// here; promote individual cases once they're shown to round-trip
     /// cleanly through both decoders.
     ReportOnly,
+    /// Logged AND gates CI on a minimum per-channel PSNR (dB). Used for
+    /// fixtures whose decode is known-good so a regression that drops
+    /// the PSNR below the floor fails the build.
+    MinPsnr(f64),
 }
 
 /// Per-channel diff numbers + aggregate match percentage and PSNR.
@@ -344,7 +380,9 @@ fn decode_stream(input: &[u8]) -> DecodedPcm {
     let mut frames_ok = 0usize;
     let mut first_error: Option<String> = None;
     let mut channels: u16 = 0;
-    let mut sample_rate: u32 = 0;
+    // Derive the real elementary-stream sample rate from the first
+    // syncframe header (Table 5.6 / §E.2.3.1) instead of assuming 48 kHz.
+    let sample_rate: u32 = stream_sample_rate(input).unwrap_or(0);
 
     for (i, f) in frms.iter().enumerate() {
         let payload = input[f.start..f.start + f.len].to_vec();
@@ -369,7 +407,6 @@ fn decode_stream(input: &[u8]) -> DecodedPcm {
                     if let Some(c) = n.checked_div(per_ch) {
                         channels = c as u16;
                     }
-                    sample_rate = 48_000; // AC-3 max; we don't have a per-frame field
                 }
                 samples.reserve(n);
                 for chunk in plane.chunks_exact(2) {
@@ -542,6 +579,12 @@ fn evaluate(case: &CorpusCase) {
                     case.name, ours.first_error
                 );
             }
+            Tier::MinPsnr(_) => {
+                panic!(
+                    "{}: MinPsnr requires successful decode; first_error={:?}",
+                    case.name, ours.first_error
+                );
+            }
             Tier::ReportOnly => return,
         }
     }
@@ -626,6 +669,16 @@ fn evaluate(case: &CorpusCase) {
         }
         Tier::ReportOnly => {
             // Logged; never gates CI.
+        }
+        Tier::MinPsnr(floor) => {
+            assert!(
+                psnr_min >= floor,
+                "{}: min PSNR {:.2} dB below floor {:.2} dB (max_abs_err={})",
+                case.name,
+                psnr_min,
+                floor,
+                max_err_overall,
+            );
         }
     }
 }
@@ -782,7 +835,9 @@ fn corpus_eac3_256_coeff_block() {
         channels: Some(2),
         sample_rate: Some(48_000),
         eac3: true,
-        tier: Tier::ReportOnly,
+        // Round 345: default-coupling-banding-structure (§E.2.3.3.15
+        // Table E2.12) fix lifted this fixture from 8.36 dB → 90.88 dB.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 
@@ -794,7 +849,9 @@ fn corpus_eac3_5_1_48000_384kbps() {
         channels: Some(6),
         sample_rate: Some(48_000),
         eac3: true,
-        tier: Tier::ReportOnly,
+        // Known-good multichannel decode (~90 dB); locked in as a
+        // regression guard.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 
@@ -818,7 +875,9 @@ fn corpus_eac3_from_ac3_bitstream_recombination() {
         channels: Some(2),
         sample_rate: Some(48_000),
         eac3: true,
-        tier: Tier::ReportOnly,
+        // Round 345: default-coupling-banding-structure fix lifted this
+        // fixture from 13.57 dB → 91.04 dB.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 
@@ -854,7 +913,9 @@ fn corpus_eac3_stereo_48000_192kbps() {
         channels: Some(2),
         sample_rate: Some(48_000),
         eac3: true,
-        tier: Tier::ReportOnly,
+        // Round 345: default-coupling-banding-structure fix lifted this
+        // fixture from 8.36 dB → 90.88 dB.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 

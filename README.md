@@ -86,7 +86,17 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   §E.3.3.2 `nrematbd` derivation now folds in enhanced coupling: a 2/0
   `ecplinu` block sizes its rematrix-flag field from the raw `ecplbegf`
   code (0/1/2/<5 → 0/1/2/3 bands, else 4) rather than `cplbegf`, keeping
-  the bit cursor aligned on enhanced-coupling 2/0 frames.
+  the bit cursor aligned on enhanced-coupling 2/0 frames. Standard coupling
+  now applies the §E.2.3.3.15 **default coupling banding structure**
+  (`defcplbndstrc[]`, Table E2.12, indexed by absolute sub-band) when
+  `cplbndstrce == 0` in a frame's first coupling block, instead of leaving
+  every sub-band un-merged — the prior all-zeros behaviour collapsed a
+  7-subband region to 7 bands instead of 3, corrupting the §7.4
+  coupling-coordinate scatter on every basic stereo-coupled frame. Three
+  corpus stereo fixtures (`eac3-stereo-48000-192kbps`, `eac3-256-coeff-block`,
+  `eac3-from-ac3-bitstream-recombination`) jumped from ~8-14 dB to ~91 dB
+  PSNR and are now CI-gated at an 80 dB floor (`Tier::MinPsnr` in
+  `tests/docs_corpus.rs`).
 - Encoder — independent + dependent substream pairs for 1.0 / 2.0 / 5.1
   / 7.1 layouts, with adaptive / frame-based exponent strategies. SPX
   and AHT are out of scope on the encoder side.

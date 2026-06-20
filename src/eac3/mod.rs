@@ -77,12 +77,16 @@
 //! * **Cross-frame transient pre-noise reference** (§E.3.7.1) is
 //!   clamped to the current frame; intra-frame transients (§E.3.7.2)
 //!   are fully synthesised.
-//! * Three corpus fixtures (`eac3-stereo-48000-192kbps`,
-//!   `eac3-256-coeff-block`, `eac3-from-ac3-bitstream-recombination`)
-//!   remain floor-bound on a pre-existing coupling/bit-allocation
-//!   cursor drift that also leaves a handful of base-AC-3 fixtures
-//!   muted; non-affected fixtures decode at 66-90 dB PSNR (see
-//!   crate `README.md` for the per-fixture numbers).
+//! * **Standard-coupling default banding** (§E.2.3.3.15 Table E2.12):
+//!   when `cplbndstrce == 0` in the first coupling block of a frame the
+//!   decoder now applies the `defcplbndstrc[]` default structure
+//!   (indexed by absolute sub-band number) instead of leaving every
+//!   sub-band un-merged. This was the root cause of the three
+//!   previously floor-bound stereo fixtures; they now decode at
+//!   ~91 dB PSNR (gated `MinPsnr` floors in `tests/docs_corpus.rs`).
+//! * One corpus fixture (`eac3-5.1-side-768kbps`) still sits at
+//!   ~21 dB on a side-channel glitch (max_abs_err ~25k); non-affected
+//!   fixtures decode at 66-91 dB PSNR (see crate `README.md`).
 
 pub mod aht;
 pub mod audfrm;

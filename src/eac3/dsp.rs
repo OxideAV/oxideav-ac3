@@ -242,6 +242,26 @@ const DEFAULT_SPX_BNDSTRC: [bool; 18] = {
     t
 };
 
+/// §E.2.3.3.15 Table E2.12 — Default Coupling Banding Structure
+/// `defcplbndstrc[]`. Indexed by the **absolute** coupling sub-band
+/// number (0..17). A `true` entry means that sub-band is merged into
+/// the previous band rather than starting a new band. Used when
+/// `cplbndstrce == 0` in the first coupling block of a frame (Annex E
+/// standard coupling); base AC-3 always transmits the structure
+/// explicitly and never consults this table.
+const DEFCPLBNDSTRC: [bool; 18] = {
+    let mut t = [false; 18];
+    t[8] = true;
+    t[10] = true;
+    t[11] = true;
+    t[13] = true;
+    t[14] = true;
+    t[15] = true;
+    t[16] = true;
+    t[17] = true;
+    t
+};
+
 /// Decode one E-AC-3 independent substream's audblks into interleaved
 /// f32 PCM. Returns `Ok(())` on a successful clean walk, or `Err(...)`
 /// if any block hits a feature we don't support (caller substitutes
@@ -308,6 +328,12 @@ pub fn decode_indep_audblks(
     // syncframe so we keep them as locals here rather than on `state`.
     let mut firstcplcos: [bool; MAX_FBW] = [true; MAX_FBW];
     let mut firstcplleak = true;
+    // §E.2.3.3.15 — "have we parsed coupling-banding-structure in any
+    // earlier block of THIS frame yet". The default-band-structure
+    // substitution (Table E2.12) only applies when `cplbndstrce == 0`
+    // in the FIRST coupling block of the frame; a later `cplbndstrce ==
+    // 0` reuses the previous block's structure instead.
+    let mut first_cpl_strategy_block = true;
     // §E.2.3.3.9 firstspxcos[ch] — "have we seen explicit SPX
     // coordinates for channel ch yet this frame". Resets every
     // syncframe; the first block in which a channel is in SPX carries an
@@ -711,12 +737,23 @@ pub fn decode_indep_audblks(
                         ));
                     }
                     state.cpl_nsubbnd = ncplsubnd_signed as usize;
-                    // §E.1.3.3.11 cplbndstrce — gates the cplbndstrc[]
-                    // array. When 0, all subbands stay un-merged (i.e.
-                    // cplbndstrc[bnd] = 0 for every band).
+                    // §E.2.3.3.15 cplbndstrce — gates the explicit
+                    // `cplbndstrc[]` array. When it is 1, the per-subband
+                    // merge flags follow. When it is 0 in the FIRST
+                    // coupling block of the frame, the **default coupling
+                    // banding structure** `defcplbndstrc[]` (Table E2.12)
+                    // applies — it is NOT all-zeros. When it is 0 in any
+                    // later block, the previous block's structure is
+                    // reused (handled by leaving `cpl_bndstrc` untouched).
+                    //
+                    // `defcplbndstrc[]` is indexed by the **absolute**
+                    // coupling sub-band number; our `cpl_bndstrc[]` is
+                    // indexed by the sub-band offset relative to
+                    // `cplbegf`, so the lookup is
+                    // `defcplbndstrc[cplbegf + offset]`.
                     let cplbndstrce = br.read_u32(1)? != 0;
-                    state.cpl_bndstrc[0] = false;
                     if cplbndstrce {
+                        state.cpl_bndstrc[0] = false;
                         for bnd in 1..state.cpl_nsubbnd.min(18) {
                             let v = br.read_u32(1)? != 0;
                             state.cpl_bndstrc[bnd] = v;
@@ -726,11 +763,21 @@ pub fn decode_indep_audblks(
                         for bnd in state.cpl_nsubbnd.min(18)..18 {
                             state.cpl_bndstrc[bnd] = false;
                         }
-                    } else {
-                        for bnd in 1..18 {
+                    } else if first_cpl_strategy_block {
+                        // §E.2.3.3.15 first-block default structure.
+                        state.cpl_bndstrc[0] = false;
+                        for bnd in 1..state.cpl_nsubbnd.min(18) {
+                            let abs_sbnd = state.cpl_begf as usize + bnd;
+                            state.cpl_bndstrc[bnd] =
+                                DEFCPLBNDSTRC.get(abs_sbnd).copied().unwrap_or(false);
+                        }
+                        for bnd in state.cpl_nsubbnd.min(18)..18 {
                             state.cpl_bndstrc[bnd] = false;
                         }
                     }
+                    // else (cplbndstrce == 0 in a later block): keep the
+                    // previous block's `cpl_bndstrc[]` untouched.
+                    first_cpl_strategy_block = false;
                     // Mantissa-domain coupling range: bins [37+12·begf,
                     // 37+12·(endf+3)) per §7.4.2.
                     state.cpl_begf_mant = 37 + 12 * state.cpl_begf as usize;
@@ -1295,6 +1342,23 @@ pub fn decode_indep_audblks(
                 }
             }
         }
+        #[cfg(debug_assertions)]
+        if std::env::var("EAC3_DUMP_BLK").is_ok() {
+            let ch0end = state.channels[0].end_mant;
+            let ch1end = state.channels[1].end_mant;
+            let c0excpl = state.channels[0].in_coupling;
+            let c1excpl = state.channels[1].in_coupling;
+            let cplc00 = state.cpl_coord[0][0];
+            let c00 = state.channels[0].coeffs[0];
+            let c060 = state.channels[0].coeffs[60];
+            let c0133 = state.channels[0].coeffs[133];
+            let c10 = state.channels[1].coeffs[0];
+            eprintln!(
+                "DBG blk={blk} cplinu={cplinu} cpl_in_use={} begf_m={} endf_m={} nbnd={} ch0[end={ch0end} excpl={c0excpl}] ch1[end={ch1end} excpl={c1excpl}] cplco0={cplc00:.4} c0[0]={c00:.4} c0[60]={c060:.4} c0[133]={c0133:.4} c1[0]={c10:.4}",
+                state.cpl_in_use, state.cpl_begf_mant, state.cpl_endf_mant, state.cpl_nbnd,
+            );
+        }
+
         // Coupling pseudo-channel (round 117): when coupling-AHT is in
         // use, load this block's cached coupling coefficients into the
         // `MAX_FBW` slot BEFORE `dsp_block` runs §7.4 decouple — the
