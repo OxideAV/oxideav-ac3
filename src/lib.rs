@@ -52,6 +52,7 @@ pub mod bsi;
 pub mod crc;
 pub mod decoder;
 pub mod downmix;
+pub mod drc;
 pub mod eac3;
 pub mod encoder;
 pub mod imdct;
