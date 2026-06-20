@@ -445,6 +445,16 @@ pub fn decode_frame(
     br.skip(bsi.bits_consumed as u32)?;
     state.audblk_start_bits = br.bit_position();
     state.blkidx = 0;
+    // §7.2.2.6 / A/52 §5.4.3.47: the cpldeltnseg and deltnseg[ch] delta
+    // bit-allocation segment counts must be initialised to 0 at the
+    // start of every syncframe so a `deltbaie == 0` / `deltbae == reuse`
+    // block-0 inherits "no delta", not stale segments left over from the
+    // previous frame's dba. Without this reset a frame whose block 0
+    // reuses (deltbae == 0) a prior frame's segments applies a phantom
+    // mask offset, perturbing bap[] and desynchronising mantissa unpack.
+    for d in state.deltnseg.iter_mut() {
+        *d = 0;
+    }
 
     let nchans = bsi.nchans as usize; // output channel count (fbw + lfe)
     let nfchans = bsi.nfchans as usize;
