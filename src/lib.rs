@@ -52,6 +52,7 @@ pub mod bsi;
 pub mod crc;
 pub mod decoder;
 pub mod downmix;
+pub mod drc;
 pub mod eac3;
 pub mod encoder;
 pub mod imdct;
@@ -65,6 +66,12 @@ use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 pub const CODEC_ID_STR: &str = "ac3";
 pub const CODEC_ID_STR_EAC3: &str = "eac3";
+
+/// Re-export the §6.1.9 / §7.6 / §7.7 dynamic-range-control + dialogue-
+/// normalisation control surface at the crate root so callers can build a
+/// DRC-configured decoder via [`decoder::make_decoder_with_drc`] without
+/// reaching into the [`drc`] submodule.
+pub use crate::drc::{DrcMode, DrcSettings};
 
 /// Register the AC-3 + E-AC-3 decoder + encoder with the supplied codec
 /// registry.

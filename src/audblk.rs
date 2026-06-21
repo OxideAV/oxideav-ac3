@@ -338,6 +338,14 @@ pub struct Ac3State {
     /// lifetimes outlive a single syncframe, so the state lives here. Base
     /// AC-3 and standard E-AC-3 coupling never touch it.
     pub ecpl_state: crate::eac3::ecpl::EcplState,
+
+    /// §6.1.9 / §7.7 dynamic-range control settings. Steers how the
+    /// per-block `dynrng` word (and, in RF mode, the frame-level `compr`
+    /// word) is turned into the linear coefficient gain. [`Default`] is
+    /// line-out — the mandatory §7.7.1 full-`dynrng` decode — so existing
+    /// behaviour is unchanged unless a caller opts in via the decoder's
+    /// DRC API.
+    pub drc: crate::drc::DrcSettings,
 }
 
 impl Default for Ac3State {
@@ -401,6 +409,7 @@ impl Ac3State {
             bap_override: None,
             skip_decouple: false,
             ecpl_state: crate::eac3::ecpl::EcplState::new(),
+            drc: crate::drc::DrcSettings::default(),
         }
     }
 
@@ -470,6 +479,16 @@ pub fn decode_frame(
     state.apply_bsi_params(bsi);
     state.audblk_start_bits = br.bit_position();
     state.blkidx = 0;
+    // §7.2.2.6 / A/52 §5.4.3.47: the cpldeltnseg and deltnseg[ch] delta
+    // bit-allocation segment counts must be initialised to 0 at the
+    // start of every syncframe so a `deltbaie == 0` / `deltbae == reuse`
+    // block-0 inherits "no delta", not stale segments left over from the
+    // previous frame's dba. Without this reset a frame whose block 0
+    // reuses (deltbae == 0) a prior frame's segments applies a phantom
+    // mask offset, perturbing bap[] and desynchronising mantissa unpack.
+    for d in state.deltnseg.iter_mut() {
+        *d = 0;
+    }
 
     let nchans = bsi.nchans as usize; // output channel count (fbw + lfe)
     let nfchans = bsi.nfchans as usize;
@@ -807,20 +826,33 @@ pub(crate) fn parse_audblk_into(
     }
     trace_mark(trace.as_deref_mut(), "after_dithflag", br, None);
 
+    // The frame-level §5.4.2.10 heavy-compression words, consulted only
+    // when the DRC control surface is in RF mode (§7.7.2.1). `compr`
+    // drives ch1 (and every fbw channel for acmod != 0); `compr_ch2`
+    // drives ch2 in 1+1 dual mono.
+    let compr_ch1 = bsi.compr.map(|c| c.raw());
+    let compr_ch2 = bsi.compr_ch2.map(|c| c.raw());
     // §5.4.3.3 dynrnge — dynamic-range word present (1 bit).
     let dynrnge = br.read_u32(1)? != 0;
     side.dynrnge = dynrnge;
     if dynrnge {
-        // §5.4.3.4 dynrng — 8-bit dynamic-range gain word.
+        // §5.4.3.4 dynrng — 8-bit dynamic-range gain word. The DRC
+        // control surface (§7.7.1.2 partial compression / §7.7.2 heavy
+        // compression) maps the raw word to the applied linear gain;
+        // line-out (the default) reproduces the bare §7.7.1.2 word.
         let dynrng = br.read_u32(8)? as u8;
         side.dynrng = dynrng;
-        let g = dynrng_to_linear(dynrng);
+        let g = state.drc.resolve_block_gain(dynrng, compr_ch1);
         for ch in 0..nfchans {
             state.channels[ch].dynrng = g;
         }
     } else if blk == 0 {
+        // §7.7.1.2 — block 0 with no dynrng word uses '0000 0000' (0 dB).
+        // In RF mode that 0 dB dynrng still yields to the frame's compr
+        // word, so route the block-0 default through the same resolver.
+        let g = state.drc.resolve_block_gain(0x00, compr_ch1);
         for ch in 0..nfchans {
-            state.channels[ch].dynrng = 1.0;
+            state.channels[ch].dynrng = g;
         }
     }
     trace_mark(
@@ -838,9 +870,9 @@ pub(crate) fn parse_audblk_into(
         if dynrng2e {
             let d2 = br.read_u32(8)? as u8;
             side.dynrng2 = d2;
-            state.channels[1].dynrng = dynrng_to_linear(d2);
+            state.channels[1].dynrng = state.drc.resolve_block_gain(d2, compr_ch2);
         } else if blk == 0 {
-            state.channels[1].dynrng = 1.0;
+            state.channels[1].dynrng = state.drc.resolve_block_gain(0x00, compr_ch2);
         }
     }
 
@@ -1579,23 +1611,6 @@ pub(crate) fn parse_audblk_into(
     }
 
     Ok(())
-}
-
-/// Convert an 8-bit dynrng word to linear gain (§7.7.1.2).
-fn dynrng_to_linear(dynrng: u8) -> f32 {
-    // X0 X1 X2 . Y3 Y4 Y5 Y6 Y7
-    // Interpret X as 3-bit signed int in range -4..3.
-    let x = ((dynrng >> 5) & 0x7) as i32;
-    let x_signed = if x >= 4 { x - 8 } else { x };
-    let y = (dynrng & 0x1F) as i32;
-    // Y is unsigned fractional with leading 1, so Y = 0.1Y3Y4Y5Y6Y7_binary.
-    // Value = (32 + y) / 64.
-    let y_val = (32 + y) as f32 / 64.0;
-    // Total gain in dB = (x_signed + 1) * 6.02 dB, combined with Y as
-    // linear multiplier.
-    let shift = x_signed + 1; // number of left arithmetic shifts
-    let base = 2f32.powi(shift);
-    base * y_val
 }
 
 /// Number of rematrix bands (Table 5.15).

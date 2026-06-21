@@ -112,6 +112,16 @@ impl Eac3DecoderState {
         self.indep_nchans
     }
 
+    /// Propagate §7.7 DRC control settings into both the independent and
+    /// dependent substream DSP states so the next packet's `dynrng` /
+    /// `compr` decode (in [`crate::eac3::dsp`]) applies the requested
+    /// regime. Called by the decoder whenever the caller changes its DRC
+    /// configuration.
+    pub fn set_drc(&mut self, drc: crate::drc::DrcSettings) {
+        self.indep_state.drc = drc;
+        self.dep_state.drc = drc;
+    }
+
     /// Channel-location list assigned to the dep substream when
     /// `chanmape == 0` (no custom channel map present), per
     /// §E.2.3.1.7: "the channel map for a dependent substream shall
@@ -236,6 +246,12 @@ pub struct DecodedFrame {
     /// (in `acmod` bitstream order); the dep channels occupy slots
     /// `indep_nchans..` in the order of this list.
     pub dep_locations: Vec<ChannelLocation>,
+    /// Independent substream's 5-bit `dialnorm` word (§E.2.3.1.x, headroom
+    /// in dB below digital 100%, `1..=31`). Surfaced so a caller that owns
+    /// the playback gain can apply §7.6 dialogue normalisation toward a
+    /// chosen target level. Advisory — the core decode does not scale by
+    /// it (the spec leaves dialnorm to the reproduction system).
+    pub dialnorm: u8,
 }
 
 /// Decode one or more concatenated E-AC-3 syncframes contained in a
@@ -397,6 +413,7 @@ fn decode_indep_substream(
         // packet-level driver overwrites this with the accumulated
         // `state.dep_locations` if dep substreams follow.
         dep_locations: Vec::new(),
+        dialnorm: bsi.dialnorm,
     })
 }
 
@@ -549,6 +566,7 @@ fn build_silent_indep(bsi: &Eac3Bsi) -> Result<DecodedFrame> {
         // Silent-fallback path emits the indep program only — no
         // dep channels were spliced.
         dep_locations: Vec::new(),
+        dialnorm: bsi.dialnorm,
     })
 }
 

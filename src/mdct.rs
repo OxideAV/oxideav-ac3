@@ -9,12 +9,13 @@
 //! ```
 //!
 //! with **N = 512** for the long block (α = 0) and **two N = 256
-//! transforms** for a short-block pair. The pair is built with the
-//! same kernel offset on both halves (matching the decoder's FFT-path
-//! short-block IMDCT — see `crate::imdct::imdct_256_pair_fft` and the
-//! `(-yi, yr)` swap rationale documented there). The 128 coefficients
-//! from each short transform are interleaved into a single 256-coeff
-//! buffer per §7.9.4.2 step 1: `X[2k] = X1[k]`, `X[2k+1] = X2[k]`.
+//! transforms** for a short-block pair, the first using α = −1 and the
+//! second α = +1. Each half therefore carries a different `(π/4)·(2k+1)
+//! ·(1+α)` phase offset — the analysis counterpart of the asymmetric
+//! §7.9.4.2 step-5 de-interleave in `crate::imdct::imdct_256_pair_fft`.
+//! The 128 coefficients from each short transform are interleaved into
+//! a single 256-coeff buffer per §7.9.4.2 step 1: `X[2k] = X1[k]`,
+//! `X[2k+1] = X2[k]`.
 //!
 //! The 256-coefficient output of this transform, when fed back through
 //! our [`super::audblk::imdct_512`] reference, recovers the windowed
@@ -58,37 +59,36 @@ pub fn mdct_512(input: &[f32; 512], output: &mut [f32; 256]) {
 }
 
 /// 256-point forward MDCT used for one half of a short-block pair
-/// (§8.2.3.2). Both halves of the AC-3 short block share the same
-/// kernel — the decoder's FFT-path short IMDCT (`imdct_256_pair_fft`)
-/// applies the **same** `(-yi, yr, -yr, yi)` de-interleave pattern to
-/// short1 and short2 (see the swap rationale in `imdct.rs` around the
-/// `out[256+2*n]` lines), which means the forward step does the same.
+/// (§8.2.3.2). The two halves do **not** share a kernel: the spec's
+/// forward transform carries a phase-offset parameter
 ///
-/// The kernel is the standard MDCT-IV cosine `cos(π/(2N) * (2n+1) * (2k+1))`
-/// with N=256; this is the α=−1 form of §8.2.3.2 with the constant
-/// `+ (π/4)·(2k+1)·(1+α)` term collapsed to zero. The `-2/N` scale
-/// pairs with the decoder's IMDCT scale + overlap-add gain so the
-/// analysis-synthesis chain lands on unity gain when run alongside
-/// the spec's KBD window.
+///   X[k] = (-2/N) · Σ x[n] · cos( (2π/4N)·(2n+1)·(2k+1)
+///                                 + (π/4)·(2k+1)·(1+α) )
+///
+/// with α = −1 for the first short transform and α = +1 for the
+/// second (§8.2.3.2). The corresponding decoder IMDCT
+/// (`imdct_256_pair_fft`) realises that same α distinction through the
+/// asymmetric §7.9.4.2 step-5 de-interleave, so the forward half must
+/// pass the matching α to round-trip. The `-2/N` scale pairs with the
+/// decoder's IMDCT scale + overlap-add gain to land on unity gain
+/// under the spec's KBD window.
 ///
 /// `input`  : 256 windowed time-domain samples (one half of the
 ///            short-block pair).
+/// `alpha`  : −1 for the first short transform, +1 for the second.
 /// `output` : 128 MDCT coefficients.
-fn mdct_256_half(input: &[f32; 256], output: &mut [f32; 128]) {
+fn mdct_256_half(input: &[f32; 256], alpha: f32, output: &mut [f32; 128]) {
     let n: usize = 256;
-    // α=-1 form (no `+N/2` time shift) — matches the FFT-path
-    // inverse for *both* halves, which uses the short1 indexing
-    // pattern on short2 as well (see the `(-yi, yr)` swap rationale
-    // in `imdct.rs`).
-    //
-    //   X[k] = (-2/N) * Σ x[n] * cos( π/(2N) * (2n+1) * (2k+1) )
     let scale: f32 = -2.0 / n as f32;
+    // (2π/4N)·(2n+1)·(2k+1) = (π/2N)·(2n+1)·(2k+1).
     let pi_over_2n = PI / (2.0 * n as f32);
+    let quarter_pi = PI / 4.0;
     for k in 0..128 {
         let mut s = 0.0f32;
         let two_k_plus_1 = (2 * k + 1) as f32;
+        let phase_offset = quarter_pi * two_k_plus_1 * (1.0 + alpha);
         for nn in 0..n {
-            let phase = pi_over_2n * (2 * nn + 1) as f32 * two_k_plus_1;
+            let phase = pi_over_2n * (2 * nn + 1) as f32 * two_k_plus_1 + phase_offset;
             s += input[nn] * phase.cos();
         }
         output[k] = scale * s;
@@ -124,8 +124,9 @@ pub fn mdct_256_pair(input: &[f32; 512], output: &mut [f32; 256]) {
     h2.copy_from_slice(&input[256..]);
     let mut x1 = [0.0f32; 128];
     let mut x2 = [0.0f32; 128];
-    mdct_256_half(&h1, &mut x1);
-    mdct_256_half(&h2, &mut x2);
+    // First short transform uses α=−1, the second α=+1 (§8.2.3.2).
+    mdct_256_half(&h1, -1.0, &mut x1);
+    mdct_256_half(&h2, 1.0, &mut x2);
     for k in 0..128 {
         output[2 * k] = x1[k];
         output[2 * k + 1] = x2[k];

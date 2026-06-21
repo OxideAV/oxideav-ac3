@@ -32,6 +32,9 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
 8. [`eac3`] — Annex E decoder + encoder.
 9. [`crc`] — §7.10.1 CRC-16 over poly 0x8005, shared between the encoder
    and the opt-in `decoder::verify_packet_crc` residue check.
+10. [`drc`] — §6.1.9 / §7.6 / §7.7 dynamic-range-control + dialogue-
+    normalisation control surface (`DrcSettings`: partial-compression
+    cut/boost, heavy-compression "RF mode", dialnorm playback target).
 
 ## Capabilities
 
@@ -50,6 +53,18 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
 - IMDCT synthesis (§7.9) — both 512-point long-block and 256-point
   short-block paths.
 - Channel coupling (§7.4) + rematrix (§7.5) + dynrng (§7.7).
+- **Dynamic-range-control + dialogue-normalisation control surface**
+  (§6.1.9 / §7.6 / §7.7, [`drc`]). The mandatory §7.7.1 full-`dynrng`
+  decode is the default ("line out"); a listener-facing
+  [`DrcSettings`] steers the §7.7.1.2 *partial-compression* cut/boost
+  factors (apply a fraction of each gain reduction / increase, with
+  independent directions), §7.7.2 *heavy compression* ("RF mode" —
+  substitutes the BSI `compr` word, ±48 dB, falling back to `dynrng`
+  when a frame carries no `compr` per §7.7.2.1), and §7.6 dialogue
+  normalisation (an opt-in playback scalar `10^((target − dialnorm)/20)`
+  toward a chosen headroom target). Build a configured decoder with
+  `decoder::make_decoder_with_drc(params, DrcSettings)`. Applies to both
+  the AC-3 and E-AC-3 paths.
 - Downmix (§7.8) — LoRo and LtRt 2-channel.
 - Bitstream → WAV channel reorder for multichannel layouts.
 

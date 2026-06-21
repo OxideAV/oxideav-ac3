@@ -472,25 +472,33 @@ pub fn decode_indep_audblks(
         }
 
         // ---- dynrng ----
+        // The §6.1.9 / §7.7 DRC control surface maps the dynrng word
+        // (line-out / partial-compression) or the frame-level compr word
+        // (RF mode, §7.7.2.1) to the applied linear gain. Default is
+        // line-out (full dynrng), so existing E-AC-3 decodes are
+        // unaffected unless the caller opts in.
+        let compr_ch1 = bsi.compr.map(|c| c.raw());
+        let compr_ch2 = bsi.compr_ch2.map(|c| c.raw());
         let dynrnge = br.read_u32(1)? != 0;
         if dynrnge {
             let dynrng = br.read_u32(8)? as u8;
-            let g = dynrng_to_linear(dynrng);
+            let g = state.drc.resolve_block_gain(dynrng, compr_ch1);
             for ch in 0..nfchans {
                 state.channels[ch].dynrng = g;
             }
         } else if blk == 0 {
+            let g = state.drc.resolve_block_gain(0x00, compr_ch1);
             for ch in 0..nfchans {
-                state.channels[ch].dynrng = 1.0;
+                state.channels[ch].dynrng = g;
             }
         }
         if bsi.acmod == 0 {
             let dynrng2e = br.read_u32(1)? != 0;
             if dynrng2e {
                 let d2 = br.read_u32(8)? as u8;
-                state.channels[1].dynrng = dynrng_to_linear(d2);
+                state.channels[1].dynrng = state.drc.resolve_block_gain(d2, compr_ch2);
             } else if blk == 0 {
-                state.channels[1].dynrng = 1.0;
+                state.channels[1].dynrng = state.drc.resolve_block_gain(0x00, compr_ch2);
             }
         }
 
@@ -2332,19 +2340,6 @@ fn build_syncinfo_shim(bsi: &Eac3Bsi) -> SyncInfo {
         sample_rate: bsi.sample_rate,
         frame_length: bsi.frame_bytes,
     }
-}
-
-/// Convert an 8-bit dynrng word to linear gain (§7.7.1.2). Same as
-/// AC-3 (§E.2 reuses the base spec). Duplicated here to avoid making
-/// the AC-3 private helper public.
-fn dynrng_to_linear(dynrng: u8) -> f32 {
-    let x = ((dynrng >> 5) & 0x7) as i32;
-    let x_signed = if x >= 4 { x - 8 } else { x };
-    let y = (dynrng & 0x1F) as i32;
-    let y_val = (32 + y) as f32 / 64.0;
-    let shift = x_signed + 1;
-    let base = 2f32.powi(shift);
-    base * y_val
 }
 
 #[cfg(test)]
