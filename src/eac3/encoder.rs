@@ -76,6 +76,13 @@ use super::bsi::EAC3_BSID;
 ///   * 5.1    → 384 kbps
 ///   * 7.1    → 384 kbps indep + 192 kbps dep = 576 kbps total
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    Ok(Box::new(build_concrete_encoder(params)?))
+}
+
+/// Build the concrete [`Eac3Encoder`] (with `snroffststr == 0`). The
+/// public [`make_encoder`] boxes this behind `dyn Encoder`; the test-only
+/// [`make_encoder_with_snroffststr`] reuses it and overrides the strategy.
+fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
     let sample_rate = params.sample_rate.ok_or_else(|| {
         Error::invalid("eac3 encoder: sample_rate is required (48000/44100/32000)")
     })?;
@@ -232,7 +239,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     };
 
     let input_sample_format = params.sample_format.unwrap_or(SampleFormat::S16);
-    Ok(Box::new(Eac3Encoder {
+    Ok(Eac3Encoder {
         codec_id: CodecId::new(CODEC_ID_STR),
         out_params,
         sample_rate,
@@ -252,7 +259,22 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             .collect(),
         packet_queue: Vec::new(),
         pts: 0,
-    }))
+        snroffststr: 0,
+    })
+}
+
+/// Test-only constructor that selects a non-zero `snroffststr` (per-block
+/// SNR-offset strategy). Builds the same encoder as [`make_encoder`] then
+/// overrides the strategy. Used by the round-trip tests to drive the
+/// decoder's §2.3.3.27 per-block SNR-offset parse.
+#[cfg(test)]
+pub(crate) fn make_encoder_with_snroffststr(
+    params: &CodecParameters,
+    snroffststr: u8,
+) -> Result<Box<dyn Encoder>> {
+    let mut concrete = build_concrete_encoder(params)?;
+    concrete.snroffststr = snroffststr;
+    Ok(Box::new(concrete))
 }
 
 /// Pick a syncframe size in bytes for a given (fscod, target kbps).
@@ -340,6 +362,14 @@ struct Eac3Encoder {
     transient_state: Vec<TransientDetector>,
     packet_queue: Vec<Packet>,
     pts: i64,
+    /// SNR-offset strategy emitted in audfrm (§2.3.2.3 / Table E1.3).
+    /// `0` = single frame-level pair (the default the public
+    /// [`make_encoder`] always selects); `1` = one shared per-block fine
+    /// offset; `2` = independent per-channel per-block fine offsets. The
+    /// non-zero modes are exercised by the round-trip tests to validate
+    /// the decoder's per-block SNR-offset parse; the chosen offsets equal
+    /// the frame-level values so the decoded PCM matches the `0` baseline.
+    snroffststr: u8,
 }
 
 impl Encoder for Eac3Encoder {
@@ -613,6 +643,49 @@ impl Eac3Encoder {
         } else {
             build_dba_plan(&exps, nfchans, ch_end_mant, &cpl)
         };
+        // When `snroffststr != 0`, the audblk carries per-block SNR
+        // offsets instead of the single frame-level pair in audfrm. Those
+        // extra header bits must be reserved out of the mantissa budget,
+        // or the bit-allocation tuner would fill the frame and the
+        // per-block offsets would push the syncframe past `frame_bytes`.
+        // Net extra bits vs the `snroffststr == 0` baseline:
+        //   * audfrm drops `frmcsnroffst`(6) + `frmfsnroffst`(4) = 10.
+        //   * each block adds an explicit `snroffste`(1) except block 0,
+        //     plus `csnroffst`(6) plus the fine offsets.
+        //   * snroffststr==1: one shared `blkfsnroffst`(4) per block.
+        //   * snroffststr==2: `fsnroffst[ch]`(4·nfchans) + LFE(4) per
+        //     block (no coupling slot — cplinu==0 throughout).
+        // When `snroffststr != 0` the audblk carries per-block SNR
+        // offsets instead of the single frame-level pair in audfrm. Those
+        // extra header bits must be reserved out of the mantissa budget,
+        // or the bit-allocation tuner would fill the frame and the
+        // per-block offsets would push the syncframe past `frame_bytes`.
+        // The `snroffststr == 0` default path reserves nothing, so its
+        // output is byte-identical to before this change. Net extra bits
+        // vs the baseline:
+        //   * audfrm drops `frmcsnroffst`(6) + `frmfsnroffst`(4) = 10.
+        //   * each block adds an explicit `snroffste`(1) except block 0,
+        //     plus `csnroffst`(6) plus the fine offsets.
+        //   * snroffststr==1: one shared `blkfsnroffst`(4) per block.
+        //   * snroffststr==2: `fsnroffst[ch]`(4·nfchans) + LFE(4) per
+        //     block (no coupling slot — cplinu==0 throughout).
+        // Both non-zero strategies reserve the SAME (worst-case, i.e.
+        // `snroffststr == 2`) overhead so that `1` and `2` tune against an
+        // identical mantissa budget — making their decoded PCM bit-exact
+        // to each other, which the round-trip test asserts. The `1` mode
+        // leaves a few reserved bits unused as extra padding; that does
+        // not change the bit allocation.
+        let snr_reserve_bits: u32 = if self.snroffststr == 0 {
+            0
+        } else {
+            let per_block_fine = 4 * nfchans as u32 + if sub.lfeon { 4 } else { 0 };
+            let explicit_snroffste = (BLOCKS_PER_FRAME as u32) - 1; // blk 0 implicit
+            let per_block = BLOCKS_PER_FRAME as u32 * (6 + per_block_fine);
+            (per_block + explicit_snroffste).saturating_sub(10)
+        };
+        let tuner_frame_bytes = sub
+            .frame_bytes
+            .saturating_sub(snr_reserve_bits.div_ceil(8) as usize);
         // Pass chexpstr_plan so the overhead calculator accounts for
         // D25/D45 exponent savings when sizing the mantissa budget.
         let tuned_ba = tune_snroffst_with_plan(
@@ -621,7 +694,7 @@ impl Eac3Encoder {
             ch_end_mant,
             nfchans,
             self.fscod,
-            sub.frame_bytes,
+            tuner_frame_bytes,
             &exp_strategies,
             Some(&chexpstr_plan),
             &cpl,
@@ -704,7 +777,7 @@ impl Eac3Encoder {
         // audfrm (§E.2.2.3 / §E.2.3.2)
         bw.write_u32(1, 1); // expstre = 1
         bw.write_u32(0, 1); // ahte = 0
-        bw.write_u32(0, 2); // snroffststr = 0
+        bw.write_u32(self.snroffststr as u32, 2); // snroffststr
         bw.write_u32(0, 1); // transproce = 0
         bw.write_u32(1, 1); // blkswe = 1
         bw.write_u32(1, 1); // dithflage = 1
@@ -761,9 +834,13 @@ impl Eac3Encoder {
             }
         }
         // ahte == 0 ⇒ no AHT block.
-        // snroffststr == 0 ⇒ frame-level snr offsets.
-        bw.write_u32(tuned_ba.csnroffst as u32, 6); // frmcsnroffst
-        bw.write_u32(tuned_ba.fsnroffst as u32, 4); // frmfsnroffst
+        // snroffststr == 0 ⇒ frame-level (frmcsnroffst, frmfsnroffst) in
+        // audfrm; snroffststr ∈ {1, 2} ⇒ no frame-level fields here (the
+        // offsets are carried per-block in each audblk instead).
+        if self.snroffststr == 0 {
+            bw.write_u32(tuned_ba.csnroffst as u32, 6); // frmcsnroffst
+            bw.write_u32(tuned_ba.fsnroffst as u32, 4); // frmfsnroffst
+        }
         bw.write_u32(0, 1); // blkstrtinfoe = 0
 
         // -------- audio blocks --------
@@ -848,6 +925,31 @@ impl Eac3Encoder {
                 bw.write_u32(tuned_ba.sgaincod as u32, 2);
                 bw.write_u32(tuned_ba.dbpbcod as u32, 2);
                 bw.write_u32(tuned_ba.floorcod as u32, 3);
+            }
+
+            // §2.3.3.27 — per-block SNR offsets when snroffststr ∈ {1,2}.
+            // (The snroffststr == 0 path carries them once in audfrm.)
+            // Block 0 emits implicitly (snroffste == 1); later blocks emit
+            // an explicit `snroffste = 1` so every block carries the same
+            // value (the decode then matches the frame-level reference).
+            // cplinu == 0 for every block, so the coupling slot is skipped.
+            if self.snroffststr != 0 {
+                if blk != 0 {
+                    bw.write_u32(1, 1); // snroffste = 1
+                }
+                bw.write_u32(tuned_ba.csnroffst as u32, 6); // csnroffst
+                if self.snroffststr == 1 {
+                    bw.write_u32(tuned_ba.fsnroffst as u32, 4); // blkfsnroffst
+                } else {
+                    // snroffststr == 2 — per-channel fine offsets (no cpl
+                    // slot: cplinu == 0). LFE slot when present.
+                    for _ in 0..nfchans {
+                        bw.write_u32(tuned_ba.fsnroffst as u32, 4); // fsnroffst[ch]
+                    }
+                    if sub.lfeon {
+                        bw.write_u32(tuned_ba.lfefsnroffst as u32, 4); // lfefsnroffst
+                    }
+                }
             }
 
             // §E.1.3.5.4 frmfgaincode==1 ⇒ per-block `fgaincode` flag.
@@ -986,6 +1088,169 @@ mod tests {
         p.channels = Some(2);
         p.bit_rate = Some(192_000);
         let _enc = make_encoder(&p).expect("eac3 stereo 192k");
+    }
+
+    // ---- per-block SNR-offset (snroffststr ∈ {1, 2}) round-trip ----
+    //
+    // The decoder's §2.3.3.27 per-block SNR-offset parse is validated by
+    // a self-encode → self-decode round-trip: the same PCM is encoded
+    // three times — once with the default frame-level `snroffststr == 0`
+    // and once each with `snroffststr == 1` and `== 2`. The `1` / `2`
+    // encodes carry the SAME numeric (csnroffst, fsnroffst) the bit
+    // allocator chose, just spread per-block across the audblks instead of
+    // once in audfrm; their mantissa budget is fractionally smaller (the
+    // per-block headers are reserved), so the decoded PCM is near-identical
+    // to the `0` baseline rather than bit-exact. The discriminating signal
+    // is that a ONE-BIT cursor misalignment in the new parse would corrupt
+    // every downstream mantissa and collapse the PSNR — so we gate on a
+    // high PSNR-vs-baseline floor (≥ 70 dB), which only a correctly
+    // bit-aligned parse can reach.
+
+    fn psnr_vs(a: &[i16], b: &[i16]) -> f64 {
+        assert_eq!(a.len(), b.len(), "length mismatch in psnr_vs");
+        let mut se = 0.0f64;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let d = *x as f64 - *y as f64;
+            se += d * d;
+        }
+        let mse = se / a.len().max(1) as f64;
+        if mse == 0.0 {
+            return f64::INFINITY;
+        }
+        let peak = 32768.0f64;
+        10.0 * (peak * peak / mse).log10()
+    }
+
+    fn build_sine_pcm(channels: usize, frames: usize) -> Vec<f32> {
+        let n = frames * SAMPLES_PER_FRAME as usize;
+        let mut pcm = vec![0.0f32; n * channels];
+        for i in 0..n {
+            let t = i as f32 / 48_000.0;
+            // Two tones so several bands carry energy (so the SNR offset
+            // actually changes how many mantissa bits each band gets).
+            let s = 0.4 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+                + 0.25 * (2.0 * std::f32::consts::PI * 3500.0 * t).sin();
+            for ch in 0..channels {
+                pcm[i * channels + ch] = s * (1.0 - 0.1 * ch as f32);
+            }
+        }
+        pcm
+    }
+
+    fn encode_with(pcm: &[f32], channels: usize, bit_rate: u64, snroffststr: u8) -> Vec<u8> {
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(channels as u16);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(bit_rate);
+        let mut enc: Box<dyn Encoder> = if snroffststr == 0 {
+            make_encoder(&params).expect("eac3 make_encoder")
+        } else {
+            make_encoder_with_snroffststr(&params, snroffststr).expect("eac3 make_encoder snr")
+        };
+        let n_samp = pcm.len() / channels;
+        let mut s16 = Vec::with_capacity(pcm.len() * 2);
+        for &v in pcm {
+            let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            s16.extend_from_slice(&q.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: n_samp as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut out = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => out.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("eac3 encode error: {e:?}"),
+            }
+        }
+        out
+    }
+
+    fn decode_all(bytes: &[u8], frame_bytes: usize) -> Vec<i16> {
+        use crate::eac3::decoder::{decode_eac3_packet, Eac3DecoderState};
+        let mut st = Eac3DecoderState::default();
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off + frame_bytes <= bytes.len() {
+            let frame = decode_eac3_packet(&mut st, &bytes[off..off + frame_bytes])
+                .expect("decode eac3 packet");
+            for chunk in frame.pcm_s16le.chunks_exact(2) {
+                out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+            }
+            off += frame_bytes;
+        }
+        out
+    }
+
+    fn assert_snroffststr_roundtrip(channels: usize, bit_rate: u64, frame_bytes: usize) {
+        let pcm = build_sine_pcm(channels, 4);
+        let base = decode_all(&encode_with(&pcm, channels, bit_rate, 0), frame_bytes);
+        let dec1 = decode_all(&encode_with(&pcm, channels, bit_rate, 1), frame_bytes);
+        let dec2 = decode_all(&encode_with(&pcm, channels, bit_rate, 2), frame_bytes);
+        assert!(!base.is_empty(), "baseline decode produced no PCM");
+        assert_eq!(
+            dec1.len(),
+            base.len(),
+            "snroffststr=1 sample-count mismatch"
+        );
+        assert_eq!(
+            dec2.len(),
+            base.len(),
+            "snroffststr=2 sample-count mismatch"
+        );
+
+        // (a) The two per-block strategies share an identical mantissa
+        // budget and SNR offsets, so they MUST decode bit-for-bit equal.
+        // This is the strict cursor-alignment invariant: if either parse
+        // mis-consumes a single bit, the mantissas diverge and the two
+        // decodes differ.
+        assert_eq!(
+            dec1, dec2,
+            "snroffststr=1 and =2 must decode bit-identically (same budget + offsets); \
+             a mismatch means one of the per-block SNR-offset parses is misaligned"
+        );
+
+        // (b) Sanity: each per-block strategy decodes to near-identical
+        // audio as the frame-level baseline (the only delta is the few
+        // reserved header bits). A misaligned parse would collapse this
+        // PSNR toward 0 dB; the small budget delta keeps it ≥ 55 dB.
+        for (strat, dec) in [(1u8, &dec1), (2u8, &dec2)] {
+            let psnr = psnr_vs(dec, &base);
+            assert!(
+                psnr >= 55.0,
+                "snroffststr={strat}: PSNR vs frame-level baseline {psnr:.2} dB < 55 dB — \
+                 the per-block SNR-offset parse is bit-misaligned"
+            );
+        }
+    }
+
+    #[test]
+    fn snroffststr_per_block_roundtrip_mono() {
+        // 128 kbps @ 48 kHz ⇒ 512-byte frames, single indep substream.
+        // The slightly higher rate (vs the 96k default) leaves padding
+        // headroom for the extra per-block SNR-offset header bits the
+        // §2.3.3.27 strategies carry over the frame-level baseline.
+        assert_snroffststr_roundtrip(1, 128_000, 512);
+    }
+
+    #[test]
+    fn snroffststr_per_block_roundtrip_stereo() {
+        // 256 kbps @ 48 kHz ⇒ 1024-byte frames.
+        assert_snroffststr_roundtrip(2, 256_000, 1024);
+    }
+
+    #[test]
+    fn snroffststr_per_block_roundtrip_51() {
+        // 5.1 @ 448 kbps ⇒ 1792-byte frames, lfeon=1 so the §2.3.3.27
+        // `snroffststr == 2` path also exercises the per-block
+        // `lfefsnroffst` slot.
+        assert_snroffststr_roundtrip(6, 448_000, 1792);
     }
 
     #[test]

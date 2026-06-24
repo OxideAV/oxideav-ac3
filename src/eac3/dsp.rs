@@ -1119,20 +1119,18 @@ pub fn decode_indep_audblks(
             state.floorcod = 0x7;
         }
 
-        // ---- SNR offset (§E.1.3.5.2) ----
-        // Round 5 supports snroffststr == 0 (single frame-level value
-        // applied to every block). Block 0 of each frame initialises
-        // every channel's csnroffst/fsnroffst from the audfrm frame
-        // values; later blocks reuse them.
+        // ---- SNR offset (§E.1.3.5.2 / Annex E audblk §2.3.3.27) ----
+        // Two strategies (Table E1.4 / spec §2.3.3.27):
+        //   * `snroffststr == 0` — a single (frmcsnroffst, frmfsnroffst)
+        //     pair carried once in audfrm applies to every block of the
+        //     frame (the frame-level path).
+        //   * `snroffststr == 0x1` / `0x2` — per-block SNR offsets carried
+        //     in the audblk itself. Block 0 always emits its offsets
+        //     (implicit `snroffste = 1`); later blocks emit a 1-bit
+        //     `snroffste` and reuse the prior block's values when it is 0.
+        // The fast-gain (`fgaincod`) defaults are independent of
+        // `snroffststr`, so they are initialised at block 0 either way.
         if blk == 0 {
-            state.snroffst_coarse = audfrm.frmcsnroffst;
-            for ch in 0..nfchans {
-                state.fsnroffst[ch] = audfrm.frmfsnroffst;
-            }
-            if lfeon {
-                state.lfefsnroffst = audfrm.frmfsnroffst;
-            }
-            state.cpl_fsnroffst = audfrm.frmfsnroffst;
             // §E.2.2.4: "If bamode == 0 the encoder uses fast-gain
             // codeword 0x4 (mid)". Carry through for fgaincod when
             // frmfgaincode == 0 (no per-block fgaincod).
@@ -1143,6 +1141,53 @@ pub fn decode_indep_audblks(
                 state.lfefgaincod = 0x4;
             }
             state.cpl_fgaincod = 0x4;
+        }
+        if audfrm.snroffststr == 0 {
+            // Frame-level: block 0 latches the audfrm values; later
+            // blocks reuse them (they never change within the frame).
+            if blk == 0 {
+                state.snroffst_coarse = audfrm.frmcsnroffst;
+                for ch in 0..nfchans {
+                    state.fsnroffst[ch] = audfrm.frmfsnroffst;
+                }
+                if lfeon {
+                    state.lfefsnroffst = audfrm.frmfsnroffst;
+                }
+                state.cpl_fsnroffst = audfrm.frmfsnroffst;
+            }
+        } else {
+            // Per-block SNR offsets (§2.3.3.27). `snroffste` is implicit
+            // 1 in block 0 and explicit thereafter; when 0 the prior
+            // block's `(csnroffst, *fsnroffst)` values are reused (they
+            // already live on `state`).
+            let snroffste = if blk == 0 { true } else { br.read_u32(1)? != 0 };
+            if snroffste {
+                state.snroffst_coarse = br.read_u32(6)? as u8;
+                if audfrm.snroffststr == 0x1 {
+                    // One shared fine offset for coupling + every fbw
+                    // channel + LFE.
+                    let blkfsnroffst = br.read_u32(4)? as u8;
+                    state.cpl_fsnroffst = blkfsnroffst;
+                    for ch in 0..nfchans {
+                        state.fsnroffst[ch] = blkfsnroffst;
+                    }
+                    if lfeon {
+                        state.lfefsnroffst = blkfsnroffst;
+                    }
+                } else {
+                    // snroffststr == 0x2 — independent fine offset per
+                    // coupling / channel / LFE slot.
+                    if cplinu {
+                        state.cpl_fsnroffst = br.read_u32(4)? as u8;
+                    }
+                    for ch in 0..nfchans {
+                        state.fsnroffst[ch] = br.read_u32(4)? as u8;
+                    }
+                    if lfeon {
+                        state.lfefsnroffst = br.read_u32(4)? as u8;
+                    }
+                }
+            }
         }
 
         // ---- §E.1.3.5.4 fgaincode (per-block fgain override) ----
@@ -2209,12 +2254,12 @@ fn reject_unsupported(bsi: &Eac3Bsi, audfrm: &AudFrm) -> Result<()> {
     // the dsp body sees the same per-block-per-channel shape it
     // already consumes for the expstre==1 case. Every validator-produced
     // E-AC-3 fixture in the corpus picks expstre==0.
-    if audfrm.snroffststr != 0 {
-        return Err(Error::unsupported(format!(
-            "eac3 dsp: snroffststr={} — round 2 only handles 0 (single frame value)",
-            audfrm.snroffststr
-        )));
-    }
+    // snroffststr handling — all three strategies are supported. `0`
+    // uses the single frame-level (frmcsnroffst, frmfsnroffst) pair from
+    // audfrm; `0x1` / `0x2` read per-block SNR offsets out of each audblk
+    // (`snroffste` + `csnroffst` + the shared/per-channel fine offsets)
+    // per the Annex E audblk §2.3.3.27 syntax. See the SNR-offset block
+    // in `decode_indep_audblks`.
     // Transient pre-noise processing (`transproce`) is no longer a
     // whole-frame reject: the per-channel time-scaling synthesis runs in
     // `apply_transient_prenoise` after overlap-add (§E.3.7.2). The

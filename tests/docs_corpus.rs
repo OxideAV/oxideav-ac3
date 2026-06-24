@@ -863,7 +863,11 @@ fn corpus_eac3_5_1_side_768kbps() {
         channels: Some(6),
         sample_rate: Some(48_000),
         eac3: true,
-        tier: Tier::ReportOnly,
+        // Decodes stably at ~91.7 dB (every channel ≥ 91 dB). Promoted
+        // from ReportOnly to a CI-gated 80 dB floor (matching the other
+        // known-good E-AC-3 5.1 / stereo fixtures) so a regression in the
+        // multichannel decode path is caught.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 

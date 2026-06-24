@@ -83,7 +83,11 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
 - Decoder — BSI, audfrm (Tables E1.2 / E1.3), audblk DSP, the §3.4
   Adaptive Hybrid Transform on fbw / LFE / coupling channels, §3.6
   spectral extension with the §3.6.4.2.3 SPXATTEN border notch, and
-  §3.7.2 transient pre-noise processing. Enhanced coupling
+  §3.7.2 transient pre-noise processing. All three §2.3.2.3 SNR-offset
+  strategies decode: the frame-level `snroffststr == 0` pair plus the
+  §2.3.3.27 per-block modes `0x1` (one shared `blkfsnroffst`) and `0x2`
+  (independent per-coupling/channel/LFE fine offsets), each gated by the
+  per-block `snroffste` reuse flag. Enhanced coupling
   (`ecplinu == 1`, §E.2.3.3.16-26 / §E.3.5.5) decodes end-to-end: the
   audblk parser reads the strategy + per-channel amplitude/angle/chaos
   coordinates, decodes the enhanced-coupling channel through the shared
