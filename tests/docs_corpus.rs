@@ -696,7 +696,10 @@ fn corpus_ac3_2_1_48000_256kbps() {
         channels: Some(3),
         sample_rate: Some(48_000),
         eac3: false,
-        tier: Tier::ReportOnly,
+        // r370: decodes deterministically at ~91.0 dB on every channel;
+        // promoted from ReportOnly to a CI-gated 80 dB floor so a base
+        // AC-3 decode regression is caught.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 
@@ -708,7 +711,8 @@ fn corpus_ac3_3_0_48000() {
         channels: Some(3),
         sample_rate: Some(48_000),
         eac3: false,
-        tier: Tier::ReportOnly,
+        // r370: ~89.0 dB min-channel, deterministic. Gated at 80 dB.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 
@@ -720,7 +724,8 @@ fn corpus_ac3_3_2_48000_384kbps() {
         channels: Some(5),
         sample_rate: Some(48_000),
         eac3: false,
-        tier: Tier::ReportOnly,
+        // r370: ~88.9 dB min-channel, deterministic. Gated at 80 dB.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 
@@ -732,7 +737,9 @@ fn corpus_ac3_3_2_lfe_48000_448kbps() {
         channels: Some(6),
         sample_rate: Some(48_000),
         eac3: false,
-        tier: Tier::ReportOnly,
+        // r370: ~90.4 dB min-channel (incl. LFE), deterministic. Gated
+        // at 80 dB.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 
@@ -744,7 +751,10 @@ fn corpus_ac3_32000hz_stereo() {
         channels: Some(2),
         sample_rate: Some(32_000),
         eac3: false,
-        tier: Tier::ReportOnly,
+        // r370: the earlier "1.34× RMS inflation" 32 kHz bit-allocation
+        // defect is resolved — this fixture now decodes at ~92.0 dB
+        // min-channel (max_abs_err=2). Gated at 80 dB.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 
@@ -756,7 +766,8 @@ fn corpus_ac3_44100hz_stereo() {
         channels: Some(2),
         sample_rate: Some(44_100),
         eac3: false,
-        tier: Tier::ReportOnly,
+        // r370: ~90.9 dB min-channel, deterministic. Gated at 80 dB.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 
@@ -780,7 +791,10 @@ fn corpus_ac3_mono_48000_96kbps() {
         channels: Some(1),
         sample_rate: Some(48_000),
         eac3: false,
-        tier: Tier::ReportOnly,
+        // r370: ~86.4 dB, deterministic. Gated at 78 dB (a touch lower
+        // than the 80 dB used for the higher-rate fixtures to leave
+        // headroom for this single-channel 96 kbps case).
+        tier: Tier::MinPsnr(78.0),
     });
 }
 
@@ -792,7 +806,8 @@ fn corpus_ac3_stereo_48000_192kbps() {
         channels: Some(2),
         sample_rate: Some(48_000),
         eac3: false,
-        tier: Tier::ReportOnly,
+        // r370: ~91.1 dB min-channel, deterministic. Gated at 80 dB.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 
@@ -804,7 +819,8 @@ fn corpus_ac3_with_audprodie() {
         channels: Some(2),
         sample_rate: Some(48_000),
         eac3: false,
-        tier: Tier::ReportOnly,
+        // r370: ~90.7 dB min-channel, deterministic. Gated at 80 dB.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 
@@ -816,7 +832,8 @@ fn corpus_ac3_with_dialnorm_set() {
         channels: Some(2),
         sample_rate: Some(48_000),
         eac3: false,
-        tier: Tier::ReportOnly,
+        // r370: ~91.1 dB min-channel, deterministic. Gated at 80 dB.
+        tier: Tier::MinPsnr(80.0),
     });
 }
 
