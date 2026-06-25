@@ -910,7 +910,12 @@ fn corpus_eac3_low_bitrate_32kbps() {
         channels: Some(1),
         sample_rate: Some(48_000),
         eac3: true,
-        tier: Tier::ReportOnly,
+        // r370: ~66.3 dB min-channel, deterministic. The residual is the
+        // 32 kbps lossy floor, concentrated in the signal attack/release
+        // blocks (the steady interior decodes much higher). Gated at a
+        // loose 60 dB floor so a gross decode regression is still caught
+        // without pinning the lossy edge headroom.
+        tier: Tier::MinPsnr(60.0),
     });
 }
 
@@ -922,7 +927,11 @@ fn corpus_eac3_low_rate_stereo_64kbps() {
         channels: Some(2),
         sample_rate: Some(48_000),
         eac3: true,
-        tier: Tier::ReportOnly,
+        // r370: ~71.7 dB min-channel, deterministic. High-coupling
+        // 64 kbps stereo; the per-frame error is confined to the tone
+        // attack/release blocks (the steady interior decodes at ~85 dB+).
+        // Gated at a loose 65 dB floor as a gross-regression guard.
+        tier: Tier::MinPsnr(65.0),
     });
 }
 
