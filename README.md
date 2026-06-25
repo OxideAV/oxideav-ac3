@@ -126,6 +126,22 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
 generation, augmented form for crc2) and the opt-in decoder residue
 check.
 
+## Conformance corpus
+
+`tests/docs_corpus.rs` decodes the AC-3 / E-AC-3 fixture set under
+`docs/audio/ac3/fixtures/` (each a raw elementary stream paired with a
+reference PCM decode) and scores per-channel PSNR. The decode is
+floating-point in the IMDCT, so it is not bit-exact against the
+reference, but it is **deterministic** (identical PSNR run-to-run).
+
+Fixtures whose decode is known-good are gated at a `Tier::MinPsnr`
+floor so a regression fails CI; the rest log deltas without gating:
+
+| Tier | AC-3 | E-AC-3 |
+| --- | --- | --- |
+| `MinPsnr` (CI-gated) | 10 fixtures — mono / stereo / 2/1 / 3/0 / 3/2 (±LFE) at 48 / 44.1 / 32 kHz, 96-448 kbps, ~86-92 dB (80 dB floor, 96 kbps mono at 78) | 4 fixtures — stereo + 5.1 + 256-coeff, ~91 dB (80 dB floor) |
+| `ReportOnly` | `ac3-low-bitrate-32kbps-mono` (~62 dB — the 32 kbps lossy floor, residual confined to the tone attack/release blocks) | the torture-grade low-rate `eac3-low-bitrate-32kbps` (~66 dB) and `eac3-low-rate-stereo-64kbps` (~72 dB) |
+
 ## Installation
 
 ```toml
