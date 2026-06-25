@@ -355,32 +355,38 @@ fn decoder_matches_ffmpeg_within_psnr_floor() {
     assert!(psnr > 80.0, "PSNR {psnr:.2} dB below 80 dB floor");
 }
 
-/// The transient-burst fixture must actually carry short-block audblks;
-/// otherwise its PSNR test degenerates to another long-block gate.
-/// Enforced here so a future fixture regen that accidentally selects
-/// all-long never silently drops short-block coverage.
+/// Short-block (§5.4.3.1 `blksw`) coverage must be exercised end-to-end:
+/// the §8.2.2 transient detector has to select the 256-point transform
+/// pair on a transient input, the encoder has to emit `blksw=1`
+/// side-info, the §5.4.3 parser has to read it back, and the §7.9.4.2
+/// short-block IMDCT has to reconstruct it.
 ///
-/// **Round 12 finding (2026-04-25):** the previous version of
-/// `parse_frame_side_info` double-called `unpack_mantissas` per block,
-/// so this test was passing on garbage `blksw` bits read from inside
-/// the previous block's mantissa region. Fixing that bug exposes that
-/// ffmpeg's own AC-3 encoder, when invoked on a short Gaussian-burst
-/// signal, still selects all long blocks (psy-acoustic block-switch
-/// decision didn't cross the encoder's threshold). The transient PSNR
-/// test still gates the long-block path under a transient onset, so
-/// short-block coverage is asserted via the dedicated IMDCT unit
-/// tests (`imdct_256_pair_fft_*`) instead.
+/// **History (round 12, 2026-04-25):** an earlier `TRANSIENT_FIXTURE`
+/// (a black-box-validator re-encode of three Gaussian bursts) turned
+/// out to select *all long blocks* — the validator encoder's psycho-
+/// acoustic block-switch decision never crossed its own threshold on
+/// that signal, so the test could not assert short-block coverage and
+/// was suspended. Re-armed here without any dependency on an external
+/// encoder: the fixture is generated *in-process* by the in-tree
+/// encoder, whose §8.2.2 detector reliably flips `blksw` on a
+/// per-block click train. This makes the test self-contained,
+/// deterministic, and a genuine gate on the whole short-block path
+/// (detect → emit → parse → IMDCT), not just on the side-info reader.
 #[test]
-#[ignore = "fixture re-encoded with ffmpeg uses all long blocks; round-12 finding"]
 fn transient_fixture_has_short_blocks() {
+    // 1) Encode a click-train transient with the in-tree encoder.
+    let stream = encode_click_train_stream();
+
+    // 2) Walk the side-info; the §8.2.2 detector must have flipped
+    //    `blksw` on the bulk of the per-block click onsets.
     let mut offset = 0;
     let mut total_blocks = 0usize;
     let mut short_blocks = 0usize;
-    while offset < TRANSIENT_FIXTURE.len() {
-        let si = syncinfo::parse(&TRANSIENT_FIXTURE[offset..]).unwrap();
+    while offset < stream.len() {
+        let si = syncinfo::parse(&stream[offset..]).unwrap();
         let flen = si.frame_length as usize;
-        let b = bsi::parse(&TRANSIENT_FIXTURE[offset + 5..]).unwrap();
-        let frame = &TRANSIENT_FIXTURE[offset..offset + flen];
+        let b = bsi::parse(&stream[offset + 5..]).unwrap();
+        let frame = &stream[offset..offset + flen];
         let side =
             audblk::parse_frame_side_info(&si, &b, frame).expect("transient fixture: side-info");
         for s in side.iter() {
@@ -391,12 +397,114 @@ fn transient_fixture_has_short_blocks() {
         }
         offset += flen;
     }
-    // Built with three Gaussian bursts — must yield at least a few
-    // tens of short blocks.
+    assert!(
+        total_blocks > 100,
+        "fixture too short: {total_blocks} blocks"
+    );
     assert!(
         short_blocks >= 30,
-        "only {short_blocks}/{total_blocks} short blocks — fixture lost coverage?"
+        "only {short_blocks}/{total_blocks} short blocks — the §8.2.2 \
+         detector or the §5.4.3.1 emit/parse path regressed"
     );
+
+    // 3) Decode the same stream; the §7.9.4.2 short-block IMDCT must
+    //    reconstruct non-silent, finite audio (a NaN / silent short
+    //    path would crater the RMS).
+    let mut reg = CodecRegistry::new();
+    oxideav_ac3::register_codecs(&mut reg);
+    let params = CodecParameters::audio(CodecId::new("ac3"));
+    let mut dec = reg.first_decoder(&params).expect("make_decoder");
+    let mut decoded: Vec<i16> = Vec::new();
+    let mut offset = 0;
+    let mut frame_idx: i64 = 0;
+    while offset < stream.len() {
+        let si = syncinfo::parse(&stream[offset..]).unwrap();
+        let flen = si.frame_length as usize;
+        let pkt = Packet::new(
+            0,
+            TimeBase::new(1, 48_000),
+            stream[offset..offset + flen].to_vec(),
+        )
+        .with_pts(frame_idx * SAMPLES_PER_FRAME as i64);
+        dec.send_packet(&pkt).unwrap();
+        if let Ok(Frame::Audio(a)) = dec.receive_frame() {
+            for s in a.data[0].chunks_exact(2) {
+                decoded.push(i16::from_le_bytes([s[0], s[1]]));
+            }
+        }
+        offset += flen;
+        frame_idx += 1;
+    }
+    assert!(
+        !decoded.is_empty(),
+        "short-block decode produced no samples"
+    );
+    let skip = 1536.min(decoded.len());
+    let sq: f64 = decoded[skip..]
+        .iter()
+        .map(|&s| (s as f64) * (s as f64))
+        .sum();
+    let rms = (sq / (decoded.len() - skip).max(1) as f64).sqrt();
+    assert!(
+        rms > 50.0,
+        "short-block round-trip RMS {rms:.1} too low — the §7.9.4.2 \
+         256-point IMDCT path may be broken"
+    );
+}
+
+/// Build a 2-second 48 kHz stereo AC-3 stream from a per-block click
+/// train, encoded by the in-tree encoder. Every 256-sample block opens
+/// with a sharp 6 kHz-carrier Gaussian click, which the §8.2.2
+/// transient detector flips to a short block. Returns the concatenated
+/// syncframes.
+fn encode_click_train_stream() -> Vec<u8> {
+    use oxideav_ac3::encoder;
+    use oxideav_core::{AudioFrame, Error, SampleFormat};
+
+    let mut params = CodecParameters::audio(CodecId::new("ac3"));
+    params.sample_rate = Some(48_000);
+    params.channels = Some(2);
+    params.sample_format = Some(SampleFormat::S16);
+    params.bit_rate = Some(192_000);
+    let mut enc = encoder::make_encoder(&params).expect("make_encoder");
+
+    let sr = 48_000usize;
+    let nsamp = sr * 2;
+    let mut pcm = vec![0i16; nsamp * 2];
+    for n in 0..nsamp {
+        let t = n as f32 / sr as f32;
+        // One sharp Gaussian click at the head of every 256-sample
+        // block, modulating a 6 kHz carrier (well inside the encoder's
+        // 8 kHz high-pass transient band).
+        let phase = (n % 256) as f32 / 6.0;
+        let env = (-phase * phase).exp();
+        let carrier = (2.0 * std::f32::consts::PI * 6000.0 * t).sin();
+        let s = (env * carrier * 0.9).clamp(-1.0, 1.0);
+        let q = (s * 32767.0) as i16;
+        pcm[n * 2] = q;
+        pcm[n * 2 + 1] = q;
+    }
+    let mut bytes = Vec::with_capacity(pcm.len() * 2);
+    for s in &pcm {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    enc.send_frame(&Frame::Audio(AudioFrame {
+        samples: nsamp as u32,
+        pts: Some(0),
+        data: vec![bytes],
+    }))
+    .unwrap();
+    let _ = enc.flush();
+
+    let mut stream = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => stream.extend_from_slice(&p.data),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("receive_packet: {e:?}"),
+        }
+    }
+    stream
 }
 
 /// Decode the transient fixture and the ffmpeg reference decode, then
