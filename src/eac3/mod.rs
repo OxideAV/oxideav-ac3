@@ -84,9 +84,17 @@
 //!   sub-band un-merged. This was the root cause of the three
 //!   previously floor-bound stereo fixtures; they now decode at
 //!   ~91 dB PSNR (gated `MinPsnr` floors in `tests/docs_corpus.rs`).
-//! * One corpus fixture (`eac3-5.1-side-768kbps`) still sits at
-//!   ~21 dB on a side-channel glitch (max_abs_err ~25k); non-affected
-//!   fixtures decode at 66-91 dB PSNR (see crate `README.md`).
+//! * Corpus status: every multichannel / stereo E-AC-3 fixture in the
+//!   `tests/docs_corpus.rs` set now decodes at ~88-92 dB PSNR and is
+//!   CI-gated at a `MinPsnr(80.0)` floor — including
+//!   `eac3-5.1-side-768kbps` (~91.7 dB, promoted from the earlier
+//!   side-channel-glitch floor in round 365). The only remaining
+//!   `ReportOnly` E-AC-3 fixtures are the deliberately torture-grade
+//!   low-rate cases (`eac3-low-bitrate-32kbps` ~66 dB,
+//!   `eac3-low-rate-stereo-64kbps` ~72 dB), whose error is confined to
+//!   the signal attack/release blocks (the steady-state interior
+//!   decodes at ~85 dB+) and reflects the lossy floor at those budgets
+//!   rather than a decode defect (see crate `README.md`).
 
 pub mod aht;
 pub mod audfrm;
