@@ -139,8 +139,12 @@ floor so a regression fails CI; the rest log deltas without gating:
 
 | Tier | AC-3 | E-AC-3 |
 | --- | --- | --- |
-| `MinPsnr` (CI-gated) | 10 fixtures — mono / stereo / 2/1 / 3/0 / 3/2 (±LFE) at 48 / 44.1 / 32 kHz, 96-448 kbps, ~86-92 dB (80 dB floor, 96 kbps mono at 78) | 6 fixtures — stereo + 5.1 + 256-coeff at ~91 dB (80 dB floor), plus the low-rate `eac3-low-bitrate-32kbps` (~66 dB, 60 dB floor) and `eac3-low-rate-stereo-64kbps` (~72 dB, 65 dB floor) as gross-regression guards |
-| `ReportOnly` | `ac3-low-bitrate-32kbps-mono` (~62 dB — the 32 kbps lossy floor, residual confined to the tone attack/release blocks) | — |
+| `MinPsnr` (CI-gated) | 11 fixtures — mono / stereo / 2/1 / 3/0 / 3/2 (±LFE) at 48 / 44.1 / 32 kHz, 32-448 kbps, ~86-92 dB (80 dB floor, 96 kbps mono at 78), plus the torture-grade `ac3-low-bitrate-32kbps-mono` (~62 dB — the 32 kbps lossy / onset-overlap floor — at a loose 50 dB gross-regression floor) | 6 fixtures — stereo + 5.1 + 256-coeff at ~91 dB (80 dB floor), plus the low-rate `eac3-low-bitrate-32kbps` (~66 dB, 60 dB floor) and `eac3-low-rate-stereo-64kbps` (~72 dB, 65 dB floor) as gross-regression guards |
+
+Every corpus fixture is now CI-gated; none remain `ReportOnly`. The
+decoder is additionally fuzzed for panic-safety against
+truncation / bit-flip / sync-prefixed-garbage corruption of every
+fixture (`tests/robustness.rs`).
 
 ## Installation
 

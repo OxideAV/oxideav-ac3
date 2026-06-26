@@ -2092,10 +2092,17 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
         let cpl_ch = MAX_FBW;
         let start = state.cpl_begf_mant;
         let end = state.cpl_endf_mant;
-        // Build subband->band lookup.
+        // Build subband->band lookup. The §7.4.2 coupling region spans at
+        // most 18 sub-bands (bins 37..253, 12 bins each), so `cpl_bndstrc`
+        // / `cpl_coord` / `cpl_phsflg` / `sbnd2bnd` are all sized 18. A
+        // malformed frame can decode `cpl_nsubbnd > 18` (e.g. an
+        // enhanced-coupling span of up to 22 sub-bands threaded into the
+        // standard decouple path); clamp the walk so it degrades to the
+        // valid prefix instead of indexing out of bounds.
+        let nsub = state.cpl_nsubbnd.min(18);
         let mut sbnd2bnd = [0usize; 18];
         let mut bnd = 0usize;
-        for sbnd in 0..state.cpl_nsubbnd {
+        for sbnd in 0..nsub {
             if sbnd > 0 && !state.cpl_bndstrc[sbnd] {
                 bnd += 1;
             }
@@ -2105,7 +2112,7 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
             if !state.channels[ch].in_coupling {
                 continue;
             }
-            for sbnd_off in 0..state.cpl_nsubbnd {
+            for sbnd_off in 0..nsub {
                 let band = sbnd2bnd[sbnd_off];
                 let coord = state.cpl_coord[ch][band] * 8.0;
                 let base = start + sbnd_off * 12;

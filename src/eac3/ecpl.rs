@@ -88,7 +88,7 @@
 use crate::imdct::{dft_512_forward, imdct_512_fft};
 use crate::tables::WINDOW;
 use oxideav_core::bits::BitReader;
-use oxideav_core::Result;
+use oxideav_core::{Error, Result};
 
 /// Table E3.9 — `ecplsubbndtab[]`. The starting transform-coefficient
 /// number of each of the 22 enhanced-coupling sub-bands, with a
@@ -184,10 +184,12 @@ pub fn end_subbnd(spxinu: bool, ecplendf: u8, spxbegf: usize) -> usize {
 #[inline]
 pub fn necplbnd(begin: usize, end: usize, bndstrc: &[bool; N_ECPL_SUBBND]) -> usize {
     let span = end.saturating_sub(begin);
-    let merges = bndstrc[begin..end.min(N_ECPL_SUBBND)]
-        .iter()
-        .filter(|&&b| b)
-        .count();
+    // Clamp the slice bounds so an inverted or out-of-grid `begin..end`
+    // (only reachable on malformed input — `parse_strategy` rejects it
+    // upstream) cannot panic: `lo > hi` would be an invalid range.
+    let lo = begin.min(N_ECPL_SUBBND);
+    let hi = end.min(N_ECPL_SUBBND).max(lo);
+    let merges = bndstrc[lo..hi].iter().filter(|&&b| b).count();
     span - merges
 }
 
@@ -201,7 +203,12 @@ pub fn necplbnd(begin: usize, end: usize, bndstrc: &[bool; N_ECPL_SUBBND]) -> us
 /// length [`necplbnd`].
 pub fn band_bin_counts(begin: usize, end: usize, bndstrc: &[bool; N_ECPL_SUBBND]) -> Vec<usize> {
     let mut counts: Vec<usize> = Vec::new();
-    for sbnd in begin..end.min(N_ECPL_SUBBND) {
+    // `begin..end` is validated `< N_ECPL_SUBBND` and non-empty by
+    // `parse_strategy`; clamp here too so a stray inverted range from a
+    // future caller degrades to an empty walk instead of a panic.
+    let lo = begin.min(ECPL_SUBBND_TAB.len().saturating_sub(1));
+    let hi = end.min(N_ECPL_SUBBND).max(lo);
+    for sbnd in lo..hi {
         let bins = ECPL_SUBBND_TAB[sbnd + 1] - ECPL_SUBBND_TAB[sbnd];
         if !bndstrc[sbnd] {
             // New band.
@@ -322,6 +329,22 @@ pub fn parse_strategy(
     let begin = begin_subbnd(ecplbegf);
     let ecplendf = if spxinu { 0 } else { br.read_u32(4)? as u8 };
     let end = end_subbnd(spxinu, ecplendf, spxbegf);
+
+    // §E.2.3.3.16-17: the enhanced-coupling region must be a non-empty
+    // span within the valid sub-band grid. `ecplbegf`/`ecplendf` are raw
+    // 4-bit codes, so a malformed frame can decode to `begin >= end` or
+    // `end > N_ECPL_SUBBND` — e.g. `ecplbegf == 15` (begin = 20) paired
+    // with a low `ecplendf`. Left unchecked, the inverted `begin..end`
+    // range panics the band-structure slicing in `necplbnd` /
+    // `band_bin_counts`. Reject here (mirroring the §E.2.3.3.4-6 SPX
+    // sub-band-range guard in `eac3::dsp`) so adversarial input yields a
+    // recoverable decode error instead of a process abort.
+    if begin >= end || end > N_ECPL_SUBBND {
+        return Err(Error::invalid(
+            "eac3 ecpl: enhanced-coupling sub-band range invalid \
+             (begin >= end or end > N_ECPL_SUBBND)",
+        ));
+    }
 
     let ecplbndstrce = br.read_u32(1)? != 0;
     let bndstrc = if ecplbndstrce {

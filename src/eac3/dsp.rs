@@ -792,8 +792,11 @@ pub fn decode_indep_audblks(
                     state.cpl_endf_mant = 37 + 12 * (state.cpl_endf as usize + 3);
                     // Derive ncplbnd by merging sub-bands whose
                     // cplbndstrc=1 (same algorithm as base AC-3).
+                    // `cpl_bndstrc` is sized 18 (§7.4.2 max sub-bands); clamp
+                    // the merge walk so a malformed `cpl_nsubbnd > 18` can't
+                    // index past it.
                     let mut n = state.cpl_nsubbnd;
-                    for bnd in 1..state.cpl_nsubbnd {
+                    for bnd in 1..state.cpl_nsubbnd.min(18) {
                         if state.cpl_bndstrc[bnd] {
                             n -= 1;
                         }
