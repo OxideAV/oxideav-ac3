@@ -782,8 +782,8 @@ fn corpus_ac3_low_bitrate_32kbps_mono() {
         // r373: promoted from ReportOnly to a loose gross-regression guard.
         // The ~62 dB min-PSNR is the genuine 32 kbps lossy floor, not a
         // decode defect: the residual is dominated by the onset frame's
-        // IMDCT overlap-add warm-up, and the FFmpeg reference exhibits the
-        // *same* ~46-50 dB frame-0-vs-frame-1 self-inconsistency on this
+        // IMDCT overlap-add warm-up, and the black-box reference output
+        // exhibits the *same* ~46-50 dB frame-0-vs-frame-1 self-inconsistency on this
         // bit-identical-frame stream (the first block overlaps with silence
         // so the tone is not exactly block-periodic at the boundary). The
         // higher-rate twin (`ac3-mono-48000-96kbps`, same signal) reaches
