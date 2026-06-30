@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.9...v0.0.10) - 2026-06-30
+
+### Other
+
+- eac3 r381: dependent-substream channel combination per §E.3.8.2 (replace-or-extend, not blind append)
+- scrub black-box-validator naming in r373 PSNR-floor comment (neutral wording)
+- ac3/eac3 r373: fix two decoder panics on malformed input + panic-safety fuzz test
+- ac3 r370: gate the two low-rate E-AC-3 fixtures as gross-regression guards
+- ac3 r370: document the conformance corpus + per-tier fixture status in README
+- ac3 r370: gate 10 base-AC-3 corpus fixtures at MinPsnr floors (regression guards)
+- ac3 r370: correct stale eac3 mod.rs corpus-status doc (5.1-side now ~91.7 dB, gated)
+- ac3 r370: re-arm two suspended tests (short-block coverage + 5.1 coupling) per guardrail #3
+- eac3 r365: per-block SNR-offset strategies (snroffststr 1/2) + 5.1-side fixture promotion
+- fix railed sample bursts from wrong LATAB log-addition table
+- neutralise validator-fixture provenance phrasing in DRC test comments
+- re-export DrcMode/DrcSettings at crate root + document DRC surface in README/CHANGELOG
+- wire §7.7 DRC control surface through both decode paths + §7.6 dialnorm output scalar
+- §6.1.9/§7.6/§7.7 DRC control surface — drc module (partial-compression cut/boost, heavy-compr, dialnorm)
+- CHANGELOG — neutral 'reference encoder' for 32 kHz bit-alloc discrepancy note
+- reset deltnseg[] per syncframe (§7.2.2.6 / §5.4.3.47 init note)
+- §7.9.4.2/§8.2.3.2 short-block transform — α=−1/α=+1 per sub-block
+- corpus driver derives real sample rate from syncframe header
+- §E.2.3.3.15 default coupling banding structure — 3 fixtures 8→91 dB
+- eac3 r335: thread §E.3.5.5.1 prior-frame edge into block-0 enhanced-coupling carrier
+- eac3 r321: §E.3.3.2 nrematbd folds in enhanced coupling (2/0 rematrix band count)
+- neutralize black-box-validator naming in ecpl module doc
+- eac3 r317: exact spxbegf recovery for SPX-co-active enhanced coupling
+- eac3 r317: enhanced-coupling (ecplinu==1) decoder-level integration (§E.3.5.5)
+- §E.3.5.5.1 enhanced-coupling carrier reconstruction (r314)
+- refresh to current status, drop per-round changelog cruft
+
 ### Fixed
 
 - eac3 round 381 (r381): **dependent-substream channel combination now follows §E.3.8.2 (replace-or-extend) instead of blind append** — the broadcast greater-than-5.1 decode defect. A real Dolby Digital Plus stream carrying a single program with more than 5.1 channels stores a 5.1 downmix in independent substream 0 and rides one or more dependent substreams that *replace or supplement* those channels (A/52:2018 §E.3.8.2). The decoder previously **appended every dependent coded channel** at the end of the indep program regardless of location. For the common broadcast case — a dep substream re-coding the Center / LFE (with `chanmape == 0`, the dep `acmod`/`lfeon` identify channels that "overwrite" the indep ones) or, with a custom `chanmap`, even L/R (Table E2.5 shaded entries) — blind-append duplicated and reordered those channels, producing a spatially decorrelated ("uncorrelated") rendered layout. `splice_dep_into_indep` now partitions each dep coded channel by its `ChannelLocation`: a location already present in the indep program **replaces** the matching slot in place (no channel-count growth); a new location **extends** the output. The indep program's per-channel locations are recorded at decode time (natural acmod/lfeon order, Table 5.8) to drive the partition. `DecodedFrame::dep_locations` now reports only the *extending* channels (replacements stay in their original slot). The in-tree 7.1 encoder path (indep 5.1 + dep [Lrs/Rrs] pair, both new locations) is unchanged — its `eac3_71_decoder_surfaces_chanmap_lrs_rrs` round-trip still yields 8 channels / `dep_locations = [Lrs, Rrs]`. Three new unit tests (`splice_extend_appends_new_locations`, `splice_replace_overwrites_shared_location_in_place`, `splice_mixed_replace_and_extend`) pin the §E.3.8.2 rule directly (replace / extend / mixed). No corpus fixture carries a dependent substream, so all 20 PSNR-gated corpus decodes are byte-unchanged. 3 new lib tests (367 → 370).
