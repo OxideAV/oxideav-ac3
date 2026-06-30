@@ -22,15 +22,22 @@
 //!
 //! 6. Walk dependent substreams in the same packet, decode each via
 //!    the round-2 DSP, and **splice** the resulting channels into
-//!    [`Eac3DecoderState::indep_pcm_f32`] so the final emitted PCM
-//!    is `(indep_nchans + Σ dep_nchans) × samples`. The chanmap
-//!    field (Table E2.5) is parsed but not used to reorder — round
-//!    3 simply appends dep channels at the end of the indep program.
-//!    None of the corpus fixtures actually exercise dep substreams
-//!    (the validator-encoded corpus omits them per
-//!    `eac3-5.1-side-768kbps/notes.md`); the plumbing is in place so
-//!    a future custom-built fixture (or interop with a real DD+
-//!    7.1 stream) works end-to-end.
+//!    [`Eac3DecoderState::indep_pcm_f32`] per the §E.3.8.2 channel-
+//!    and-program-extension rule: each dep coded channel is routed by
+//!    its Table E2.5 location (or natural `acmod` order when
+//!    `chanmape == 0`); a location already present in the indep
+//!    program *replaces* that channel in place, a new location
+//!    *extends* the output. The replace-vs-extend partition is what
+//!    keeps a real greater-than-5.1 broadcast stream spatially
+//!    correct — a dep substream commonly re-codes Center / LFE (or,
+//!    with a custom chanmap, even L/R) that the indep 5.1 downmix
+//!    already carries, and a naive blind-append would duplicate and
+//!    decorrelate those channels.
+//!    None of the validator-encoded corpus fixtures exercise dep
+//!    substreams (the corpus omits them per
+//!    `eac3-5.1-side-768kbps/notes.md`); the in-tree 7.1 encoder
+//!    (indep 5.1 + dep [Lrs/Rrs] pair) and the
+//!    `splice_*_replace`/`_extend` unit tests cover the path.
 
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
@@ -74,6 +81,14 @@ pub struct Eac3DecoderState {
     /// the indep BSI's `nchans` and grows as dep substreams splice
     /// their channels in.
     indep_nchans: u16,
+    /// Physical channel locations of the **independent** substream's
+    /// own channels, in `indep_pcm_f32` slot order (natural
+    /// `acmod`/`lfeon` order, Table 5.8). Populated by
+    /// [`decode_indep_substream`]. Used by [`splice_dep_into_indep`]
+    /// to implement the §E.3.8.2 dependent-substream combination rule:
+    /// a dep channel whose location already exists in this list
+    /// *replaces* the indep channel in place rather than being appended.
+    indep_locations: Vec<ChannelLocation>,
     /// Samples-per-frame (per channel) of [`Self::indep_pcm_f32`].
     indep_samples_per_frame: u32,
     /// Per-frame error string (last seen). Diagnostic only.
@@ -94,9 +109,10 @@ impl Eac3DecoderState {
     /// Read-only view of the indep substream's per-frame interleaved
     /// f32 PCM (range -1..1). After [`decode_eac3_packet`] this is the
     /// indep substream's PCM in `(acmod, lfeon)` bitstream order; if
-    /// any dep substreams contributed in the same packet, their channels
-    /// have been appended at the end, growing the channel count to
-    /// `indep_nchans + Σ dep_nchans` (see
+    /// any dep substreams contributed in the same packet, their
+    /// channels have been combined in per §E.3.8.2 — replacing the
+    /// matching indep slot when the location is shared, or extending
+    /// the buffer when it is new (see
     /// [`crate::eac3::decoder::splice_dep_into_indep`]).
     ///
     /// `process_eac3_frame` consumes this directly when running the
@@ -217,9 +233,11 @@ pub struct DecodedFrame {
     /// multichannel layouts into WAV-mask order can pick the right
     /// permutation via [`crate::wave_order`]. For dep-substream-extended
     /// programs (e.g. 7.1 emitted as indep 5.1 + dep [Lb,Rb]) this
-    /// reflects the **indep** acmod only — the additional dep channels
-    /// are appended at the end of the PCM buffer per
-    /// `splice_dep_into_indep` and are not covered by Table 5.8.
+    /// reflects the **indep** acmod only — any dep channels at *new*
+    /// locations are appended at the end of the PCM buffer per the
+    /// §E.3.8.2 rule in `splice_dep_into_indep` and are not covered by
+    /// Table 5.8 (dep channels at a *shared* location replace the
+    /// matching indep slot in place and do not grow the layout).
     pub acmod: u8,
     /// Independent substream's `lfeon` flag (1 bit, §E.1.2.1).
     pub lfeon: bool,
@@ -235,16 +253,18 @@ pub struct DecodedFrame {
     /// constructor uses these as overrides for the §7.8.2 fixed-0.707
     /// LtRt defaults and the 0.707 LoRo defaults.
     pub annex_e_mix_levels: Option<crate::bsi::AnnexDMixLevels>,
-    /// Physical channel locations for the dep-substream channels
-    /// appended to the indep program, in append order
-    /// (§E.2.3.1.7-8). One entry per **dep** coded channel, derived
-    /// from `chanmap` (Table E2.5) when `chanmape == 1` or from the
-    /// dep substream's `acmod`/`lfeon` natural order when
-    /// `chanmape == 0`. Empty when no dep substream contributed.
+    /// Physical channel locations for the dep-substream channels that
+    /// *extended* the indep program (i.e. were appended because their
+    /// location was new), in append order (§E.3.8.2 / §E.2.3.1.7-8).
+    /// One entry per extending dep coded channel, derived from
+    /// `chanmap` (Table E2.5) when `chanmape == 1` or from the dep
+    /// substream's `acmod`/`lfeon` natural order when `chanmape == 0`.
+    /// Empty when no dep substream contributed, or when every dep
+    /// channel *replaced* a shared indep location (§E.3.8.2 replace).
     ///
-    /// The indep program's channels occupy slots `0..nfchans+lfeon`
-    /// (in `acmod` bitstream order); the dep channels occupy slots
-    /// `indep_nchans..` in the order of this list.
+    /// The indep program's channels occupy slots `0..indep_nchans`
+    /// (replacements overwrite the matching slot in place); the
+    /// extending dep channels occupy the appended slots in this order.
     pub dep_locations: Vec<ChannelLocation>,
     /// Independent substream's 5-bit `dialnorm` word (§E.2.3.1.x, headroom
     /// in dB below digital 100%, `1..=31`). Surfaced so a caller that owns
@@ -394,6 +414,11 @@ fn decode_indep_substream(
     state.indep_pcm_f32 = floats;
     state.indep_nchans = nchans as u16;
     state.indep_samples_per_frame = samples;
+    // Record the indep substream's own per-channel locations (natural
+    // acmod/lfeon order, Table 5.8) so a following dep substream can
+    // tell which of its channels *replace* an indep channel (shared
+    // location, §E.3.8.2) versus *extend* the program (new location).
+    state.indep_locations = Eac3DecoderState::default_dep_locations(bsi.acmod, bsi.lfeon);
 
     // Pack indep PCM only. If a dep substream follows, the packet-
     // level driver will rebuild the final S16 buffer in
@@ -480,13 +505,20 @@ fn decode_dep_substream(
         return Err(e);
     }
 
-    // Splice channels per chanmap (Table E2.5).
-    splice_dep_into_indep(state, bsi, &dep_floats);
+    // Splice channels per §E.3.8.2: dep channels whose location already
+    // exists in the indep program *replace* the indep channel in place;
+    // dep channels with a new location *extend* the output. The
+    // `dep_locations` list (resolved above from chanmap / acmod) gives
+    // each dep coded channel its physical location.
+    let extended_locations =
+        splice_dep_into_indep(state, dep_nchans, bsi.chanmap, &dep_floats, &dep_locations);
 
-    // Record the per-dep-channel locations so callers (e.g. a future
-    // WAV-mask reorderer or the §7.8 downmix when extended to 7.1)
-    // can find Lb/Rb without re-parsing the chanmap.
-    state.dep_locations.extend(dep_locations);
+    // Record only the *extending* dep-channel locations (the ones that
+    // grew the output past the indep program) so callers (e.g. a future
+    // WAV-mask reorderer or the §7.8 downmix when extended to 7.1) can
+    // find Lb/Rb without re-parsing the chanmap. Replaced channels are
+    // not appended, so they do not appear here.
+    state.dep_locations.extend(extended_locations);
 
     Ok(state.indep_nchans)
 }
@@ -503,45 +535,118 @@ fn pack_f32_to_s16le(floats: &[f32]) -> Vec<u8> {
     out
 }
 
-/// Splice the dep substream's `nfchans` channels into the indep PCM
-/// scratch per the chanmap field (Table E2.5). Grows the scratch's
-/// channel count + reinterleaves on the fly.
+/// Splice the dep substream's channels into the indep PCM scratch per
+/// the §E.3.8.2 channel-and-program-extension combination rule.
 ///
-/// Round 3 implementation strategy: simply **append** the dep
-/// substream's channels at the end of the indep program (i.e. for an
-/// indep 5.1 + dep [Lc Rc], the output becomes 8 channels [L C R Ls
-/// Rs LFE Lc Rc]). The chanmap bits aren't currently used to
-/// reorder — Table E2.5 specifies where each channel sits in a 16-
-/// channel reference grid, but downstream consumers (the corpus
-/// driver and the `Downmix` engine) work in acmod-native layouts
-/// only. A future round can route per-bit if/when a fixture exercises
-/// a non-trivial chanmap.
-fn splice_dep_into_indep(state: &mut Eac3DecoderState, bsi: &Eac3Bsi, dep_floats: &[f32]) {
-    let dep_nchans = bsi.nchans as usize;
+/// A/52:2018 §E.3.8.2 (Decoding a Single Program with Greater than 5.1
+/// Channels):
+///
+/// > If channels are present in the dependent substream that
+/// > correspond to channels in the associated independent substream,
+/// > then the dependent substream data for those channels replaces the
+/// > independent substream data for the corresponding channels. All
+/// > channels present in the dependent substream that do not correspond
+/// > to channels in the independent substream are used to enable output
+/// > for speaker configurations with greater than 5.1 channels.
+///
+/// The same paragraph also covers `chanmape == 0`, where the dep
+/// substream's `acmod`/`lfeon` identify its channels and "the
+/// corresponding audio channels in the independent substream are
+/// overwritten with the dependent audio channel data". Both cases
+/// therefore reduce to: for each dep coded channel, *replace in place*
+/// when its [`ChannelLocation`] already exists in the indep program,
+/// otherwise *append* it as a new output channel.
+///
+/// Replacing rather than blind-appending is what keeps a real
+/// greater-than-5.1 broadcast stream spatially correct — a dep
+/// substream commonly re-codes the Center / LFE (or, with a custom
+/// chanmap, even L/R; Table E2.5 shaded entries) that the indep
+/// program already carries. A naive append duplicates and reorders
+/// those channels, decorrelating the rendered layout.
+///
+/// `dep_locations[ch]` gives the physical location of dep coded
+/// channel `ch` (resolved from the chanmap, or the natural acmod
+/// order when `chanmape == 0`). Returns the locations of only the
+/// channels that *extended* the program (the ones that were appended),
+/// in append order, so the caller can record them on
+/// [`Eac3DecoderState::dep_locations`].
+fn splice_dep_into_indep(
+    state: &mut Eac3DecoderState,
+    dep_nchans: usize,
+    chanmap: Option<u16>,
+    dep_floats: &[f32],
+    dep_locations: &[ChannelLocation],
+) -> Vec<ChannelLocation> {
     let samples = state.indep_samples_per_frame as usize;
     let indep_nchans = state.indep_nchans as usize;
-    let new_nchans = indep_nchans + dep_nchans;
+
+    // Partition the dep channels into "replace existing indep slot"
+    // versus "extend". For replacement, find the indep slot index that
+    // carries the same location. The indep_locations list is in
+    // indep_pcm_f32 slot order, so its index *is* the slot index.
+    // Defensive: if locations weren't recorded (shouldn't happen on a
+    // real decode), fall back to extend-only so we never lose audio.
+    let mut replace_slot: Vec<Option<usize>> = Vec::with_capacity(dep_nchans);
+    let mut extend_locs: Vec<ChannelLocation> = Vec::new();
+    for loc in dep_locations.iter().copied().take(dep_nchans) {
+        match state.indep_locations.iter().position(|&l| l == loc) {
+            Some(slot) => replace_slot.push(Some(slot)),
+            None => {
+                replace_slot.push(None);
+                extend_locs.push(loc);
+            }
+        }
+    }
+    // Any dep channels beyond the resolved location list (malformed /
+    // missing locations) are extended with an unknown location to
+    // preserve their audio rather than drop it.
+    for _ in dep_locations.len().min(dep_nchans)..dep_nchans {
+        replace_slot.push(None);
+        extend_locs.push(ChannelLocation::Left);
+    }
+
+    let num_extend = extend_locs.len();
+    let new_nchans = indep_nchans + num_extend;
 
     let mut grown = vec![0.0f32; samples * new_nchans];
     for n in 0..samples {
+        // Start from the indep program (which the in-place replacements
+        // below overwrite slot-by-slot).
         for ch in 0..indep_nchans {
             grown[n * new_nchans + ch] = state.indep_pcm_f32[n * indep_nchans + ch];
         }
-        for ch in 0..dep_nchans {
-            grown[n * new_nchans + indep_nchans + ch] = dep_floats[n * dep_nchans + ch];
+        let mut extend_cursor = 0usize;
+        for (dch, slot) in replace_slot.iter().copied().enumerate() {
+            let sample = dep_floats[n * dep_nchans + dch];
+            match slot {
+                // §E.3.8.2 replace: overwrite the matching indep slot.
+                Some(s) => grown[n * new_nchans + s] = sample,
+                // §E.3.8.2 extend: append in extend order.
+                None => {
+                    grown[n * new_nchans + indep_nchans + extend_cursor] = sample;
+                    extend_cursor += 1;
+                }
+            }
         }
     }
     state.indep_pcm_f32 = grown;
     state.indep_nchans = new_nchans as u16;
+    // The extended channels grow the location list; replaced channels
+    // already have their location in indep_locations and keep their slot.
+    state.indep_locations.extend(extend_locs.iter().copied());
 
     // Diagnostic: log the chanmap for any future bug hunts.
-    if let Some(map) = bsi.chanmap {
+    if let Some(map) = chanmap {
         if std::env::var("EAC3_TRACE_CHANMAP").is_ok() {
             eprintln!(
-                "TRACE-CHANMAP dep substream: chanmap=0x{map:04X} dep_nchans={dep_nchans} → indep grown to {new_nchans} channels",
+                "TRACE-CHANMAP dep substream: chanmap=0x{map:04X} dep_nchans={dep_nchans} \
+                 replaced={} extended={num_extend} → indep grown to {new_nchans} channels",
+                dep_nchans - num_extend,
             );
         }
     }
+
+    extend_locs
 }
 
 /// Build a silent S16 PCM buffer of the right shape for one
@@ -664,5 +769,98 @@ mod tests {
         data[0] = 0xFF;
         let mut st = Eac3DecoderState::default();
         assert!(decode_eac3_packet(&mut st, &data).is_err());
+    }
+
+    /// Set up a decoder state with a 1-sample, 3-channel indep program
+    /// at the given locations and the given per-channel constant values.
+    fn indep_state_3ch(locs: [ChannelLocation; 3], vals: [f32; 3]) -> Eac3DecoderState {
+        Eac3DecoderState {
+            indep_samples_per_frame: 1,
+            indep_nchans: 3,
+            indep_pcm_f32: vals.to_vec(),
+            indep_locations: locs.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// §E.3.8.2: a dep channel whose location is NOT in the indep
+    /// program *extends* the output (grows the channel count). The 7.1
+    /// case: indep 5.1 (here shrunk to L,C,R for the test) + a dep
+    /// [Lrs, Rrs] pair → 5 channels, the two new ones appended at the
+    /// end, and `dep_locations` reports exactly [Lrs, Rrs].
+    #[test]
+    fn splice_extend_appends_new_locations() {
+        use ChannelLocation::*;
+        let mut st = indep_state_3ch([Left, Center, Right], [1.0, 2.0, 3.0]);
+        // Dep substream: 2 coded channels at the rear-surround pair.
+        // Table E2.5 bit 6 = Lrs/Rrs.
+        let chanmap = Some(1u16 << (15 - 6));
+        let dep_floats = [4.0f32, 5.0f32]; // 1 sample × 2 dep channels
+        let locs = vec![LeftRearSurround, RightRearSurround];
+        let extended = splice_dep_into_indep(&mut st, 2, chanmap, &dep_floats, &locs);
+        assert_eq!(st.indep_nchans, 5, "indep 3 + 2 new dep = 5 channels");
+        // Indep channels untouched; dep pair appended in order.
+        assert_eq!(st.indep_pcm_f32, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(extended, vec![LeftRearSurround, RightRearSurround]);
+        assert_eq!(
+            st.indep_locations,
+            vec![Left, Center, Right, LeftRearSurround, RightRearSurround]
+        );
+    }
+
+    /// §E.3.8.2: a dep channel whose location ALREADY exists in the
+    /// indep program *replaces* the matching indep slot in place — it
+    /// does NOT grow the channel count, and the original indep sample
+    /// at that slot is overwritten with the dep data. This is the case
+    /// the spec spells out explicitly ("the center channel audio data
+    /// carried in the dependent stream will replace the center channel
+    /// audio data carried in the independent stream"). A naive append
+    /// would have produced [L,C,R, C'] (4 channels, duplicated +
+    /// decorrelated center) — the broadcast-decode defect this fixes.
+    #[test]
+    fn splice_replace_overwrites_shared_location_in_place() {
+        use ChannelLocation::*;
+        let mut st = indep_state_3ch([Left, Center, Right], [1.0, 2.0, 3.0]);
+        // Dep substream: a single channel re-coding the Center.
+        // Table E2.5 bit 1 = Center.
+        let chanmap = Some(1u16 << (15 - 1));
+        let dep_floats = [9.0f32]; // 1 sample × 1 dep channel
+        let locs = vec![Center];
+        let extended = splice_dep_into_indep(&mut st, 1, chanmap, &dep_floats, &locs);
+        assert_eq!(
+            st.indep_nchans, 3,
+            "replace must NOT grow the channel count"
+        );
+        // Center slot (index 1) overwritten; L and R unchanged.
+        assert_eq!(st.indep_pcm_f32, vec![1.0, 9.0, 3.0]);
+        assert!(
+            extended.is_empty(),
+            "a replaced channel does not extend the program"
+        );
+        assert_eq!(st.indep_locations, vec![Left, Center, Right]);
+    }
+
+    /// §E.3.8.2 mixed case: a dep substream carrying both a shared
+    /// location (Center, replaced in place) and a new location (Cs,
+    /// appended). Verifies the partition is per-channel, not all-or-
+    /// nothing, and that the appended channel lands after the indep
+    /// program while the replaced one stays in its original slot.
+    #[test]
+    fn splice_mixed_replace_and_extend() {
+        use ChannelLocation::*;
+        let mut st = indep_state_3ch([Left, Center, Right], [1.0, 2.0, 3.0]);
+        // Table E2.5 bit 1 = Center, bit 7 = Cs.
+        let chanmap = Some((1u16 << (15 - 1)) | (1u16 << (15 - 7)));
+        let dep_floats = [7.0f32, 8.0f32]; // Center', Cs
+        let locs = vec![Center, CenterSurround];
+        let extended = splice_dep_into_indep(&mut st, 2, chanmap, &dep_floats, &locs);
+        assert_eq!(st.indep_nchans, 4, "1 replace + 1 extend → 3 + 1 = 4");
+        // Center (slot 1) replaced with 7.0; Cs appended at slot 3.
+        assert_eq!(st.indep_pcm_f32, vec![1.0, 7.0, 3.0, 8.0]);
+        assert_eq!(extended, vec![CenterSurround]);
+        assert_eq!(
+            st.indep_locations,
+            vec![Left, Center, Right, CenterSurround]
+        );
     }
 }

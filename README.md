@@ -115,7 +115,15 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   corpus stereo fixtures (`eac3-stereo-48000-192kbps`, `eac3-256-coeff-block`,
   `eac3-from-ac3-bitstream-recombination`) jumped from ~8-14 dB to ~91 dB
   PSNR and are now CI-gated at an 80 dB floor (`Tier::MinPsnr` in
-  `tests/docs_corpus.rs`).
+  `tests/docs_corpus.rs`). Dependent-substream channel combination follows
+  the §E.3.8.2 replace-or-extend rule: each dep coded channel is routed by
+  its Table E2.5 location (or natural `acmod` order when `chanmape == 0`),
+  *replacing* the matching independent-substream channel in place when the
+  location is shared (e.g. a dep substream re-coding Center / LFE, or L/R
+  via a custom `chanmap`) and *extending* the output only for genuinely new
+  locations — so a real greater-than-5.1 broadcast program reassembles
+  spatially correctly rather than duplicating and decorrelating the shared
+  channels a blind append would have appended.
 - Encoder — independent + dependent substream pairs for 1.0 / 2.0 / 5.1
   / 7.1 layouts, with adaptive / frame-based exponent strategies. SPX
   and AHT are out of scope on the encoder side.
