@@ -29,7 +29,7 @@
 //!   exponent / mantissa / master-coordinate quantiser, with
 //!   [`decode_coord`] as the exact decoder-side inverse for tests.
 
-use crate::audblk::{spx_translation_plan, N_COEFFS};
+use crate::audblk::{spx_translation_plan, N_COEFFS, SPX_ATTEN_TABLE};
 use oxideav_core::{Error, Result};
 
 /// Encoder-facing SPX configuration.
@@ -57,6 +57,27 @@ pub struct SpxParams {
     /// dominated while admitting some §E.3.6.4.2.4 noise fill in the
     /// top bands.
     pub spxblnd: u8,
+    /// When true the encoder re-evaluates `spxstrtf` per frame: it
+    /// scores every valid copy-start candidate (0..=3, copy region
+    /// non-empty) by the total coordinate saturation the frame's
+    /// spectra would incur (a §3.6.4.3 target above the representable
+    /// `0.875` ceiling means the translated source region is too weak
+    /// to reach the original band energy) and picks the least-saturated
+    /// one, preferring lower codes (larger copy regions) on ties. The
+    /// configured [`SpxParams::spxstrtf`] is ignored when set. This
+    /// matters for spectra with a hole just above the first copy
+    /// sub-band: a fixed copy start would translate near-silence into
+    /// a loud extension band and pin its coordinate at the ceiling.
+    pub adaptive_copy_start: bool,
+    /// Optional §3.6.4.2.3 spectral-extension attenuation: `Some(code)`
+    /// signals `spxattene = 1` in audfrm with `chinspxatten[ch] = 1` +
+    /// `spxattencod[ch] = code` (0..=31, a Table E3.14 row) for every
+    /// fbw channel. The decoder then applies the 5-tap symmetric notch
+    /// filter at the baseband/extension border and at every
+    /// translation-copy wrap point; the encoder folds the notch into
+    /// its §3.6.4.3 energy computation so the coordinates compensate
+    /// (band energy still matches). Larger codes attenuate harder.
+    pub atten_code: Option<u8>,
     /// When true the encoder emits `spxbndstrce = 1` with an explicit
     /// band structure (identical content to the Table E2.11 default);
     /// when false it emits `spxbndstrce = 0` and relies on the
@@ -75,6 +96,8 @@ impl Default for SpxParams {
             spxendf: 7,
             spxstrtf: 0,
             spxblnd: 24,
+            adaptive_copy_start: false,
+            atten_code: None,
             explicit_band_structure: false,
         }
     }
@@ -119,6 +142,11 @@ impl SpxGeometry {
         if params.spxbegf > 7 || params.spxendf > 7 || params.spxstrtf > 3 || params.spxblnd > 31 {
             return Err(Error::invalid(
                 "spxenc: field out of range (spxbegf/spxendf 0..=7, spxstrtf 0..=3, spxblnd 0..=31)",
+            ));
+        }
+        if params.atten_code.is_some_and(|c| c > 31) {
+            return Err(Error::invalid(
+                "spxenc: spxattencod out of range (0..=31, Table E3.14)",
             ));
         }
         // §E.2.3.3.5-6 sub-band derivations (same arms as the decoder).
@@ -204,12 +232,65 @@ pub fn band_coord_targets(coeffs: &[f32; N_COEFFS], geom: &SpxGeometry) -> [f32;
 /// `spxcoe == 0` blocks reuse it, §E.2.3.3.9), so the coordinate must
 /// energy-match the *whole span*, not just the refresh block.
 pub fn band_coord_targets_span(blocks: &[&[f32; N_COEFFS]], geom: &SpxGeometry) -> [f32; 18] {
-    let (copy_map, _wrap) = spx_translation_plan(
+    band_coord_targets_span_atten(blocks, geom, None)
+}
+
+/// [`band_coord_targets_span`] with the §3.6.4.2.3 attenuation folded
+/// in. The decoder computes the banded RMS (which scales both the
+/// noise fill and — through the coordinate — the final output) *after*
+/// applying the border/wrap notch filters to the translated
+/// coefficients, so when attenuation is signalled the encoder must
+/// derive its coordinates from the *notched* translated energy or every
+/// filtered band would come out low by the notch loss. Only the
+/// extension-side taps affect the translated energy; the two
+/// coded-region bins below the border are attenuated in the decoder's
+/// output but are not part of any SPX band.
+pub fn band_coord_targets_span_atten(
+    blocks: &[&[f32; N_COEFFS]],
+    geom: &SpxGeometry,
+    atten_code: Option<u8>,
+) -> [f32; 18] {
+    let (copy_map, wrapflag) = spx_translation_plan(
         geom.copy_start_tc,
         geom.begin_tc,
         geom.nbnds,
         &geom.bndsztab,
     );
+    let total: usize = geom.bndsztab[..geom.nbnds].iter().sum();
+    // Extension-relative notch gain profile (unity when no attenuation):
+    // the 5-tap kernel [T0, T1, T2, T1, T0] sits centred one bin below
+    // each border/wrap bin (filter start = site - 2), so extension bins
+    // site+0/+1/+2 receive T2/T1/T0. Sites: the baseband/extension
+    // border (offset 0, unconditional) and every wrapped band start.
+    let mut gain = vec![1.0f64; total];
+    if let Some(code) = atten_code {
+        let row = SPX_ATTEN_TABLE[(code & 0x1F) as usize];
+        let taps = [
+            row[0] as f64,
+            row[1] as f64,
+            row[2] as f64,
+            row[1] as f64,
+            row[0] as f64,
+        ];
+        let mut apply = |site: usize| {
+            for (i, tap) in taps.iter().enumerate() {
+                // Filter start is 2 bins below the site; extension-side
+                // indices are site - 2 + i (negative → coded region).
+                let idx = site as isize - 2 + i as isize;
+                if idx >= 0 && (idx as usize) < total {
+                    gain[idx as usize] *= *tap;
+                }
+            }
+        };
+        apply(0); // baseband / extension border (§3.6.4.2.3)
+        let mut band_start = 0usize;
+        for bnd in 0..geom.nbnds {
+            if bnd > 0 && wrapflag[bnd] {
+                apply(band_start);
+            }
+            band_start += geom.bndsztab[bnd];
+        }
+    }
     let mut out = [0.0f32; 18];
     let mut offset = 0usize;
     for bnd in 0..geom.nbnds {
@@ -225,7 +306,7 @@ pub fn band_coord_targets_span(blocks: &[&[f32; N_COEFFS]], geom: &SpxGeometry) 
                 }
                 let src = copy_map[offset + i];
                 if src < N_COEFFS {
-                    let v = coeffs[src] as f64;
+                    let v = coeffs[src] as f64 * gain[offset + i];
                     e_trans += v * v;
                 }
             }
@@ -528,6 +609,68 @@ mod tests {
                 "mstr={mstr} saturated the largest target {max:e} → {dec:e}"
             );
         }
+    }
+
+    // ---- §3.6.4.2.3 attenuation folding ----
+
+    #[test]
+    fn atten_fold_raises_border_band_coordinate() {
+        // Uniform copy region + uniform HF: without attenuation every
+        // band's target is (B/A)/32. With attenuation, band 0's first
+        // three translated bins are notched by [T2, T1, T0], so its
+        // translated energy drops by exactly
+        //   (T2² + T1² + T0² + (n-3)) / n
+        // and the target must rise by the inverse square root. Bands
+        // that neither border nor wrap are unchanged.
+        let p = SpxParams::default(); // copy 25..109 (84 bins), spx 109..229
+        let g = SpxGeometry::derive(&p, &DEFAULT_SPX_BNDSTRC).unwrap();
+        let mut coeffs = [0.0f32; N_COEFFS];
+        for tc in g.copy_start_tc..g.begin_tc {
+            coeffs[tc] = 0.02;
+        }
+        for tc in g.begin_tc..g.end_tc {
+            coeffs[tc] = 0.005;
+        }
+        let code = 14u8; // Table E3.14 row [0.5, 0.25, 0.125]
+        let plain = band_coord_targets_span(&[&coeffs], &g);
+        let atten = band_coord_targets_span_atten(&[&coeffs], &g, Some(code));
+        let row = SPX_ATTEN_TABLE[code as usize];
+        let n = g.bndsztab[0] as f64;
+        let notched =
+            ((row[2] as f64).powi(2) + (row[1] as f64).powi(2) + (row[0] as f64).powi(2) + n - 3.0)
+                / n;
+        let want = plain[0] as f64 / notched.sqrt();
+        assert!(
+            (atten[0] as f64 - want).abs() / want < 1e-4,
+            "band 0: atten target {:.6e}, want {want:.6e}",
+            atten[0]
+        );
+        // Band 1 starts at translated offset 24 with copy region 84
+        // bins — no wrap yet — so it is unchanged.
+        assert!(
+            (atten[1] - plain[1]).abs() / plain[1] < 1e-6,
+            "band 1 must be unaffected (no border, no wrap)"
+        );
+        // Band 3 (offset 72; 72 + 24 > 84 → pre-band wrap) is notched
+        // at its start → its target must exceed the plain one.
+        assert!(
+            atten[3] > plain[3] * 1.001,
+            "wrapped band 3 must compensate the wrap-site notch"
+        );
+    }
+
+    #[test]
+    fn geometry_rejects_bad_atten_code() {
+        let p = SpxParams {
+            atten_code: Some(32),
+            ..SpxParams::default()
+        };
+        assert!(SpxGeometry::derive(&p, &DEFAULT_SPX_BNDSTRC).is_err());
+        let p = SpxParams {
+            atten_code: Some(31),
+            ..SpxParams::default()
+        };
+        assert!(SpxGeometry::derive(&p, &DEFAULT_SPX_BNDSTRC).is_ok());
     }
 
     // ---- §3.6.4.3 energy-matching coordinate targets ----

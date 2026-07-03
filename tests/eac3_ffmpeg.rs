@@ -679,3 +679,45 @@ fn eac3_spx_mono_decodes_through_ffmpeg() {
         "mono SPX decode RMS delta {delta:+.2} dB vs source"
     );
 }
+
+#[test]
+fn eac3_spx_atten_band_energy_through_ffmpeg() {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg not in PATH — skipping SPX attenuation interop test");
+        return;
+    }
+    // §3.6.4.2.3 attenuation: the encoder signals spxattene /
+    // chinspxatten / spxattencod in audfrm and folds the border/wrap
+    // notch into its coordinate computation. Through an EXTERNAL
+    // decoder this cross-validates (a) the audfrm attenuation-field
+    // placement (a mis-sized field would desynchronise everything
+    // after it) and (b) that the notch-compensated coordinates still
+    // deliver the §3.6.4.3 banded energy.
+    let spx = SpxParams {
+        atten_code: Some(14), // Table E3.14 taps [0.5, 0.25, 0.125]
+        ..SpxParams::default()
+    };
+    let geom = SpxGeometry::derive(&spx, &oxideav_ac3::eac3::dsp::DEFAULT_SPX_BNDSTRC)
+        .expect("SPX geometry");
+    let pcm = build_spx_multitone(2);
+    let stream = encode_eac3_spx(&pcm, 2, 192_000, spx);
+    let decoded = ffmpeg_decode(&stream, 2).expect("ffmpeg rejected the SPX+atten stream");
+    assert!(decoded.len() as f32 >= pcm.len() as f32 * 0.9);
+    let orig_prof = mdct_energy_profile(&pcm, 2, 0);
+    let dec_prof = mdct_energy_profile(&decoded, 2, 0);
+    let mut lo = geom.begin_tc;
+    let mut deltas = Vec::new();
+    for bnd in 0..geom.nbnds {
+        let hi = lo + geom.bndsztab[bnd];
+        let eo: f64 = orig_prof[lo..hi].iter().sum();
+        let ed: f64 = dec_prof[lo..hi].iter().sum();
+        deltas.push(10.0 * (ed.max(1e-30) / eo.max(1e-30)).log10());
+        lo = hi;
+    }
+    for (bnd, d) in deltas.iter().enumerate() {
+        assert!(
+            d.abs() <= 4.0,
+            "SPX band {bnd} (atten): external-decoder energy delta {d:+.2} dB (all: {deltas:?})"
+        );
+    }
+}

@@ -56,7 +56,7 @@ use crate::tables::WINDOW;
 
 use super::dsp::DEFAULT_SPX_BNDSTRC;
 use super::spxenc::{
-    band_coord_targets_span, choose_mstrspxco, quantise_coord, SpxGeometry, SpxParams,
+    band_coord_targets_span_atten, choose_mstrspxco, quantise_coord, SpxGeometry, SpxParams,
 };
 
 /// Codec id string used by the E-AC-3 encoder (registered separately from
@@ -566,8 +566,47 @@ impl Eac3Encoder {
         // coded bandwidth ends at the SPX begin frequency
         // (`endmant = spxbandtable[spx_begin_subbnd]`) and no chbwcod
         // is emitted; without SPX the bandwidth code drives it.
+        // The emitted `spxstrtf` — either the configured code or, with
+        // `adaptive_copy_start`, the per-frame least-saturated pick.
+        let mut spx_strtf_emit: u8 = self.spx.as_ref().map_or(0, |p| p.spxstrtf);
         let spx_geom = match &self.spx {
-            Some(p) => Some(SpxGeometry::derive(p, &DEFAULT_SPX_BNDSTRC)?),
+            Some(p) => {
+                let mut geom = SpxGeometry::derive(p, &DEFAULT_SPX_BNDSTRC)?;
+                if p.adaptive_copy_start {
+                    // Score each valid candidate by the frame's total
+                    // coordinate saturation (log-excess above the 0.875
+                    // representable ceiling, §E.2.3.3.11-13), summed
+                    // over channels and bands. Strict `<` keeps the
+                    // lowest candidate on ties — the largest copy
+                    // region carries the most source correlation.
+                    let mut best_score = f64::INFINITY;
+                    for cand in 0..=3u8 {
+                        let cand_params = SpxParams {
+                            spxstrtf: cand,
+                            ..*p
+                        };
+                        let Ok(g) = SpxGeometry::derive(&cand_params, &DEFAULT_SPX_BNDSTRC) else {
+                            continue; // empty copy region — invalid
+                        };
+                        let mut score = 0.0f64;
+                        for ch_coeffs in coeffs.iter().take(nfchans) {
+                            let span: Vec<&[f32; N_COEFFS]> = ch_coeffs.iter().collect();
+                            let targets = band_coord_targets_span_atten(&span, &g, p.atten_code);
+                            for &t in targets.iter().take(g.nbnds) {
+                                if t as f64 > 0.875 {
+                                    score += (t as f64 / 0.875).log2();
+                                }
+                            }
+                        }
+                        if score < best_score {
+                            best_score = score;
+                            spx_strtf_emit = cand;
+                            geom = g;
+                        }
+                    }
+                }
+                Some(geom)
+            }
             None => None,
         };
         let end_mant: usize = match &spx_geom {
@@ -693,7 +732,11 @@ impl Eac3Encoder {
                     SPX_REFRESH_BLOCKS.map(|start| {
                         let span: Vec<&[f32; N_COEFFS]> =
                             (start..start + SPX_SPAN).map(|b| &coeffs[ch][b]).collect();
-                        let targets = band_coord_targets_span(&span, g);
+                        let targets = band_coord_targets_span_atten(
+                            &span,
+                            g,
+                            self.spx.as_ref().and_then(|p| p.atten_code),
+                        );
                         let mstr = choose_mstrspxco(&targets[..g.nbnds]);
                         let mut codes = [(0u8, 0u8); 18];
                         for bnd in 0..g.nbnds {
@@ -785,9 +828,16 @@ impl Eac3Encoder {
                 let strat = chinspx + 2 + 3 + 3 + 1 + (g.end_subbnd - g.begin_subbnd - 1) as u32;
                 // Coordinates: spxblnd(5) + mstrspxco(2) + 6 bits/band.
                 let payload = 5 + 2 + 6 * g.nbnds as u32;
+                // Attenuation (audfrm): chinspxatten(1) + spxattencod(5)
+                // per fbw channel when signalled.
+                let atten = if self.spx.as_ref().is_some_and(|p| p.atten_code.is_some()) {
+                    6 * nfchans as u32
+                } else {
+                    0
+                };
                 // blk 0: payload (spxcoe implicit); blk 3: 1 + payload;
                 // blks 1/2/4/5: 1-bit spxcoe each.
-                strat + nfchans as u32 * (payload + (1 + payload) + 4)
+                strat + atten + nfchans as u32 * (payload + (1 + payload) + 4)
             }
         };
         let tuner_frame_bytes = sub
@@ -892,7 +942,8 @@ impl Eac3Encoder {
         bw.write_u32(1, 1); // frmfgaincode = 1
         bw.write_u32(1, 1); // dbaflde = 1
         bw.write_u32(1, 1); // skipflde = 1
-        bw.write_u32(0, 1); // spxattene = 0
+        let spx_atten: Option<u8> = self.spx.as_ref().and_then(|p| p.atten_code);
+        bw.write_u32(u32::from(spx_atten.is_some()), 1); // spxattene (§2.3.2.23)
         if sub.acmod > 1 {
             bw.write_u32(0, 1); // cplinu[0] = 0
             for _blk in 1..BLOCKS_PER_FRAME {
@@ -948,6 +999,17 @@ impl Eac3Encoder {
             bw.write_u32(tuned_ba.csnroffst as u32, 6); // frmcsnroffst
             bw.write_u32(tuned_ba.fsnroffst as u32, 4); // frmfsnroffst
         }
+        // §2.3.2.24-25 — spectral extension attenuation data: one
+        // chinspxatten[ch] bit per fbw channel, + spxattencod[ch]
+        // (5 bits) when set. Emitted between the SNR-offset tail and
+        // blkstrtinfoe per Table E1.3. Every fbw channel is in SPX, so
+        // all channels carry the (shared) code.
+        if let Some(code) = spx_atten {
+            for _ in 0..nfchans {
+                bw.write_u32(1, 1); // chinspxatten[ch] = 1
+                bw.write_u32(code as u32, 5); // spxattencod[ch]
+            }
+        }
         bw.write_u32(0, 1); // blkstrtinfoe = 0
 
         // -------- audio blocks --------
@@ -976,7 +1038,7 @@ impl Eac3Encoder {
                             bw.write_u32(1, 1);
                         }
                     }
-                    bw.write_u32(p.spxstrtf as u32, 2); // §E.2.3.3.4
+                    bw.write_u32(spx_strtf_emit as u32, 2); // §E.2.3.3.4
                     bw.write_u32(p.spxbegf as u32, 3); // §E.2.3.3.5
                     bw.write_u32(p.spxendf as u32, 3); // §E.2.3.3.6
                     if p.explicit_band_structure {
@@ -1675,7 +1737,7 @@ mod tests {
             spxendf: 3,
             spxstrtf: 1,
             spxblnd: 31,
-            explicit_band_structure: false,
+            ..SpxParams::default()
         };
         let geom = SpxGeometry::derive(&spx, &DEFAULT_SPX_BNDSTRC).unwrap();
         assert_eq!((geom.begin_tc, geom.end_tc), (73, 133));
@@ -1692,6 +1754,122 @@ mod tests {
                 "SPX band {bnd}: energy delta {d:+.2} dB (all: {deltas:?})"
             );
         }
+    }
+
+    /// Fixture for the adaptive copy-start test: a spectral HOLE in
+    /// tc# 25..49 (no content between ~2.3 and ~4.6 kHz), LF tones only
+    /// above it, HF tones in SPX bands 0/2/3, and a bed too weak to
+    /// carry a band on its own. With `spxstrtf = 0` the copy region
+    /// starts at tc# 25, so SPX band 0 (tc 109..133) translates the
+    /// near-silent hole and its coordinate pins at the 0.875 ceiling;
+    /// `spxstrtf = 2` starts the copy at tc# 49 where the tones live.
+    fn build_gap_multitone(channels: usize, frames: usize) -> Vec<f32> {
+        let n = frames * SAMPLES_PER_FRAME as usize;
+        let mut pcm = vec![0.0f32; n * channels];
+        let tones: [(f32, f32); 6] = [
+            (700.0, 0.20),     // below the copy region entirely
+            (5_500.0, 0.16),   // tc ≈ 58 — inside 49..109
+            (8_600.0, 0.12),   // tc ≈ 91 — inside 49..109
+            (12_200.0, 0.045), // SPX band 0
+            (15_400.0, 0.030), // SPX band 2
+            (19_000.0, 0.025), // SPX band 3
+        ];
+        let mut lfsr: u32 = 0x0BAD_5EED;
+        for i in 0..n {
+            let t = i as f32 / 48_000.0;
+            let mut s = 0.0f32;
+            for (f, a) in tones {
+                s += a * (2.0 * std::f32::consts::PI * f * t).sin();
+            }
+            lfsr ^= lfsr << 13;
+            lfsr ^= lfsr >> 17;
+            lfsr ^= lfsr << 5;
+            s += ((lfsr as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.001;
+            for ch in 0..channels {
+                pcm[i * channels + ch] = s * (1.0 - 0.08 * ch as f32);
+            }
+        }
+        pcm
+    }
+
+    #[test]
+    fn spx_adaptive_copy_start_avoids_saturation() {
+        let geom = SpxGeometry::derive(&SpxParams::default(), &DEFAULT_SPX_BNDSTRC).unwrap();
+        let pcm = build_gap_multitone(2, 8);
+        // Tone-bearing SPX bands (12.2 / 15.4 / 19 kHz → bands 0/2/3).
+        let tone_bands = [0usize, 2, 3];
+
+        // Fixed spxstrtf = 0: band 0's translation source is the
+        // spectral hole → the coordinate saturates and the band decodes
+        // far below the original energy.
+        let fixed = SpxParams::default(); // spxstrtf = 0
+        let dec_fixed = to_f32_interleaved(&decode_all(&encode_spx(&pcm, 2, 192_000, fixed), 768));
+        let orig_prof = mdct_energy_profile(&pcm, 2, 0);
+        let fixed_prof = mdct_energy_profile(&dec_fixed, 2, 0);
+        let fixed_deltas = band_db_deltas(&orig_prof, &fixed_prof, &geom);
+        assert!(
+            fixed_deltas[0] < -6.0,
+            "premise: fixed copy-start must saturate band 0 (delta {:+.2} dB)",
+            fixed_deltas[0]
+        );
+
+        // Adaptive: the per-frame scorer must move the copy start past
+        // the hole and recover every tone band.
+        let adaptive = SpxParams {
+            adaptive_copy_start: true,
+            ..SpxParams::default()
+        };
+        let dec_ad = to_f32_interleaved(&decode_all(&encode_spx(&pcm, 2, 192_000, adaptive), 768));
+        let ad_prof = mdct_energy_profile(&dec_ad, 2, 0);
+        let ad_deltas = band_db_deltas(&orig_prof, &ad_prof, &geom);
+        for &bnd in &tone_bands {
+            assert!(
+                ad_deltas[bnd].abs() <= 3.5,
+                "adaptive: SPX band {bnd} delta {:+.2} dB (all: {ad_deltas:?}; fixed: {fixed_deltas:?})",
+                ad_deltas[bnd]
+            );
+        }
+        // Coded band unaffected by the choice.
+        let eo: f64 = orig_prof[..geom.begin_tc].iter().sum();
+        let ed: f64 = ad_prof[..geom.begin_tc].iter().sum();
+        assert!((10.0 * (ed / eo).log10()).abs() <= 1.5);
+    }
+
+    #[test]
+    fn spx_atten_roundtrip_stereo_band_energy() {
+        // §3.6.4.2.3 attenuation: spxattene=1 in audfrm with
+        // chinspxatten/spxattencod per channel; the decoder notches the
+        // translated coefficients at the border + wrap sites and the
+        // encoder folds the notch into its coordinate computation, so
+        // the banded-energy contract must STILL hold. This gates (a)
+        // the audfrm attenuation-field alignment (a mis-sized field
+        // shifts blkstrtinfoe and every audblk after it) and (b) the
+        // energy compensation.
+        let spx = SpxParams {
+            atten_code: Some(14), // taps [0.5, 0.25, 0.125] — a strong notch
+            ..SpxParams::default()
+        };
+        let geom = SpxGeometry::derive(&spx, &DEFAULT_SPX_BNDSTRC).unwrap();
+        let pcm = build_spx_multitone(2, 8);
+        let stream = encode_spx(&pcm, 2, 192_000, spx);
+        let dec = decode_all(&stream, 768);
+        let dec_f = to_f32_interleaved(&dec);
+        for ch in 0..2 {
+            let orig_prof = mdct_energy_profile(&pcm, 2, ch);
+            let dec_prof = mdct_energy_profile(&dec_f, 2, ch);
+            let deltas = band_db_deltas(&orig_prof, &dec_prof, &geom);
+            for (bnd, d) in deltas.iter().enumerate() {
+                assert!(
+                    d.abs() <= 3.0,
+                    "ch{ch} SPX band {bnd} (atten): energy delta {d:+.2} dB (all: {deltas:?})"
+                );
+            }
+        }
+        // The attenuated stream must actually differ from the plain
+        // one (the notch + the audfrm fields are real bit-level
+        // effects, not a silent no-op).
+        let plain = encode_spx(&pcm, 2, 192_000, SpxParams::default());
+        assert_ne!(stream, plain, "attenuation must change the bitstream");
     }
 
     #[test]
