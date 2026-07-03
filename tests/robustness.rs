@@ -185,3 +185,66 @@ fn eac3_malformed_coupling_range_does_not_panic() {
         }
     }
 }
+
+/// SPX-bearing stream corruption sweep. The encoder-side spectral
+/// extension (r386) emits syntax the corpus fixtures only partially
+/// exercise (explicit band structures, per-channel attenuation codes,
+/// non-zero copy-start offsets), and the decoder's SPX strategy /
+/// coordinate parse carries several derived-geometry slices
+/// (`spx_bndsztab`, translation plan, blend tables). Generate an SPX +
+/// attenuation stream IN-PROCESS (no corpus dependency — this runs on
+/// the standalone-repo CI too) and drive it through the same three
+/// corruption families as the corpus sweep.
+#[test]
+fn eac3_spx_encoded_stream_survives_corruption() {
+    use oxideav_core::{AudioFrame, Encoder, Error, Frame, SampleFormat};
+
+    // Build ~4 frames of HF-rich stereo PCM and encode with SPX +
+    // attenuation + explicit band structure (the densest SPX syntax).
+    let n = 4 * 1536usize;
+    let mut pcm_s16 = Vec::with_capacity(n * 2 * 2);
+    let mut lfsr: u32 = 0xC0FF_EE01;
+    for i in 0..n {
+        let t = i as f32 / 48_000.0;
+        let mut s = 0.16 * (2.0 * std::f32::consts::PI * 3_100.0 * t).sin()
+            + 0.05 * (2.0 * std::f32::consts::PI * 14_000.0 * t).sin();
+        lfsr ^= lfsr << 13;
+        lfsr ^= lfsr >> 17;
+        lfsr ^= lfsr << 5;
+        s += ((lfsr as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.01;
+        let q = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        pcm_s16.extend_from_slice(&q.to_le_bytes()); // L
+        pcm_s16.extend_from_slice(&q.to_le_bytes()); // R
+    }
+    let mut params = CodecParameters::audio(CodecId::new("eac3"));
+    params.sample_rate = Some(48_000);
+    params.channels = Some(2);
+    params.sample_format = Some(SampleFormat::S16);
+    params.bit_rate = Some(192_000);
+    let spx = oxideav_ac3::eac3::SpxParams {
+        atten_code: Some(14),
+        explicit_band_structure: true,
+        ..Default::default()
+    };
+    let mut enc: Box<dyn Encoder> =
+        oxideav_ac3::eac3::make_encoder_with_spx(&params, spx).expect("spx encoder");
+    enc.send_frame(&Frame::Audio(AudioFrame {
+        samples: n as u32,
+        pts: Some(0),
+        data: vec![pcm_s16],
+    }))
+    .unwrap();
+    enc.flush().unwrap();
+    let mut stream = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => stream.extend_from_slice(&p.data),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("spx encode error: {e:?}"),
+        }
+    }
+    assert!(stream.len() >= 768, "expected at least one 768-byte frame");
+
+    // Same three corruption families as the corpus sweep.
+    sweep_one("eac3", &stream);
+}
