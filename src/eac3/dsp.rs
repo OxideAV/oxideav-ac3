@@ -232,7 +232,7 @@ use super::bsi::{Bsi as Eac3Bsi, StreamType};
 /// '1' entries at sub-bands 8, 10, 12, 14, 16) means "merge into the
 /// previous band". Used the first time SPX is active in a frame when
 /// `spxbndstrce == 0`.
-const DEFAULT_SPX_BNDSTRC: [bool; 18] = {
+pub const DEFAULT_SPX_BNDSTRC: [bool; 18] = {
     let mut t = [false; 18];
     t[8] = true;
     t[10] = true;

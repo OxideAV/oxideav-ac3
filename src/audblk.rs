@@ -1925,6 +1925,55 @@ fn spx_noise(lfsr: &mut u32) -> f32 {
     u * 1.732_050_8
 }
 
+/// §E.3.6.4.1 transform-coefficient translation plan, shared between
+/// the decoder ([`apply_spectral_extension`]) and the encoder
+/// (`eac3::spxenc` — which must predict exactly which LF bin the
+/// decoder will copy into each SPX bin to compute the §3.6.4.3
+/// energy-matching coordinates).
+///
+/// Returns:
+/// * `map` — for each SPX-region bin `i` (absolute tc# =
+///   `spx_begin_tc + i`), the LF source tc# the translation copies
+///   from. The copy cursor starts at `copystart` and wraps back to it
+///   per the spec's dual wrap checks: the pre-band
+///   `copyindex + bandsize > copyend` test AND the per-bin
+///   `copyindex == copyend` test.
+/// * `wrapflag[bnd]` — true when band `bnd >= 1` wrapped (its start is
+///   a copy boundary), driving the §3.6.4.2.3 border-notch re-filter
+///   sites. Band 0's border site (the baseband / extension border
+///   itself) is unconditional and not flagged here.
+pub(crate) fn spx_translation_plan(
+    copystart: usize,
+    copyend: usize,
+    nbnds: usize,
+    bndsztab: &[usize; 18],
+) -> (Vec<usize>, [bool; 18]) {
+    let total: usize = bndsztab[..nbnds].iter().sum();
+    let mut map = Vec::with_capacity(total);
+    let mut wrapflag = [false; 18];
+    let mut copyindex = copystart;
+    for bnd in 0..nbnds {
+        let bandsize = bndsztab[bnd];
+        let mut wrapped = false;
+        if copyindex + bandsize > copyend {
+            copyindex = copystart;
+            wrapped = true;
+        }
+        for _ in 0..bandsize {
+            if copyindex == copyend {
+                copyindex = copystart;
+                wrapped = true;
+            }
+            map.push(copyindex);
+            copyindex += 1;
+        }
+        if bnd > 0 && wrapped {
+            wrapflag[bnd] = true;
+        }
+    }
+    (map, wrapflag)
+}
+
 /// E-AC-3 spectral extension high-frequency regeneration (§E.3.6).
 ///
 /// For each fbw channel with `in_spx == true` this synthesizes the SPX
@@ -1959,48 +2008,27 @@ fn apply_spectral_extension(state: &mut Ac3State, nfchans: usize) {
         return;
     }
 
+    // 1. Transform coefficient translation plan (§E.3.6.4.1) —
+    //    channel-independent, so compute it once. `wrapflag[bnd]` is
+    //    true when the band-relative copy cursor had to wrap back to
+    //    `copystart` before consuming this band's `bandsize` samples —
+    //    i.e. the band straddles a copy boundary. The spec applies the
+    //    §3.6.4.2.3 border notch filter at every such wrap point AND at
+    //    the baseband / extension border itself (the bin straddling
+    //    `spx_begin_tc`). The plan is shared with the encoder
+    //    (`eac3::spxenc`) so both sides agree bin-for-bin.
+    let (copy_map, wrapflag) = spx_translation_plan(copystart, copyend, nbnds, &state.spx_bndsztab);
+
     for ch in 0..nfchans {
         if !state.channels[ch].in_spx {
             continue;
         }
 
-        // 1. Transform coefficient translation (§E.3.6.4.1).
-        //    `wrapflag[bnd]` is true when the band-relative copy cursor
-        //    had to wrap back to `copystart` before consuming this
-        //    band's `bandsize` samples — i.e. the band straddles a copy
-        //    boundary. The spec applies the §3.6.4.2.3 border notch
-        //    filter at every such wrap point AND at the baseband /
-        //    extension border itself (the bin straddling `spx_begin_tc`).
-        let mut copyindex = copystart;
-        let mut insertindex = spx_begin_tc;
-        let mut wrapflag = [false; 18];
-        for bnd in 0..nbnds {
-            let bandsize = state.spx_bndsztab[bnd];
-            // Spec pseudocode applies wrap detection at TWO points: the
-            // pre-band check `(copyindex + bandsize > copyend)` AND the
-            // per-bin `(copyindex == copyend)` check. Either path is a
-            // wrap from the band's point of view. Band 0 is the
-            // baseband/extension border itself — its filter site is
-            // emitted unconditionally outside this loop, so only
-            // bnd >= 1 wraps need flagging.
-            let mut wrapped = false;
-            if copyindex + bandsize > copyend {
-                copyindex = copystart;
-                wrapped = true;
-            }
-            for _ in 0..bandsize {
-                if copyindex == copyend {
-                    copyindex = copystart;
-                    wrapped = true;
-                }
-                if insertindex < N_COEFFS && copyindex < N_COEFFS {
-                    state.channels[ch].coeffs[insertindex] = state.channels[ch].coeffs[copyindex];
-                }
-                insertindex += 1;
-                copyindex += 1;
-            }
-            if bnd > 0 && wrapped {
-                wrapflag[bnd] = true;
+        // Execute the translation copy.
+        for (i, &src) in copy_map.iter().enumerate() {
+            let insertindex = spx_begin_tc + i;
+            if insertindex < N_COEFFS && src < N_COEFFS {
+                state.channels[ch].coeffs[insertindex] = state.channels[ch].coeffs[src];
             }
         }
 
@@ -2427,6 +2455,67 @@ mod spx_tests {
         assert_eq!(spx_bandtable(9), 133);
         assert_eq!(spx_bandtable(16), 217);
         assert_eq!(spx_bandtable(17), 229);
+    }
+
+    /// §E.3.6.4.1 translation plan — no-wrap case: the copy region is
+    /// at least as large as the SPX region, so the cursor never wraps
+    /// and the map is a straight run from `copystart`.
+    #[test]
+    fn spx_translation_plan_no_wrap() {
+        // copy region [25, 133) = 108 bins; SPX region of 2×12-bin
+        // bands = 24 bins — fits without wrapping.
+        let mut sztab = [0usize; 18];
+        sztab[0] = 12;
+        sztab[1] = 12;
+        let (map, wrap) = spx_translation_plan(25, 133, 2, &sztab);
+        assert_eq!(map.len(), 24);
+        for (i, &src) in map.iter().enumerate() {
+            assert_eq!(src, 25 + i);
+        }
+        assert!(wrap.iter().all(|&w| !w), "no band may wrap");
+    }
+
+    /// §E.3.6.4.1 translation plan — wrap case with the spec's
+    /// PRE-BAND check: when the next band would run past `copyend`,
+    /// the cursor resets to `copystart` BEFORE the band starts (it does
+    /// not consume the tail of the copy region first).
+    #[test]
+    fn spx_translation_plan_pre_band_wrap() {
+        // Copy region [25, 43) = 18 bins; three 12-bin bands.
+        // Band 0: bins 25..37 (12 taken, cursor at 37).
+        // Band 1: 37 + 12 > 43 → pre-band wrap → bins 25..37 again.
+        // Band 2: 37 + 12 > 43 → pre-band wrap → bins 25..37 again.
+        let mut sztab = [0usize; 18];
+        sztab[0] = 12;
+        sztab[1] = 12;
+        sztab[2] = 12;
+        let (map, wrap) = spx_translation_plan(25, 43, 3, &sztab);
+        assert_eq!(map.len(), 36);
+        assert_eq!(&map[0..12], &(25..37).collect::<Vec<_>>()[..]);
+        assert_eq!(&map[12..24], &(25..37).collect::<Vec<_>>()[..]);
+        assert_eq!(&map[24..36], &(25..37).collect::<Vec<_>>()[..]);
+        assert!(!wrap[0], "band 0 border site is unconditional, not flagged");
+        assert!(wrap[1] && wrap[2], "bands 1/2 wrap");
+    }
+
+    /// §E.3.6.4.1 translation plan — wrap case with the spec's PER-BIN
+    /// check: a merged (24-bin) band larger than the copy region wraps
+    /// mid-band via the `copyindex == copyend` test.
+    #[test]
+    fn spx_translation_plan_per_bin_wrap() {
+        // Copy region [25, 41) = 16 bins; one 24-bin merged band.
+        // Pre-band check fires (24 > 16) → start at 25; after 16 bins
+        // the per-bin check wraps the cursor back to 25 for the last 8.
+        let mut sztab = [0usize; 18];
+        sztab[0] = 24;
+        let (map, wrap) = spx_translation_plan(25, 41, 1, &sztab);
+        assert_eq!(map.len(), 24);
+        assert_eq!(&map[0..16], &(25..41).collect::<Vec<_>>()[..]);
+        assert_eq!(&map[16..24], &(25..33).collect::<Vec<_>>()[..]);
+        assert!(
+            !wrap[0],
+            "band 0 wraps are not flagged (border site is unconditional)"
+        );
     }
 
     /// §E.3.3.2 `nrematbd` decision tree — every arm of the spec

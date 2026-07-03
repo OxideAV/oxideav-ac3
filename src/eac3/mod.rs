@@ -104,6 +104,7 @@ pub mod decoder;
 pub mod dsp;
 pub mod ecpl;
 pub mod encoder;
+pub mod spxenc;
 pub mod tables;
 
 // Re-exports — keep the public surface identical to the old single-
