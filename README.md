@@ -1,5 +1,7 @@
 # oxideav-ac3
 
+[![CI](https://github.com/OxideAV/oxideav-ac3/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-ac3/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-ac3.svg)](https://crates.io/crates/oxideav-ac3) [![docs.rs](https://docs.rs/oxideav-ac3/badge.svg)](https://docs.rs/oxideav-ac3) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **AC-3 (Dolby Digital)** + **E-AC-3 (Enhanced AC-3 / Dolby
 Digital Plus)** audio decoder + encoder — elementary streams per
 ATSC A/52:2018 (= ETSI TS 102 366). Zero C dependencies.
