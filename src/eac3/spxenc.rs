@@ -194,6 +194,16 @@ impl SpxGeometry {
 /// there is nothing to scale; the decoder will synthesize silence
 /// (plus noise-blend fill scaled by the same zero RMS).
 pub fn band_coord_targets(coeffs: &[f32; N_COEFFS], geom: &SpxGeometry) -> [f32; 18] {
+    band_coord_targets_span(&[coeffs], geom)
+}
+
+/// Multi-block variant of [`band_coord_targets`]: accumulates the
+/// original / translated band energies across all supplied blocks
+/// before forming the ratio. The encoder signals one coordinate set
+/// per refresh span (`spxcoe[ch] == 1` block; the following
+/// `spxcoe == 0` blocks reuse it, §E.2.3.3.9), so the coordinate must
+/// energy-match the *whole span*, not just the refresh block.
+pub fn band_coord_targets_span(blocks: &[&[f32; N_COEFFS]], geom: &SpxGeometry) -> [f32; 18] {
     let (copy_map, _wrap) = spx_translation_plan(
         geom.copy_start_tc,
         geom.begin_tc,
@@ -206,16 +216,18 @@ pub fn band_coord_targets(coeffs: &[f32; N_COEFFS], geom: &SpxGeometry) -> [f32;
         let bandsize = geom.bndsztab[bnd];
         let mut e_orig = 0.0f64;
         let mut e_trans = 0.0f64;
-        for i in 0..bandsize {
-            let tc = geom.begin_tc + offset + i;
-            if tc < N_COEFFS {
-                let v = coeffs[tc] as f64;
-                e_orig += v * v;
-            }
-            let src = copy_map[offset + i];
-            if src < N_COEFFS {
-                let v = coeffs[src] as f64;
-                e_trans += v * v;
+        for coeffs in blocks {
+            for i in 0..bandsize {
+                let tc = geom.begin_tc + offset + i;
+                if tc < N_COEFFS {
+                    let v = coeffs[tc] as f64;
+                    e_orig += v * v;
+                }
+                let src = copy_map[offset + i];
+                if src < N_COEFFS {
+                    let v = coeffs[src] as f64;
+                    e_trans += v * v;
+                }
             }
         }
         out[bnd] = if e_trans > f64::MIN_POSITIVE && e_orig > f64::MIN_POSITIVE {

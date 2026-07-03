@@ -3,8 +3,12 @@
 //! for 1.0/2.0/5.1 layouts, plus a paired indep+dep substream emission
 //! for 7.1 input (5.1 downmix in indep, Lb/Rb in dep with `chanmap`
 //! bit 6 = Lrs/Rrs pair set). `bsid=16`, 6 audio blocks per syncframe
-//! (`numblkscod=3`), no coupling, no spectral extension, no Adaptive
-//! Hybrid Transform.
+//! (`numblkscod=3`), no coupling, no Adaptive Hybrid Transform.
+//! Spectral extension (§E.2.3.3 / §E.3.6) is available opt-in through
+//! [`make_encoder_with_spx`] — every fbw channel of every substream is
+//! then coded only up to the SPX begin frequency and the decoder
+//! synthesizes the extension region from the [`super::spxenc`]
+//! energy-matching coordinates.
 //!
 //! Differences from AC-3 (`super::encoder`) at this scope:
 //!
@@ -39,7 +43,7 @@ use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
 
-use crate::audblk::{BLOCKS_PER_FRAME, N_COEFFS, SAMPLES_PER_BLOCK};
+use crate::audblk::{remat_band_count_spx, BLOCKS_PER_FRAME, N_COEFFS, SAMPLES_PER_BLOCK};
 use crate::decoder::SAMPLES_PER_FRAME;
 use crate::encoder::{
     ac3_crc_update, build_dba_plan, compute_bap, decode_input_samples, extract_exponent,
@@ -49,6 +53,11 @@ use crate::encoder::{
 };
 use crate::mdct::{mdct_256_pair, mdct_512};
 use crate::tables::WINDOW;
+
+use super::dsp::DEFAULT_SPX_BNDSTRC;
+use super::spxenc::{
+    band_coord_targets_span, choose_mstrspxco, quantise_coord, SpxGeometry, SpxParams,
+};
 
 /// Codec id string used by the E-AC-3 encoder (registered separately from
 /// the AC-3 decoder/encoder in [`crate::register`]).
@@ -260,7 +269,36 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
         packet_queue: Vec::new(),
         pts: 0,
         snroffststr: 0,
+        spx: None,
     })
+}
+
+/// Build an E-AC-3 encoder with Spectral Extension (SPX, §E.2.3.3 /
+/// §E.3.6) enabled.
+///
+/// SPX is E-AC-3's parametric high-frequency reconstruction: the coded
+/// bandwidth of every full-bandwidth channel stops at the SPX begin
+/// frequency (`25 + 12·spx_begin_subbnd` transform coefficients; tc#
+/// 109 ≈ 10.2 kHz at 48 kHz for the default [`SpxParams`]), and the
+/// decoder regenerates the extension region from a translated copy of
+/// the channel's own low-frequency spectrum, noise-blended and scaled
+/// by per-band coordinates the encoder derives from the §3.6.4.3
+/// energy-matching rule. The bits saved on high-frequency exponents /
+/// mantissas are re-spent on the coded low band by the SNR-offset
+/// tuner, so SPX trades exact HF waveforms for a better LF floor —
+/// the intended low-bit-rate operating mode.
+///
+/// Accepts the same `params` as [`make_encoder`]. The geometry is
+/// validated up front; an invalid combination (inverted sub-band
+/// range, empty copy region, out-of-range field) fails here rather
+/// than at the first frame.
+pub fn make_encoder_with_spx(params: &CodecParameters, spx: SpxParams) -> Result<Box<dyn Encoder>> {
+    // Fail fast on invalid geometry (same validation the per-frame
+    // emitter performs).
+    SpxGeometry::derive(&spx, &DEFAULT_SPX_BNDSTRC)?;
+    let mut concrete = build_concrete_encoder(params)?;
+    concrete.spx = Some(spx);
+    Ok(Box::new(concrete))
 }
 
 /// Test-only constructor that selects a non-zero `snroffststr` (per-block
@@ -370,6 +408,11 @@ struct Eac3Encoder {
     /// the decoder's per-block SNR-offset parse; the chosen offsets equal
     /// the frame-level values so the decoded PCM matches the `0` baseline.
     snroffststr: u8,
+    /// Spectral extension configuration (§E.2.3.3 / §E.3.6). `None`
+    /// (the [`make_encoder`] default) codes the full bandwidth; `Some`
+    /// (via [`make_encoder_with_spx`]) puts every fbw channel of every
+    /// substream in SPX.
+    spx: Option<SpxParams>,
 }
 
 impl Encoder for Eac3Encoder {
@@ -519,7 +562,18 @@ impl Eac3Encoder {
         let mut exps: Vec<Vec<[u8; N_COEFFS]>> =
             vec![vec![[24u8; N_COEFFS]; BLOCKS_PER_FRAME]; nfchans + 2];
         let chbwcod: u8 = 60;
-        let end_mant: usize = 37 + 3 * (chbwcod as usize + 12);
+        // §E.2.3.3 / §E.3.3.3 — with SPX in use, every fbw channel's
+        // coded bandwidth ends at the SPX begin frequency
+        // (`endmant = spxbandtable[spx_begin_subbnd]`) and no chbwcod
+        // is emitted; without SPX the bandwidth code drives it.
+        let spx_geom = match &self.spx {
+            Some(p) => Some(SpxGeometry::derive(p, &DEFAULT_SPX_BNDSTRC)?),
+            None => None,
+        };
+        let end_mant: usize = match &spx_geom {
+            Some(g) => g.begin_tc,
+            None => 37 + 3 * (chbwcod as usize + 12),
+        };
         let ch_end_mant = end_mant;
         for ch in 0..nfchans {
             for blk in 0..BLOCKS_PER_FRAME {
@@ -620,6 +674,37 @@ impl Eac3Encoder {
             }
         }
 
+        // -------- SPX coordinate planning (§E.2.3.3.9-13 / §E.3.6.3) --------
+        //
+        // Coordinates are refreshed twice per frame — block 0 (where
+        // `spxcoe` is implicit for a channel's first SPX block,
+        // §E.2.3.3.9) and block 3, matching the exponent anchor
+        // pattern; blocks 1/2/4/5 emit `spxcoe = 0` and reuse. Each
+        // refresh's coordinate set energy-matches its whole 3-block
+        // span (§3.6.4.3), computed from the encoder's own unquantised
+        // MDCT spectra via the shared decoder translation plan.
+        const SPX_REFRESH_BLOCKS: [usize; 2] = [0, 3];
+        const SPX_SPAN: usize = 3;
+        // Per channel, per refresh span: (mstrspxco, per-band (exp, mant)).
+        type SpxCoordSet = (u8, [(u8, u8); 18]);
+        let spx_coords: Option<Vec<[SpxCoordSet; 2]>> = spx_geom.as_ref().map(|g| {
+            (0..nfchans)
+                .map(|ch| {
+                    SPX_REFRESH_BLOCKS.map(|start| {
+                        let span: Vec<&[f32; N_COEFFS]> =
+                            (start..start + SPX_SPAN).map(|b| &coeffs[ch][b]).collect();
+                        let targets = band_coord_targets_span(&span, g);
+                        let mstr = choose_mstrspxco(&targets[..g.nbnds]);
+                        let mut codes = [(0u8, 0u8); 18];
+                        for bnd in 0..g.nbnds {
+                            codes[bnd] = quantise_coord(targets[bnd], mstr);
+                        }
+                        (mstr, codes)
+                    })
+                })
+                .collect()
+        });
+
         // -------- Bit allocation --------
         let ba = BitAllocParams {
             sdcycod: 2,
@@ -683,9 +768,31 @@ impl Eac3Encoder {
             let per_block = BLOCKS_PER_FRAME as u32 * (6 + per_block_fine);
             (per_block + explicit_snroffste).saturating_sub(10)
         };
+        // SPX header bits over the SPX-off baseline (which spends one
+        // bit per block on the disabled `spxinu`/`spxstre` slot). The
+        // reserve always assumes the worst case — an explicit
+        // `spxbndstrce == 1` band structure — so the default-banding
+        // and explicit-banding emissions tune against an identical
+        // mantissa budget and decode bit-identically (pinned by test).
+        let spx_reserve_bits: u32 = match &spx_geom {
+            None => 0,
+            Some(g) => {
+                // Block-0 strategy: chinspx (explicit unless mono) +
+                // spxstrtf(2) + spxbegf(3) + spxendf(3) + spxbndstrce(1)
+                // + explicit structure flags. spxinu itself replaces the
+                // baseline's 1-bit slot (no delta).
+                let chinspx = if sub.acmod == 0x1 { 0 } else { nfchans as u32 };
+                let strat = chinspx + 2 + 3 + 3 + 1 + (g.end_subbnd - g.begin_subbnd - 1) as u32;
+                // Coordinates: spxblnd(5) + mstrspxco(2) + 6 bits/band.
+                let payload = 5 + 2 + 6 * g.nbnds as u32;
+                // blk 0: payload (spxcoe implicit); blk 3: 1 + payload;
+                // blks 1/2/4/5: 1-bit spxcoe each.
+                strat + nfchans as u32 * (payload + (1 + payload) + 4)
+            }
+        };
         let tuner_frame_bytes = sub
             .frame_bytes
-            .saturating_sub(snr_reserve_bits.div_ceil(8) as usize);
+            .saturating_sub((snr_reserve_bits + spx_reserve_bits).div_ceil(8) as usize);
         // Pass chexpstr_plan so the overhead calculator accounts for
         // D25/D45 exponent savings when sizing the mantissa budget.
         let tuned_ba = tune_snroffst_with_plan(
@@ -853,21 +960,80 @@ impl Eac3Encoder {
             }
             bw.write_u32(0, 1); // dynrnge = 0
 
-            // SPX strategy.
-            if blk == 0 {
-                bw.write_u32(0, 1); // spxinu = 0
-            } else {
-                bw.write_u32(0, 1); // spxstre = 0
+            // SPX strategy (§E.2.3.3.1-8). Block 0 has implicit
+            // `spxstre = 1` and emits `spxinu` directly; later blocks
+            // emit `spxstre = 0` (strategy reuse) — the geometry is
+            // frame-constant.
+            match (&spx_geom, blk) {
+                (Some(g), 0) => {
+                    let p = self.spx.as_ref().expect("spx params when geom is set");
+                    bw.write_u32(1, 1); // spxinu = 1
+                                        // §E.2.3.3.3 chinspx[ch] — implicit for mono
+                                        // (acmod == 0x1); explicit per fbw channel
+                                        // otherwise. Every channel is in SPX.
+                    if sub.acmod != 0x1 {
+                        for _ in 0..nfchans {
+                            bw.write_u32(1, 1);
+                        }
+                    }
+                    bw.write_u32(p.spxstrtf as u32, 2); // §E.2.3.3.4
+                    bw.write_u32(p.spxbegf as u32, 3); // §E.2.3.3.5
+                    bw.write_u32(p.spxendf as u32, 3); // §E.2.3.3.6
+                    if p.explicit_band_structure {
+                        // §E.2.3.3.7-8 — explicit structure carrying the
+                        // same content as the Table E2.11 default.
+                        bw.write_u32(1, 1);
+                        for bnd in (g.begin_subbnd + 1)..g.end_subbnd {
+                            bw.write_u32(u32::from(g.bndstrc[bnd]), 1);
+                        }
+                    } else {
+                        bw.write_u32(0, 1); // spxbndstrce = 0 → default banding
+                    }
+                }
+                (Some(_), _) => bw.write_u32(0, 1), // spxstre = 0 (reuse)
+                (None, 0) => bw.write_u32(0, 1),    // spxinu = 0
+                (None, _) => bw.write_u32(0, 1),    // spxstre = 0
+            }
+            // SPX coordinates (§E.2.3.3.9-13). `spxcoe` is implicit-1
+            // on a channel's first SPX block (block 0 here); explicit
+            // thereafter. Refresh on the anchor blocks, reuse between.
+            if let (Some(g), Some(coords)) = (&spx_geom, &spx_coords) {
+                let refresh = SPX_REFRESH_BLOCKS.contains(&blk);
+                let span_idx = usize::from(blk >= SPX_REFRESH_BLOCKS[1]);
+                let spxblnd = self.spx.as_ref().expect("spx params").spxblnd;
+                for ch in 0..nfchans {
+                    if blk != 0 {
+                        bw.write_u32(u32::from(refresh), 1); // spxcoe[ch]
+                    }
+                    if refresh {
+                        let (mstr, codes) = &coords[ch][span_idx];
+                        bw.write_u32(spxblnd as u32, 5); // §E.2.3.3.10
+                        bw.write_u32(*mstr as u32, 2); // §E.2.3.3.11
+                        for bnd in 0..g.nbnds {
+                            bw.write_u32(codes[bnd].0 as u32, 4); // spxcoexp
+                            bw.write_u32(codes[bnd].1 as u32, 2); // spxcomant
+                        }
+                    }
+                }
             }
 
             // Coupling: cplinu always 0 — block 0 hits the "else"
             // branch with no body; later blocks have cplstre=0 so
             // skip entirely.
 
-            // Rematrixing — only acmod==2 (and not when SPX/cpl region
-            // covers everything). Round-1 disables it.
+            // Rematrixing — only acmod==2. The flag-field size folds in
+            // SPX per §E.3.3.2 (spxbegf < 2 → 3 bands, else 4; 4 when
+            // SPX is off since coupling is never in use here). Round-1
+            // keeps rematrixing disabled (all flags 0).
             if sub.acmod == 2 {
-                let nrematbd = 4usize;
+                let nrematbd = remat_band_count_spx(
+                    false,
+                    0,
+                    false,
+                    0,
+                    spx_geom.is_some(),
+                    spx_geom.as_ref().map_or(0, |g| g.begin_subbnd),
+                );
                 if blk == 0 {
                     for _bnd in 0..nrematbd {
                         bw.write_u32(0, 1);
@@ -886,12 +1052,16 @@ impl Eac3Encoder {
             //
             // §E.1.2.4 chbwcod[ch] — 6 bits per fbw channel whose
             // strategy this block is non-REUSE AND that channel is
-            // neither in coupling nor in spectral extension. Our
-            // encoder runs cplinu=0 + spxinu=0 so we emit chbwcod for
-            // every channel with a non-REUSE (chexpstr != 0) strategy.
-            for ch in 0..nfchans {
-                if chexpstr_plan[ch][blk] != 0 {
-                    bw.write_u32(chbwcod as u32, 6);
+            // neither in coupling nor in spectral extension
+            // (`if((!chincpl[ch]) && (!chinspx[ch])) {chbwcod[ch]}`).
+            // With SPX every fbw channel is in SPX, so no chbwcod is
+            // emitted — the decoder derives the bandwidth from the SPX
+            // begin frequency (§E.3.3.3).
+            if spx_geom.is_none() {
+                for ch in 0..nfchans {
+                    if chexpstr_plan[ch][blk] != 0 {
+                        bw.write_u32(chbwcod as u32, 6);
+                    }
                 }
             }
             // §E.1.2.4 fbw exponents (cplexps section is skipped:
@@ -1251,6 +1421,299 @@ mod tests {
         // `snroffststr == 2` path also exercises the per-block
         // `lfefsnroffst` slot.
         assert_snroffststr_roundtrip(6, 448_000, 1792);
+    }
+
+    // ---- spectral extension (§E.2.3.3 / §E.3.6) round-trips ----
+    //
+    // The SPX encode is validated with the in-tree decoder on two
+    // axes:
+    //
+    // 1. **Cursor alignment** — the SPX strategy + coordinate fields
+    //    thread through the audblk between the dynrng and coupling
+    //    slots and re-gate chbwcod / nrematbd; one mis-sized field
+    //    corrupts every downstream exponent + mantissa and collapses
+    //    the decode to noise. The banded-energy gates below can only
+    //    pass on a bit-aligned parse.
+    // 2. **§3.6.4.3 energy matching** — the whole point of the tool:
+    //    per SPX band, the synthesized HF energy must match the
+    //    original signal's banded HF energy (the encoder's coordinate
+    //    computation + quantiser + the decoder's translation / blend /
+    //    scale chain, end to end).
+    //
+    // The analysis measures banded energy in the encoder's own MDCT
+    // domain (same window + transform), averaged over the steady-state
+    // interior. Pure-tone content is stationary, so the metric is
+    // insensitive to coder delay and needs no lag alignment.
+
+    fn encode_spx(pcm: &[f32], channels: usize, bit_rate: u64, spx: SpxParams) -> Vec<u8> {
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(channels as u16);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(bit_rate);
+        let mut enc = make_encoder_with_spx(&params, spx).expect("eac3 make_encoder_with_spx");
+        let n_samp = pcm.len() / channels;
+        let mut s16 = Vec::with_capacity(pcm.len() * 2);
+        for &v in pcm {
+            let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            s16.extend_from_slice(&q.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: n_samp as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut out = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => out.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("eac3 spx encode error: {e:?}"),
+            }
+        }
+        out
+    }
+
+    /// Multitone with content below AND above the default SPX begin
+    /// frequency (tc# 109 ≈ 10.2 kHz at 48 kHz): LF tones at 700 Hz /
+    /// 3.1 kHz / 6 kHz feed the coded band + translation copy region,
+    /// HF tones at 12.2 / 15.4 / 19 kHz land in SPX bands 0 / 2 / 3.
+    ///
+    /// A deterministic broadband noise bed (~-38 dBFS) rides under the
+    /// tones. SPX synthesizes each HF band by *scaling a translated
+    /// copy* of the low band — a band whose translation source is
+    /// spectrally EMPTY can only be filled up to the coordinate
+    /// ceiling (`0.875 · 32 ×` the source RMS), so an all-tones signal
+    /// with silent gaps between tones is unencodable by construction
+    /// (the coordinate saturates and the band comes out low). Real
+    /// content carries a broadband floor; the bed models that and
+    /// keeps every band's coordinate inside the representable range.
+    fn build_spx_multitone(channels: usize, frames: usize) -> Vec<f32> {
+        let n = frames * SAMPLES_PER_FRAME as usize;
+        let mut pcm = vec![0.0f32; n * channels];
+        let tones: [(f32, f32); 6] = [
+            (700.0, 0.22),
+            (3_100.0, 0.18),
+            (6_000.0, 0.14),
+            (12_200.0, 0.055),
+            (15_400.0, 0.035),
+            (19_000.0, 0.030),
+        ];
+        let mut lfsr: u32 = 0x2545_F491;
+        for i in 0..n {
+            let t = i as f32 / 48_000.0;
+            let mut s = 0.0f32;
+            for (f, a) in tones {
+                s += a * (2.0 * std::f32::consts::PI * f * t).sin();
+            }
+            // Deterministic xorshift noise bed, uniform in ±0.012.
+            lfsr ^= lfsr << 13;
+            lfsr ^= lfsr >> 17;
+            lfsr ^= lfsr << 5;
+            s += ((lfsr as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.012;
+            for ch in 0..channels {
+                pcm[i * channels + ch] = s * (1.0 - 0.08 * ch as f32);
+            }
+        }
+        pcm
+    }
+
+    /// Mean per-bin MDCT energy of one channel of interleaved PCM,
+    /// using the encoder's own window + long transform, skipping the
+    /// first / last few blocks (codec priming + flush edges).
+    fn mdct_energy_profile(pcm: &[f32], channels: usize, ch: usize) -> [f64; N_COEFFS] {
+        use crate::mdct::mdct_512;
+        use crate::tables::WINDOW;
+        let n = pcm.len() / channels;
+        let mut acc = [0.0f64; N_COEFFS];
+        let mut blocks = 0usize;
+        let mut start = 4 * SAMPLES_PER_BLOCK; // skip priming edge
+        while start + 512 + 4 * SAMPLES_PER_BLOCK <= n {
+            let mut win = [0.0f32; 512];
+            for k in 0..256 {
+                win[k] = pcm[(start + k) * channels + ch] * WINDOW[k];
+                win[511 - k] = pcm[(start + 511 - k) * channels + ch] * WINDOW[k];
+            }
+            let mut coeffs = [0.0f32; N_COEFFS];
+            mdct_512(&win, &mut coeffs);
+            for (a, &c) in acc.iter_mut().zip(coeffs.iter()) {
+                *a += (c as f64) * (c as f64);
+            }
+            blocks += 1;
+            start += SAMPLES_PER_BLOCK;
+        }
+        assert!(blocks > 8, "analysis needs a steady-state interior");
+        for a in acc.iter_mut() {
+            *a /= blocks as f64;
+        }
+        acc
+    }
+
+    fn band_db_deltas(
+        orig: &[f64; N_COEFFS],
+        dec: &[f64; N_COEFFS],
+        geom: &crate::eac3::spxenc::SpxGeometry,
+    ) -> Vec<f64> {
+        let mut out = Vec::new();
+        let mut lo = geom.begin_tc;
+        for bnd in 0..geom.nbnds {
+            let hi = lo + geom.bndsztab[bnd];
+            let eo: f64 = orig[lo..hi].iter().sum();
+            let ed: f64 = dec[lo..hi].iter().sum();
+            out.push(10.0 * (ed.max(1e-30) / eo.max(1e-30)).log10());
+            lo = hi;
+        }
+        out
+    }
+
+    fn to_f32_interleaved(pcm: &[i16]) -> Vec<f32> {
+        pcm.iter().map(|&v| v as f32 / 32767.0).collect()
+    }
+
+    fn assert_spx_roundtrip(channels: usize, bit_rate: u64, frame_bytes: usize, tol_db: f64) {
+        let spx = SpxParams::default();
+        let geom = SpxGeometry::derive(&spx, &DEFAULT_SPX_BNDSTRC).unwrap();
+        let pcm = build_spx_multitone(channels, 8);
+        let stream = encode_spx(&pcm, channels, bit_rate, spx);
+        assert_eq!(
+            stream.len() % frame_bytes,
+            0,
+            "stream not a whole number of {frame_bytes}-byte frames"
+        );
+        let dec = decode_all(&stream, frame_bytes);
+        assert_eq!(
+            dec.len() / channels,
+            (stream.len() / frame_bytes) * SAMPLES_PER_FRAME as usize,
+            "sample-count mismatch"
+        );
+        let dec_f = to_f32_interleaved(&dec);
+        for ch in 0..channels.min(2) {
+            let orig_prof = mdct_energy_profile(&pcm, channels, ch);
+            let dec_prof = mdct_energy_profile(&dec_f, channels, ch);
+            // (a) SPX-band energy match (§3.6.4.3).
+            let deltas = band_db_deltas(&orig_prof, &dec_prof, &geom);
+            for (bnd, d) in deltas.iter().enumerate() {
+                assert!(
+                    d.abs() <= tol_db,
+                    "ch{ch} SPX band {bnd}: energy delta {d:+.2} dB exceeds ±{tol_db} dB \
+                     (all deltas: {deltas:?})"
+                );
+            }
+            // (b) Coded-band fidelity: total LF energy within ±1.5 dB.
+            let eo: f64 = orig_prof[..geom.begin_tc].iter().sum();
+            let ed: f64 = dec_prof[..geom.begin_tc].iter().sum();
+            let lf_delta = 10.0 * (ed / eo).log10();
+            assert!(
+                lf_delta.abs() <= 1.5,
+                "ch{ch}: coded-band energy delta {lf_delta:+.2} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn spx_roundtrip_stereo_band_energy() {
+        // 192 kbps @ 48 kHz ⇒ 768-byte frames.
+        assert_spx_roundtrip(2, 192_000, 768, 3.0);
+    }
+
+    #[test]
+    fn spx_roundtrip_mono_implicit_chinspx() {
+        // Mono exercises the §E.2.3.3.3 implicit `chinspx[0] = 1` arm
+        // (no per-channel bits). 96 kbps ⇒ 384-byte frames.
+        assert_spx_roundtrip(1, 96_000, 384, 3.0);
+    }
+
+    #[test]
+    fn spx_roundtrip_51_with_lfe() {
+        // 5.1 exercises SPX alongside the LFE pseudo-channel (LFE is
+        // never in SPX; its exponents/mantissas follow the fbw SPX
+        // fields, so a mis-sized SPX field would corrupt it too).
+        // 384 kbps ⇒ 1536-byte frames.
+        assert_spx_roundtrip(6, 384_000, 1536, 3.5);
+    }
+
+    #[test]
+    fn spx_explicit_band_structure_decodes_bit_identically() {
+        // `spxbndstrce = 1` with the Table E2.11 content vs
+        // `spxbndstrce = 0` (decoder default): identical geometry and
+        // — because the encoder reserves the worst-case (explicit)
+        // header bits in both modes — identical mantissa budgets, so
+        // the two decodes must match bit-for-bit. A one-bit misparse
+        // of the explicit structure field would break this instantly.
+        let pcm = build_spx_multitone(2, 4);
+        let dec_default = decode_all(&encode_spx(&pcm, 2, 192_000, SpxParams::default()), 768);
+        let dec_explicit = decode_all(
+            &encode_spx(
+                &pcm,
+                2,
+                192_000,
+                SpxParams {
+                    explicit_band_structure: true,
+                    ..SpxParams::default()
+                },
+            ),
+            768,
+        );
+        assert!(!dec_default.is_empty());
+        assert_eq!(
+            dec_default, dec_explicit,
+            "default-banding and explicit-banding SPX encodes must decode bit-identically"
+        );
+    }
+
+    #[test]
+    fn spx_narrow_region_nondefault_codes() {
+        // Non-default geometry: begin sub-band 4 (spxbegf=2 → tc 73),
+        // end sub-band 9 (spxendf=3 → tc 133), copy start sub-band 1
+        // (tc 37 — non-zero spxstrtf arm), low-noise blend. Exercises
+        // remat_band_count_spx's spxbegf ≥ 2 arm with a narrower coded
+        // band and a copy region smaller than the SPX span (wraps).
+        let spx = SpxParams {
+            spxbegf: 2,
+            spxendf: 3,
+            spxstrtf: 1,
+            spxblnd: 31,
+            explicit_band_structure: false,
+        };
+        let geom = SpxGeometry::derive(&spx, &DEFAULT_SPX_BNDSTRC).unwrap();
+        assert_eq!((geom.begin_tc, geom.end_tc), (73, 133));
+        let pcm = build_spx_multitone(2, 6);
+        let stream = encode_spx(&pcm, 2, 192_000, spx);
+        let dec = decode_all(&stream, 768);
+        let dec_f = to_f32_interleaved(&dec);
+        let orig_prof = mdct_energy_profile(&pcm, 2, 0);
+        let dec_prof = mdct_energy_profile(&dec_f, 2, 0);
+        let deltas = band_db_deltas(&orig_prof, &dec_prof, &geom);
+        for (bnd, d) in deltas.iter().enumerate() {
+            assert!(
+                d.abs() <= 3.5,
+                "SPX band {bnd}: energy delta {d:+.2} dB (all: {deltas:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn make_encoder_with_spx_rejects_invalid_geometry() {
+        let mut p = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        p.sample_rate = Some(48_000);
+        p.channels = Some(2);
+        // Inverted sub-band range (begf=7 → sub-band 11, endf=0 → 5).
+        let bad = SpxParams {
+            spxbegf: 7,
+            spxendf: 0,
+            ..SpxParams::default()
+        };
+        assert!(make_encoder_with_spx(&p, bad).is_err());
+        // Empty copy region (strtf sub-band 3 ≥ begin sub-band 2).
+        let bad = SpxParams {
+            spxbegf: 0,
+            spxendf: 7,
+            spxstrtf: 3,
+            ..SpxParams::default()
+        };
+        assert!(make_encoder_with_spx(&p, bad).is_err());
     }
 
     #[test]
