@@ -84,8 +84,91 @@ use super::bsi::EAC3_BSID;
 ///   * stereo → 192 kbps
 ///   * 5.1    → 384 kbps
 ///   * 7.1    → 384 kbps indep + 192 kbps dep = 576 kbps total
+///
+/// Spectral extension (§E.2.3.3 / §E.3.6) can be enabled through
+/// `params.options` so the registry path reaches it too (the typed
+/// alternative is [`make_encoder_with_spx`]):
+///
+/// | key | value | meaning |
+/// | --- | --- | --- |
+/// | `spx` | `1`/`true` | enable SPX with [`SpxParams::default`] |
+/// | `spx_begf` | `0..=7` | §E.2.3.3.5 begin frequency code |
+/// | `spx_endf` | `0..=7` | §E.2.3.3.6 end frequency code |
+/// | `spx_strtf` | `0..=3` | §E.2.3.3.4 copy start code |
+/// | `spx_blnd` | `0..=31` | §E.2.3.3.10 noise blend offset |
+/// | `spx_atten` | `0..=31` | §3.6.4.2.3 attenuation code (Table E3.14) |
+/// | `spx_adaptive_copy_start` | `1`/`true` | per-frame `spxstrtf` re-selection |
+/// | `spx_explicit_band_structure` | `1`/`true` | emit `spxbndstrce = 1` |
+///
+/// The sub-keys imply `spx` unless it is explicitly `0`/`false`.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    Ok(Box::new(build_concrete_encoder(params)?))
+    let mut concrete = build_concrete_encoder(params)?;
+    if let Some(spx) = spx_params_from_options(params)? {
+        // Same construction-time validation as make_encoder_with_spx.
+        SpxGeometry::derive(&spx, &DEFAULT_SPX_BNDSTRC)?;
+        concrete.spx = Some(spx);
+    }
+    Ok(Box::new(concrete))
+}
+
+/// Parse the `spx*` codec options (see [`make_encoder`]) into an
+/// [`SpxParams`], or `None` when SPX is not requested.
+fn spx_params_from_options(params: &CodecParameters) -> Result<Option<SpxParams>> {
+    let opts = &params.options;
+    let parse_bool = |key: &str| -> Result<Option<bool>> {
+        match opts.get(key) {
+            None => Ok(None),
+            Some("1") | Some("true") => Ok(Some(true)),
+            Some("0") | Some("false") => Ok(Some(false)),
+            Some(v) => Err(Error::invalid(format!(
+                "eac3 encoder: option {key}={v} (expected 1/true/0/false)"
+            ))),
+        }
+    };
+    let parse_u8 = |key: &str, max: u8| -> Result<Option<u8>> {
+        match opts.get(key) {
+            None => Ok(None),
+            Some(v) => match v.parse::<u8>() {
+                Ok(n) if n <= max => Ok(Some(n)),
+                _ => Err(Error::invalid(format!(
+                    "eac3 encoder: option {key}={v} (expected 0..={max})"
+                ))),
+            },
+        }
+    };
+    let enabled = parse_bool("spx")?;
+    let begf = parse_u8("spx_begf", 7)?;
+    let endf = parse_u8("spx_endf", 7)?;
+    let strtf = parse_u8("spx_strtf", 3)?;
+    let blnd = parse_u8("spx_blnd", 31)?;
+    let atten = parse_u8("spx_atten", 31)?;
+    let adaptive = parse_bool("spx_adaptive_copy_start")?;
+    let explicit = parse_bool("spx_explicit_band_structure")?;
+    let any_subkey = begf.is_some()
+        || endf.is_some()
+        || strtf.is_some()
+        || blnd.is_some()
+        || atten.is_some()
+        || adaptive.is_some()
+        || explicit.is_some();
+    // `spx=0` wins over sub-keys; sub-keys alone imply enablement.
+    let on = match enabled {
+        Some(v) => v,
+        None => any_subkey,
+    };
+    if !on {
+        return Ok(None);
+    }
+    let d = SpxParams::default();
+    Ok(Some(SpxParams {
+        spxbegf: begf.unwrap_or(d.spxbegf),
+        spxendf: endf.unwrap_or(d.spxendf),
+        spxstrtf: strtf.unwrap_or(d.spxstrtf),
+        spxblnd: blnd.unwrap_or(d.spxblnd),
+        adaptive_copy_start: adaptive.unwrap_or(d.adaptive_copy_start),
+        atten_code: atten,
+        explicit_band_structure: explicit.unwrap_or(d.explicit_band_structure),
+    }))
 }
 
 /// Build the concrete [`Eac3Encoder`] (with `snroffststr == 0`). The
@@ -1954,6 +2037,90 @@ mod tests {
             dec_ratio >= 6.0,
             "decoded SPX band 1 must track the mid-frame level step              (orig {orig_ratio:+.1} dB, decoded {dec_ratio:+.1} dB)"
         );
+    }
+
+    #[test]
+    fn spx_options_path_matches_typed_constructor_bit_for_bit() {
+        // The registry-facing options surface (`spx*` keys on
+        // CodecParameters::options) must build the SAME encoder as the
+        // typed make_encoder_with_spx — proven by byte-identical
+        // streams for a non-default configuration.
+        let pcm = build_spx_multitone(2, 3);
+        let spx = SpxParams {
+            spxbegf: 4,
+            spxendf: 7,
+            spxstrtf: 1,
+            spxblnd: 20,
+            adaptive_copy_start: false,
+            atten_code: Some(9),
+            explicit_band_structure: true,
+        };
+        let typed = encode_spx(&pcm, 2, 192_000, spx);
+
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(2);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(192_000);
+        params.options = oxideav_core::CodecOptions::new()
+            .set("spx_begf", "4")
+            .set("spx_endf", "7")
+            .set("spx_strtf", "1")
+            .set("spx_blnd", "20")
+            .set("spx_atten", "9")
+            .set("spx_explicit_band_structure", "true");
+        let mut enc = make_encoder(&params).expect("options-driven SPX encoder");
+        let n_samp = pcm.len() / 2;
+        let mut s16 = Vec::with_capacity(pcm.len() * 2);
+        for &v in &pcm {
+            let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            s16.extend_from_slice(&q.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: n_samp as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut from_options = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => from_options.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("options encode error: {e:?}"),
+            }
+        }
+        assert_eq!(
+            typed, from_options,
+            "options-driven and typed SPX constructors must emit identical bytes"
+        );
+    }
+
+    #[test]
+    fn spx_options_validation_and_gating() {
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(2);
+        // Bad value → rejected at construction.
+        params.options = oxideav_core::CodecOptions::new().set("spx_begf", "9");
+        assert!(make_encoder(&params).is_err());
+        params.options = oxideav_core::CodecOptions::new().set("spx", "maybe");
+        assert!(make_encoder(&params).is_err());
+        // spx=0 disables even when sub-keys are present.
+        params.options = oxideav_core::CodecOptions::new()
+            .set("spx", "0")
+            .set("spx_begf", "4");
+        assert!(make_encoder(&params).is_ok());
+        // Geometry validation still applies through the options path
+        // (inverted range).
+        params.options = oxideav_core::CodecOptions::new()
+            .set("spx_begf", "7")
+            .set("spx_endf", "0");
+        assert!(make_encoder(&params).is_err());
+        // Plain enable works.
+        params.options = oxideav_core::CodecOptions::new().set("spx", "1");
+        assert!(make_encoder(&params).is_ok());
     }
 
     #[test]
