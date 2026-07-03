@@ -494,3 +494,188 @@ fn eac3_71_decoder_surfaces_chanmap_lrs_rrs() {
          (saw {seen_lrs_rrs}/{seen_packets})"
     );
 }
+
+// ---------------------------------------------------------------------
+// Spectral extension (§E.2.3.3 / §E.3.6) black-box cross-validation.
+//
+// The in-tree round-trip tests (eac3::encoder::tests::spx_*) prove the
+// encoder and OUR decoder agree; this test proves the emitted syntax
+// is what the SPEC says by handing the stream to an independent
+// decoder binary. Two gates:
+//
+//  1. ffmpeg accepts every syncframe (a mis-sized SPX field would
+//     desynchronise its parser and abort / mute);
+//  2. the §3.6.4.3 contract holds through the EXTERNAL decoder: per
+//     SPX band, the synthesized high-frequency energy matches the
+//     original signal's banded energy (loose ±4 dB — the noise-blend
+//     generator is non-normative, so exact waveforms differ, but band
+//     energies must not).
+
+use oxideav_ac3::audblk::{N_COEFFS, SAMPLES_PER_BLOCK};
+use oxideav_ac3::eac3::spxenc::{SpxGeometry, SpxParams};
+use oxideav_ac3::mdct::mdct_512;
+use oxideav_ac3::tables::WINDOW;
+
+/// Multitone + deterministic broadband bed (mirrors the in-tree SPX
+/// round-trip fixture): LF tones feed the coded band / translation
+/// copy region, HF tones land in SPX bands, and the bed keeps every
+/// band's energy-matching coordinate inside the representable range.
+fn build_spx_multitone(channels: usize) -> Vec<f32> {
+    let n = (SR as f32 * DUR_SEC) as usize;
+    let tones: [(f32, f32); 6] = [
+        (700.0, 0.22),
+        (3_100.0, 0.18),
+        (6_000.0, 0.14),
+        (12_200.0, 0.055),
+        (15_400.0, 0.035),
+        (19_000.0, 0.030),
+    ];
+    let mut lfsr: u32 = 0x2545_F491;
+    let mut pcm = vec![0.0f32; n * channels];
+    for i in 0..n {
+        let t = i as f32 / SR as f32;
+        let mut s = 0.0f32;
+        for (f, a) in tones {
+            s += a * (2.0 * std::f32::consts::PI * f * t).sin();
+        }
+        lfsr ^= lfsr << 13;
+        lfsr ^= lfsr >> 17;
+        lfsr ^= lfsr << 5;
+        s += ((lfsr as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.012;
+        for ch in 0..channels {
+            pcm[i * channels + ch] = s * (1.0 - 0.08 * ch as f32);
+        }
+    }
+    pcm
+}
+
+fn encode_eac3_spx(pcm: &[f32], channels: usize, bit_rate: u64, spx: SpxParams) -> Vec<u8> {
+    let mut params = CodecParameters::audio(CodecId::new(eac3::CODEC_ID_STR));
+    params.sample_rate = Some(SR);
+    params.channels = Some(channels as u16);
+    params.sample_format = Some(SampleFormat::S16);
+    params.bit_rate = Some(bit_rate);
+    let mut enc = eac3::make_encoder_with_spx(&params, spx).expect("eac3 make_encoder_with_spx");
+    let n_samp = pcm.len() / channels;
+    let mut s16 = Vec::with_capacity(pcm.len() * 2);
+    for &v in pcm {
+        let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        s16.extend_from_slice(&q.to_le_bytes());
+    }
+    enc.send_frame(&Frame::Audio(AudioFrame {
+        samples: n_samp as u32,
+        pts: Some(0),
+        data: vec![s16],
+    }))
+    .unwrap();
+    enc.flush().unwrap();
+    let mut out = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => out.extend_from_slice(&p.data),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("eac3 spx encode error: {e:?}"),
+        }
+    }
+    out
+}
+
+/// Mean per-bin MDCT energy of one channel (encoder window + long
+/// transform), skipping priming/flush edges. Pure-tone-plus-bed
+/// content is stationary, so no delay alignment is needed.
+fn mdct_energy_profile(pcm: &[f32], channels: usize, ch: usize) -> [f64; N_COEFFS] {
+    let n = pcm.len() / channels;
+    let mut acc = [0.0f64; N_COEFFS];
+    let mut blocks = 0usize;
+    let mut start = 4 * SAMPLES_PER_BLOCK;
+    while start + 512 + 4 * SAMPLES_PER_BLOCK <= n {
+        let mut win = [0.0f32; 512];
+        for k in 0..256 {
+            win[k] = pcm[(start + k) * channels + ch] * WINDOW[k];
+            win[511 - k] = pcm[(start + 511 - k) * channels + ch] * WINDOW[k];
+        }
+        let mut coeffs = [0.0f32; N_COEFFS];
+        mdct_512(&win, &mut coeffs);
+        for (a, &c) in acc.iter_mut().zip(coeffs.iter()) {
+            *a += (c as f64) * (c as f64);
+        }
+        blocks += 1;
+        start += SAMPLES_PER_BLOCK;
+    }
+    assert!(blocks > 8, "analysis needs a steady-state interior");
+    for a in acc.iter_mut() {
+        *a /= blocks as f64;
+    }
+    acc
+}
+
+#[test]
+fn eac3_spx_stereo_band_energy_through_ffmpeg() {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg not in PATH — skipping SPX interop test");
+        return;
+    }
+    let spx = SpxParams::default();
+    let geom = SpxGeometry::derive(&spx, &oxideav_ac3::eac3::dsp::DEFAULT_SPX_BNDSTRC)
+        .expect("default SPX geometry");
+    let pcm = build_spx_multitone(2);
+    let stream = encode_eac3_spx(&pcm, 2, 192_000, spx);
+    assert!(!stream.is_empty());
+    let decoded = ffmpeg_decode(&stream, 2).expect("ffmpeg rejected the SPX stream");
+    assert!(
+        decoded.len() as f32 >= pcm.len() as f32 * 0.9,
+        "ffmpeg returned too few samples ({} vs {})",
+        decoded.len(),
+        pcm.len()
+    );
+    for ch in 0..2 {
+        let orig_prof = mdct_energy_profile(&pcm, 2, ch);
+        let dec_prof = mdct_energy_profile(&decoded, 2, ch);
+        // SPX-band energy match through the external decoder.
+        let mut lo = geom.begin_tc;
+        let mut deltas = Vec::new();
+        for bnd in 0..geom.nbnds {
+            let hi = lo + geom.bndsztab[bnd];
+            let eo: f64 = orig_prof[lo..hi].iter().sum();
+            let ed: f64 = dec_prof[lo..hi].iter().sum();
+            deltas.push(10.0 * (ed.max(1e-30) / eo.max(1e-30)).log10());
+            lo = hi;
+        }
+        for (bnd, d) in deltas.iter().enumerate() {
+            assert!(
+                d.abs() <= 4.0,
+                "ch{ch} SPX band {bnd}: external-decoder energy delta {d:+.2} dB \
+                 exceeds ±4 dB (all: {deltas:?})"
+            );
+        }
+        // Coded-band sanity through the external decoder.
+        let eo: f64 = orig_prof[..geom.begin_tc].iter().sum();
+        let ed: f64 = dec_prof[..geom.begin_tc].iter().sum();
+        let lf = 10.0 * (ed / eo).log10();
+        assert!(lf.abs() <= 1.5, "ch{ch}: coded-band delta {lf:+.2} dB");
+    }
+}
+
+#[test]
+fn eac3_spx_mono_decodes_through_ffmpeg() {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg not in PATH — skipping SPX mono interop test");
+        return;
+    }
+    // Mono drives the §E.2.3.3.3 implicit `chinspx[0] = 1` arm through
+    // an external parser.
+    let pcm = build_spx_multitone(1);
+    let stream = encode_eac3_spx(&pcm, 1, 96_000, SpxParams::default());
+    let decoded = ffmpeg_decode(&stream, 1).expect("ffmpeg rejected the mono SPX stream");
+    assert!(decoded.len() as f32 >= pcm.len() as f32 * 0.9);
+    // Non-silent, sane level: RMS within 3 dB of the source.
+    let rms =
+        |x: &[f32]| (x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / x.len() as f64).sqrt();
+    let r_o = rms(&pcm);
+    let r_d = rms(&decoded);
+    let delta = 20.0 * (r_d / r_o).log10();
+    assert!(
+        delta.abs() <= 3.0,
+        "mono SPX decode RMS delta {delta:+.2} dB vs source"
+    );
+}
