@@ -1058,16 +1058,22 @@ impl Eac3Encoder {
             }
             // SPX coordinates (§E.2.3.3.9-13). `spxcoe` is implicit-1
             // on a channel's first SPX block (block 0 here); explicit
-            // thereafter. Refresh on the anchor blocks, reuse between.
+            // thereafter. Refresh on the anchor blocks, reuse between —
+            // and when a channel's block-3 refresh quantises to exactly
+            // the block-0 codes (stationary spectrum), thrift the
+            // payload with `spxcoe = 0` instead: the decoder's reuse
+            // path reconstructs identical coordinates, so the decode is
+            // unchanged and the ~7 + 6·nbnds bits return to padding.
             if let (Some(g), Some(coords)) = (&spx_geom, &spx_coords) {
                 let refresh = SPX_REFRESH_BLOCKS.contains(&blk);
                 let span_idx = usize::from(blk >= SPX_REFRESH_BLOCKS[1]);
                 let spxblnd = self.spx.as_ref().expect("spx params").spxblnd;
                 for ch in 0..nfchans {
+                    let reuse_prior = !refresh || (span_idx == 1 && coords[ch][1] == coords[ch][0]);
                     if blk != 0 {
-                        bw.write_u32(u32::from(refresh), 1); // spxcoe[ch]
+                        bw.write_u32(u32::from(!reuse_prior), 1); // spxcoe[ch]
                     }
-                    if refresh {
+                    if blk == 0 || !reuse_prior {
                         let (mstr, codes) = &coords[ch][span_idx];
                         bw.write_u32(spxblnd as u32, 5); // §E.2.3.3.10
                         bw.write_u32(*mstr as u32, 2); // §E.2.3.3.11
@@ -1870,6 +1876,84 @@ mod tests {
         // effects, not a silent no-op).
         let plain = encode_spx(&pcm, 2, 192_000, SpxParams::default());
         assert_ne!(stream, plain, "attenuation must change the bitstream");
+    }
+
+    #[test]
+    fn spx_coordinate_refresh_tracks_mid_frame_level_step() {
+        // The frame carries TWO coordinate refreshes (blocks 0 and 3,
+        // each energy-matching its own 3-block span) with a thrifted
+        // `spxcoe = 0` when block 3 quantises identically. This test
+        // proves the per-span refresh actually fires when the spectrum
+        // moves: a 14 kHz tone (SPX band 1) is gated ON only in the
+        // second half of every frame. A correct encoder+decoder tracks
+        // the step — the decoded second-half band energy must sit well
+        // above the first half's. A broken span refresh (or a thrift
+        // that wrongly reuses across the step) would flatten the two
+        // halves.
+        let channels = 2usize;
+        let frames = 8usize;
+        let n = frames * SAMPLES_PER_FRAME as usize;
+        let mut pcm = vec![0.0f32; n * channels];
+        let mut lfsr: u32 = 0x1234_5677;
+        for i in 0..n {
+            let t = i as f32 / 48_000.0;
+            let in_second_half = (i % SAMPLES_PER_FRAME as usize) >= 768;
+            let mut s = 0.20 * (2.0 * std::f32::consts::PI * 700.0 * t).sin()
+                + 0.16 * (2.0 * std::f32::consts::PI * 3_100.0 * t).sin()
+                + 0.12 * (2.0 * std::f32::consts::PI * 6_000.0 * t).sin();
+            if in_second_half {
+                s += 0.10 * (2.0 * std::f32::consts::PI * 14_000.0 * t).sin();
+            }
+            lfsr ^= lfsr << 13;
+            lfsr ^= lfsr >> 17;
+            lfsr ^= lfsr << 5;
+            s += ((lfsr as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.008;
+            for ch in 0..channels {
+                pcm[i * channels + ch] = s * (1.0 - 0.08 * ch as f32);
+            }
+        }
+        let stream = encode_spx(&pcm, channels, 192_000, SpxParams::default());
+        let dec_f = to_f32_interleaved(&decode_all(&stream, 768));
+
+        // 14 kHz ≈ tc 149 → SPX band 1 of the default geometry
+        // (tc 133..157). Measure that band's energy in analysis windows
+        // confined to each half of each frame (self round-trip output
+        // is sample-aligned with the input).
+        use crate::mdct::mdct_512;
+        use crate::tables::WINDOW;
+        let band = 133usize..157;
+        let half_energy = |pcm: &[f32], second: bool| -> f64 {
+            let mut acc = 0.0f64;
+            let mut cnt = 0usize;
+            for f in 1..frames - 1 {
+                let base = f * SAMPLES_PER_FRAME as usize + if second { 768 } else { 0 };
+                for w0 in [0usize, 256] {
+                    let start = base + w0;
+                    let mut win = [0.0f32; 512];
+                    for k in 0..256 {
+                        win[k] = pcm[(start + k) * 2] * WINDOW[k];
+                        win[511 - k] = pcm[(start + 511 - k) * 2] * WINDOW[k];
+                    }
+                    let mut coeffs = [0.0f32; N_COEFFS];
+                    mdct_512(&win, &mut coeffs);
+                    for tc in band.clone() {
+                        acc += (coeffs[tc] as f64).powi(2);
+                    }
+                    cnt += 1;
+                }
+            }
+            acc / cnt as f64
+        };
+        let orig_ratio = 10.0 * (half_energy(&pcm, true) / half_energy(&pcm, false)).log10();
+        let dec_ratio = 10.0 * (half_energy(&dec_f, true) / half_energy(&dec_f, false)).log10();
+        assert!(
+            orig_ratio >= 12.0,
+            "premise: source step should be >= 12 dB (got {orig_ratio:+.1})"
+        );
+        assert!(
+            dec_ratio >= 6.0,
+            "decoded SPX band 1 must track the mid-frame level step              (orig {orig_ratio:+.1} dB, decoded {dec_ratio:+.1} dB)"
+        );
     }
 
     #[test]
