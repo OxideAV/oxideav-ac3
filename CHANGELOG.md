@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.9...v0.0.10) - 2026-07-03
+
+### Other
+
+- eac3 r386: document the encoder-side SPX subsystem (README / CHANGELOG / module docs)
+- eac3 r386: corruption-sweep an SPX+attenuation+explicit-structure stream (panic-safety)
+- eac3 r386: expose SPX through the registry constructor via CodecParameters::options (spx* keys)
+- eac3 r386: thrift stationary SPX coordinate refreshes (spxcoe=0) + mid-frame step-tracking gate
+- eac3 r386: SPX §3.6.4.2.3 attenuation signalling + per-frame adaptive copy-start selection
+- eac3 r386: SPX black-box cross-validation through an external decoder binary
+- eac3 r386: SPX-enabled encoder — §E.2.3.3 syntax emission + §3.6.4.3 energy-matched coordinates (mono/stereo/5.1/7.1)
+- eac3 r386: encoder-side SPX groundwork — shared §E.3.6.4.1 translation plan + spxenc geometry/coordinate quantiser
+- eac3 r381: dependent-substream channel combination per §E.3.8.2 (replace-or-extend, not blind append)
+- scrub black-box-validator naming in r373 PSNR-floor comment (neutral wording)
+- ac3/eac3 r373: fix two decoder panics on malformed input + panic-safety fuzz test
+- ac3 r370: gate the two low-rate E-AC-3 fixtures as gross-regression guards
+- ac3 r370: document the conformance corpus + per-tier fixture status in README
+- ac3 r370: gate 10 base-AC-3 corpus fixtures at MinPsnr floors (regression guards)
+- ac3 r370: correct stale eac3 mod.rs corpus-status doc (5.1-side now ~91.7 dB, gated)
+- ac3 r370: re-arm two suspended tests (short-block coverage + 5.1 coupling) per guardrail #3
+- eac3 r365: per-block SNR-offset strategies (snroffststr 1/2) + 5.1-side fixture promotion
+- fix railed sample bursts from wrong LATAB log-addition table
+- neutralise validator-fixture provenance phrasing in DRC test comments
+- re-export DrcMode/DrcSettings at crate root + document DRC surface in README/CHANGELOG
+- wire §7.7 DRC control surface through both decode paths + §7.6 dialnorm output scalar
+- §6.1.9/§7.6/§7.7 DRC control surface — drc module (partial-compression cut/boost, heavy-compr, dialnorm)
+- CHANGELOG — neutral 'reference encoder' for 32 kHz bit-alloc discrepancy note
+- reset deltnseg[] per syncframe (§7.2.2.6 / §5.4.3.47 init note)
+- §7.9.4.2/§8.2.3.2 short-block transform — α=−1/α=+1 per sub-block
+- corpus driver derives real sample rate from syncframe header
+- §E.2.3.3.15 default coupling banding structure — 3 fixtures 8→91 dB
+- eac3 r335: thread §E.3.5.5.1 prior-frame edge into block-0 enhanced-coupling carrier
+- eac3 r321: §E.3.3.2 nrematbd folds in enhanced coupling (2/0 rematrix band count)
+- neutralize black-box-validator naming in ecpl module doc
+- eac3 r317: exact spxbegf recovery for SPX-co-active enhanced coupling
+- eac3 r317: enhanced-coupling (ecplinu==1) decoder-level integration (§E.3.5.5)
+- §E.3.5.5.1 enhanced-coupling carrier reconstruction (r314)
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 - eac3 round 386 (r386): **encoder-side Spectral Extension (SPX)** — the E-AC-3 encoder's biggest remaining Annex E tool gap (§E.2.3.3 bitstream syntax / §E.3.6 decode model). New public constructor `eac3::make_encoder_with_spx(params, SpxParams)` (with `SpxParams` re-exported at `eac3::`): every fbw channel of every substream (1.0 / 2.0 / 5.1 / 7.1 indep+dep) is coded only up to the SPX begin frequency (§E.3.3.3 `endmant = spxbandtable[spx_begin_subbnd]`, default tc# 109 ≈ 10.2 kHz at 48 kHz) and the audblk carries the full SPX strategy + coordinate syntax: block-0 implicit `spxstre` → `spxinu=1`, `chinspx` (implicit for mono, §E.2.3.3.3), `spxstrtf`/`spxbegf`/`spxendf`, `spxbndstrce` (default Table E2.11 banding or an explicit structure), then per-refresh-block `spxcoe`/`spxblnd`/`mstrspxco`/`spxcoexp`/`spxcomant` (coordinates refresh on the exponent anchor blocks 0 and 3, reuse between). The coordinates implement the §3.6.4.3 energy-matching contract — `spxco = rms(original HF band)/(rms(translated band)·32)` — computed through a **decoder-shared translation plan** (`audblk::spx_translation_plan`, the §E.3.6.4.1 dual-wrap-check copy walk factored out of `apply_spectral_extension` so encoder and decoder agree bin-for-bin), quantised by the new `eac3::spxenc` module (§E.2.3.3.11-13 normal form `(mant+4)/8·2^-(exp+3·mstr)`, `exp==15` denormal escape, saturation + rounding-carry handling, per-channel `mstrspxco` selection). `chbwcod` is suppressed for SPX channels (§E.1.3.4.5), the 2/0 rematrix-flag count folds in SPX (§E.3.3.2), and the SNR-offset tuner budget reserves the SPX header bits so the freed HF exponent/mantissa bits are re-spent on the coded low band. Two optional tools ride on top: **§3.6.4.2.3 attenuation** (`SpxParams::atten_code` → `spxattene`/`chinspxatten`/`spxattencod` in audfrm; the encoder folds the border/wrap 5-tap notch into its translated-energy computation so band energies still match) and **adaptive copy-start** (`SpxParams::adaptive_copy_start` → per-frame `spxstrtf` re-selection scoring every candidate by coordinate saturation above the 0.875 representable ceiling; rescues spectra with a hole above the first copy sub-band, pinned by a fixture where fixed copy-start loses > 6 dB in band 0 and adaptive recovers it to within ±3.5 dB). Coordinate refreshes that quantise identically to block 0 are **thrifted** (`spxcoe = 0`; the decoder's reuse path reconstructs the same coordinates bit-for-bit), with a mid-frame level-step fixture proving the per-span refresh still fires when the spectrum moves (second-half 14 kHz band ≥ 6 dB above the first half through the full round-trip). The registry path reaches SPX too: `spx*` keys on `CodecParameters::options` (`spx`, `spx_begf/endf/strtf/blnd`, `spx_atten`, `spx_adaptive_copy_start`, `spx_explicit_band_structure`) build the same encoder as the typed constructor — pinned byte-identical. Validation: 27 new lib tests (370 → 397 — geometry arms + rejections, quantiser round-trip ≤ 12.5 % rel-err with edge cases, translation-plan wrap arms, attenuation folding closed-form, mono/stereo/5.1/narrow-geometry round-trips gating per-SPX-band decoded energy within ±3 dB and coded-band energy within ±1.5 dB via in-domain MDCT banded analysis, default-vs-explicit band structure decoding **bit-identically**, construction-time geometry rejection); 3 external-decoder interop tests (plain stereo ±4 dB banded energy, mono implicit-`chinspx`, attenuated stereo) — all passed on first run; and an SPX+attenuation+explicit-structure stream swept through the `tests/robustness.rs` truncation / bit-flip / garbage corruption families. Encoder-side AHT remains out of scope.
