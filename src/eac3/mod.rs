@@ -52,8 +52,15 @@
 //!   1.0 / 2.0 / 5.1 layouts (acmod ∈ {1, 2, 7} with `lfeon=1` for
 //!   5.1); 7.1 input emits an indep+dep substream pair (indep
 //!   carries the 5.1 program, dep 0 carries Lb/Rb back surrounds
-//!   with chanmap bit 6 set per §E.2.3.1.7-8 / §E.3.8.2). Encoder-
-//!   side SPX, AHT, and enhanced coupling are out of scope.
+//!   with chanmap bit 6 set per §E.2.3.1.7-8 / §E.3.8.2). Spectral
+//!   extension is available opt-in via [`encoder::make_encoder_with_spx`];
+//!   encoder-side AHT and enhanced coupling remain out of scope.
+//! * **[`spxenc`]** — encoder-side spectral extension (§E.2.3.3 /
+//!   §E.3.6): geometry derivation + validation, the §3.6.4.3
+//!   energy-matching coordinate targets (through the decoder-shared
+//!   translation plan, with the §3.6.4.2.3 attenuation notch folded
+//!   in when signalled), and the §E.2.3.3.11-13 exponent / mantissa /
+//!   master-coordinate quantiser.
 //!
 //! ## Known decoder gaps
 //!

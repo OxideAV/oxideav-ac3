@@ -125,8 +125,43 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   spatially correctly rather than duplicating and decorrelating the shared
   channels a blind append would have appended.
 - Encoder — independent + dependent substream pairs for 1.0 / 2.0 / 5.1
-  / 7.1 layouts, with adaptive / frame-based exponent strategies. SPX
-  and AHT are out of scope on the encoder side.
+  / 7.1 layouts, with adaptive / frame-based exponent strategies.
+  **Spectral extension is now available on the encoder side**
+  (`eac3::make_encoder_with_spx(params, SpxParams)`, §E.2.3.3 / §E.3.6):
+  every fbw channel is coded only up to the SPX begin frequency
+  (default tc# 109 ≈ 10.2 kHz at 48 kHz) and the decoder regenerates
+  the extension region (default up to tc# 229 ≈ 21.5 kHz) from a
+  translated copy of the channel's own low band, noise-blended and
+  scaled by per-band coordinates the encoder derives from the
+  §3.6.4.3 energy-matching rule (`spxco = rms(original HF band) /
+  (rms(translated band)·32)`, quantised through the §E.2.3.3.11-13
+  exponent/mantissa/master-coordinate forms). Coordinates refresh on
+  the exponent anchor blocks and are reused between (`spxcoe`);
+  geometry (begin/end/copy-start codes, noise blend, default
+  Table E2.11 vs explicit band structure) is configurable via
+  `SpxParams`; the freed high-frequency bits are re-spent on the coded
+  low band by the SNR-offset tuner. Optional extras: §3.6.4.2.3
+  **attenuation** (`spxattene`/`chinspxatten`/`spxattencod` in audfrm,
+  with the border/wrap notch folded into the encoder's coordinate
+  computation so band energies still match) and **adaptive copy-start**
+  (per-frame `spxstrtf` re-selection that scores every candidate by
+  coordinate saturation — a spectrum with a hole above the first copy
+  sub-band would otherwise pin a band's coordinate at the 0.875
+  ceiling). Validated three ways: in-tree round-trips gate per-SPX-band
+  decoded energy within ±3 dB of the original (mono / stereo / 5.1 /
+  narrow non-default geometry), default-vs-explicit band structure
+  decodes bit-identically, and an external decoder binary
+  cross-validates the emitted syntax + banded energies (±4 dB) for the
+  plain, mono, and attenuated variants. SPX-encoded streams are also
+  swept through the truncation / bit-flip / garbage corruption
+  families. Both entry points build the same encoder: the typed
+  `make_encoder_with_spx` and the registry path via
+  `CodecParameters::options` `spx*` keys (`spx`, `spx_begf`/`endf`/
+  `strtf`/`blnd`, `spx_atten`, `spx_adaptive_copy_start`,
+  `spx_explicit_band_structure`) — pinned byte-identical. Stationary
+  coordinate refreshes are thrifted (`spxcoe = 0`) with a mid-frame
+  level-step gate proving per-span refresh still tracks moving spectra.
+  AHT stays out of scope on the encoder side.
 
 ### CRC
 
