@@ -721,3 +721,139 @@ fn eac3_spx_atten_band_energy_through_ffmpeg() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// Adaptive Hybrid Transform (§3.4) black-box cross-validation.
+//
+// The in-tree round-trip tests (eac3::encoder::aht_tests) prove the
+// encoder and OUR decoder agree; these tests hand the AHT stream to an
+// independent decoder binary to prove the emitted syntax is what the
+// SPEC says. Every AHT-specific structure is on the line: the audfrm
+// chahtinu flags, the single-anchor exponent plan (nchregs == 1), the
+// front-loaded chgaqmod + gain words + VQ/GAQ codeword stream (with
+// the Table E3.5 codeword widths, including the m-1-bit Gk=2 large
+// mantissas), and the §3.4.5 DCT ordering. One mis-sized field
+// desynchronises the external parser and collapses the decode.
+
+fn encode_eac3_aht(pcm: &[f32], channels: usize, bit_rate: u64) -> Vec<u8> {
+    let mut params = CodecParameters::audio(CodecId::new(eac3::CODEC_ID_STR));
+    params.sample_rate = Some(SR);
+    params.channels = Some(channels as u16);
+    params.sample_format = Some(SampleFormat::S16);
+    params.bit_rate = Some(bit_rate);
+    let mut enc = eac3::make_encoder_with_aht(&params).expect("eac3 make_encoder_with_aht");
+    let n_samp = pcm.len() / channels;
+    let mut s16 = Vec::with_capacity(pcm.len() * 2);
+    for &v in pcm {
+        let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        s16.extend_from_slice(&q.to_le_bytes());
+    }
+    enc.send_frame(&Frame::Audio(AudioFrame {
+        samples: n_samp as u32,
+        pts: Some(0),
+        data: vec![s16],
+    }))
+    .unwrap();
+    enc.flush().unwrap();
+    let mut out = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => out.extend_from_slice(&p.data),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("eac3 aht encode error: {e:?}"),
+        }
+    }
+    out
+}
+
+#[test]
+fn eac3_aht_stereo_decodes_through_ffmpeg() {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg not in PATH — skipping AHT interop test");
+        return;
+    }
+    let pcm = build_sine_pcm(2, 440.0);
+    let baseline = encode_eac3(&pcm, 2, 192_000);
+    let stream = encode_eac3_aht(&pcm, 2, 192_000);
+    assert_ne!(stream, baseline, "AHT must change the bitstream");
+    let decoded = ffmpeg_decode(&stream, 2).expect("ffmpeg rejected the AHT stream");
+    assert!(
+        decoded.len() as f32 >= pcm.len() as f32 * 0.9,
+        "ffmpeg returned too few samples ({} vs {})",
+        decoded.len(),
+        pcm.len()
+    );
+    let p_aht = psnr_min(&pcm, &decoded, 2);
+    let p_base = psnr_min(
+        &pcm,
+        &ffmpeg_decode(&baseline, 2).expect("baseline decode"),
+        2,
+    );
+    eprintln!("E-AC-3 AHT stereo 192k → ffmpeg PSNR = {p_aht:.2} dB (baseline {p_base:.2} dB)");
+    // The stationary sine must decode at least as well as the non-AHT
+    // baseline through the EXTERNAL decoder — the 6-block transform's
+    // whole purpose — and clear the same absolute floor.
+    assert!(
+        p_aht >= 18.0,
+        "AHT PSNR {p_aht:.2} dB below the 18 dB acceptance floor"
+    );
+    assert!(
+        p_aht >= p_base,
+        "AHT ({p_aht:.2} dB) must not decode worse than baseline ({p_base:.2} dB) externally"
+    );
+}
+
+#[test]
+fn eac3_aht_mono_decodes_through_ffmpeg() {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg not in PATH — skipping AHT mono interop test");
+        return;
+    }
+    let pcm = build_sine_pcm(1, 440.0);
+    let stream = encode_eac3_aht(&pcm, 1, 96_000);
+    let decoded = ffmpeg_decode(&stream, 1).expect("ffmpeg rejected the mono AHT stream");
+    assert!(decoded.len() as f32 >= pcm.len() as f32 * 0.9);
+    let psnr = psnr_min(&pcm, &decoded, 1);
+    eprintln!("E-AC-3 AHT mono 96k → ffmpeg PSNR = {psnr:.2} dB");
+    assert!(psnr >= 18.0, "AHT mono PSNR {psnr:.2} dB below 18 dB");
+}
+
+#[test]
+fn eac3_aht_51_decodes_through_ffmpeg() {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg not in PATH — skipping AHT 5.1 interop test");
+        return;
+    }
+    // 5.1: five AHT fbw channels + the standard-path LFE. A mis-sized
+    // AHT field in block 0 would corrupt the LFE mantissas that follow
+    // it in the same block.
+    let n = (SR as f32 * DUR_SEC) as usize;
+    let mut pcm = vec![0.0f32; n * 6];
+    for i in 0..n {
+        let t = i as f32 / SR as f32;
+        let s = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.4
+            + (2.0 * std::f32::consts::PI * 3500.0 * t).sin() * 0.2;
+        let lfe = (2.0 * std::f32::consts::PI * 60.0 * t).sin() * 0.4;
+        for ch in 0..5 {
+            pcm[i * 6 + ch] = s * (1.0 - 0.1 * ch as f32);
+        }
+        pcm[i * 6 + 5] = lfe;
+    }
+    let stream = encode_eac3_aht(&pcm, 6, 384_000);
+    let decoded = ffmpeg_decode(&stream, 6).expect("ffmpeg rejected the 5.1 AHT stream");
+    assert!(decoded.len() as f32 >= pcm.len() as f32 * 0.9);
+    // ffmpeg emits SMPTE order (FL, FR, FC, LFE, SL, SR); the fixture
+    // is in AC-3 order (L, C, R, Ls, Rs, LFE). Reorder before PSNR.
+    let map = [0usize, 2, 1, 4, 5, 3]; // AC-3 slot -> ffmpeg slot
+    let mut reordered = vec![0.0f32; decoded.len()];
+    for frame_idx in 0..decoded.len() / 6 {
+        for (ac3_slot, &ff_slot) in map.iter().enumerate() {
+            reordered[frame_idx * 6 + ac3_slot] = decoded[frame_idx * 6 + ff_slot];
+        }
+    }
+    let psnr = psnr_min(&pcm, &reordered, 6);
+    eprintln!("E-AC-3 AHT 5.1 384k → ffmpeg PSNR = {psnr:.2} dB");
+    // Worst-channel PSNR across all six channels (including the LFE,
+    // whose 60 Hz tone survives the 0-120 Hz band-limit).
+    assert!(psnr >= 15.0, "AHT 5.1 PSNR {psnr:.2} dB below 15 dB");
+}

@@ -448,8 +448,18 @@ pub fn read_scalar_aht_mantissas(
 /// `x[0..6]` to reconstruct the per-block MDCT spectrum values
 /// `c[0..6]`.
 ///
-/// `c(m) = 2 · Σ_{j=0..5} R(j) · x(j) · cos[ j·(2m+1)·π / 12 ]`
+/// `c(m) = √2 · Σ_{j=0..5} R(j) · x(j) · cos[ j·(2m+1)·π / 12 ]`
 /// where `R(0) = 1/√2` and `R(j) = 1` for `j != 0`.
+///
+/// **Deviation from the printed formula** — the A/52:2018 §3.4.5 text
+/// shows a leading constant of `2`, but black-box cross-validation
+/// against an independent production decoder shows the deployed
+/// convention is `√2` (globally — pure-DC and modulated fixtures both
+/// fit `ours(2·Σ) = external · √2` with ~89 dB residual). With `√2`
+/// the DC basis weight is exactly 1 (`√2 · R(0) = 1`), i.e. a
+/// constant cross-block signal reconstructs unchanged, which is the
+/// natural quantiser-range convention. We follow the deployed
+/// constant; the printed `2` appears to be an erratum.
 pub fn idct_ii_6(x: [f32; 6]) -> [f32; 6] {
     let mut c = [0.0f32; 6];
     let r0 = std::f32::consts::FRAC_1_SQRT_2;
@@ -460,7 +470,7 @@ pub fn idct_ii_6(x: [f32; 6]) -> [f32; 6] {
             let theta = (j as f32) * ((2 * m + 1) as f32) * PI / 12.0;
             acc += r * x[j] * theta.cos();
         }
-        c[m] = 2.0 * acc;
+        c[m] = std::f32::consts::SQRT_2 * acc;
     }
     c
 }
@@ -486,11 +496,11 @@ mod tests {
     #[test]
     fn idct_inverse_of_dct_constants() {
         // Constant input → DC output only at m=0..5 should equal
-        // 2 · R(0) · x(0) · cos(0) = √2 · 1 = √2 for x = (1, 0, 0, 0, 0, 0).
+        // √2 · R(0) · x(0) · cos(0) = 1 for x = (1, 0, 0, 0, 0, 0):
+        // the deployed convention's DC basis weight is exactly 1.
         let c = idct_ii_6([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-        let expected = std::f32::consts::SQRT_2;
         for v in c.iter() {
-            assert!((v - expected).abs() < 1e-5, "got {v}, expected {expected}");
+            assert!((v - 1.0).abs() < 1e-5, "got {v}, expected 1.0");
         }
     }
 

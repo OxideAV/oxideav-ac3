@@ -36,30 +36,32 @@ use super::tables::aht_codebooks::{
 use crate::audblk::N_COEFFS;
 use crate::encoder::{compute_bap_table, BitAllocParams, DbaPlan};
 
-/// Forward DCT-II of length 6 — the inverse of the §3.4.5 transform.
+/// Forward DCT-II of length 6 — the inverse of the §3.4.5 transform
+/// as deployed (see [`super::aht::idct_ii_6`]: leading constant `√2`,
+/// black-box-validated; the printed `2` is an erratum).
 ///
-/// The §3.4.5 IDCT is
-/// `C(m) = 2 · Σ_j R(j) · X(j) · cos[j·(2m+1)·π/12]` with
+/// The IDCT is
+/// `C(m) = √2 · Σ_j R(j) · X(j) · cos[j·(2m+1)·π/12]` with
 /// `R(0) = 1/√2`, `R(j≠0) = 1`. Orthogonality of the DCT basis over
 /// 6 points (`Σ_m cos²[j·(2m+1)·π/12] = 3` for `j ≥ 1`, `= 6` for
 /// `j = 0`) inverts it as:
 ///
 /// ```text
-///     X(0) = (1 / (6·√2)) · Σ_m C(m)
-///     X(j) = (1 / 6)      · Σ_m C(m) · cos[j·(2m+1)·π/12]   (j ≥ 1)
+///     X(0) = (1 / 6)  · Σ_m C(m)
+///     X(j) = (√2 / 6) · Σ_m C(m) · cos[j·(2m+1)·π/12]   (j ≥ 1)
 /// ```
 pub fn dct_ii_6(c: &[f32; 6]) -> [f32; 6] {
-    use std::f32::consts::{FRAC_1_SQRT_2, PI};
+    use std::f32::consts::{PI, SQRT_2};
     let mut x = [0.0f32; 6];
     let sum: f32 = c.iter().sum();
-    x[0] = sum * FRAC_1_SQRT_2 / 6.0;
+    x[0] = sum / 6.0;
     for (j, xj) in x.iter_mut().enumerate().skip(1) {
         let mut acc = 0.0f32;
         for (m, &cm) in c.iter().enumerate() {
             let theta = (j as f32) * ((2 * m + 1) as f32) * PI / 12.0;
             acc += cm * theta.cos();
         }
-        *xj = acc / 6.0;
+        *xj = acc * SQRT_2 / 6.0;
     }
     x
 }
@@ -334,7 +336,11 @@ fn mode_allowed(gaqmod: u8) -> &'static [u8] {
 /// ([`scalar_bits`]) is the same expression [`quantise_scalar`] uses.
 pub fn plan_aht_channel(hebap: &[u8], start: usize, end: usize, x: &[[f32; 6]]) -> AhtChannelPlan {
     let mut best: Option<AhtChannelPlan> = None;
-    for gaqmod in 0..=3u8 {
+    let max_mode: u8 = std::env::var("EAC3_AHT_MAX_GAQMOD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    for gaqmod in 0..=max_mode {
         let endbap = endbap_for_gaqmod(gaqmod);
         let mut gains: Vec<u8> = Vec::new();
         let mut bits = 0u32;
@@ -484,8 +490,10 @@ mod tests {
 
     #[test]
     fn dct_of_constant_is_dc_only() {
+        // DC basis weight is 1 in the deployed convention: a constant
+        // cross-block mantissa maps to X(0) unchanged.
         let x = dct_ii_6(&[0.5; 6]);
-        assert!((x[0] - 0.5 * 6.0 * std::f32::consts::FRAC_1_SQRT_2 / 6.0).abs() < 1e-6);
+        assert!((x[0] - 0.5).abs() < 1e-6);
         for &v in &x[1..] {
             assert!(v.abs() < 1e-6);
         }
