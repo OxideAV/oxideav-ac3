@@ -2628,7 +2628,7 @@ fn calc_lowcomp(a: i32, b0: i32, b1: i32, bin: usize) -> i32 {
 /// channel — same order as the decoder's read schedule
 /// (`unpack_mantissas`). When `lfeon`, the LFE channel's bap (lives at
 /// `baps[nchan + 1]`) is walked last over bins 0..LFE_END_MANT.
-fn mantissa_bits_total(
+pub(crate) fn mantissa_bits_total(
     baps: &[Vec<[u8; N_COEFFS]>],
     end: usize,
     nchan: usize,
@@ -2750,7 +2750,7 @@ fn mantissa_bits_total(
 /// When `None`, falls back to the legacy frame-wide `exp_strategies`
 /// (every fbw channel uses the same strategy).
 #[allow(clippy::too_many_arguments)]
-fn overhead_bits_for(
+pub(crate) fn overhead_bits_for(
     exp_strategies: &[u8; BLOCKS_PER_FRAME],
     chexpstr_per_ch: Option<&[[u8; BLOCKS_PER_FRAME]]>,
     end: usize,

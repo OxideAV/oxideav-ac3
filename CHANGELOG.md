@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- eac3 r390: AHT encoder (§3.4) — make_encoder_with_aht / `aht` option: 6-block DCT-II + hebap + VQ/GAQ emission, ~+20 dB over the non-AHT baseline on stationary content
+- eac3 r390: encoder-side AHT primitives (forward DCT-II, VQ search, GAQ quantiser/planner) + compute_hebap via table-parametrised bit allocation
 - eac3 r390: spec-exact GAQ dequantisation (Tables E3.5/E3.6) — literal remap constants, Gk=2 large codeword corrected to m-1 bits
 
 ## [0.0.10](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.9...v0.0.10) - 2026-07-03

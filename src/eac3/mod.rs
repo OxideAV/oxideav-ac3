@@ -124,5 +124,5 @@ pub use bsi::{
     ProgramScaleFactor, BSID_BASE_AC3_MAX, EAC3_BSID,
 };
 pub use decoder::{decode_eac3_packet, Eac3DecoderState};
-pub use encoder::{make_encoder, make_encoder_with_spx, CODEC_ID_STR};
+pub use encoder::{make_encoder, make_encoder_with_aht, make_encoder_with_spx, CODEC_ID_STR};
 pub use spxenc::SpxParams;

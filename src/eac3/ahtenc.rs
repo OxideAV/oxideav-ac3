@@ -29,7 +29,7 @@
 
 use oxideav_core::bits::BitWriter;
 
-use super::aht::{endbap_for_gaqmod, gaq_remap, vq_lookup, HEBAP_MANT_BITS, VQ_BITS};
+use super::aht::{endbap_for_gaqmod, gaq_remap, HEBAP_MANT_BITS, VQ_BITS};
 use super::tables::aht_codebooks::{
     VQ_HEBAP1, VQ_HEBAP2, VQ_HEBAP3, VQ_HEBAP4, VQ_HEBAP5, VQ_HEBAP6, VQ_HEBAP7,
 };
@@ -243,6 +243,38 @@ fn quantise_bin(hebap: u8, gk: u8, x: &[f32; 6]) -> ([ScalarCode; 6], u32, f32) 
     (codes, bits, err)
 }
 
+/// Exact bit count of one mantissa under gain `gk` — the cheap
+/// (no-probe) twin of [`quantise_scalar`]; the small-vs-escape
+/// decision (`s = round(x·2^(m-1))` against the tag boundary) is the
+/// same expression, so the planner's bit accounting always matches
+/// the writer's emission.
+#[inline]
+fn scalar_bits(hebap: u8, gk: u8, x: f32) -> u32 {
+    let m = HEBAP_MANT_BITS[hebap as usize] as u32;
+    match gk {
+        1 => m,
+        2 | 4 => {
+            let small_bits = if gk == 2 { m - 1 } else { m - 2 };
+            let tag = -(1i32 << (small_bits - 1));
+            let s = (x * (1i32 << (m - 1)) as f32).round() as i32;
+            if s > tag && s < -tag {
+                small_bits
+            } else if gk == 2 {
+                small_bits + (m - 1)
+            } else {
+                small_bits + m
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Exact bit count of one bin's 6 codewords under gain `gk`.
+#[inline]
+fn bin_bits(hebap: u8, gk: u8, x: &[f32; 6]) -> u32 {
+    x.iter().map(|&v| scalar_bits(hebap, gk, v)).sum()
+}
+
 /// Per-channel GAQ plan: the chosen `gaqmod`, the per-active-bin
 /// mapped gain values (Table E3.4: 0 → Gk=1, 1 → Gk=2, 2 → Gk=4, in
 /// ascending bin order), and the exact mantissa-payload bit count
@@ -290,15 +322,22 @@ fn mode_allowed(gaqmod: u8) -> &'static [u8] {
 ///
 /// `hebap[bin]` and `x[bin]` (6 AHT-domain coefficients per bin) must
 /// cover `start..end`; bins outside the range are ignored. Evaluates
-/// all four `gaqmod` values with exact bit accounting and returns the
-/// cheapest (squared reconstruction error as tie-break).
+/// all four `gaqmod` values with exact bit accounting (VQ bins cost
+/// their Table E3.2 codeword width regardless of mode; scalar bins
+/// pick the cheapest allowed gain, Gk=1 on ties since its large-value
+/// levels are finer) and returns the cheapest mode (lowest `gaqmod`
+/// on ties).
+///
+/// Bit-count only — no codeword search — so it is cheap enough for
+/// the SNR-offset tuner's inner loop. The writer's emission consumes
+/// exactly `total_bits()` because the small-vs-escape decision here
+/// ([`scalar_bits`]) is the same expression [`quantise_scalar`] uses.
 pub fn plan_aht_channel(hebap: &[u8], start: usize, end: usize, x: &[[f32; 6]]) -> AhtChannelPlan {
-    let mut best: Option<(AhtChannelPlan, f32)> = None;
+    let mut best: Option<AhtChannelPlan> = None;
     for gaqmod in 0..=3u8 {
         let endbap = endbap_for_gaqmod(gaqmod);
         let mut gains: Vec<u8> = Vec::new();
         let mut bits = 0u32;
-        let mut err = 0.0f32;
         for bin in start..end {
             let h = hebap[bin];
             if h == 0 {
@@ -307,34 +346,25 @@ pub fn plan_aht_channel(hebap: &[u8], start: usize, end: usize, x: &[[f32; 6]]) 
             if (1..=7).contains(&h) {
                 // VQ regime — cost is fixed by the codebook.
                 bits += VQ_BITS[h as usize] as u32;
-                let idx = vq_search(h, &x[bin]);
-                let v = vq_lookup(h, idx);
-                for j in 0..6 {
-                    let d = v[j] - x[bin][j];
-                    err += d * d;
-                }
                 continue;
             }
             if gaqmod > 0 && h < endbap {
-                // GAQ-active bin: pick the cheapest allowed gain.
-                let (mut b_gain, mut b_bits, mut b_err) = (0u8, u32::MAX, f32::INFINITY);
+                // GAQ-active bin: pick the cheapest allowed gain
+                // (strict `<` keeps Gk=1 on ties).
+                let (mut b_gain, mut b_bits) = (0u8, u32::MAX);
                 for &mapped in mode_allowed(gaqmod) {
                     let gk = gain_of_mapped(mapped);
-                    let (_, gbits, gerr) = quantise_bin(h, gk, &x[bin]);
-                    if gbits < b_bits || (gbits == b_bits && gerr < b_err) {
+                    let gbits = bin_bits(h, gk, &x[bin]);
+                    if gbits < b_bits {
                         b_gain = mapped;
                         b_bits = gbits;
-                        b_err = gerr;
                     }
                 }
                 gains.push(b_gain);
                 bits += b_bits;
-                err += b_err;
             } else {
                 // Fixed quantiser (h >= endbap, or gaqmod == 0).
-                let (_, gbits, gerr) = quantise_bin(h, 1, &x[bin]);
-                bits += gbits;
-                err += gerr;
+                bits += bin_bits(h, 1, &x[bin]);
             }
         }
         // Gain-word side information (§3.4.2 gaqsections).
@@ -351,16 +381,13 @@ pub fn plan_aht_channel(hebap: &[u8], start: usize, end: usize, x: &[[f32; 6]]) 
         };
         let better = match &best {
             None => true,
-            Some((b, be)) => {
-                plan.payload_bits < b.payload_bits
-                    || (plan.payload_bits == b.payload_bits && err < *be)
-            }
+            Some(b) => plan.payload_bits < b.payload_bits,
         };
         if better {
-            best = Some((plan, err));
+            best = Some(plan);
         }
     }
-    best.expect("at least gaqmod 0 evaluated").0
+    best.expect("at least gaqmod 0 evaluated")
 }
 
 /// Emit one channel's front-loaded AHT mantissa block (§3.4.4 read
@@ -425,7 +452,6 @@ pub fn write_aht_channel(
 /// (`hebap[]`) for one channel: the base-AC-3 psd / excitation /
 /// masking pipeline with the final lookup routed through the Table
 /// E3.1 `hebaptab[]` instead of `baptab[]`.
-#[allow(dead_code)] // wired into the E-AC-3 encoder by the AHT-emission commit
 pub(crate) fn compute_hebap(
     exp: &[u8; N_COEFFS],
     end: usize,

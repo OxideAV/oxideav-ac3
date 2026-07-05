@@ -47,13 +47,15 @@ use crate::audblk::{remat_band_count_spx, BLOCKS_PER_FRAME, N_COEFFS, SAMPLES_PE
 use crate::decoder::SAMPLES_PER_FRAME;
 use crate::encoder::{
     ac3_crc_update, build_dba_plan, compute_bap, decode_input_samples, extract_exponent,
-    preprocess_d15, quantise_exponents_to_grpsize, quantise_mantissa, select_exp_strategies,
+    mantissa_bits_total, overhead_bits_for, pick_strategy_for_block, preprocess_d15,
+    quantise_exponents_to_grpsize, quantise_mantissa, select_exp_strategies,
     tune_snroffst_with_plan, write_exponents_grouped, write_mantissa_stream, BitAllocParams,
-    CouplingPlan, TransientDetector, LFE_END_MANT,
+    CouplingPlan, DbaPlan, TransientDetector, LFE_END_MANT,
 };
 use crate::mdct::{mdct_256_pair, mdct_512};
 use crate::tables::WINDOW;
 
+use super::ahtenc::{compute_hebap, dct_ii_6, plan_aht_channel, write_aht_channel};
 use super::dsp::DEFAULT_SPX_BNDSTRC;
 use super::spxenc::{
     band_coord_targets_span_atten, choose_mstrspxco, quantise_coord, SpxGeometry, SpxParams,
@@ -108,6 +110,39 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         SpxGeometry::derive(&spx, &DEFAULT_SPX_BNDSTRC)?;
         concrete.spx = Some(spx);
     }
+    match params.options.get("aht") {
+        None | Some("0") | Some("false") => {}
+        Some("1") | Some("true") => concrete.aht = true,
+        Some(v) => {
+            return Err(Error::invalid(format!(
+                "eac3 encoder: option aht={v} (expected 1/true/0/false)"
+            )))
+        }
+    }
+    if concrete.aht && concrete.spx.is_some() {
+        return Err(Error::Unsupported(
+            "eac3 encoder: aht and spx cannot be combined (single-subsystem scope)".into(),
+        ));
+    }
+    Ok(Box::new(concrete))
+}
+
+/// Build an E-AC-3 encoder with the Adaptive Hybrid Transform enabled
+/// (§3.4 / Table E1.3 `ahte`). Every full-bandwidth channel of every
+/// substream is coded through the 6-block DCT-II + VQ/GAQ quantiser
+/// stack: exponents are transmitted once per frame (block-0 anchor,
+/// blocks 1..5 REUSE, so `nchregs[ch] == 1`), the per-bin `hebap[]`
+/// pointers come from the §3.4.3.1 high-efficiency allocation, and
+/// the block-0 mantissa slot carries the front-loaded `chgaqmod` +
+/// gain words + 6×nmant codeword stream instead of six per-block
+/// mantissa payloads. Best suited to stationary content (the encoder
+/// forces long transforms — no block switching — while AHT is on).
+///
+/// Also reachable through the registry path via
+/// `CodecParameters::options` key `aht` = `1`/`true`.
+pub fn make_encoder_with_aht(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let mut concrete = build_concrete_encoder(params)?;
+    concrete.aht = true;
     Ok(Box::new(concrete))
 }
 
@@ -353,6 +388,7 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
         pts: 0,
         snroffststr: 0,
         spx: None,
+        aht: false,
     })
 }
 
@@ -496,6 +532,12 @@ struct Eac3Encoder {
     /// (via [`make_encoder_with_spx`]) puts every fbw channel of every
     /// substream in SPX.
     spx: Option<SpxParams>,
+    /// Adaptive Hybrid Transform (§3.4). When `true` (via
+    /// [`make_encoder_with_aht`] or the `aht` option) every fbw
+    /// channel of every substream is AHT-coded: single block-0
+    /// exponent anchor, hebap-driven VQ/GAQ mantissas front-loaded in
+    /// block 0, long transforms only. Mutually exclusive with `spx`.
+    aht: bool,
 }
 
 impl Encoder for Eac3Encoder {
@@ -612,11 +654,15 @@ impl Eac3Encoder {
                     &drain[blk * SAMPLES_PER_BLOCK..(blk + 1) * SAMPLES_PER_BLOCK],
                 );
                 let is_lfe_chan = sub.lfeon && ch == nfchans;
-                let is_short = if is_lfe_chan || std::env::var("EAC3_DISABLE_BLKSW").is_ok() {
-                    false
-                } else {
-                    self.transient_state[src_idx].process(&in_buf[256..])
-                };
+                // AHT frames force long transforms: the 6-block DCT-II
+                // (§3.4.1) targets stationary content and a short block
+                // would break the cross-block bin alignment.
+                let is_short =
+                    if is_lfe_chan || self.aht || std::env::var("EAC3_DISABLE_BLKSW").is_ok() {
+                        false
+                    } else {
+                        self.transient_state[src_idx].process(&in_buf[256..])
+                    };
                 if !is_lfe_chan {
                     blksw[ch][blk] = is_short;
                 }
@@ -704,6 +750,21 @@ impl Eac3Encoder {
                 }
             }
         }
+        if self.aht {
+            // §3.4.2: AHT channels transmit exponents ONCE per frame
+            // (nchregs[ch] == 1). The single set must bound all six
+            // blocks' coefficients, so extract from the per-bin frame
+            // maximum — every block's mantissa then stays sub-unity.
+            for ch in 0..nfchans {
+                for k in 0..ch_end_mant {
+                    let mut mx = 0.0f32;
+                    for blk in 0..BLOCKS_PER_FRAME {
+                        mx = mx.max(coeffs[ch][blk][k].abs());
+                    }
+                    exps[ch][0][k] = extract_exponent(mx);
+                }
+            }
+        }
         if sub.lfeon {
             // §7.1.3: LFE is spectrally constrained to 0-120 Hz per the
             // AC-3 / E-AC-3 specification. At 48 kHz with a 512-point
@@ -736,45 +797,70 @@ impl Eac3Encoder {
         // EAC3_DISABLE_EXPSTR_SEL=1 pins every anchor to D15 (same as
         // old static behaviour) for A/B testing.
         let exp_strategies: [u8; BLOCKS_PER_FRAME] = [1, 0, 0, 1, 0, 0];
-        // D15-preprocess every anchor block first so the strategy picker
-        // sees legalised exponents.
-        for ch in 0..nfchans {
-            for blk in 0..BLOCKS_PER_FRAME {
-                if exp_strategies[blk] == 1 {
-                    preprocess_d15(&mut exps[ch][blk][..ch_end_mant]);
-                }
-            }
-        }
-        let chexpstr_plan: Vec<[u8; BLOCKS_PER_FRAME]> =
-            if std::env::var("EAC3_DISABLE_EXPSTR_SEL").is_ok() {
-                let mut out = vec![[0u8; BLOCKS_PER_FRAME]; nfchans];
-                for ch in 0..nfchans {
-                    out[ch] = exp_strategies;
-                }
-                out
-            } else {
-                select_exp_strategies(&exps, nfchans, ch_end_mant)
-            };
-        // Apply grpsize quantisation for D25/D45 anchor blocks.
-        for ch in 0..nfchans {
-            for blk in 0..BLOCKS_PER_FRAME {
-                let strat = chexpstr_plan[ch][blk];
+        let chexpstr_plan: Vec<[u8; BLOCKS_PER_FRAME]> = if self.aht {
+            // §3.4.2 AHT eligibility: nchregs[ch] == 1 — a single
+            // block-0 anchor with blocks 1..5 all REUSE. Pick the
+            // smoothest legal strategy for the frame-wide exponent set
+            // and propagate it to every block (the decoder reuses the
+            // block-0 exponents for the whole frame, and the AHT
+            // mantissa cache is scaled against them once).
+            let mut out = vec![[0u8; BLOCKS_PER_FRAME]; nfchans];
+            for ch in 0..nfchans {
+                preprocess_d15(&mut exps[ch][0][..ch_end_mant]);
+                let strat = pick_strategy_for_block(&exps[ch][0], ch_end_mant);
+                out[ch][0] = strat;
                 if strat >= 2 {
                     let grpsize = if strat == 2 { 2 } else { 4 };
-                    quantise_exponents_to_grpsize(&mut exps[ch][blk][..ch_end_mant], grpsize);
+                    quantise_exponents_to_grpsize(&mut exps[ch][0][..ch_end_mant], grpsize);
                 }
-            }
-            // REUSE blocks get the most-recent anchor's exponents.
-            let mut last = 0usize;
-            for blk in 0..BLOCKS_PER_FRAME {
-                if chexpstr_plan[ch][blk] != 0 {
-                    last = blk;
-                } else {
-                    let src: [u8; N_COEFFS] = exps[ch][last];
+                for blk in 1..BLOCKS_PER_FRAME {
+                    let src: [u8; N_COEFFS] = exps[ch][0];
                     exps[ch][blk][..ch_end_mant].copy_from_slice(&src[..ch_end_mant]);
                 }
             }
-        }
+            out
+        } else {
+            // D15-preprocess every anchor block first so the strategy
+            // picker sees legalised exponents.
+            for ch in 0..nfchans {
+                for blk in 0..BLOCKS_PER_FRAME {
+                    if exp_strategies[blk] == 1 {
+                        preprocess_d15(&mut exps[ch][blk][..ch_end_mant]);
+                    }
+                }
+            }
+            let plan: Vec<[u8; BLOCKS_PER_FRAME]> =
+                if std::env::var("EAC3_DISABLE_EXPSTR_SEL").is_ok() {
+                    let mut out = vec![[0u8; BLOCKS_PER_FRAME]; nfchans];
+                    for ch in 0..nfchans {
+                        out[ch] = exp_strategies;
+                    }
+                    out
+                } else {
+                    select_exp_strategies(&exps, nfchans, ch_end_mant)
+                };
+            // Apply grpsize quantisation for D25/D45 anchor blocks.
+            for ch in 0..nfchans {
+                for blk in 0..BLOCKS_PER_FRAME {
+                    let strat = plan[ch][blk];
+                    if strat >= 2 {
+                        let grpsize = if strat == 2 { 2 } else { 4 };
+                        quantise_exponents_to_grpsize(&mut exps[ch][blk][..ch_end_mant], grpsize);
+                    }
+                }
+                // REUSE blocks get the most-recent anchor's exponents.
+                let mut last = 0usize;
+                for blk in 0..BLOCKS_PER_FRAME {
+                    if plan[ch][blk] != 0 {
+                        last = blk;
+                    } else {
+                        let src: [u8; N_COEFFS] = exps[ch][last];
+                        exps[ch][blk][..ch_end_mant].copy_from_slice(&src[..ch_end_mant]);
+                    }
+                }
+            }
+            plan
+        };
         if sub.lfeon {
             // LFE strategy: D15 on anchor blocks, REUSE elsewhere. The
             // 1-bit lfeexpstr field only supports D15 or REUSE (§5.4.3.23
@@ -830,6 +916,34 @@ impl Eac3Encoder {
                 })
                 .collect()
         });
+
+        // -------- AHT-domain coefficients (§3.4.5, forward direction) ----
+        //
+        // Per bin, the 6 per-block mantissas (coeff · 2^exp, using the
+        // frame's single exponent set) map through the forward DCT-II
+        // into the AHT coefficients X(k, j) that the VQ/GAQ quantiser
+        // stack codes once per frame.
+        let aht_x: Option<Vec<Vec<[f32; 6]>>> = if self.aht {
+            Some(
+                (0..nfchans)
+                    .map(|ch| {
+                        (0..ch_end_mant)
+                            .map(|bin| {
+                                let e = exps[ch][0][bin] as i32;
+                                let scale = 2f32.powi(e);
+                                let mut c = [0.0f32; 6];
+                                for (blk, cm) in c.iter_mut().enumerate() {
+                                    *cm = coeffs[ch][blk][bin] * scale;
+                                }
+                                dct_ii_6(&c)
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
 
         // -------- Bit allocation --------
         let ba = BitAllocParams {
@@ -923,38 +1037,63 @@ impl Eac3Encoder {
                 strat + atten + nfchans as u32 * (payload + (1 + payload) + 4)
             }
         };
-        let tuner_frame_bytes = sub
-            .frame_bytes
-            .saturating_sub((snr_reserve_bits + spx_reserve_bits).div_ceil(8) as usize);
+        // AHT header bits over the AHT-off baseline: one chahtinu bit
+        // per fbw channel in audfrm (the 2-bit chgaqmod fields are
+        // accounted inside the AHT mantissa cost).
+        let aht_reserve_bits: u32 = if self.aht { nfchans as u32 + 8 } else { 0 };
+        let tuner_frame_bytes = sub.frame_bytes.saturating_sub(
+            (snr_reserve_bits + spx_reserve_bits + aht_reserve_bits).div_ceil(8) as usize,
+        );
         // Pass chexpstr_plan so the overhead calculator accounts for
         // D25/D45 exponent savings when sizing the mantissa budget.
-        let tuned_ba = tune_snroffst_with_plan(
-            &ba,
-            &exps,
-            ch_end_mant,
-            nfchans,
-            self.fscod,
-            tuner_frame_bytes,
-            &exp_strategies,
-            Some(&chexpstr_plan),
-            &cpl,
-            &dba_plan,
-            sub.acmod,
-            sub.lfeon,
-        );
+        let tuned_ba = if let Some(x) = &aht_x {
+            tune_snroffst_aht(
+                &ba,
+                &exps,
+                x,
+                ch_end_mant,
+                nfchans,
+                self.fscod,
+                tuner_frame_bytes,
+                &exp_strategies,
+                &chexpstr_plan,
+                &dba_plan,
+                sub.acmod,
+                sub.lfeon,
+            )
+        } else {
+            tune_snroffst_with_plan(
+                &ba,
+                &exps,
+                ch_end_mant,
+                nfchans,
+                self.fscod,
+                tuner_frame_bytes,
+                &exp_strategies,
+                Some(&chexpstr_plan),
+                &cpl,
+                &dba_plan,
+                sub.acmod,
+                sub.lfeon,
+            )
+        };
         let mut baps: Vec<Vec<[u8; N_COEFFS]>> =
             vec![vec![[0u8; N_COEFFS]; BLOCKS_PER_FRAME]; nfchans + 2];
         let frame_ba = tuned_ba;
-        for ch in 0..nfchans {
-            for blk in 0..BLOCKS_PER_FRAME {
-                compute_bap(
-                    &exps[ch][blk],
-                    ch_end_mant,
-                    self.fscod,
-                    &frame_ba,
-                    &mut baps[ch][blk],
-                    Some((&dba_plan, ch)),
-                );
+        if !self.aht {
+            // AHT channels use hebap[] (computed at emission) instead
+            // of bap[]; only non-AHT frames need the fbw bap arrays.
+            for ch in 0..nfchans {
+                for blk in 0..BLOCKS_PER_FRAME {
+                    compute_bap(
+                        &exps[ch][blk],
+                        ch_end_mant,
+                        self.fscod,
+                        &frame_ba,
+                        &mut baps[ch][blk],
+                        Some((&dba_plan, ch)),
+                    );
+                }
             }
         }
         if sub.lfeon {
@@ -1016,7 +1155,7 @@ impl Eac3Encoder {
 
         // audfrm (§E.2.2.3 / §E.2.3.2)
         bw.write_u32(1, 1); // expstre = 1
-        bw.write_u32(0, 1); // ahte = 0
+        bw.write_u32(u32::from(self.aht), 1); // ahte (§2.3.2.2)
         bw.write_u32(self.snroffststr as u32, 2); // snroffststr
         bw.write_u32(0, 1); // transproce = 0
         bw.write_u32(1, 1); // blkswe = 1
@@ -1074,7 +1213,17 @@ impl Eac3Encoder {
                 bw.write_u32(0, 5); // convexpstr = 0 (REUSE codeword)
             }
         }
-        // ahte == 0 ⇒ no AHT block.
+        // §3.4.2 / Table E1.3 AHT in-use flags. Presence is gated by
+        // the decoder-derived regs counts: no cplahtinu (coupling is
+        // never in use, so ncplblks == 0), one chahtinu[ch] bit per
+        // fbw channel (every channel's plan is a single block-0
+        // anchor → nchregs[ch] == 1), and no lfeahtinu (the LFE keeps
+        // the two-anchor [1,0,0,1,0,0] pattern → nlferegs == 2).
+        if self.aht {
+            for _ in 0..nfchans {
+                bw.write_u32(1, 1); // chahtinu[ch] = 1
+            }
+        }
         // snroffststr == 0 ⇒ frame-level (frmcsnroffst, frmfsnroffst) in
         // audfrm; snroffststr ∈ {1, 2} ⇒ no frame-level fields here (the
         // offsets are carried per-block in each audblk instead).
@@ -1101,7 +1250,11 @@ impl Eac3Encoder {
                 bw.write_u32(blksw[ch][blk] as u32, 1);
             }
             for _ in 0..nfchans {
-                bw.write_u32(1, 1); // dithflag = 1
+                // AHT channels reconstruct every bin from the front-
+                // loaded coefficient cache — hebap==0 bins are true
+                // zeros, so signal dithflag=0 to keep spec-strict
+                // decoders from substituting dither there.
+                bw.write_u32(u32::from(!self.aht), 1); // dithflag
             }
             bw.write_u32(0, 1); // dynrnge = 0
 
@@ -1315,16 +1468,53 @@ impl Eac3Encoder {
             // -------- Mantissas --------
             // Order per AC-3 §5.4.3.49: fbw channels in ascending index,
             // then (when present) the LFE pseudo-channel.
+            //
+            // AHT frames front-load every fbw channel's mantissas in
+            // block 0 as a self-contained chgaqmod + gain-word +
+            // VQ/GAQ codeword stream (§3.4.4); blocks 1..5 carry no
+            // fbw mantissa bits at all (the decoder replays its
+            // 6-block coefficient cache). The LFE stays on the
+            // standard per-block path either way, and its bap-1/2/4
+            // grouping is self-contained because AHT channels
+            // contribute nothing to the shared grouping buffers.
             let mut codes: Vec<(u8, u32)> = Vec::with_capacity(nfchans * ch_end_mant + 4);
-            for ch in 0..nfchans {
-                for bin in 0..ch_end_mant {
-                    let bap = baps[ch][blk][bin];
-                    if bap == 0 {
-                        continue;
+            if let Some(x) = &aht_x {
+                if blk == 0 {
+                    for ch in 0..nfchans {
+                        // §3.4.3.1 hebap[] with the same psd/mask/
+                        // snroffset/dba state the decoder derives for
+                        // this channel's block-0 bit allocation.
+                        let mut hebap = [0u8; N_COEFFS];
+                        compute_hebap(
+                            &exps[ch][0],
+                            ch_end_mant,
+                            self.fscod,
+                            &tuned_ba,
+                            &mut hebap,
+                            Some((&dba_plan, ch)),
+                        );
+                        let plan = plan_aht_channel(&hebap[..ch_end_mant], 0, ch_end_mant, &x[ch]);
+                        write_aht_channel(
+                            &mut bw,
+                            &plan,
+                            &hebap[..ch_end_mant],
+                            0,
+                            ch_end_mant,
+                            &x[ch],
+                        );
                     }
-                    let e = exps[ch][blk][bin] as i32;
-                    let mant = quantise_mantissa(coeffs[ch][blk][bin], e, bap);
-                    codes.push((bap, mant));
+                }
+            } else {
+                for ch in 0..nfchans {
+                    for bin in 0..ch_end_mant {
+                        let bap = baps[ch][blk][bin];
+                        if bap == 0 {
+                            continue;
+                        }
+                        let e = exps[ch][blk][bin] as i32;
+                        let mant = quantise_mantissa(coeffs[ch][blk][bin], e, bap);
+                        codes.push((bap, mant));
+                    }
                 }
             }
             if sub.lfeon {
@@ -1386,6 +1576,107 @@ impl Eac3Encoder {
     }
 }
 
+/// SNR-offset tuner for AHT frames. The fbw mantissa cost is the
+/// exact §3.4.4 payload (hebap-driven VQ/GAQ codewords + gain words +
+/// chgaqmod, front-loaded once per frame) instead of six per-block bap
+/// payloads; the LFE keeps the standard bap cost. `hebap[]` — and
+/// therefore the cost — is monotone non-decreasing in the combined
+/// SNR offset, so the largest offset that fits the budget is found by
+/// binary search over `csnroffst·16 + fsnroffst`.
+#[allow(clippy::too_many_arguments)]
+fn tune_snroffst_aht(
+    ba: &BitAllocParams,
+    exps: &[Vec<[u8; N_COEFFS]>],
+    aht_x: &[Vec<[f32; 6]>],
+    end: usize,
+    nchan: usize,
+    fscod: u8,
+    frame_bytes: usize,
+    exp_strategies: &[u8; BLOCKS_PER_FRAME],
+    chexpstr_plan: &[[u8; BLOCKS_PER_FRAME]],
+    dba: &DbaPlan,
+    acmod: u8,
+    lfeon: bool,
+) -> BitAllocParams {
+    let cpl = CouplingPlan::default();
+    let overhead = overhead_bits_for(
+        exp_strategies,
+        Some(chexpstr_plan),
+        end,
+        nchan,
+        &cpl,
+        dba,
+        acmod,
+        lfeon,
+    ) + 32;
+    let total_bits = (frame_bytes * 8) as u32;
+    let mut best = *ba;
+    best.csnroffst = 0;
+    best.fsnroffst = 0;
+    best.lfefsnroffst = 0;
+    if overhead >= total_bits {
+        return best;
+    }
+    let budget = total_bits - overhead;
+
+    let used_at = |combined: i32| -> u32 {
+        let mut cand = *ba;
+        cand.csnroffst = (combined / 16) as u8;
+        cand.fsnroffst = (combined % 16) as u8;
+        cand.lfefsnroffst = cand.fsnroffst;
+        let mut used = 0u32;
+        for ch in 0..nchan {
+            let mut hebap = [0u8; N_COEFFS];
+            compute_hebap(&exps[ch][0], end, fscod, &cand, &mut hebap, Some((dba, ch)));
+            used += plan_aht_channel(&hebap[..end], 0, end, &aht_x[ch]).total_bits();
+        }
+        if lfeon {
+            let lfe_idx = nchan + 1;
+            let mut lfe_ba = cand;
+            lfe_ba.fsnroffst = cand.lfefsnroffst;
+            lfe_ba.fgaincod = cand.lfefgaincod;
+            // Layout for mantissa_bits_total with nchan == 0: slot 0 is
+            // the (unused) coupling pseudo-channel, slot 1 the LFE.
+            let mut lfe_baps: Vec<Vec<[u8; N_COEFFS]>> =
+                vec![vec![[0u8; N_COEFFS]; BLOCKS_PER_FRAME]; 2];
+            for blk in 0..BLOCKS_PER_FRAME {
+                compute_bap(
+                    &exps[lfe_idx][blk],
+                    LFE_END_MANT,
+                    fscod,
+                    &lfe_ba,
+                    &mut lfe_baps[1][blk],
+                    None,
+                );
+            }
+            used += mantissa_bits_total(&lfe_baps, 0, 0, &cpl, true);
+        }
+        used
+    };
+
+    if used_at(0) > budget {
+        // Even the most negative SNR offset overflows — emit it anyway
+        // and let the frame packer surface the budget error.
+        return best;
+    }
+    let (mut lo, mut hi) = (0i32, 63 * 16 + 15);
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if used_at(mid) <= budget {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    best.csnroffst = (lo / 16) as u8;
+    best.fsnroffst = (lo % 16) as u8;
+    best.lfefsnroffst = best.fsnroffst;
+    for ch in 0..crate::audblk::MAX_FBW {
+        best.fsnroffst_ch[ch] = best.fsnroffst;
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1427,7 +1718,7 @@ mod tests {
     // high PSNR-vs-baseline floor (≥ 70 dB), which only a correctly
     // bit-aligned parse can reach.
 
-    fn psnr_vs(a: &[i16], b: &[i16]) -> f64 {
+    pub(crate) fn psnr_vs(a: &[i16], b: &[i16]) -> f64 {
         assert_eq!(a.len(), b.len(), "length mismatch in psnr_vs");
         let mut se = 0.0f64;
         for (x, y) in a.iter().zip(b.iter()) {
@@ -1442,7 +1733,7 @@ mod tests {
         10.0 * (peak * peak / mse).log10()
     }
 
-    fn build_sine_pcm(channels: usize, frames: usize) -> Vec<f32> {
+    pub(crate) fn build_sine_pcm(channels: usize, frames: usize) -> Vec<f32> {
         let n = frames * SAMPLES_PER_FRAME as usize;
         let mut pcm = vec![0.0f32; n * channels];
         for i in 0..n {
@@ -1458,7 +1749,12 @@ mod tests {
         pcm
     }
 
-    fn encode_with(pcm: &[f32], channels: usize, bit_rate: u64, snroffststr: u8) -> Vec<u8> {
+    pub(crate) fn encode_with(
+        pcm: &[f32],
+        channels: usize,
+        bit_rate: u64,
+        snroffststr: u8,
+    ) -> Vec<u8> {
         let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
         params.sample_rate = Some(48_000);
         params.channels = Some(channels as u16);
@@ -1493,7 +1789,7 @@ mod tests {
         out
     }
 
-    fn decode_all(bytes: &[u8], frame_bytes: usize) -> Vec<i16> {
+    pub(crate) fn decode_all(bytes: &[u8], frame_bytes: usize) -> Vec<i16> {
         use crate::eac3::decoder::{decode_eac3_packet, Eac3DecoderState};
         let mut st = Eac3DecoderState::default();
         let mut out = Vec::new();
@@ -2191,5 +2487,171 @@ mod tests {
         p.channels = Some(6);
         p.bit_rate = Some(384_000);
         let _enc = make_encoder(&p).expect("eac3 5.1");
+    }
+}
+
+#[cfg(test)]
+mod aht_tests {
+    use super::tests::{build_sine_pcm, decode_all, encode_with, psnr_vs};
+    use super::*;
+
+    pub(crate) fn encode_aht(pcm: &[f32], channels: usize, bit_rate: u64) -> Vec<u8> {
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(channels as u16);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(bit_rate);
+        let mut enc = make_encoder_with_aht(&params).expect("eac3 make_encoder_with_aht");
+        let n_samp = pcm.len() / channels;
+        let mut s16 = Vec::with_capacity(pcm.len() * 2);
+        for &v in pcm {
+            let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            s16.extend_from_slice(&q.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: n_samp as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut out = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => out.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("eac3 aht encode error: {e:?}"),
+            }
+        }
+        out
+    }
+
+    /// AHT round-trip: encode stationary two-tone PCM with AHT, decode
+    /// with the in-tree decoder, and require BOTH a healthy absolute
+    /// PSNR and a clear coding-gain margin over the non-AHT baseline
+    /// at the same bit rate. The 6-block DCT-II concentrates a
+    /// stationary signal into few AHT-domain coefficients, so the
+    /// same bit budget buys a much finer spectrum — the measured gain
+    /// on this fixture is ~+20 dB; the ±6 dB gate leaves headroom.
+    ///
+    /// A single mis-sized field anywhere in the new audfrm chahtinu /
+    /// chgaqmod / gain-word / VQ / GAQ chain would corrupt every
+    /// downstream bit and collapse the PSNR to single digits, so this
+    /// is also the cursor-alignment proof.
+    fn assert_aht_roundtrip(channels: usize, bit_rate: u64, frame_bytes: usize) {
+        let pcm = build_sine_pcm(channels, 4);
+        let base_stream = encode_with(&pcm, channels, bit_rate, 0);
+        let base = decode_all(&base_stream, frame_bytes);
+        let aht_stream = encode_aht(&pcm, channels, bit_rate);
+        assert_eq!(
+            aht_stream.len() % frame_bytes,
+            0,
+            "AHT stream not a whole number of {frame_bytes}-byte frames"
+        );
+        assert_eq!(aht_stream.len(), base_stream.len(), "same rate → same size");
+        assert_ne!(aht_stream, base_stream, "AHT must change the bitstream");
+        let dec = decode_all(&aht_stream, frame_bytes);
+        assert_eq!(dec.len(), base.len(), "sample-count mismatch");
+
+        // Align out the 256-sample MDCT priming delay, and measure the
+        // fbw channels only: the LFE keeps the identical standard path
+        // in both encoders, and its 0-120 Hz band-limit makes it drop
+        // the fixture's tonal content by design — including it would
+        // just mask the fbw comparison behind a shared floor.
+        let delay = 256 * channels;
+        let fbw = if channels == 6 { 5 } else { channels };
+        let input_i16: Vec<i16> = pcm
+            .iter()
+            .map(|&v| (v * 32767.0).clamp(-32768.0, 32767.0) as i16)
+            .collect();
+        let n = base.len() - delay;
+        let strip_lfe = |data: &[i16]| -> Vec<i16> {
+            data.iter()
+                .enumerate()
+                .filter(|(i, _)| i % channels < fbw)
+                .map(|(_, &v)| v)
+                .collect()
+        };
+        let p_base = psnr_vs(&strip_lfe(&base[delay..]), &strip_lfe(&input_i16[..n]));
+        let p_aht = psnr_vs(&strip_lfe(&dec[delay..]), &strip_lfe(&input_i16[..n]));
+        assert!(
+            p_aht >= 35.0,
+            "AHT decode PSNR {p_aht:.2} dB < 35 dB (baseline {p_base:.2} dB)"
+        );
+        assert!(
+            p_aht >= p_base + 6.0,
+            "AHT ({p_aht:.2} dB) must out-code the non-AHT baseline ({p_base:.2} dB) by >= 6 dB              on stationary content"
+        );
+    }
+
+    #[test]
+    fn aht_roundtrip_mono() {
+        assert_aht_roundtrip(1, 96_000, 384);
+    }
+
+    #[test]
+    fn aht_roundtrip_stereo() {
+        assert_aht_roundtrip(2, 192_000, 768);
+    }
+
+    #[test]
+    fn aht_roundtrip_51_with_lfe() {
+        // 5.1 exercises AHT alongside the (non-AHT) LFE pseudo-channel:
+        // the LFE's standard per-block mantissas follow the fbw AHT
+        // blocks in block 0 and stand alone in blocks 1..5.
+        assert_aht_roundtrip(6, 384_000, 1536);
+    }
+
+    #[test]
+    fn aht_options_path_matches_typed_constructor_bit_for_bit() {
+        let pcm = build_sine_pcm(2, 3);
+        let typed = encode_aht(&pcm, 2, 192_000);
+
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(2);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(192_000);
+        params.options = oxideav_core::CodecOptions::new().set("aht", "1");
+        let mut enc = make_encoder(&params).expect("options-driven AHT encoder");
+        let n_samp = pcm.len() / 2;
+        let mut s16 = Vec::with_capacity(pcm.len() * 2);
+        for &v in &pcm {
+            let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            s16.extend_from_slice(&q.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: n_samp as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut from_options = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => from_options.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("options aht encode error: {e:?}"),
+            }
+        }
+        assert_eq!(
+            typed, from_options,
+            "options-driven and typed AHT constructors must emit identical bytes"
+        );
+    }
+
+    #[test]
+    fn aht_and_spx_cannot_combine() {
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(2);
+        params.options = oxideav_core::CodecOptions::new()
+            .set("aht", "1")
+            .set("spx", "1");
+        assert!(make_encoder(&params).is_err());
+        // Bad value rejected too.
+        params.options = oxideav_core::CodecOptions::new().set("aht", "maybe");
+        assert!(make_encoder(&params).is_err());
     }
 }
