@@ -320,8 +320,12 @@ fn q15(v: i16) -> f32 {
 /// §3.4.4.2 / Table E3.6 post-process `y = x + a·x + b` for a
 /// large-mantissa (or `Gk = 1` symmetric) codeword. `x` is the
 /// codeword interpreted as a signed two's-complement fraction.
+///
+/// `pub(crate)` so the encoder side ([`super::ahtenc`]) can invert the
+/// EXACT mapping (quantise by minimising `|gaq_remap(code) - target|`)
+/// instead of duplicating the constants.
 #[inline]
-fn gaq_remap(hebap: u8, gk: u8, x: f32) -> f32 {
+pub(crate) fn gaq_remap(hebap: u8, gk: u8, x: f32) -> f32 {
     let row = &GAQ_REMAP[(hebap as usize - 8).min(11)];
     let (a, b) = match gk {
         1 => (row.a_g1, 0i16),

@@ -2327,6 +2327,26 @@ pub(crate) fn compute_bap(
     bap_out: &mut [u8; N_COEFFS],
     dba: Option<(&DbaPlan, usize)>,
 ) {
+    compute_bap_table(exp, end, fscod, ba, bap_out, dba, &BAPTAB)
+}
+
+/// [`compute_bap`] with a caller-selected 64-entry pointer table for
+/// the final address lookup. Base AC-3 passes `BAPTAB` (§7.2.2.4);
+/// the E-AC-3 AHT path passes the Annex E Table E3.1 `hebaptab[]` to
+/// derive the high-efficiency `hebap[]` array from the SAME psd /
+/// excitation / masking pipeline (§3.4.3.1: "the bit allocation
+/// routine for that channel is modified to incorporate the new high
+/// efficiency bit allocation pointers" — only the last table lookup
+/// differs).
+pub(crate) fn compute_bap_table(
+    exp: &[u8; N_COEFFS],
+    end: usize,
+    fscod: u8,
+    ba: &BitAllocParams,
+    bap_out: &mut [u8; N_COEFFS],
+    dba: Option<(&DbaPlan, usize)>,
+    ptr_tab: &[u8; 64],
+) {
     if end == 0 {
         return;
     }
@@ -2447,7 +2467,7 @@ pub(crate) fn compute_bap(
         m += floor;
         while i < lastbin {
             let addr = ((psd[i] - m) >> 5).clamp(0, 63) as usize;
-            bap_out[i] = BAPTAB[addr];
+            bap_out[i] = ptr_tab[addr];
             i += 1;
         }
         if i >= end {

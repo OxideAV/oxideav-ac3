@@ -104,6 +104,7 @@
 //!   rather than a decode defect (see crate `README.md`).
 
 pub mod aht;
+pub mod ahtenc;
 pub mod audfrm;
 pub mod bsi;
 pub mod chanmap;
