@@ -271,20 +271,86 @@ pub fn vq_lookup(hebap: u8, index: usize) -> [f32; 6] {
     out
 }
 
-/// Read 6 mantissas for a single AHT bin with `hebap` in the
-/// scalar/GAQ regime (`hebap >= 8`). When `gaqbin == 1` the encoder
-/// has applied a gain (signalled via the per-section gain word
-/// `gain_code`), so the small-quantiser regime is in effect: each
-/// mantissa is read as a `m-1` (mode 1/3, Gk=2) or `m-2` (mode 2,
-/// Gk=4) bit two's-complement value, with the full-scale-negative tag
-/// triggering an extra `m`-bit large-mantissa read.
+/// Table E3.6 — large-mantissa inverse-quantisation (remapping)
+/// constants, transcribed literally from A/52:2018 Annex E. One row
+/// per `hebap` in `8..=19`. Each `(a, b_pos, b_neg)` triple is a set
+/// of 16-bit signed two's-complement Q15 fractions for the
+/// `y = x + a·x + b` post-process (§3.4.4.2), with `b` selected by
+/// the sign of the codeword `x` (`b_pos` for `x >= 0`, `b_neg` for
+/// `x < 0`).
 ///
-/// When `gaqbin == 0` (or `-1`), the bin uses the fixed quantiser:
-/// `m`-bit two's-complement values, post-processed via Table E3.6 to
-/// produce a symmetric output.
+/// Columns: `Gk = 1` (applies to ALL `gaqmod == 0` / gain-1 scalar
+/// quantisers; `b == 0` in the spec table so only `a` is stored),
+/// `Gk = 2` and `Gk = 4` (large-mantissa dead-zone remaps). The spec
+/// marks `Gk = 2` / `Gk = 4` rows for `hebap >= 17` as N/A — those
+/// hebaps sit outside every GAQ-active range (Table E3.3), so the
+/// rows are unreachable; they are stored as zeros.
+struct GaqRemap {
+    /// `Gk = 1` column: `a` (Q15); `b` is 0x0000 for every row.
+    a_g1: i16,
+    /// `Gk = 2` column: `(a, b for x>=0, b for x<0)` (Q15).
+    g2: (i16, i16, i16),
+    /// `Gk = 4` column: `(a, b for x>=0, b for x<0)` (Q15).
+    g4: (i16, i16, i16),
+}
+
+/// Rows indexed by `hebap - 8` (hebap 8..=19).
+#[rustfmt::skip]
+const GAQ_REMAP: [GaqRemap; 12] = [
+    /*  8 */ GaqRemap { a_g1: 0x1249, g2: (0xd555u16 as i16, 0x4000, 0xeaabu16 as i16), g4: (0xedb7u16 as i16, 0x2000, 0xfb6eu16 as i16) },
+    /*  9 */ GaqRemap { a_g1: 0x0889, g2: (0xc925u16 as i16, 0x4000, 0xd249u16 as i16), g4: (0xe666u16 as i16, 0x2000, 0xeccdu16 as i16) },
+    /* 10 */ GaqRemap { a_g1: 0x0421, g2: (0xc444u16 as i16, 0x4000, 0xc889u16 as i16), g4: (0xe319u16 as i16, 0x2000, 0xe632u16 as i16) },
+    /* 11 */ GaqRemap { a_g1: 0x0208, g2: (0xc211u16 as i16, 0x4000, 0xc421u16 as i16), g4: (0xe186u16 as i16, 0x2000, 0xe30cu16 as i16) },
+    /* 12 */ GaqRemap { a_g1: 0x0102, g2: (0xc104u16 as i16, 0x4000, 0xc208u16 as i16), g4: (0xe0c2u16 as i16, 0x2000, 0xe183u16 as i16) },
+    /* 13 */ GaqRemap { a_g1: 0x0081, g2: (0xc081u16 as i16, 0x4000, 0xc102u16 as i16), g4: (0xe060u16 as i16, 0x2000, 0xe0c1u16 as i16) },
+    /* 14 */ GaqRemap { a_g1: 0x0040, g2: (0xc040u16 as i16, 0x4000, 0xc081u16 as i16), g4: (0xe030u16 as i16, 0x2000, 0xe060u16 as i16) },
+    /* 15 */ GaqRemap { a_g1: 0x0020, g2: (0xc020u16 as i16, 0x4000, 0xc040u16 as i16), g4: (0xe018u16 as i16, 0x2000, 0xe030u16 as i16) },
+    /* 16 */ GaqRemap { a_g1: 0x0010, g2: (0xc010u16 as i16, 0x4000, 0xc020u16 as i16), g4: (0xe00cu16 as i16, 0x2000, 0xe018u16 as i16) },
+    /* 17 */ GaqRemap { a_g1: 0x0008, g2: (0, 0, 0), g4: (0, 0, 0) },
+    /* 18 */ GaqRemap { a_g1: 0x0002, g2: (0, 0, 0), g4: (0, 0, 0) },
+    /* 19 */ GaqRemap { a_g1: 0x0000, g2: (0, 0, 0), g4: (0, 0, 0) },
+];
+
+/// Q15 fraction → f32.
+#[inline]
+fn q15(v: i16) -> f32 {
+    v as f32 / 32768.0
+}
+
+/// §3.4.4.2 / Table E3.6 post-process `y = x + a·x + b` for a
+/// large-mantissa (or `Gk = 1` symmetric) codeword. `x` is the
+/// codeword interpreted as a signed two's-complement fraction.
+#[inline]
+fn gaq_remap(hebap: u8, gk: u8, x: f32) -> f32 {
+    let row = &GAQ_REMAP[(hebap as usize - 8).min(11)];
+    let (a, b) = match gk {
+        1 => (row.a_g1, 0i16),
+        2 => (row.g2.0, if x >= 0.0 { row.g2.1 } else { row.g2.2 }),
+        _ => (row.g4.0, if x >= 0.0 { row.g4.1 } else { row.g4.2 }),
+    };
+    x + q15(a) * x + q15(b)
+}
+
+/// Read 6 mantissas for a single AHT bin with `hebap` in the
+/// scalar/GAQ regime (`hebap >= 8`), per §3.4.4.2 / Tables E3.5-E3.6.
+///
+/// When `gaqbin == 1` the encoder may have applied a gain (signalled
+/// via the per-section gain word `gain_code`):
+///
+/// * **`Gk = 1`** (or no GAQ for this bin) — a single `m`-bit
+///   two's-complement codeword per mantissa, post-processed with the
+///   Table E3.6 `Gk = 1` column (`y = x·(1 + a)`, symmetric
+///   `2^m - 1`-level quantiser of step `2 / (2^m - 1)`).
+/// * **`Gk = 2`** (mode 1/3) — an `(m-1)`-bit small codeword of step
+///   `1 / 2^(m-1)`; the full-scale-negative tag announces an
+///   `(m-1)`-bit large codeword remapped via the `Gk = 2` column
+///   (dead-zone quantiser, `2^(m-1)` points of step
+///   `1 / (2^(m-1) - 1)`).
+/// * **`Gk = 4`** (mode 2/3) — an `(m-2)`-bit small codeword of step
+///   `1 / 2^(m-1)`; the tag announces an `m`-bit large codeword
+///   remapped via the `Gk = 4` column (step `3 / (2^(m+1) - 2)`).
 ///
 /// Returns the 6 dequantised mantissas in `(-1, 1)` normalised range.
-#[allow(clippy::too_many_arguments)]
 pub fn read_scalar_aht_mantissas(
     br: &mut BitReader<'_>,
     hebap: u8,
@@ -319,56 +385,50 @@ pub fn read_scalar_aht_mantissas(
     for sample in out.iter_mut() {
         match gk {
             1 => {
-                // Conventional symmetric quantiser: read m bits, sign-
-                // extend, divide by 2^(m-1).
+                // Symmetric quantiser: read m bits, sign-extend,
+                // interpret as a Q(m-1) fraction, stretch by (1 + a)
+                // to the Table E3.5 step of 2/(2^m - 1).
                 let raw = br.read_u32(m)? as i32;
                 let signed = (raw << (32 - m)) >> (32 - m);
-                *sample = signed as f32 * scale_full;
+                *sample = gaq_remap(hebap, 1, signed as f32 * scale_full);
             }
             2 => {
-                // Mode 1 / 3 with Gk=2: (m-1)-bit small value; check
-                // for full-scale-negative tag → m-bit large value.
+                // Mode 1 / 3 with Gk=2: (m-1)-bit small value; the
+                // full-scale-negative tag announces an (m-1)-bit
+                // large value (Table E3.5: 2^(m-1) output points).
                 let small_bits = m - 1;
                 let raw_s = br.read_u32(small_bits)? as i32;
                 let small_signed = (raw_s << (32 - small_bits)) >> (32 - small_bits);
                 let small_min = -(1i32 << (small_bits - 1));
                 if small_signed == small_min {
-                    // Tag detected — large mantissa follows (m bits).
-                    let raw_l = br.read_u32(m)? as i32;
-                    let large_signed = (raw_l << (32 - m)) >> (32 - m);
-                    *sample = remap_large_mantissa(hebap, gk, large_signed, m);
+                    // Tag — (m-1)-bit large codeword, Q(m-2) fraction.
+                    let raw_l = br.read_u32(small_bits)? as i32;
+                    let large_signed = (raw_l << (32 - small_bits)) >> (32 - small_bits);
+                    let x = large_signed as f32 / ((1u32 << (m - 2)) as f32);
+                    *sample = gaq_remap(hebap, 2, x);
                 } else {
-                    // Small mantissa: divide by 2^(m-2) per Table E3.5
-                    // step size 1/(2^(m-2))? — actually step = 1/(2^(m-2) - 1).
-                    // We use the simpler 2's complement Q(m-1) form which
-                    // matches the encoder's mid-tread quantiser, then the
-                    // 1/Gk gain compensation divides by Gk.
-                    let small_scale = 1.0f32 / ((1u32 << (small_bits - 1)) as f32);
-                    *sample = small_signed as f32 * small_scale / gk as f32;
+                    // Small mantissa: the encoder amplified by Gk=2
+                    // and coded with one fewer bit, so the composed
+                    // step is 1/2^(m-1) (Table E3.5).
+                    *sample = small_signed as f32 * scale_full;
                 }
             }
             4 => {
-                // Mode 2 with Gk=4: (m-2)-bit small value; check for
-                // full-scale-negative → m-bit large value.
+                // Mode 2 / 3 with Gk=4: (m-2)-bit small value; the
+                // tag announces an m-bit large value.
                 let small_bits = m - 2;
-                if small_bits == 0 {
-                    // Edge case: m=2 → no small-value bits; treat as
-                    // full-scale-negative every time.
-                    let raw_l = br.read_u32(m)? as i32;
-                    let large_signed = (raw_l << (32 - m)) >> (32 - m);
-                    *sample = remap_large_mantissa(hebap, gk, large_signed, m);
-                    continue;
-                }
                 let raw_s = br.read_u32(small_bits)? as i32;
                 let small_signed = (raw_s << (32 - small_bits)) >> (32 - small_bits);
                 let small_min = -(1i32 << (small_bits - 1));
                 if small_signed == small_min {
                     let raw_l = br.read_u32(m)? as i32;
                     let large_signed = (raw_l << (32 - m)) >> (32 - m);
-                    *sample = remap_large_mantissa(hebap, gk, large_signed, m);
+                    let x = large_signed as f32 * scale_full;
+                    *sample = gaq_remap(hebap, 4, x);
                 } else {
-                    let small_scale = 1.0f32 / ((1u32 << (small_bits - 1)) as f32);
-                    *sample = small_signed as f32 * small_scale / gk as f32;
+                    // Encoder amplified by Gk=4, coded with two fewer
+                    // bits; composed step 1/2^(m-1) (Table E3.5).
+                    *sample = small_signed as f32 * scale_full;
                 }
             }
             _ => {
@@ -378,29 +438,6 @@ pub fn read_scalar_aht_mantissas(
         }
     }
     Ok(())
-}
-
-/// Apply Table E3.6 dead-zone-quantiser remap to a large mantissa
-/// codeword. The remap is `y = x + a·x + b` with `(a, b)` selected by
-/// `(hebap, gk, sign(x))`. We approximate the spec's Q15 constants
-/// with the simpler closed-form symmetric-output formula `y = sgn(x)
-/// · (|x| + 0.5) · scale` which matches the spec's intent
-/// (post-process restores symmetry around 0) without the lookup-table
-/// machinery. This is good enough for "non-silent PCM" output; a
-/// future round can replace this with the literal Table E3.6 constants
-/// for last-bit fidelity vs. the validator binary's PCM.
-fn remap_large_mantissa(_hebap: u8, _gk: u8, signed: i32, m: u32) -> f32 {
-    // Treat the m-bit signed value as a Q(m-1) fractional. Push by
-    // half a step so the dead-zone gap centred on 0 reconstructs to
-    // `±step/2` instead of `0`.
-    let scale = 1.0f32 / ((1u32 << (m - 1)) as f32);
-    let half_step = 0.5f32 * scale;
-    let v = signed as f32 * scale;
-    if v >= 0.0 {
-        v + half_step
-    } else {
-        v - half_step
-    }
 }
 
 /// Apply the §3.4.5 inverse DCT-II to the 6 AHT-domain coefficients
@@ -450,6 +487,119 @@ mod tests {
         let expected = std::f32::consts::SQRT_2;
         for v in c.iter() {
             assert!((v - expected).abs() < 1e-5, "got {v}, expected {expected}");
+        }
+    }
+
+    use oxideav_core::bits::BitWriter;
+
+    fn bits_of(f: impl FnOnce(&mut BitWriter)) -> Vec<u8> {
+        let mut bw = BitWriter::with_capacity(16);
+        f(&mut bw);
+        bw.write_u32(0, 32); // tail padding so short reads never starve
+        bw.into_bytes()
+    }
+
+    /// Table E3.5 `Gk = 1` column: hebap 8 (m = 3) is a 7-level
+    /// symmetric quantiser of step 2/7 — codeword 3 (`011`)
+    /// reconstructs to 6/7 via the Table E3.6 stretch `y = x·(1 + a)`.
+    #[test]
+    fn scalar_gk1_symmetric_step() {
+        let bytes = bits_of(|bw| bw.write_u32(0b011, 3));
+        let mut br = BitReader::new(&bytes);
+        let mut out = [0.0f32; 6];
+        // Consume ONE mantissa then stop (remaining reads eat padding).
+        read_scalar_aht_mantissas(&mut br, 8, 0, 0, 0, &mut out).unwrap();
+        assert!(
+            (out[0] - 6.0 / 7.0).abs() < 1e-4,
+            "Gk=1 hebap=8 code 3 → 6/7, got {}",
+            out[0]
+        );
+        // Codeword 0 → exactly 0 (mid-tread).
+        assert_eq!(out[1], 0.0);
+    }
+
+    /// Table E3.5 `Gk = 2` column, hebap 8 (m = 3): a 2-bit small
+    /// codeword of step 1/4, with the full-scale-negative tag (`10`)
+    /// announcing a 2-bit large codeword remapped by Table E3.6 to the
+    /// dead-zone points {±1/2, ±5/6} (step 1/3).
+    #[test]
+    fn scalar_gk2_small_and_large() {
+        let bytes = bits_of(|bw| {
+            bw.write_u32(0b01, 2); // small = +1 → 1/4
+            bw.write_u32(0b10, 2); // tag
+            bw.write_u32(0b01, 2); // large = +1 → x=1/2 → 5/6
+            bw.write_u32(0b10, 2); // tag
+            bw.write_u32(0b00, 2); // large = 0 → x=0 → 1/2
+            bw.write_u32(0b10, 2); // tag
+            bw.write_u32(0b10, 2); // large = -2 → x=-1 → -5/6
+        });
+        let mut br = BitReader::new(&bytes);
+        let mut out = [0.0f32; 6];
+        // gaqmod=1, gaqbin=1, gain code 1 → Gk=2.
+        read_scalar_aht_mantissas(&mut br, 8, 1, 1, 1, &mut out).unwrap();
+        assert!((out[0] - 0.25).abs() < 1e-6, "small: got {}", out[0]);
+        assert!(
+            (out[1] - 5.0 / 6.0).abs() < 1e-4,
+            "large +1: got {}",
+            out[1]
+        );
+        assert!((out[2] - 0.5).abs() < 1e-4, "large 0: got {}", out[2]);
+        assert!(
+            (out[3] + 5.0 / 6.0).abs() < 1e-4,
+            "large -2: got {}",
+            out[3]
+        );
+    }
+
+    /// Table E3.5 `Gk = 4` column, hebap 9 (m = 4): 2-bit small of
+    /// step 1/8; tag announces an m-bit (4-bit) large codeword of
+    /// step 3/(2^5 - 2) = 0.1 anchored at ±1/4.
+    #[test]
+    fn scalar_gk4_large_step() {
+        let bytes = bits_of(|bw| {
+            bw.write_u32(0b10, 2); // tag (small_bits = m-2 = 2)
+            bw.write_u32(0b0000, 4); // large = 0 → 0.25
+            bw.write_u32(0b10, 2); // tag
+            bw.write_u32(0b0010, 4); // large = +2 → 0.45
+            bw.write_u32(0b01, 2); // small = +1 → 1/8
+        });
+        let mut br = BitReader::new(&bytes);
+        let mut out = [0.0f32; 6];
+        // gaqmod=2, gaqbin=1, gain code 1 → Gk=4.
+        read_scalar_aht_mantissas(&mut br, 9, 2, 1, 1, &mut out).unwrap();
+        assert!((out[0] - 0.25).abs() < 1e-4, "large 0: got {}", out[0]);
+        assert!((out[1] - 0.45).abs() < 1e-4, "large +2: got {}", out[1]);
+        assert!((out[2] - 0.125).abs() < 1e-6, "small: got {}", out[2]);
+    }
+
+    /// The Gk = 2 escape consumes (m-1) + (m-1) bits — the large
+    /// codeword is `m-1` bits per Table E3.5 (2^(m-1) output points),
+    /// NOT m bits.
+    #[test]
+    fn scalar_gk2_escape_bit_length() {
+        let bytes = bits_of(|bw| {
+            for _ in 0..6 {
+                bw.write_u32(0b100, 3); // tag (m-1 = 3 bits for hebap 9)
+                bw.write_u32(0b001, 3); // large (m-1 = 3 bits)
+            }
+        });
+        let mut br = BitReader::new(&bytes);
+        let mut out = [0.0f32; 6];
+        read_scalar_aht_mantissas(&mut br, 9, 1, 1, 1, &mut out).unwrap();
+        assert_eq!(br.bit_position(), 6 * 6, "6 escapes × (3 tag + 3 large)");
+    }
+
+    #[test]
+    fn gaq_remap_table_row_consistency() {
+        // Gk=1 `a` constants track 1/(2^m - 1) (Q15, spec-rounded).
+        for hebap in 8u8..=19 {
+            let m = HEBAP_MANT_BITS[hebap as usize] as i32;
+            let expect = 32768.0 / ((1i64 << m) - 1) as f64;
+            let got = GAQ_REMAP[hebap as usize - 8].a_g1 as f64;
+            assert!(
+                (got - expect).abs() <= 1.0,
+                "hebap {hebap}: a_g1 {got} vs 1/(2^m-1) {expect:.2}"
+            );
         }
     }
 
