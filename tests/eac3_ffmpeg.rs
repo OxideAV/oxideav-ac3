@@ -853,7 +853,8 @@ fn eac3_aht_51_decodes_through_ffmpeg() {
     }
     let psnr = psnr_min(&pcm, &reordered, 6);
     eprintln!("E-AC-3 AHT 5.1 384k → ffmpeg PSNR = {psnr:.2} dB");
-    // Worst-channel PSNR across all six channels (including the LFE,
-    // whose 60 Hz tone survives the 0-120 Hz band-limit).
-    assert!(psnr >= 15.0, "AHT 5.1 PSNR {psnr:.2} dB below 15 dB");
+    // Worst-channel PSNR across all six channels (including the
+    // LFE-AHT-coded LFE, whose 60 Hz tone survives the 0-120 Hz
+    // band-limit). Measured 33.4 dB with fbw+LFE AHT.
+    assert!(psnr >= 24.0, "AHT 5.1 PSNR {psnr:.2} dB below 24 dB");
 }

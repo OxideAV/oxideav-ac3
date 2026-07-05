@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- eac3 r390: LFE AHT (lfeahtinu) — single-anchor LFE exponents + front-loaded LFE-AHT block; 5.1 external-decoder PSNR 21.6 -> 33.4 dB
+
 - eac3 r390: AHT black-box cross-validation + §3.4.5 leading-constant correction (2 → √2, empirically confirmed against an independent decoder)
 - eac3 r390: AHT encoder (§3.4) — make_encoder_with_aht / `aht` option: 6-block DCT-II + hebap + VQ/GAQ emission, ~+20 dB over the non-AHT baseline on stationary content
 - eac3 r390: encoder-side AHT primitives (forward DCT-II, VQ search, GAQ quantiser/planner) + compute_hebap via table-parametrised bit allocation
