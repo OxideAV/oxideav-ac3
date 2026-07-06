@@ -163,7 +163,55 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   `spx_explicit_band_structure`) — pinned byte-identical. Stationary
   coordinate refreshes are thrifted (`spxcoe = 0`) with a mid-frame
   level-step gate proving per-span refresh still tracks moving spectra.
-  AHT stays out of scope on the encoder side.
+  **Mixed per-channel membership** (§E.2.3.3.3) is supported via
+  `SpxParams::channel_mask` / the `spx_chmask` option: excluded
+  channels emit `chinspx[ch] = 0`, keep their `chbwcod`, and are
+  waveform-coded to full bandwidth while member channels stop at the
+  SPX begin frequency — the SNR tuner budgets every channel at its own
+  coded bandwidth (per-channel `end_mant` plumbed through
+  `tune_snroffst_with_plan_ends` / `overhead_bits_for_ends` /
+  `mantissa_bits_total_ends`). The mixed split is validated in-tree
+  (SPX band-energy contract on the member channel AND full-bandwidth
+  HF fidelity on the excluded one) and through the external decoder.
+
+  **The Adaptive Hybrid Transform is now on the encoder side too**
+  (`eac3::make_encoder_with_aht(params)` / the `aht` option, §3.4):
+  every fbw channel — and the LFE (`lfeahtinu`) — moves to a single
+  block-0 exponent anchor (`nchregs[ch] == nlferegs == 1`, per-bin
+  6-block-max exponents), long transforms are forced, and block 0
+  front-loads the §3.4.4 mantissa stream: `chgaqmod` + gain words +
+  per-bin codewords against the §3.4.3.1 `hebap[]` (the shared
+  psd/excitation/mask pipeline with the Table E3.1 pointer table).
+  Quantiser stack per Tables E3.2/E3.5/E3.6: minimum-Euclidean-
+  distance VQ over Tables E4.1..E4.7 for `hebap` 1..7, and
+  gain-adaptive quantisation for `hebap` >= 8 — the per-channel
+  `gaqmod` (all four Table E3.3 modes, incl. the 5-bit composite gain
+  triplets) is chosen by exact bit accounting, with per-bin Gk in
+  {1, 2, 4} splitting short small-mantissa codewords from
+  tag + dead-zone large escapes. The SNR-offset tuner costs AHT
+  channels by their exact front-loaded payload and binary-searches
+  the monotone `csnroffst·16 + fsnroffst` axis. Measured on a
+  stationary stereo two-tone (in-tree decode): 42.0 dB @ 96 kbps
+  rising to 75.6 dB @ 448 kbps versus a flat ~23.9 dB for the
+  standard path (+18 to +52 dB); on a multitone+noise bed fixture
+  +7 to +22 dB. Black-box: mono / stereo / 5.1 AHT streams decode
+  through an external decoder binary at 28.1 / 28.1 / 33.4 dB
+  (vs 22.3 dB non-AHT baseline through the same harness).
+  `examples/eac3_rate_curves.rs` prints the full standard/AHT/SPX
+  rate ladder; `aht_quality_scales_with_rate` gates the curve shape
+  in CI. AHT and SPX remain mutually exclusive per encoder instance
+  (single-subsystem scope); encoder-side enhanced coupling is still
+  out of scope.
+
+  Two spec-fidelity notes from this work: (1) GAQ dequantisation now
+  uses the literal Table E3.5/E3.6 characteristics — the `Gk = 2`
+  large mantissa is an `(m-1)`-bit codeword (2^(m-1) output points),
+  and all scalar quantisers apply the exact Q15 `y = x + ax + b`
+  remap. (2) The §3.4.5 IDCT's printed leading constant `2` measures
+  as `√2` against an independent production decoder (a pure-DC and a
+  40 Hz-modulated fixture both fit `external = ours(2·Σ)/√2` with
+  ~89 dB residual); with `√2` the DC basis weight is exactly 1, and
+  both transforms follow the deployed constant.
 
 ### CRC
 

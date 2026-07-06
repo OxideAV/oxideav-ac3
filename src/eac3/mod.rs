@@ -25,11 +25,19 @@
 //!   produced `nchregs[ch]` / `ncplregs` / `nlferegs` from the per-block
 //!   exponent strategies, [`audfrm::parse_phase_b`] consumes the
 //!   variable-width `chahtinu` / `cplahtinu` / `lfeahtinu` bits.
-//! * **[`aht`]** — Adaptive Hybrid Transform (§3.4). VQ codebooks
-//!   E4.1..E4.7 (956 × 6 i16) + `hebap` pointer table (E3.1) +
-//!   quantiser-bit table (E3.2). [`aht::vq_lookup`] /
+//! * **[`aht`]** — Adaptive Hybrid Transform decode (§3.4). VQ
+//!   codebooks E4.1..E4.7 (956 × 6 i16) + `hebap` pointer table
+//!   (E3.1) + quantiser-bit table (E3.2) + the literal Table E3.6
+//!   Q15 remap constants. [`aht::vq_lookup`] /
 //!   [`aht::read_scalar_aht_mantissas`] plus the §3.4.5 inverse
-//!   DCT-II ([`aht::idct_ii_6`]).
+//!   DCT-II ([`aht::idct_ii_6`] — leading constant √2 per black-box
+//!   validation; the printed `2` is an erratum).
+//! * **[`ahtenc`]** — encoder-side AHT (§3.4, encode direction):
+//!   forward DCT-II, §3.4.4.1 minimum-distance VQ search, the
+//!   Tables E3.5/E3.6 scalar+GAQ quantiser (exact inverse of the
+//!   decoder's remap), per-channel `gaqmod` planning by exact bit
+//!   accounting, the §3.4.4 emission order, and the §3.4.3.1
+//!   `hebap[]` derivation through the shared bit-allocation core.
 //! * **[`ecpl`]** — enhanced-coupling sub-band / band geometry
 //!   (§E.2.3.3.16-19 + §E.3.5.2): the Table E3.8 begin/end sub-band
 //!   derivations, Table E3.9 `ecplsubbndtab[]`, Table E2.14 default
@@ -53,8 +61,12 @@
 //!   5.1); 7.1 input emits an indep+dep substream pair (indep
 //!   carries the 5.1 program, dep 0 carries Lb/Rb back surrounds
 //!   with chanmap bit 6 set per §E.2.3.1.7-8 / §E.3.8.2). Spectral
-//!   extension is available opt-in via [`encoder::make_encoder_with_spx`];
-//!   encoder-side AHT and enhanced coupling remain out of scope.
+//!   extension is available opt-in via [`encoder::make_encoder_with_spx`]
+//!   (incl. mixed per-channel `chinspx` via
+//!   `SpxParams::channel_mask`), and the Adaptive Hybrid Transform
+//!   via [`encoder::make_encoder_with_aht`] (fbw + LFE channels,
+//!   §3.4 — mutually exclusive with SPX). Encoder-side enhanced
+//!   coupling remains out of scope.
 //! * **[`spxenc`]** — encoder-side spectral extension (§E.2.3.3 /
 //!   §E.3.6): geometry derivation + validation, the §3.6.4.3
 //!   energy-matching coordinate targets (through the decoder-shared
