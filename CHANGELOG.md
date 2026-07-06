@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- eac3 r390: rate/quality instrumentation — eac3_rate_curves example (standard/AHT/SPX PSNR ladder) + AHT rate-monotonicity regression gate
+
 - eac3 r390: mixed per-channel chinspx (SpxParams::channel_mask / `spx_chmask`) + per-channel end_mant through the SNR tuner (r386 follow-up)
 
 - eac3 r390: LFE AHT (lfeahtinu) — single-anchor LFE exponents + front-loaded LFE-AHT block; 5.1 external-decoder PSNR 21.6 -> 33.4 dB

@@ -2960,6 +2960,40 @@ mod aht_tests {
         );
     }
 
+    /// The per-frame SNR-offset search must convert additional rate
+    /// into quality: across a 96 → 192 → 384 kbps ladder the AHT
+    /// decode PSNR must be non-decreasing and gain substantially end
+    /// to end (the measured stereo curve runs ~42 dB at 96 kbps to
+    /// ~73 dB at 384 kbps; the ±0.5 dB slack and the ≥ 15 dB
+    /// end-to-end floor leave wide margins). A tuner regression that
+    /// stopped spending the larger budget — or a cost model that
+    /// overflowed a frame — would flatten or break the curve.
+    #[test]
+    fn aht_quality_scales_with_rate() {
+        let pcm = build_sine_pcm(2, 4);
+        let input: Vec<i16> = pcm
+            .iter()
+            .map(|&v| (v * 32767.0).clamp(-32768.0, 32767.0) as i16)
+            .collect();
+        let delay = 256 * 2;
+        let mut curve = Vec::new();
+        for (rate, frame_bytes) in [(96_000u64, 384usize), (192_000, 768), (384_000, 1536)] {
+            let dec = decode_all(&encode_aht(&pcm, 2, rate), frame_bytes);
+            let n = dec.len() - delay;
+            curve.push(psnr_vs(&dec[delay..], &input[..n]));
+        }
+        for w in curve.windows(2) {
+            assert!(
+                w[1] >= w[0] - 0.5,
+                "AHT PSNR must be non-decreasing in rate: {curve:?}"
+            );
+        }
+        assert!(
+            curve[curve.len() - 1] - curve[0] >= 15.0,
+            "AHT PSNR must gain >= 15 dB from 96k to 384k: {curve:?}"
+        );
+    }
+
     #[test]
     fn aht_options_path_matches_typed_constructor_bit_for_bit() {
         let pcm = build_sine_pcm(2, 3);
