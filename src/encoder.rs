@@ -2262,13 +2262,25 @@ pub(crate) fn select_exp_strategies(
     nchan: usize,
     end: usize,
 ) -> Vec<[u8; BLOCKS_PER_FRAME]> {
+    select_exp_strategies_per_end(exps, nchan, &vec![end; nchan])
+}
+
+/// [`select_exp_strategies`] with a per-channel coded bandwidth —
+/// needed when a subset of channels is in spectral extension (their
+/// exponent sets stop at the SPX begin frequency while full-bandwidth
+/// siblings run to the chbwcod-derived end).
+pub(crate) fn select_exp_strategies_per_end(
+    exps: &[Vec<[u8; N_COEFFS]>],
+    nchan: usize,
+    ends: &[usize],
+) -> Vec<[u8; BLOCKS_PER_FRAME]> {
     let mut out = vec![[0u8; BLOCKS_PER_FRAME]; nchan];
     for (ch, plan) in out.iter_mut().enumerate().take(nchan) {
         // Anchor pattern: blocks 0 and 3 are "new". Pick the
         // cheapest legal strategy for each anchor based on its
         // smoothness; the in-between blocks REUSE.
-        let s0 = pick_strategy_for_block(&exps[ch][0], end);
-        let s3 = pick_strategy_for_block(&exps[ch][3], end);
+        let s0 = pick_strategy_for_block(&exps[ch][0], ends[ch]);
+        let s3 = pick_strategy_for_block(&exps[ch][3], ends[ch]);
         plan[0] = s0;
         plan[1] = 0;
         plan[2] = 0;
@@ -2635,6 +2647,19 @@ pub(crate) fn mantissa_bits_total(
     cpl: &CouplingPlan,
     lfeon: bool,
 ) -> u32 {
+    mantissa_bits_total_ends(baps, end, None, nchan, cpl, lfeon)
+}
+
+/// [`mantissa_bits_total`] with an optional per-channel coded
+/// bandwidth (`end_ch[ch]` overrides `end` for fbw channel `ch`).
+pub(crate) fn mantissa_bits_total_ends(
+    baps: &[Vec<[u8; N_COEFFS]>],
+    end: usize,
+    end_ch: Option<&[usize]>,
+    nchan: usize,
+    cpl: &CouplingPlan,
+    lfeon: bool,
+) -> u32 {
     let blocks = baps[0].len();
     let mut total = 0u32;
     let cpl_idx = nchan;
@@ -2647,7 +2672,8 @@ pub(crate) fn mantissa_bits_total(
         let mut g4_left = 0u32;
         let mut got_cplchan = false;
         for ch in 0..nchan {
-            for bin in 0..end {
+            let ch_end = end_ch.map_or(end, |e| e[ch]);
+            for bin in 0..ch_end {
                 let bap = baps[ch][blk][bin];
                 match bap {
                     0 => {}
@@ -2760,6 +2786,34 @@ pub(crate) fn overhead_bits_for(
     acmod: u8,
     lfeon: bool,
 ) -> u32 {
+    overhead_bits_for_ends(
+        exp_strategies,
+        chexpstr_per_ch,
+        end,
+        None,
+        nchan,
+        cpl,
+        dba,
+        acmod,
+        lfeon,
+    )
+}
+
+/// [`overhead_bits_for`] with an optional per-channel coded bandwidth
+/// (`end_ch[ch]` overrides `end` when sizing channel `ch`'s exponent
+/// payload).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn overhead_bits_for_ends(
+    exp_strategies: &[u8; BLOCKS_PER_FRAME],
+    chexpstr_per_ch: Option<&[[u8; BLOCKS_PER_FRAME]]>,
+    end: usize,
+    end_ch: Option<&[usize]>,
+    nchan: usize,
+    cpl: &CouplingPlan,
+    dba: &DbaPlan,
+    acmod: u8,
+    lfeon: bool,
+) -> u32 {
     // syncinfo: 16 (sync) + 16 (crc1) + 2 (fscod) + 6 (frmsizecod) = 40
     // BSI fixed: bsid(5) + bsmod(3) + acmod(3) + lfeon(1) + dialnorm(5)
     //            + 8 single-bit flags (compre/langcode/audprodie/copyrightb/
@@ -2781,18 +2835,19 @@ pub(crate) fn overhead_bits_for(
     let mut bits: u32 = 40 + bsi_bits;
     // Per-strategy bits-per-channel helper: 4-bit absexp + 7-bit groups.
     // grpsize ∈ {1, 2, 4} matches strategy code {1, 2, 3}.
-    let exp_bits_for_strategy = |strategy: u8| -> u32 {
+    let exp_bits_for_strategy = |strategy: u8, ch_end: usize| -> u32 {
         let grpsize = match strategy {
             1 => 1,
             2 => 2,
             3 => 4,
             _ => return 0,
         };
-        4 + 7 * ngrps_for_strategy(end, grpsize) as u32
+        4 + 7 * ngrps_for_strategy(ch_end, grpsize) as u32
     };
+    let end_for = |ch: usize| -> usize { end_ch.map_or(end, |e| e[ch]) };
     // Default fbw bits when the per-channel plan isn't supplied (every
     // channel uses the frame-wide strategy code from `exp_strategies`).
-    let d15_bits_per_ch = exp_bits_for_strategy(1);
+    let d15_bits_per_ch = exp_bits_for_strategy(1, end);
     // D15 ngrps for the cpl pseudo-channel (over [cpl_begf_mant,
     // cpl_endf_mant)). Per §7.1.3 cpl uses
     // ncplgrps = (cplendmant - cplstrtmant) / 3 for D15.
@@ -2895,7 +2950,7 @@ pub(crate) fn overhead_bits_for(
         for ch in 0..nchan {
             let strat = ch_strategy(ch);
             if strat != 0 {
-                bits += exp_bits_for_strategy(strat) + 2 /* gainrng */;
+                bits += exp_bits_for_strategy(strat, end_for(ch)) + 2 /* gainrng */;
             }
         }
         if s == 1 && lfeon {
@@ -3025,9 +3080,56 @@ pub(crate) fn tune_snroffst_with_plan(
     acmod: u8,
     lfeon: bool,
 ) -> BitAllocParams {
-    let overhead =
-        overhead_bits_for(exp_strategies, chexpstr_per_ch, end, nchan, cpl, dba, acmod, lfeon)
-            + 32 /* safety */;
+    tune_snroffst_with_plan_ends(
+        ba,
+        exps,
+        end,
+        None,
+        nchan,
+        fscod,
+        frame_bytes,
+        exp_strategies,
+        chexpstr_per_ch,
+        cpl,
+        dba,
+        acmod,
+        lfeon,
+    )
+}
+
+/// [`tune_snroffst_with_plan`] with an optional per-channel coded
+/// bandwidth: `end_ch[ch]` overrides `end` for fbw channel `ch` in
+/// the bap computation, mantissa accounting, and exponent-overhead
+/// sizing. Needed for mixed per-channel `chinspx` frames, where SPX
+/// channels stop at the SPX begin frequency while full-bandwidth
+/// channels run to the chbwcod-derived end.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tune_snroffst_with_plan_ends(
+    ba: &BitAllocParams,
+    exps: &[Vec<[u8; N_COEFFS]>],
+    end: usize,
+    end_ch: Option<&[usize]>,
+    nchan: usize,
+    fscod: u8,
+    frame_bytes: usize,
+    exp_strategies: &[u8; BLOCKS_PER_FRAME],
+    chexpstr_per_ch: Option<&[[u8; BLOCKS_PER_FRAME]]>,
+    cpl: &CouplingPlan,
+    dba: &DbaPlan,
+    acmod: u8,
+    lfeon: bool,
+) -> BitAllocParams {
+    let overhead = overhead_bits_for_ends(
+        exp_strategies,
+        chexpstr_per_ch,
+        end,
+        end_ch,
+        nchan,
+        cpl,
+        dba,
+        acmod,
+        lfeon,
+    ) + 32 /* safety */;
     let total_bits = (frame_bytes * 8) as u32;
     if overhead >= total_bits {
         return *ba;
@@ -3058,10 +3160,11 @@ pub(crate) fn tune_snroffst_with_plan(
             let mut baps: Vec<Vec<[u8; N_COEFFS]>> =
                 vec![vec![[0u8; N_COEFFS]; exps[0].len()]; nchan + 2];
             for ch in 0..nchan {
+                let ch_end = end_ch.map_or(end, |e| e[ch]);
                 for blk in 0..exps[ch].len() {
                     compute_bap(
                         &exps[ch][blk],
-                        end,
+                        ch_end,
                         fscod,
                         &cand,
                         &mut baps[ch][blk],
@@ -3104,7 +3207,7 @@ pub(crate) fn tune_snroffst_with_plan(
                     );
                 }
             }
-            let used = mantissa_bits_total(&baps, end, nchan, cpl, lfeon);
+            let used = mantissa_bits_total_ends(&baps, end, end_ch, nchan, cpl, lfeon);
             if used <= budget {
                 let combined = (csnr as i32) * 16 + fsnr as i32;
                 if combined > best_offset {
@@ -3163,10 +3266,11 @@ pub(crate) fn tune_snroffst_with_plan(
         for ch in 0..nchan {
             let mut ch_ba = *ba_in;
             ch_ba.fsnroffst = ba_in.fsnroffst_ch[ch];
+            let ch_end = end_ch.map_or(end, |e| e[ch]);
             for blk in 0..exps[ch].len() {
                 compute_bap(
                     &exps[ch][blk],
-                    end,
+                    ch_end,
                     fscod,
                     &ch_ba,
                     &mut bps[ch][blk],
@@ -3209,7 +3313,7 @@ pub(crate) fn tune_snroffst_with_plan(
                 );
             }
         }
-        mantissa_bits_total(&bps, end, nchan, cpl, lfeon)
+        mantissa_bits_total_ends(&bps, end, end_ch, nchan, cpl, lfeon)
     };
     // Per-channel greedy bumps, **least-served first with fairness
     // cap** (r95).

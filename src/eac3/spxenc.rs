@@ -84,6 +84,16 @@ pub struct SpxParams {
     /// decoder's default banding. Both decode identically — the flag
     /// exists so tests can pin the two syntax paths against each other.
     pub explicit_band_structure: bool,
+    /// Mixed per-channel SPX (§E.2.3.3.3 `chinspx[ch]`): bit `ch` set
+    /// means fbw channel `ch` is in spectral extension. `None` (the
+    /// default) puts every fbw channel in SPX. Channels NOT in SPX are
+    /// waveform-coded to their full chbwcod-derived bandwidth (they
+    /// emit `chinspx[ch] = 0`, keep their `chbwcod`, and carry no SPX
+    /// coordinates); the SNR tuner budgets each channel at its own
+    /// coded bandwidth. Constraints: at least one bit for a coded
+    /// channel must be set, and mono (`acmod == 0x1`) cannot exclude
+    /// its only channel (the spec makes `chinspx[0]` implicit there).
+    pub channel_mask: Option<u8>,
 }
 
 impl Default for SpxParams {
@@ -99,6 +109,7 @@ impl Default for SpxParams {
             adaptive_copy_start: false,
             atten_code: None,
             explicit_band_structure: false,
+            channel_mask: None,
         }
     }
 }

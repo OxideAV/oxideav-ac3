@@ -858,3 +858,54 @@ fn eac3_aht_51_decodes_through_ffmpeg() {
     // band-limit). Measured 33.4 dB with fbw+LFE AHT.
     assert!(psnr >= 24.0, "AHT 5.1 PSNR {psnr:.2} dB below 24 dB");
 }
+
+#[test]
+fn eac3_spx_mixed_membership_through_ffmpeg() {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg not in PATH — skipping mixed-chinspx interop test");
+        return;
+    }
+    // §E.2.3.3.3 mixed membership: ch0 in SPX, ch1 waveform-coded to
+    // full bandwidth. Through an EXTERNAL parser this cross-validates
+    // the chinspx[ch] = 0 arm: the non-SPX channel must keep its
+    // chbwcod, its longer exponent set, and its own mantissa run —
+    // one mis-gated field desynchronises the whole frame.
+    let spx = SpxParams {
+        channel_mask: Some(0b01),
+        ..SpxParams::default()
+    };
+    let geom = SpxGeometry::derive(&spx, &oxideav_ac3::eac3::dsp::DEFAULT_SPX_BNDSTRC)
+        .expect("SPX geometry");
+    let pcm = build_spx_multitone(2);
+    let stream = encode_eac3_spx(&pcm, 2, 256_000, spx);
+    let decoded = ffmpeg_decode(&stream, 2).expect("ffmpeg rejected the mixed-chinspx stream");
+    assert!(decoded.len() as f32 >= pcm.len() as f32 * 0.9);
+    // ch0: SPX band-energy contract through the external decoder.
+    let orig0 = mdct_energy_profile(&pcm, 2, 0);
+    let dec0 = mdct_energy_profile(&decoded, 2, 0);
+    let mut lo = geom.begin_tc;
+    let mut deltas = Vec::new();
+    for bnd in 0..geom.nbnds {
+        let hi = lo + geom.bndsztab[bnd];
+        let eo: f64 = orig0[lo..hi].iter().sum();
+        let ed: f64 = dec0[lo..hi].iter().sum();
+        deltas.push(10.0 * (ed.max(1e-30) / eo.max(1e-30)).log10());
+        lo = hi;
+    }
+    for (bnd, d) in deltas.iter().enumerate() {
+        assert!(
+            d.abs() <= 4.0,
+            "ch0 (SPX) band {bnd}: external energy delta {d:+.2} dB (all: {deltas:?})"
+        );
+    }
+    // ch1: full-bandwidth HF energy carried by real mantissas.
+    let orig1 = mdct_energy_profile(&pcm, 2, 1);
+    let dec1 = mdct_energy_profile(&decoded, 2, 1);
+    let hf_o: f64 = orig1[geom.begin_tc..geom.end_tc].iter().sum();
+    let hf_d: f64 = dec1[geom.begin_tc..geom.end_tc].iter().sum();
+    let hf_delta = 10.0 * (hf_d.max(1e-30) / hf_o.max(1e-30)).log10();
+    assert!(
+        hf_delta.abs() <= 3.5,
+        "ch1 (full-bw) external HF energy delta {hf_delta:+.2} dB"
+    );
+}

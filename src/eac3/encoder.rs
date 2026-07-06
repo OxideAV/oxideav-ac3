@@ -48,8 +48,8 @@ use crate::decoder::SAMPLES_PER_FRAME;
 use crate::encoder::{
     ac3_crc_update, build_dba_plan, compute_bap, decode_input_samples, extract_exponent,
     mantissa_bits_total, overhead_bits_for, pick_strategy_for_block, preprocess_d15,
-    quantise_exponents_to_grpsize, quantise_mantissa, select_exp_strategies,
-    tune_snroffst_with_plan, write_exponents_grouped, write_mantissa_stream, BitAllocParams,
+    quantise_exponents_to_grpsize, quantise_mantissa, select_exp_strategies_per_end,
+    tune_snroffst_with_plan_ends, write_exponents_grouped, write_mantissa_stream, BitAllocParams,
     CouplingPlan, DbaPlan, TransientDetector, LFE_END_MANT,
 };
 use crate::mdct::{mdct_256_pair, mdct_512};
@@ -108,6 +108,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     if let Some(spx) = spx_params_from_options(params)? {
         // Same construction-time validation as make_encoder_with_spx.
         SpxGeometry::derive(&spx, &DEFAULT_SPX_BNDSTRC)?;
+        validate_spx_channel_mask(&spx, params.channels.unwrap_or(0))?;
         concrete.spx = Some(spx);
     }
     match params.options.get("aht") {
@@ -179,13 +180,17 @@ fn spx_params_from_options(params: &CodecParameters) -> Result<Option<SpxParams>
     let atten = parse_u8("spx_atten", 31)?;
     let adaptive = parse_bool("spx_adaptive_copy_start")?;
     let explicit = parse_bool("spx_explicit_band_structure")?;
+    // §E.2.3.3.3 mixed per-channel chinspx: a bitmask of fbw channels
+    // in SPX (bit ch → channel ch). 0 / absent → all channels.
+    let chmask = parse_u8("spx_chmask", 255)?;
     let any_subkey = begf.is_some()
         || endf.is_some()
         || strtf.is_some()
         || blnd.is_some()
         || atten.is_some()
         || adaptive.is_some()
-        || explicit.is_some();
+        || explicit.is_some()
+        || chmask.is_some();
     // `spx=0` wins over sub-keys; sub-keys alone imply enablement.
     let on = match enabled {
         Some(v) => v,
@@ -203,6 +208,10 @@ fn spx_params_from_options(params: &CodecParameters) -> Result<Option<SpxParams>
         adaptive_copy_start: adaptive.unwrap_or(d.adaptive_copy_start),
         atten_code: atten,
         explicit_band_structure: explicit.unwrap_or(d.explicit_band_structure),
+        channel_mask: match chmask {
+            None | Some(0) => None,
+            m => m,
+        },
     }))
 }
 
@@ -392,6 +401,26 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
     })
 }
 
+/// Validate a mixed-membership `channel_mask` against the encoder's
+/// channel count (§E.2.3.3.3): the mask must keep at least one coded
+/// channel in SPX, and mono cannot exclude its only channel (the
+/// spec makes `chinspx[0]` implicit for `acmod == 0x1`).
+fn validate_spx_channel_mask(spx: &SpxParams, channels: u16) -> Result<()> {
+    if let Some(m) = spx.channel_mask {
+        if m == 0 {
+            return Err(Error::invalid(
+                "eac3 encoder: spx channel_mask must keep at least one channel in SPX",
+            ));
+        }
+        if channels == 1 && m & 1 == 0 {
+            return Err(Error::invalid(
+                "eac3 encoder: mono SPX cannot exclude channel 0 (chinspx[0] is implicit)",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Build an E-AC-3 encoder with Spectral Extension (SPX, §E.2.3.3 /
 /// §E.3.6) enabled.
 ///
@@ -415,6 +444,7 @@ pub fn make_encoder_with_spx(params: &CodecParameters, spx: SpxParams) -> Result
     // Fail fast on invalid geometry (same validation the per-frame
     // emitter performs).
     SpxGeometry::derive(&spx, &DEFAULT_SPX_BNDSTRC)?;
+    validate_spx_channel_mask(&spx, params.channels.unwrap_or(0))?;
     let mut concrete = build_concrete_encoder(params)?;
     concrete.spx = Some(spx);
     Ok(Box::new(concrete))
@@ -738,14 +768,45 @@ impl Eac3Encoder {
             }
             None => None,
         };
+        let end_full: usize = 37 + 3 * (chbwcod as usize + 12);
+        // §E.2.3.3.3 chinspx[ch] — mixed per-channel SPX membership.
+        // With no mask (or SPX off) the vector is uniform.
+        let in_spx: Vec<bool> = (0..nfchans)
+            .map(|ch| {
+                spx_geom.is_some()
+                    && (
+                        // Mono substreams carry no chinspx bits — the
+                        // decoder assumes chinspx[0] == 1 (§E.2.3.3.3),
+                        // so the mask cannot exclude the only channel.
+                        (sub.acmod == 0x1 && ch == 0)
+                            || self
+                                .spx
+                                .as_ref()
+                                .and_then(|p| p.channel_mask)
+                                .map_or(true, |m| m & (1 << ch) != 0)
+                    )
+            })
+            .collect();
         let end_mant: usize = match &spx_geom {
             Some(g) => g.begin_tc,
-            None => 37 + 3 * (chbwcod as usize + 12),
+            None => end_full,
         };
+        // Per-channel coded bandwidth: SPX channels stop at the SPX
+        // begin frequency (§E.3.3.3), the rest run to the
+        // chbwcod-derived end.
+        let end_mant_ch: Vec<usize> = (0..nfchans)
+            .map(|ch| {
+                if in_spx[ch] {
+                    spx_geom.as_ref().map_or(end_full, |g| g.begin_tc)
+                } else {
+                    end_full
+                }
+            })
+            .collect();
         let ch_end_mant = end_mant;
         for ch in 0..nfchans {
             for blk in 0..BLOCKS_PER_FRAME {
-                for k in 0..ch_end_mant {
+                for k in 0..end_mant_ch[ch] {
                     exps[ch][blk][k] = extract_exponent(coeffs[ch][blk][k]);
                 }
             }
@@ -833,7 +894,7 @@ impl Eac3Encoder {
             for ch in 0..nfchans {
                 for blk in 0..BLOCKS_PER_FRAME {
                     if exp_strategies[blk] == 1 {
-                        preprocess_d15(&mut exps[ch][blk][..ch_end_mant]);
+                        preprocess_d15(&mut exps[ch][blk][..end_mant_ch[ch]]);
                     }
                 }
             }
@@ -845,15 +906,16 @@ impl Eac3Encoder {
                     }
                     out
                 } else {
-                    select_exp_strategies(&exps, nfchans, ch_end_mant)
+                    select_exp_strategies_per_end(&exps, nfchans, &end_mant_ch)
                 };
             // Apply grpsize quantisation for D25/D45 anchor blocks.
             for ch in 0..nfchans {
+                let ch_end = end_mant_ch[ch];
                 for blk in 0..BLOCKS_PER_FRAME {
                     let strat = plan[ch][blk];
                     if strat >= 2 {
                         let grpsize = if strat == 2 { 2 } else { 4 };
-                        quantise_exponents_to_grpsize(&mut exps[ch][blk][..ch_end_mant], grpsize);
+                        quantise_exponents_to_grpsize(&mut exps[ch][blk][..ch_end], grpsize);
                     }
                 }
                 // REUSE blocks get the most-recent anchor's exponents.
@@ -863,7 +925,7 @@ impl Eac3Encoder {
                         last = blk;
                     } else {
                         let src: [u8; N_COEFFS] = exps[ch][last];
-                        exps[ch][blk][..ch_end_mant].copy_from_slice(&src[..ch_end_mant]);
+                        exps[ch][blk][..ch_end].copy_from_slice(&src[..ch_end]);
                     }
                 }
             }
@@ -1002,7 +1064,12 @@ impl Eac3Encoder {
         let dba_plan = if std::env::var("EAC3_DISABLE_DBA").is_ok() {
             crate::encoder::DbaPlan::default()
         } else {
-            build_dba_plan(&exps, nfchans, ch_end_mant, &cpl)
+            build_dba_plan(
+                &exps,
+                nfchans,
+                end_mant_ch.iter().copied().min().unwrap_or(ch_end_mant),
+                &cpl,
+            )
         };
         // When `snroffststr != 0`, the audblk carries per-block SNR
         // offsets instead of the single frame-level pair in audfrm. Those
@@ -1069,8 +1136,10 @@ impl Eac3Encoder {
                     0
                 };
                 // blk 0: payload (spxcoe implicit); blk 3: 1 + payload;
-                // blks 1/2/4/5: 1-bit spxcoe each.
-                strat + atten + nfchans as u32 * (payload + (1 + payload) + 4)
+                // blks 1/2/4/5: 1-bit spxcoe each. Only channels in
+                // SPX carry coordinates (mixed chinspx).
+                let n_spx = in_spx.iter().filter(|&&v| v).count() as u32;
+                strat + atten + n_spx * (payload + (1 + payload) + 4)
             }
         };
         // AHT header bits over the AHT-off baseline: one chahtinu bit
@@ -1103,10 +1172,11 @@ impl Eac3Encoder {
                 sub.lfeon,
             )
         } else {
-            tune_snroffst_with_plan(
+            tune_snroffst_with_plan_ends(
                 &ba,
                 &exps,
                 ch_end_mant,
+                Some(&end_mant_ch),
                 nfchans,
                 self.fscod,
                 tuner_frame_bytes,
@@ -1128,7 +1198,7 @@ impl Eac3Encoder {
                 for blk in 0..BLOCKS_PER_FRAME {
                     compute_bap(
                         &exps[ch][blk],
-                        ch_end_mant,
+                        end_mant_ch[ch],
                         self.fscod,
                         &frame_ba,
                         &mut baps[ch][blk],
@@ -1279,12 +1349,16 @@ impl Eac3Encoder {
         // §2.3.2.24-25 — spectral extension attenuation data: one
         // chinspxatten[ch] bit per fbw channel, + spxattencod[ch]
         // (5 bits) when set. Emitted between the SNR-offset tail and
-        // blkstrtinfoe per Table E1.3. Every fbw channel is in SPX, so
-        // all channels carry the (shared) code.
+        // blkstrtinfoe per Table E1.3. Channels in SPX carry the
+        // (shared) code; non-SPX channels signal chinspxatten = 0.
         if let Some(code) = spx_atten {
-            for _ in 0..nfchans {
-                bw.write_u32(1, 1); // chinspxatten[ch] = 1
-                bw.write_u32(code as u32, 5); // spxattencod[ch]
+            for ch in 0..nfchans {
+                if in_spx[ch] {
+                    bw.write_u32(1, 1); // chinspxatten[ch] = 1
+                    bw.write_u32(code as u32, 5); // spxattencod[ch]
+                } else {
+                    bw.write_u32(0, 1); // chinspxatten[ch] = 0
+                }
             }
         }
         bw.write_u32(0, 1); // blkstrtinfoe = 0
@@ -1313,10 +1387,10 @@ impl Eac3Encoder {
                     bw.write_u32(1, 1); // spxinu = 1
                                         // §E.2.3.3.3 chinspx[ch] — implicit for mono
                                         // (acmod == 0x1); explicit per fbw channel
-                                        // otherwise. Every channel is in SPX.
+                                        // otherwise (mixed membership allowed).
                     if sub.acmod != 0x1 {
-                        for _ in 0..nfchans {
-                            bw.write_u32(1, 1);
+                        for &member in in_spx.iter().take(nfchans) {
+                            bw.write_u32(u32::from(member), 1);
                         }
                     }
                     bw.write_u32(spx_strtf_emit as u32, 2); // §E.2.3.3.4
@@ -1350,6 +1424,11 @@ impl Eac3Encoder {
                 let span_idx = usize::from(blk >= SPX_REFRESH_BLOCKS[1]);
                 let spxblnd = self.spx.as_ref().expect("spx params").spxblnd;
                 for ch in 0..nfchans {
+                    if !in_spx[ch] {
+                        // §E.2.3.3.9: spxcoe exists only for channels
+                        // with chinspx[ch] == 1.
+                        continue;
+                    }
                     let reuse_prior = !refresh || (span_idx == 1 && coords[ch][1] == coords[ch][0]);
                     if blk != 0 {
                         bw.write_u32(u32::from(!reuse_prior), 1); // spxcoe[ch]
@@ -1403,14 +1482,12 @@ impl Eac3Encoder {
             // strategy this block is non-REUSE AND that channel is
             // neither in coupling nor in spectral extension
             // (`if((!chincpl[ch]) && (!chinspx[ch])) {chbwcod[ch]}`).
-            // With SPX every fbw channel is in SPX, so no chbwcod is
-            // emitted — the decoder derives the bandwidth from the SPX
-            // begin frequency (§E.3.3.3).
-            if spx_geom.is_none() {
-                for ch in 0..nfchans {
-                    if chexpstr_plan[ch][blk] != 0 {
-                        bw.write_u32(chbwcod as u32, 6);
-                    }
+            // SPX channels derive their bandwidth from the SPX begin
+            // frequency instead (§E.3.3.3); with mixed chinspx the
+            // full-bandwidth channels still carry their chbwcod.
+            for ch in 0..nfchans {
+                if !in_spx[ch] && chexpstr_plan[ch][blk] != 0 {
+                    bw.write_u32(chbwcod as u32, 6);
                 }
             }
             // §E.1.2.4 fbw exponents (cplexps section is skipped:
@@ -1426,7 +1503,7 @@ impl Eac3Encoder {
                         2 => 2usize,
                         _ => 4usize,
                     };
-                    write_exponents_grouped(&mut bw, &exps[ch][blk], ch_end_mant, grpsize);
+                    write_exponents_grouped(&mut bw, &exps[ch][blk], end_mant_ch[ch], grpsize);
                     bw.write_u32(0, 2); // gainrng[ch] = 0
                 }
             }
@@ -1579,7 +1656,7 @@ impl Eac3Encoder {
                 }
             } else {
                 for ch in 0..nfchans {
-                    for bin in 0..ch_end_mant {
+                    for bin in 0..end_mant_ch[ch] {
                         let bap = baps[ch][blk][bin];
                         if bap == 0 {
                             continue;
@@ -2423,6 +2500,148 @@ mod tests {
         );
     }
 
+    /// Mixed per-channel chinspx (§E.2.3.3.3): stereo with ch0 in SPX
+    /// and ch1 waveform-coded to its full chbwcod bandwidth. Gates:
+    ///
+    /// * ch0 keeps the §3.6.4.3 SPX band-energy contract;
+    /// * ch1's high-frequency region (above the SPX begin frequency,
+    ///   where ch0 is synthesized) is waveform-coded and must hold its
+    ///   total energy;
+    /// * both coded bands stay faithful.
+    ///
+    /// This exercises the per-channel end_mant plumbing end to end:
+    /// exponent sets of different lengths in one frame, chbwcod
+    /// emitted only for the non-SPX channel, spxcoe/coordinates only
+    /// for the SPX channel, and the SNR tuner budgeting each channel
+    /// at its own bandwidth. A mis-sized field desyncs everything.
+    #[test]
+    fn spx_mixed_membership_stereo() {
+        let spx = SpxParams {
+            channel_mask: Some(0b01), // ch0 in SPX, ch1 full-bandwidth
+            ..SpxParams::default()
+        };
+        let geom = SpxGeometry::derive(&spx, &DEFAULT_SPX_BNDSTRC).unwrap();
+        let pcm = build_spx_multitone(2, 8);
+        // 256 kbps ⇒ 1024-byte frames — headroom for the full-bw ch1.
+        let stream = encode_spx(&pcm, 2, 256_000, spx);
+        assert_eq!(stream.len() % 1024, 0);
+        // Mixed membership must actually change the bitstream vs the
+        // uniform all-SPX encode at the same rate.
+        assert_ne!(
+            stream,
+            encode_spx(&pcm, 2, 256_000, SpxParams::default()),
+            "channel_mask must change the emission"
+        );
+        let dec_f = to_f32_interleaved(&decode_all(&stream, 1024));
+
+        // ch0 — SPX band-energy contract (§3.6.4.3).
+        let orig0 = mdct_energy_profile(&pcm, 2, 0);
+        let dec0 = mdct_energy_profile(&dec_f, 2, 0);
+        let deltas = band_db_deltas(&orig0, &dec0, &geom);
+        for (bnd, d) in deltas.iter().enumerate() {
+            assert!(
+                d.abs() <= 3.5,
+                "ch0 (SPX) band {bnd}: energy delta {d:+.2} dB (all: {deltas:?})"
+            );
+        }
+        let eo: f64 = orig0[..geom.begin_tc].iter().sum();
+        let ed: f64 = dec0[..geom.begin_tc].iter().sum();
+        assert!(
+            (10.0 * (ed / eo).log10()).abs() <= 1.5,
+            "ch0 coded-band energy"
+        );
+
+        // ch1 — full-bandwidth waveform coding: the HF region that ch0
+        // synthesizes must be carried by real mantissas here.
+        let orig1 = mdct_energy_profile(&pcm, 2, 1);
+        let dec1 = mdct_energy_profile(&dec_f, 2, 1);
+        let hf_o: f64 = orig1[geom.begin_tc..geom.end_tc].iter().sum();
+        let hf_d: f64 = dec1[geom.begin_tc..geom.end_tc].iter().sum();
+        let hf_delta = 10.0 * (hf_d.max(1e-30) / hf_o.max(1e-30)).log10();
+        assert!(
+            hf_delta.abs() <= 3.0,
+            "ch1 (full-bw) HF energy delta {hf_delta:+.2} dB"
+        );
+        let lo_o: f64 = orig1[..geom.begin_tc].iter().sum();
+        let lo_d: f64 = dec1[..geom.begin_tc].iter().sum();
+        assert!(
+            (10.0 * (lo_d / lo_o).log10()).abs() <= 1.5,
+            "ch1 coded-band energy"
+        );
+    }
+
+    /// The `spx_chmask` option key must build the same encoder as the
+    /// typed channel_mask, and the §E.2.3.3.3 constraints are enforced
+    /// at construction.
+    #[test]
+    fn spx_chmask_option_and_validation() {
+        let pcm = build_spx_multitone(2, 3);
+        let typed = encode_spx(
+            &pcm,
+            2,
+            192_000,
+            SpxParams {
+                channel_mask: Some(0b10),
+                ..SpxParams::default()
+            },
+        );
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(2);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(192_000);
+        params.options = oxideav_core::CodecOptions::new().set("spx_chmask", "2");
+        let mut enc = make_encoder(&params).expect("options-driven mixed SPX encoder");
+        let n_samp = pcm.len() / 2;
+        let mut s16 = Vec::with_capacity(pcm.len() * 2);
+        for &v in &pcm {
+            let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            s16.extend_from_slice(&q.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: n_samp as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut from_options = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => from_options.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("options mixed-spx encode error: {e:?}"),
+            }
+        }
+        assert_eq!(
+            typed, from_options,
+            "spx_chmask option and typed channel_mask must emit identical bytes"
+        );
+
+        // Validation: an all-zero typed mask is rejected.
+        let mut p = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        p.sample_rate = Some(48_000);
+        p.channels = Some(2);
+        assert!(make_encoder_with_spx(
+            &p,
+            SpxParams {
+                channel_mask: Some(0),
+                ..SpxParams::default()
+            }
+        )
+        .is_err());
+        // Mono cannot exclude its only channel (chinspx[0] implicit).
+        p.channels = Some(1);
+        assert!(make_encoder_with_spx(
+            &p,
+            SpxParams {
+                channel_mask: Some(0b10),
+                ..SpxParams::default()
+            }
+        )
+        .is_err());
+    }
+
     #[test]
     fn spx_options_path_matches_typed_constructor_bit_for_bit() {
         // The registry-facing options surface (`spx*` keys on
@@ -2438,6 +2657,7 @@ mod tests {
             adaptive_copy_start: false,
             atten_code: Some(9),
             explicit_band_structure: true,
+            channel_mask: None,
         };
         let typed = encode_spx(&pcm, 2, 192_000, spx);
 
