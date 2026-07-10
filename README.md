@@ -103,15 +103,20 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   enhanced-coupling block (carried on `EcplState`, §E.3.5.5.1), so the
   prior-frame edge no longer collapses to a zero carrier; the frame's
   last block's "next block" still uses a zero carrier (it lives in a
-  not-yet-decoded frame — streaming lookahead is out of scope). Two
-  enhanced-coupling conformance defects fixed in r406, both pinned by
-  the new encoder round-trips: `chincpl[ch]` is read directly after
+  not-yet-decoded frame — streaming lookahead is out of scope). Three
+  enhanced-coupling conformance defects fixed in r406, pinned by the
+  new encoder round-trips: `chincpl[ch]` is read directly after
   `ecplinu` (BEFORE the standard/enhanced strategy split — the prior
   order desynced every multichannel ecpl frame, invisibly in 2/0 where
-  the flags are implicit), and `ecplparam1e/2e == 0` now REUSE the
+  the flags are implicit); `ecplparam1e/2e == 0` now REUSE the
   previously transmitted amplitudes / angle+chaos values per
   §2.3.3.21-22 (previously each block's coordinate set was replaced
-  wholesale, silencing every band of a reusing channel). The
+  wholesale, silencing every band of a reusing channel); and the
+  resolved banding structure masks its entries up to and including
+  `max(ecpl_begin_subbnd, 8)` per §E.2.3.3.19 — the Table E2.14
+  default carries a merge bit at sub-band 9, so a default-banded
+  region beginning there previously made `necplbnd` disagree with the
+  §E.3.5.5.1 band walk by one band (a coordinate-count desync). The
   §E.3.3.2 `nrematbd` derivation now folds in enhanced coupling: a 2/0
   `ecplinu` block sizes its rematrix-flag field from the raw `ecplbegf`
   code (0/1/2/<5 → 0/1/2/3 bands, else 4) rather than `cplbegf`, keeping
@@ -231,7 +236,18 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   through the final exponent + bap quantiser; the previous frame's
   carried quantised last block at the frame head, zero after the
   tail), refreshed on blocks 0/3 with §2.3.3.21-22 reuse thrift when
-  the block-3 refresh quantises identically. Validated in-tree:
+  the block-3 refresh quantises identically. **Chaos coordinates**
+  (Table E3.12, on by default via `EcplParams::chaos` / the
+  `ecpl_chaos` option) are derived from the measured per-band
+  coherence — the incoherent fraction maps onto the 8-step grid,
+  engaging the decoder's §E.3.5.5.3 per-bin random de-correlation for
+  content the shared carrier cannot represent, with the transmitted
+  amplitude pre-divided by the decoder's `1 + 0.38·chaosval`
+  modification (chaos backs off when the pre-compensated amplitude
+  would exceed the 1.0 ceiling — band energy wins over width). A
+  partial-coherence stereo fixture gates the effect: decoded
+  in-region inter-channel coherence 0.914 chaos-less → 0.796 with
+  chaos (source 0.706), band energies still matched. Validated in-tree:
   stereo band-energy round-trip (±3 dB per signal band, ±1.5 dB coded
   low band, 20 dB waveform floor), a stereo **quadrature** fixture
   (channel 1's tones 90° off the carrier — pins the angle path at an

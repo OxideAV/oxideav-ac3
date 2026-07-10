@@ -4475,4 +4475,149 @@ mod ecpl_tests {
             }
         }
     }
+    #[test]
+    fn ecpl_roundtrip_narrow_geometry() {
+        // Non-default begin/end codes: ecplbegf = 7 exercises the
+        // Table E3.8 middle arm (begin = ecplbegf + 2 = 9 → tc 97);
+        // ecplendf = 8 → end sub-band 15 → tc 169. The region spans
+        // 9.1-15.8 kHz and the default Table E2.14 banding merges its
+        // 6 sub-bands into 3 bands (merges at 9, 11, 13).
+        let params = EcplParams {
+            ecplbegf: 7,
+            ecplendf: 8,
+            ..EcplParams::default()
+        };
+        let geom = EcplGeometry::derive(&params, &DEFAULT_ECPL_BNDSTRC).unwrap();
+        assert_eq!((geom.start_bin, geom.end_bin), (97, 169));
+        // Span 9..15 under the default banding: sub-band 9 starts band
+        // 0 (its Table E2.14 merge bit is masked per §E.2.3.3.19),
+        // merges at 11 and 13 → 4 bands.
+        assert_eq!(geom.necplbnd, 4);
+        assert_eq!(geom.band_bins.len(), 4);
+
+        // Tones inside the narrow region (10.1 / 12.4 / 14.6 kHz →
+        // bins 108 / 132 / 156) + LF anchor below it.
+        let n = 8 * SAMPLES_PER_FRAME as usize;
+        let mut pcm = vec![0.0f32; n * 2];
+        for i in 0..n {
+            let t = i as f32 / 48_000.0;
+            let lf = 0.20 * (2.0 * std::f32::consts::PI * 700.0 * t).sin();
+            for ch in 0..2 {
+                let phase = 0.5 * ch as f32;
+                let s = lf
+                    + 0.15 * (2.0 * std::f32::consts::PI * 10_100.0 * t + phase).sin()
+                    + 0.12 * (2.0 * std::f32::consts::PI * 12_400.0 * t + phase).sin()
+                    + 0.08 * (2.0 * std::f32::consts::PI * 14_600.0 * t + phase).sin();
+                pcm[i * 2 + ch] = s * (1.0 - 0.1 * ch as f32);
+            }
+        }
+        let stream = encode_ecpl(&pcm, 2, 192_000, params);
+        assert_eq!(stream.len() % 768, 0);
+        let dec_f = to_f32_interleaved(&decode_all(&stream, 768));
+        for ch in 0..2 {
+            let orig_prof = mdct_energy_profile(&pcm, 2, ch);
+            let dec_prof = mdct_energy_profile(&dec_f, 2, ch);
+            let deltas = ecpl_band_db_deltas(&orig_prof, &dec_prof, &geom);
+            for (bnd, d) in deltas.iter().enumerate() {
+                assert!(
+                    d.abs() <= 3.0,
+                    "ch{ch} narrow band {bnd}: energy delta {d:+.2} dB (all: {deltas:?})"
+                );
+            }
+            // Content ABOVE the narrow region is waveform-coded
+            // normally (chbwcod suppressed but end_mant for coupled
+            // channels is the region start... the region end < full
+            // bandwidth means bins above 169 are NOT coded — the
+            // decoder zeroes them). The fixture keeps everything
+            // below tc 169, so total energy still matches.
+            let eo: f64 = orig_prof[..geom.start_bin].iter().sum();
+            let ed: f64 = dec_prof[..geom.start_bin].iter().sum();
+            let lf_delta: f64 = 10.0 * (ed / eo).log10();
+            assert!(
+                lf_delta.abs() <= 1.5,
+                "ch{ch}: below-region energy delta {lf_delta:+.2} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn ecpl_roundtrip_44100() {
+        // fscod = 1 interplay: the coupling grid is a transform-bin
+        // grid, so nothing rate-specific should change — this guards
+        // the frame-size lookup + bit-allocation table plumbing at
+        // 44.1 kHz. 192 kbps @ 44.1 kHz frames.
+        let params = {
+            let mut p = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+            p.sample_rate = Some(44_100);
+            p.channels = Some(2);
+            p.sample_format = Some(SampleFormat::S16);
+            p.bit_rate = Some(192_000);
+            p
+        };
+        let mut enc =
+            make_encoder_with_ecpl(&params, EcplParams::default()).expect("44.1k ecpl encoder");
+        let geom = EcplGeometry::derive(&EcplParams::default(), &DEFAULT_ECPL_BNDSTRC).unwrap();
+        let frames = 8usize;
+        let n = frames * SAMPLES_PER_FRAME as usize;
+        let mut pcm = vec![0.0f32; n * 2];
+        for i in 0..n {
+            let t = i as f32 / 44_100.0;
+            let lf = 0.20 * (2.0 * std::f32::consts::PI * 650.0 * t).sin();
+            for ch in 0..2 {
+                let phase = 0.5 * ch as f32;
+                let s = lf
+                    + 0.16 * (2.0 * std::f32::consts::PI * 4_000.0 * t + phase).sin()
+                    + 0.12 * (2.0 * std::f32::consts::PI * 8_200.0 * t + phase).sin()
+                    + 0.08 * (2.0 * std::f32::consts::PI * 13_000.0 * t + phase).sin();
+                pcm[i * 2 + ch] = s * (1.0 - 0.1 * ch as f32);
+            }
+        }
+        let mut s16 = Vec::with_capacity(pcm.len() * 2);
+        for &v in &pcm {
+            let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            s16.extend_from_slice(&q.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut stream = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => stream.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("44.1k ecpl encode error: {e:?}"),
+            }
+        }
+        assert_eq!(stream.len() % frames, 0, "uneven frame sizes");
+        let frame_bytes = stream.len() / frames;
+        let dec = decode_all(&stream, frame_bytes);
+        assert_eq!(dec.len() / 2, frames * SAMPLES_PER_FRAME as usize);
+        let dec_f = to_f32_interleaved(&dec);
+        for ch in 0..2 {
+            let orig_prof = mdct_energy_profile(&pcm, 2, ch);
+            let dec_prof = mdct_energy_profile(&dec_f, 2, ch);
+            let deltas = ecpl_band_db_deltas(&orig_prof, &dec_prof, &geom);
+            let mut lo = geom.start_bin;
+            let mut energies = Vec::new();
+            for &nb in &geom.band_bins {
+                let hi = (lo + nb).min(N_COEFFS);
+                energies.push(orig_prof[lo..hi].iter().sum::<f64>());
+                lo = hi;
+            }
+            let peak = energies.iter().cloned().fold(0.0f64, f64::max);
+            for (bnd, d) in deltas.iter().enumerate() {
+                if energies[bnd] < peak * 1e-3 {
+                    continue;
+                }
+                assert!(
+                    d.abs() <= 3.0,
+                    "ch{ch} 44.1k band {bnd}: energy delta {d:+.2} dB (all: {deltas:?})"
+                );
+            }
+        }
+    }
 }

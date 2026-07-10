@@ -347,7 +347,7 @@ pub fn parse_strategy(
     }
 
     let ecplbndstrce = br.read_u32(1)? != 0;
-    let bndstrc = if ecplbndstrce {
+    let mut bndstrc = if ecplbndstrce {
         // Fresh structure from the wire. Sub-bands up to and including
         // max(8, begin) are implicitly 0 and not transmitted; the loop
         // starts at max(9, begin + 1). The merge bit for the very first
@@ -364,6 +364,20 @@ pub fn parse_strategy(
         // structure (later block) — no bits consumed.
         *prev_bndstrc
     };
+    // §E.2.3.3.19: "the elements of the array corresponding to the
+    // sub-bands up to and including ecpl_begin_subbnd or 8 (whichever
+    // is greater), are always zero". This must be enforced on the
+    // RESOLVED structure too: the Table E2.14 default carries a merge
+    // bit at sub-band 9, and a region beginning there (ecplbegf == 7)
+    // would otherwise count a phantom merge — `necplbnd` and the
+    // §E.3.5.5.1 band walk would disagree by one band, desyncing every
+    // coordinate field that follows.
+    for slot in bndstrc
+        .iter_mut()
+        .take((begin.max(8) + 1).min(N_ECPL_SUBBND))
+    {
+        *slot = false;
+    }
 
     let necplbnd = necplbnd(begin, end, &bndstrc);
     Ok(EcplStrategy {
@@ -1541,9 +1555,19 @@ mod tests {
         let strat = parse_strategy(&mut br, false, 0, &DEFAULT_ECPL_BNDSTRC).unwrap();
         assert_eq!(strat.begin_subbnd, 9);
         assert_eq!(strat.end_subbnd, 22);
-        assert_eq!(strat.bndstrc, DEFAULT_ECPL_BNDSTRC);
-        // begin=9, end=22, default banding → 4 bands (see geometry test).
-        assert_eq!(strat.necplbnd, 4);
+        // §E.2.3.3.19: the resolved structure masks the default table's
+        // merge bit AT the first active sub-band (entries up to and
+        // including max(begin, 8) are always zero) — sub-band 9 starts
+        // band 0 here, so the region has 5 bands, not 4. (The pre-r406
+        // code counted the phantom merge in necplbnd while the
+        // §E.3.5.5.1 band walk opened a band anyway — a one-band
+        // coordinate-count desync on any default-banded region
+        // beginning at sub-band 9+.)
+        let mut expected = DEFAULT_ECPL_BNDSTRC;
+        expected[9] = false;
+        assert_eq!(strat.bndstrc, expected);
+        assert_eq!(strat.necplbnd, 5);
+        assert_eq!(strat.band_bin_counts().len(), 5);
         assert_eq!(strat.begin_bin(), 97);
         assert_eq!(strat.end_bin(), 253);
         // Exactly 9 bits consumed (4 + 4 + 1).

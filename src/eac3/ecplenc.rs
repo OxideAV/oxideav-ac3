@@ -138,14 +138,25 @@ impl EcplGeometry {
                  (need begin < end <= 22)",
             ));
         }
-        let necplbnd = super::ecpl::necplbnd(begin, end, bndstrc);
-        let band_bins = band_bin_counts(begin, end, bndstrc);
+        // §E.2.3.3.19: bndstrc entries up to and including
+        // max(begin, 8) are always zero — mask the (default) table so
+        // a region beginning at sub-band 9+ cannot carry a phantom
+        // leading merge (necplbnd vs the band walk would disagree).
+        let mut bndstrc = *bndstrc;
+        for slot in bndstrc
+            .iter_mut()
+            .take((begin.max(8) + 1).min(N_ECPL_SUBBND))
+        {
+            *slot = false;
+        }
+        let necplbnd = super::ecpl::necplbnd(begin, end, &bndstrc);
+        let band_bins = band_bin_counts(begin, end, &bndstrc);
         Ok(Self {
             ecplbegf: params.ecplbegf,
             ecplendf: params.ecplendf,
             begin_subbnd: begin,
             end_subbnd: end,
-            bndstrc: *bndstrc,
+            bndstrc,
             necplbnd,
             start_bin: begin_bin(begin),
             end_bin: end_bin(end),
@@ -187,14 +198,25 @@ impl EcplGeometry {
                  out-of-grid enhanced-coupling region (need begin < end <= 22)",
             ));
         }
-        let necplbnd = super::ecpl::necplbnd(begin, end, bndstrc);
-        let band_bins = band_bin_counts(begin, end, bndstrc);
+        // §E.2.3.3.19: bndstrc entries up to and including
+        // max(begin, 8) are always zero — mask the (default) table so
+        // a region beginning at sub-band 9+ cannot carry a phantom
+        // leading merge (necplbnd vs the band walk would disagree).
+        let mut bndstrc = *bndstrc;
+        for slot in bndstrc
+            .iter_mut()
+            .take((begin.max(8) + 1).min(N_ECPL_SUBBND))
+        {
+            *slot = false;
+        }
+        let necplbnd = super::ecpl::necplbnd(begin, end, &bndstrc);
+        let band_bins = band_bin_counts(begin, end, &bndstrc);
         Ok(Self {
             ecplbegf: params.ecplbegf,
             ecplendf: 0,
             begin_subbnd: begin,
             end_subbnd: end,
-            bndstrc: *bndstrc,
+            bndstrc,
             necplbnd,
             start_bin: begin_bin(begin),
             end_bin: end_bin(end),
