@@ -349,7 +349,11 @@ pub(crate) fn gaq_remap(hebap: u8, gk: u8, x: f32) -> f32 {
 ///   `1 / 2^(m-1)`; the full-scale-negative tag announces an
 ///   `(m-1)`-bit large codeword remapped via the `Gk = 2` column
 ///   (dead-zone quantiser, `2^(m-1)` points of step
-///   `1 / (2^(m-1) - 1)`).
+///   `1 / (2^(m-1) - 1)`). The `(m-1)` LARGE width is easy to misread
+///   as `m` off the printed Table E3.5 layout — the clarification
+///   (with the `2^(m-1)` reconstruction-point cross-check) is
+///   codified as `docs/audio/ac3/ac3-errata.md` entry **E2**; pinned
+///   by `tests::scalar_gk2_small_and_large`.
 /// * **`Gk = 4`** (mode 2/3) — an `(m-2)`-bit small codeword of step
 ///   `1 / 2^(m-1)`; the tag announces an `m`-bit large codeword
 ///   remapped via the `Gk = 4` column (step `3 / (2^(m+1) - 2)`).
@@ -459,7 +463,10 @@ pub fn read_scalar_aht_mantissas(
 /// the DC basis weight is exactly 1 (`√2 · R(0) = 1`), i.e. a
 /// constant cross-block signal reconstructs unchanged, which is the
 /// natural quantiser-range convention. We follow the deployed
-/// constant; the printed `2` appears to be an erratum.
+/// constant; the printed `2` is an erratum, codified with the fitted
+/// evidence as `docs/audio/ac3/ac3-errata.md` entry **E1** (the
+/// `R_0 = 1/√2` corollary keeping the DC gain at 1 is recorded
+/// there). Pinned by `tests::idct_inverse_of_dct_constants`.
 pub fn idct_ii_6(x: [f32; 6]) -> [f32; 6] {
     let mut c = [0.0f32; 6];
     let r0 = std::f32::consts::FRAC_1_SQRT_2;

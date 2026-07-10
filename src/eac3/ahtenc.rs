@@ -38,7 +38,8 @@ use crate::encoder::{compute_bap_table, BitAllocParams, DbaPlan};
 
 /// Forward DCT-II of length 6 — the inverse of the §3.4.5 transform
 /// as deployed (see [`super::aht::idct_ii_6`]: leading constant `√2`,
-/// black-box-validated; the printed `2` is an erratum).
+/// black-box-validated; the printed `2` is an erratum, codified as
+/// `docs/audio/ac3/ac3-errata.md` entry E1).
 ///
 /// The IDCT is
 /// `C(m) = √2 · Σ_j R(j) · X(j) · cos[j·(2m+1)·π/12]` with
