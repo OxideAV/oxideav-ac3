@@ -55,16 +55,28 @@ pub struct EcplParams {
     /// `ecplendf` (4 bits) — end-frequency code, Table E3.8:
     /// `ecpl_end_subbnd = ecplendf + 7`.
     pub ecplendf: u8,
+    /// Signal per-band **chaos** coordinates (§E.2.3.3.25 /
+    /// Table E3.12) derived from the measured band coherence, so the
+    /// decoder's §E.3.5.5.3 random de-correlation restores the
+    /// statistical character of channel content the shared carrier
+    /// cannot represent (inter-channel width). The transmitted
+    /// amplitude is pre-divided by the decoder's `1 + 0.38·chaosval`
+    /// modification so band energies stay matched. `false` transmits
+    /// chaos 0 everywhere (fully correlated model — the decode is then
+    /// a deterministic pure amplitude+angle reconstruction).
+    pub chaos: bool,
 }
 
 impl Default for EcplParams {
     /// Default geometry: begin sub-band 4 (tc 37 ≈ 3.5 kHz at 48 kHz)
     /// through end sub-band 22 (tc 253) — the full coupling-eligible
-    /// region above the independently-coded low band.
+    /// region above the independently-coded low band. Coherence-driven
+    /// chaos coordinates are on.
     fn default() -> Self {
         Self {
             ecplbegf: 2,
             ecplendf: 15,
+            chaos: true,
         }
     }
 }
@@ -284,6 +296,41 @@ impl BandStats {
         }
         (self.ci.atan2(self.cr) / std::f64::consts::PI) as f32
     }
+
+    /// Band **coherence** `|Σ X·conj(Z)| / sqrt(ΣE_X · ΣE_Z)` in
+    /// `0.0 ..= 1.0`: how much of the channel's band content is a
+    /// (rotated, scaled) copy of the carrier. `1.0` = fully coherent
+    /// (a pure amplitude+angle relation reconstructs it exactly);
+    /// low values mean the channel carries content the carrier does
+    /// not — the §E.3.5.5.3 chaos de-correlation restores its
+    /// statistical character. Silent bands report full coherence
+    /// (nothing to de-correlate).
+    pub fn coherence(&self) -> f32 {
+        if self.ex <= 0.0 || self.ez <= 0.0 {
+            return 1.0;
+        }
+        let num = (self.cr * self.cr + self.ci * self.ci).sqrt();
+        (num / (self.ex * self.ez).sqrt()).clamp(0.0, 1.0) as f32
+    }
+}
+
+/// Map a band coherence to a Table E3.12 `ecplchaos` code (0..=7,
+/// value `-code/7`): the incoherent fraction `1 - γ` scaled onto the
+/// 8-step grid. Fully coherent → code 0 (no de-correlation); fully
+/// incoherent → code 7 (angle jitter up to ±π, uniform phase).
+pub fn chaos_code_for(coherence: f32) -> u8 {
+    let incoherent = (1.0 - coherence).clamp(0.0, 1.0);
+    (incoherent * 7.0).round() as u8
+}
+
+/// The §E.3.5.5.2 amplitude-modification factor the decoder applies to
+/// a non-transient, non-first coupled channel: `1 + 0.38 · chaosval`
+/// with `chaosval = -code/7` (Table E3.12) — always in `0.62 ..= 1.0`.
+/// The encoder divides its measured amplitude by this factor before
+/// quantisation so the decoded band energy stays matched.
+pub fn chaos_amp_factor(chaos_code: u8) -> f32 {
+    let chaosval = -(chaos_code.min(7) as f32) / 7.0;
+    1.0 + 0.38 * chaosval
 }
 
 /// Accumulate per-band cross statistics for one block: `X[k]` is the
@@ -428,6 +475,7 @@ mod tests {
             let p = EcplParams {
                 ecplbegf: begf,
                 ecplendf: 15,
+                ..EcplParams::default()
             };
             assert!(EcplGeometry::derive(&p, &DEFAULT_ECPL_BNDSTRC).is_err());
         }
@@ -435,6 +483,7 @@ mod tests {
         let p = EcplParams {
             ecplbegf: 13,
             ecplendf: 0,
+            ..EcplParams::default()
         };
         // begin_subbnd(13) = 16, end = 7 → inverted.
         assert!(EcplGeometry::derive(&p, &DEFAULT_ECPL_BNDSTRC).is_err());
@@ -477,6 +526,51 @@ mod tests {
                 "code {code} (angle {v}) did not round-trip"
             );
         }
+    }
+
+    #[test]
+    fn chaos_code_and_amp_factor() {
+        // Full coherence → no chaos; full incoherence → code 7.
+        assert_eq!(chaos_code_for(1.0), 0);
+        assert_eq!(chaos_code_for(0.0), 7);
+        // Grid midpoints round to the nearest step.
+        assert_eq!(chaos_code_for(0.5), 4); // (1-0.5)*7 = 3.5 → 4
+        assert_eq!(chaos_code_for(1.5), 0); // clamped
+                                            // Amplitude-modification factor: 1 + 0.38·(-code/7).
+        assert!((chaos_amp_factor(0) - 1.0).abs() < 1e-6);
+        assert!((chaos_amp_factor(7) - 0.62).abs() < 1e-6);
+        assert!((chaos_amp_factor(3) - (1.0 - 0.38 * 3.0 / 7.0)).abs() < 1e-6);
+        // Round-trip with the decoder's chaos modification: pre-divided
+        // amp × decoder factor ≈ measured amp.
+        for code in 0..=7u8 {
+            let measured = 0.5f32;
+            let sent = measured / chaos_amp_factor(code);
+            let decoded = sent * chaos_amp_factor(code);
+            assert!((decoded - measured).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn coherence_measures_correlation() {
+        // Identical spectra → coherence 1; orthogonal (Re vs Im) → the
+        // cross terms cancel per-bin only if constructed so; use the
+        // direct accumulator forms.
+        let full = BandStats {
+            ex: 4.0,
+            ez: 1.0,
+            cr: 2.0,
+            ci: 0.0,
+        };
+        assert!((full.coherence() - 1.0).abs() < 1e-6);
+        let none = BandStats {
+            ex: 4.0,
+            ez: 1.0,
+            cr: 0.0,
+            ci: 0.0,
+        };
+        assert!(none.coherence() < 1e-6);
+        let silent = BandStats::default();
+        assert!((silent.coherence() - 1.0).abs() < 1e-6);
     }
 
     #[test]
