@@ -507,6 +507,33 @@ pub fn parse_coords(
     })
 }
 
+/// §2.3.3.21-22 reuse semantics: when `ecplparam1e[ch] == 0` the
+/// previously transmitted amplitudes for that channel are reused, and
+/// when `ecplparam2e[ch] == 0` the previously transmitted angle + chaos
+/// values are reused. [`parse_coords`] leaves the corresponding vectors
+/// empty on a reuse block; this merges the prior block's values into the
+/// fresh set so the §E.3.5.5 synthesis sees the persistent coordinates.
+///
+/// Values are only carried when the prior vector's length matches the
+/// active band count (`necplbnd`) — a mid-frame strategy change that
+/// alters the banding invalidates stale coordinates (the spec requires
+/// retransmission in that case; degrading to silence is the defensive
+/// fallback for a malformed stream).
+pub fn merge_reused_params(curr: &mut EcplCoords, prev: &EcplCoords, necplbnd: usize) {
+    for (ch, params) in curr.channels.iter_mut().enumerate() {
+        let Some(prior) = prev.channels.get(ch) else {
+            continue;
+        };
+        if !params.param1e && params.amp.is_empty() && prior.amp.len() == necplbnd {
+            params.amp = prior.amp.clone();
+        }
+        if !params.param2e && params.angle.is_empty() && prior.angle.len() == necplbnd {
+            params.angle = prior.angle.clone();
+            params.chaos = prior.chaos.clone();
+        }
+    }
+}
+
 // ===========================================================================
 // §E.3.5.5.2 / §E.3.5.5.3 — enhanced-coupling parameter processing
 // ===========================================================================
@@ -1697,6 +1724,77 @@ mod tests {
         assert!(c.channels[2].param2e);
         // 1 + 5 + (5 + 6 + 3 + 1) = 21 bits.
         assert_eq!(br.bit_position(), 21);
+    }
+
+    #[test]
+    fn merge_reused_params_threads_prior_block_values() {
+        // Prior block: full coordinate sets for a 2-band geometry.
+        let prev = EcplCoords {
+            angleintrp: false,
+            channels: vec![
+                EcplChannelParams {
+                    param1e: true,
+                    param2e: false,
+                    amp: vec![3, 4],
+                    angle: vec![],
+                    chaos: vec![],
+                    trans: false,
+                },
+                EcplChannelParams {
+                    param1e: true,
+                    param2e: true,
+                    amp: vec![5, 6],
+                    angle: vec![10, 20],
+                    chaos: vec![1, 2],
+                    trans: false,
+                },
+            ],
+        };
+        // Current block: ch0 reuses amps; ch1 reuses angle/chaos but
+        // retransmits amps.
+        let mut curr = EcplCoords {
+            angleintrp: false,
+            channels: vec![
+                EcplChannelParams::default(),
+                EcplChannelParams {
+                    param1e: true,
+                    param2e: false,
+                    amp: vec![7, 8],
+                    angle: vec![],
+                    chaos: vec![],
+                    trans: true,
+                },
+            ],
+        };
+        merge_reused_params(&mut curr, &prev, 2);
+        assert_eq!(curr.channels[0].amp, vec![3, 4]); // §2.3.3.21 reuse
+        assert_eq!(curr.channels[1].amp, vec![7, 8]); // fresh, kept
+        assert_eq!(curr.channels[1].angle, vec![10, 20]); // §2.3.3.22 reuse
+        assert_eq!(curr.channels[1].chaos, vec![1, 2]);
+        assert!(curr.channels[1].trans); // trans is per-block, kept
+    }
+
+    #[test]
+    fn merge_reused_params_ignores_stale_band_count() {
+        // Prior coords sized for 3 bands; the active strategy has 2 —
+        // stale values must NOT be carried.
+        let prev = EcplCoords {
+            angleintrp: false,
+            channels: vec![EcplChannelParams {
+                param1e: true,
+                param2e: false,
+                amp: vec![3, 4, 5],
+                angle: vec![],
+                chaos: vec![],
+                trans: false,
+            }],
+        };
+        let mut curr = EcplCoords {
+            angleintrp: false,
+            channels: vec![EcplChannelParams::default()],
+        };
+        merge_reused_params(&mut curr, &prev, 2);
+        assert!(curr.channels[0].amp.is_empty());
     }
 
     // ---- §E.3.5.5.2 / §E.3.5.5.3 parameter processing ----

@@ -653,6 +653,25 @@ pub fn decode_indep_audblks(
             if cplinu {
                 // §E.1.3.3.6 ecplinu — enhanced coupling flag.
                 let ecplinu = br.read_u32(1)? != 0;
+                // §E.1.3.3.7 chincpl[ch] — per the Annex E audblk syntax
+                // the per-channel in-coupling flags follow `ecplinu`
+                // immediately, BEFORE the standard/enhanced arm split:
+                // implicit 1 for both channels in 2/0, explicit 1-bit
+                // field per fbw channel otherwise. (An earlier revision
+                // read them after the enhanced-coupling begin/end/banding
+                // fields, which desynced the cursor on any multichannel
+                // — acmod > 2 — enhanced-coupling frame; harmless in 2/0
+                // where no bits are transmitted. Pinned by the 5.1
+                // enhanced-coupling encoder round-trip.)
+                if bsi.acmod == 0x2 {
+                    state.channels[0].in_coupling = true;
+                    state.channels[1].in_coupling = true;
+                } else {
+                    for ch in 0..nfchans {
+                        let v = br.read_u32(1)? != 0;
+                        state.channels[ch].in_coupling = v;
+                    }
+                }
                 if ecplinu {
                     // §E.2.3.3.16-19 enhanced-coupling strategy. The
                     // §E.3.5.5 carrier synthesis runs on the deferred path
@@ -684,33 +703,11 @@ pub fn decode_indep_audblks(
                     ecpl_in_use = true;
                     state.cpl_begf_mant = strat.begin_bin();
                     state.cpl_endf_mant = strat.end_bin();
-                    // §E.1.3.3.7 chincpl[ch] — implicit 1 for both channels
-                    // in 2/0; explicit per-fbw-channel bit otherwise.
-                    if bsi.acmod == 0x2 {
-                        state.channels[0].in_coupling = true;
-                        state.channels[1].in_coupling = true;
-                    } else {
-                        for ch in 0..nfchans {
-                            let v = br.read_u32(1)? != 0;
-                            state.channels[ch].in_coupling = v;
-                        }
-                    }
                     state.cpl_in_use = true;
                     state.cpl_nsubbnd = strat.end_subbnd - strat.begin_subbnd;
                     state.cpl_nbnd = strat.necplbnd;
                     ecpl_strategy = Some(strat);
                 } else {
-                    // §E.1.3.3.7 chincpl[ch] — implicit 1 for both channels
-                    // in 2/0; explicit per-fbw-channel bit otherwise.
-                    if bsi.acmod == 0x2 {
-                        state.channels[0].in_coupling = true;
-                        state.channels[1].in_coupling = true;
-                    } else {
-                        for ch in 0..nfchans {
-                            let v = br.read_u32(1)? != 0;
-                            state.channels[ch].in_coupling = v;
-                        }
-                    }
                     // §E.1.3.3.8 phsflginu — only in 2/0.
                     state.phsflginu = if bsi.acmod == 0x2 {
                         br.read_u32(1)? != 0
@@ -840,13 +837,22 @@ pub fn decode_indep_audblks(
             let chincpl: Vec<bool> = (0..nfchans)
                 .map(|ch| state.channels[ch].in_coupling)
                 .collect();
-            let coords = super::ecpl::parse_coords(
+            let mut coords = super::ecpl::parse_coords(
                 br,
                 nfchans,
                 &chincpl,
                 &mut firstcplcos[..nfchans],
                 state.cpl_nbnd,
             )?;
+            // §2.3.3.21-22: `ecplparam1e[ch] == 0` / `ecplparam2e[ch] == 0`
+            // mean "the previously transmitted amplitudes / angle+chaos for
+            // this channel shall be reused" — thread the prior block's
+            // values into the fresh coordinate set (an earlier revision
+            // replaced the whole set each block, silencing every band of a
+            // reusing channel).
+            if let Some(prev) = &ecpl_coords {
+                super::ecpl::merge_reused_params(&mut coords, prev, state.cpl_nbnd);
+            }
             ecpl_coords = Some(coords);
         } else if cplinu {
             // ecplinu == 0 path (standard coupling coordinates).
