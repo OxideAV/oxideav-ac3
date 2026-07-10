@@ -1924,7 +1924,12 @@ pub(crate) fn preprocess_d15(exp: &mut [u8]) {
 ///    / 2` so the first delta lies inside ±2.
 /// 2. **Groups span `[cpl_strtmant, cpl_endmant)`.** With D15 grpsize=1
 ///    that's `ncplgrps = (cpl_endmant - cpl_strtmant) / 3` 7-bit words.
-fn write_exponents_cpl(bw: &mut BitWriter, exp: &[u8; N_COEFFS], start: usize, end: usize) {
+pub(crate) fn write_exponents_cpl(
+    bw: &mut BitWriter,
+    exp: &[u8; N_COEFFS],
+    start: usize,
+    end: usize,
+) {
     if end <= start {
         return;
     }
@@ -2503,7 +2508,7 @@ pub(crate) fn compute_bap_table(
 /// `ba.fsnroffst` and `ba.fgaincod` should be the cpl-specific
 /// values (cplfsnroffst, cplfgaincod) — the caller is responsible for
 /// substituting them into the BitAllocParams before calling.
-fn compute_bap_cpl(
+pub(crate) fn compute_bap_cpl(
     exp: &[u8; N_COEFFS],
     start: usize,
     end: usize,
@@ -3965,6 +3970,33 @@ pub(crate) fn quantise_mantissa(coeff: f32, exp: i32, bap: u8) -> u32 {
     }
 }
 
+/// The decoder-side reconstruction of one mantissa after [`quantise_mantissa`]:
+/// the de-normalised coefficient value (`level * 2^-exp`) the decoder's
+/// §7.3.3 dequantisation produces for the code the encoder would emit.
+/// Used by the E-AC-3 enhanced-coupling encoder to measure coordinates
+/// against the carrier the decoder will actually reconstruct (bap = 0
+/// bins are true zeros — the coupling channel is never dithered).
+pub(crate) fn quantise_reconstruct(coeff: f32, exp: i32, bap: u8) -> f32 {
+    let m = (coeff * 2f32.powi(exp)).clamp(-1.0, 1.0);
+    let level = match bap {
+        0 => 0.0,
+        1 => MANT_LEVEL_3[nearest_symmetric(m, &MANT_LEVEL_3)],
+        2 => MANT_LEVEL_5[nearest_symmetric(m, &MANT_LEVEL_5)],
+        3 => MANT_LEVEL_7[nearest_symmetric(m, &MANT_LEVEL_7)],
+        4 => MANT_LEVEL_11[nearest_symmetric(m, &MANT_LEVEL_11)],
+        5 => MANT_LEVEL_15[nearest_symmetric(m, &MANT_LEVEL_15)],
+        b => {
+            let nbits = QUANTIZATION_BITS[b as usize] as u32;
+            let shift = nbits - 1;
+            let v = (m * (1u32 << shift) as f32).round() as i32;
+            let max = (1i32 << shift) - 1;
+            let min = -(1i32 << shift);
+            v.clamp(min, max) as f32 / (1u32 << shift) as f32
+        }
+    };
+    level * 2f32.powi(-exp)
+}
+
 fn nearest_symmetric(m: f32, table: &[f32]) -> usize {
     let mut best_i = 0usize;
     let mut best_d = f32::INFINITY;
@@ -4245,6 +4277,40 @@ impl Default for CouplingPlan {
 }
 
 impl CouplingPlan {
+    /// Build a coupling plan describing the **enhanced-coupling**
+    /// carrier region for the shared tuner / bit-accounting machinery
+    /// (`tune_snroffst_with_plan_ends`, `mantissa_bits_total_ends`,
+    /// `compute_bap_cpl`). Enhanced coupling with `ecpl_begin_subbnd >=
+    /// 4` lives on the same 12-bin grid as standard coupling
+    /// (`ecplsubbndtab[s] = 37 + 12*(s - 4)` for `s >= 4`), so the
+    /// standard-coupling mantissa-domain mapping applies with
+    /// `begf = begin_subbnd - 4` / `endf = end_subbnd - 7`. Only the
+    /// region bounds, the channel membership and the band count are
+    /// meaningful to those helpers; the coordinate-plan fields stay at
+    /// their defaults (enhanced-coupling coordinates are planned and
+    /// emitted by `eac3::encoder` itself).
+    pub(crate) fn for_ecpl(
+        begin_subbnd: usize,
+        end_subbnd: usize,
+        nfchans: usize,
+        necplbnd: usize,
+    ) -> Self {
+        debug_assert!(begin_subbnd >= 4 && end_subbnd > begin_subbnd && end_subbnd <= 22);
+        let mut chincpl = [false; MAX_FBW];
+        for slot in chincpl.iter_mut().take(nfchans.min(MAX_FBW)) {
+            *slot = true;
+        }
+        Self {
+            in_use: true,
+            begf: (begin_subbnd - 4) as u8,
+            endf: (end_subbnd - 7) as u8,
+            chincpl,
+            nsubbnd: end_subbnd - begin_subbnd,
+            nbnd: necplbnd,
+            ..Self::default()
+        }
+    }
+
     /// Mantissa-domain inclusive lower bound of coupling region.
     fn begf_mant(&self) -> usize {
         37 + 12 * self.begf as usize

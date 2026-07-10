@@ -46,17 +46,23 @@ use oxideav_core::{
 use crate::audblk::{remat_band_count_spx, BLOCKS_PER_FRAME, N_COEFFS, SAMPLES_PER_BLOCK};
 use crate::decoder::SAMPLES_PER_FRAME;
 use crate::encoder::{
-    ac3_crc_update, build_dba_plan, compute_bap, decode_input_samples, extract_exponent,
-    mantissa_bits_total, overhead_bits_for, pick_strategy_for_block, preprocess_d15,
-    quantise_exponents_to_grpsize, quantise_mantissa, select_exp_strategies_per_end,
-    tune_snroffst_with_plan_ends, write_exponents_grouped, write_mantissa_stream, BitAllocParams,
-    CouplingPlan, DbaPlan, TransientDetector, LFE_END_MANT,
+    ac3_crc_update, build_dba_plan, compute_bap, compute_bap_cpl, decode_input_samples,
+    extract_exponent, mantissa_bits_total, overhead_bits_for, pick_strategy_for_block,
+    preprocess_d15, quantise_exponents_to_grpsize, quantise_mantissa,
+    select_exp_strategies_per_end, tune_snroffst_with_plan_ends, write_exponents_cpl,
+    write_exponents_grouped, write_mantissa_stream, BitAllocParams, CouplingPlan, DbaPlan,
+    TransientDetector, LFE_END_MANT,
 };
 use crate::mdct::{mdct_256_pair, mdct_512};
 use crate::tables::WINDOW;
 
 use super::ahtenc::{compute_hebap, dct_ii_6, plan_aht_channel, write_aht_channel};
 use super::dsp::DEFAULT_SPX_BNDSTRC;
+use super::ecpl::{reconstruct_carrier, DEFAULT_ECPL_BNDSTRC};
+use super::ecplenc::{
+    band_cross_stats, band_mdct_energies, build_carrier_block, carrier_band_gains, quantise_amp,
+    quantise_angle, region_restrict, BandStats, EcplGeometry, EcplParams,
+};
 use super::spxenc::{
     band_coord_targets_span_atten, choose_mstrspxco, quantise_coord, SpxGeometry, SpxParams,
 };
@@ -120,12 +126,109 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             )))
         }
     }
+    if let Some(ecpl) = ecpl_params_from_options(params)? {
+        validate_ecpl(&ecpl, params.channels.unwrap_or(0))?;
+        concrete.ecpl = Some(ecpl);
+    }
     if concrete.aht && concrete.spx.is_some() {
         return Err(Error::Unsupported(
             "eac3 encoder: aht and spx cannot be combined (single-subsystem scope)".into(),
         ));
     }
+    if concrete.ecpl.is_some() && (concrete.aht || concrete.spx.is_some()) {
+        return Err(Error::Unsupported(
+            "eac3 encoder: ecpl cannot be combined with aht or spx (single-subsystem scope)".into(),
+        ));
+    }
     Ok(Box::new(concrete))
+}
+
+/// Build an E-AC-3 encoder with **enhanced coupling** enabled
+/// (§E.2.3.3.16-26 syntax / §E.3.5.5 decode model). Every fbw channel
+/// of the independent substream is coupled: below the enhanced-coupling
+/// begin frequency each channel is waveform-coded as usual; above it a
+/// single shared **carrier** channel is coded through the standard
+/// exponent / bit-allocation / mantissa path and each coupled channel
+/// is reconstructed from it via per-band amplitude + angle coordinates
+/// (chaos = 0, no random de-correlation — deterministic decode). The
+/// carrier is phase-locked to the first coupled channel (whose angle is
+/// spec-fixed to 0) and scaled per band so the loudest channel maps to
+/// the Table E3.10 amplitude ceiling. Coordinates refresh on the
+/// exponent anchor blocks (0 and 3) and are thrifted (`ecplparam1e = 0`)
+/// when the block-3 refresh quantises identically. Long transforms are
+/// forced while enhanced coupling is on.
+///
+/// Requires at least 2 fbw channels (stereo / 5.1 / 7.1; the 7.1 pair's
+/// dependent substream stays plain). Also reachable through the
+/// registry path via `CodecParameters::options` keys `ecpl` =
+/// `1`/`true`, `ecpl_begf` (2..=13) and `ecpl_endf` (0..=15).
+pub fn make_encoder_with_ecpl(
+    params: &CodecParameters,
+    ecpl: EcplParams,
+) -> Result<Box<dyn Encoder>> {
+    // Same construction-time validation as the options path.
+    EcplGeometry::derive(&ecpl, &DEFAULT_ECPL_BNDSTRC)?;
+    validate_ecpl(&ecpl, params.channels.unwrap_or(0))?;
+    let mut concrete = build_concrete_encoder(params)?;
+    concrete.ecpl = Some(ecpl);
+    Ok(Box::new(concrete))
+}
+
+/// Parse the `ecpl*` codec options (see [`make_encoder`]) into an
+/// [`EcplParams`], or `None` when enhanced coupling is not requested.
+/// Sub-keys imply `ecpl` unless it is explicitly `0`/`false`; the
+/// resulting geometry is validated via [`EcplGeometry::derive`].
+fn ecpl_params_from_options(params: &CodecParameters) -> Result<Option<EcplParams>> {
+    let opts = &params.options;
+    let enabled = match opts.get("ecpl") {
+        None => None,
+        Some("1") | Some("true") => Some(true),
+        Some("0") | Some("false") => Some(false),
+        Some(v) => {
+            return Err(Error::invalid(format!(
+                "eac3 encoder: option ecpl={v} (expected 1/true/0/false)"
+            )))
+        }
+    };
+    let parse_u8 = |key: &str| -> Result<Option<u8>> {
+        match opts.get(key) {
+            None => Ok(None),
+            Some(v) => match v.parse::<u8>() {
+                Ok(n) if n <= 15 => Ok(Some(n)),
+                _ => Err(Error::invalid(format!(
+                    "eac3 encoder: option {key}={v} (expected 0..=15)"
+                ))),
+            },
+        }
+    };
+    let begf = parse_u8("ecpl_begf")?;
+    let endf = parse_u8("ecpl_endf")?;
+    let on = match enabled {
+        Some(v) => v,
+        None => begf.is_some() || endf.is_some(),
+    };
+    if !on {
+        return Ok(None);
+    }
+    let d = EcplParams::default();
+    let p = EcplParams {
+        ecplbegf: begf.unwrap_or(d.ecplbegf),
+        ecplendf: endf.unwrap_or(d.ecplendf),
+    };
+    EcplGeometry::derive(&p, &DEFAULT_ECPL_BNDSTRC)?;
+    Ok(Some(p))
+}
+
+/// Enhanced coupling needs at least two coupled fbw channels in the
+/// independent substream — mono has nothing to couple.
+fn validate_ecpl(_ecpl: &EcplParams, channels: u16) -> Result<()> {
+    match channels {
+        2 | 6 | 8 => Ok(()),
+        n => Err(Error::Unsupported(format!(
+            "eac3 encoder: ecpl requires 2, 6, or 8 input channels (got {n}) — \
+             the independent substream must carry at least two fbw channels"
+        ))),
+    }
 }
 
 /// Build an E-AC-3 encoder with the Adaptive Hybrid Transform enabled
@@ -398,6 +501,8 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
         snroffststr: 0,
         spx: None,
         aht: false,
+        ecpl: None,
+        ecpl_carry: vec![None, None],
     })
 }
 
@@ -568,6 +673,32 @@ struct Eac3Encoder {
     /// exponent anchor, hebap-driven VQ/GAQ mantissas front-loaded in
     /// block 0, long transforms only. Mutually exclusive with `spx`.
     aht: bool,
+    /// Enhanced coupling (§E.2.3.3.16-26 / §E.3.5.5). When `Some` (via
+    /// [`make_encoder_with_ecpl`] or the `ecpl*` options) every fbw
+    /// channel of the independent substream is coupled: the region
+    /// above the enhanced-coupling begin frequency is carried by one
+    /// shared carrier channel plus per-band amplitude/angle
+    /// coordinates. Long transforms are forced while enhanced coupling
+    /// is on. Mutually exclusive with `spx` and `aht`
+    /// (single-subsystem scope).
+    ecpl: Option<EcplParams>,
+    /// Per-substream cross-frame enhanced-coupling analysis carry: the
+    /// previous frame's last-block carrier + per-channel
+    /// region-restricted MDCT buffers, mirroring the decoder's
+    /// `EcplState::prev_frame_last_mant` threading (§E.3.5.5.1 "previous
+    /// block" of frame block 0). Index = substream position in the
+    /// layout (0 = indep, 1 = dep).
+    ecpl_carry: Vec<Option<EcplCarry>>,
+}
+
+/// Cross-frame enhanced-coupling carry (see [`Eac3Encoder::ecpl_carry`]).
+#[derive(Clone)]
+struct EcplCarry {
+    /// Previous frame's last-block carrier MDCT (region-restricted).
+    carrier: [f32; 256],
+    /// Previous frame's last-block per-fbw-channel region-restricted
+    /// MDCT buffers (the per-channel §E.3.5.5.1 analysis neighbours).
+    channels: Vec<[f32; 256]>,
 }
 
 impl Encoder for Eac3Encoder {
@@ -643,8 +774,8 @@ impl Eac3Encoder {
             Layout::Indep(s) => vec![s.clone()],
             Layout::Pair { indep, dep } => vec![indep.clone(), dep.clone()],
         };
-        for sub in &substreams {
-            let bytes = self.emit_substream(sub, &frame_pcm)?;
+        for (sub_idx, sub) in substreams.iter().enumerate() {
+            let bytes = self.emit_substream(sub_idx, sub, &frame_pcm)?;
             payload.extend_from_slice(&bytes);
         }
 
@@ -665,9 +796,22 @@ impl Eac3Encoder {
 
     /// Emit one E-AC-3 syncframe (indep or dep substream) of size
     /// `sub.frame_bytes` bytes for the channels named by `sub.src_indices`.
-    fn emit_substream(&mut self, sub: &SubstreamLayout, frame_pcm: &[Vec<f32>]) -> Result<Vec<u8>> {
+    fn emit_substream(
+        &mut self,
+        sub_idx: usize,
+        sub: &SubstreamLayout,
+        frame_pcm: &[Vec<f32>],
+    ) -> Result<Vec<u8>> {
         let nfchans = sub.nfchans;
         let total_chans = nfchans + usize::from(sub.lfeon);
+        // Enhanced coupling applies to the independent substream only
+        // (the 7.1 pair's dependent Lb/Rb stream stays plain) and needs
+        // at least two fbw channels to couple.
+        let ecpl_on = self.ecpl.is_some() && sub.strmtyp == 0 && nfchans >= 2;
+        let ecpl_geom: Option<EcplGeometry> = match (&self.ecpl, ecpl_on) {
+            (Some(p), true) => Some(EcplGeometry::derive(p, &DEFAULT_ECPL_BNDSTRC)?),
+            _ => None,
+        };
 
         // -------- DSP: window + MDCT per substream channel per block --------
         let mut coeffs: Vec<Vec<[f32; N_COEFFS]>> =
@@ -687,12 +831,15 @@ impl Eac3Encoder {
                 // AHT frames force long transforms: the 6-block DCT-II
                 // (§3.4.1) targets stationary content and a short block
                 // would break the cross-block bin alignment.
-                let is_short =
-                    if is_lfe_chan || self.aht || std::env::var("EAC3_DISABLE_BLKSW").is_ok() {
-                        false
-                    } else {
-                        self.transient_state[src_idx].process(&in_buf[256..])
-                    };
+                let is_short = if is_lfe_chan
+                    || self.aht
+                    || ecpl_on
+                    || std::env::var("EAC3_DISABLE_BLKSW").is_ok()
+                {
+                    false
+                } else {
+                    self.transient_state[src_idx].process(&in_buf[256..])
+                };
                 if !is_lfe_chan {
                     blksw[ch][blk] = is_short;
                 }
@@ -787,16 +934,21 @@ impl Eac3Encoder {
                     )
             })
             .collect();
-        let end_mant: usize = match &spx_geom {
-            Some(g) => g.begin_tc,
-            None => end_full,
+        let end_mant: usize = match (&spx_geom, &ecpl_geom) {
+            (Some(g), _) => g.begin_tc,
+            (None, Some(g)) => g.start_bin,
+            (None, None) => end_full,
         };
         // Per-channel coded bandwidth: SPX channels stop at the SPX
-        // begin frequency (§E.3.3.3), the rest run to the
+        // begin frequency (§E.3.3.3), enhanced-coupling channels stop
+        // at the region start (§E.3.3.3: endmant[ch] =
+        // ecplsubbndtab[ecpl_begin_subbnd]), the rest run to the
         // chbwcod-derived end.
         let end_mant_ch: Vec<usize> = (0..nfchans)
             .map(|ch| {
-                if in_spx[ch] {
+                if let Some(g) = &ecpl_geom {
+                    g.start_bin
+                } else if in_spx[ch] {
                     spx_geom.as_ref().map_or(end_full, |g| g.begin_tc)
                 } else {
                     end_full
@@ -963,6 +1115,44 @@ impl Eac3Encoder {
             }
         }
 
+        // -------- Enhanced coupling: carrier + coordinates (§E.3.5.5) ------
+        //
+        // Built before the SNR tuner so the carrier's exponents ride the
+        // shared coupling-channel accounting. The coordinate measurement
+        // (pass 2) analyses the decoder-faithful carrier — including the
+        // zero next-block spectrum at the frame edge and the previous
+        // frame's carried last block — so every analysis imperfection
+        // folds into the transmitted amplitudes/angles.
+        let ecpl_carrier_plan: Option<EcplCarrierPlan> = ecpl_geom
+            .as_ref()
+            .map(|g| build_ecpl_carrier(g, &coeffs, nfchans));
+        if let (Some(g), Some(plan)) = (&ecpl_geom, &ecpl_carrier_plan) {
+            // Carrier exponents into the cpl pseudo-channel slot: D15 on
+            // the anchor blocks (0 and 3, matching `exp_strategies` and
+            // the audfrm `cplexpstr[blk]` codes), REUSE elsewhere —
+            // mirroring the fbw handling so the decoder's exponent state
+            // matches the encoder's `exps[]` bin-for-bin.
+            let cpl_idx = nfchans;
+            for blk in 0..BLOCKS_PER_FRAME {
+                for k in g.start_bin..g.end_bin {
+                    exps[cpl_idx][blk][k] = extract_exponent(plan.carrier[blk][k]);
+                }
+                if exp_strategies[blk] == 1 {
+                    preprocess_d15(&mut exps[cpl_idx][blk][g.start_bin..g.end_bin]);
+                }
+            }
+            let mut last = 0usize;
+            for blk in 0..BLOCKS_PER_FRAME {
+                if exp_strategies[blk] == 1 {
+                    last = blk;
+                } else {
+                    let src: [u8; N_COEFFS] = exps[cpl_idx][last];
+                    exps[cpl_idx][blk][g.start_bin..g.end_bin]
+                        .copy_from_slice(&src[g.start_bin..g.end_bin]);
+                }
+            }
+        }
+
         // -------- SPX coordinate planning (§E.2.3.3.9-13 / §E.3.6.3) --------
         //
         // Coordinates are refreshed twice per frame — block 0 (where
@@ -1059,8 +1249,12 @@ impl Eac3Encoder {
             cplfgaincod: 4,
             lfefgaincod: 4,
         };
-        // No coupling.
-        let cpl = CouplingPlan::default();
+        // Coupling plan: the enhanced-coupling carrier region for the
+        // shared tuner / bap machinery, or the no-coupling default.
+        let cpl = match &ecpl_geom {
+            Some(g) => CouplingPlan::for_ecpl(g.begin_subbnd, g.end_subbnd, nfchans, g.necplbnd),
+            None => CouplingPlan::default(),
+        };
         let dba_plan = if std::env::var("EAC3_DISABLE_DBA").is_ok() {
             crate::encoder::DbaPlan::default()
         } else {
@@ -1150,8 +1344,46 @@ impl Eac3Encoder {
         } else {
             0
         };
+        // Enhanced-coupling header bits over what the shared (base-AC-3
+        // shaped) overhead model already counts once `cpl.in_use` is set.
+        // The model prices AC-3 standard-coupling syntax: strategy fields
+        // on BOTH anchor blocks, per-block `cplcoe` bits and one
+        // block-0 `mstrcplco + 8·nbnd` coordinate payload per coupled
+        // channel. True Annex E enhanced coupling emits its strategy on
+        // block 0 only but carries a much larger coordinate block —
+        // `ecplangleintrp` every block plus per-channel exist bits,
+        // 5-bit amplitudes, 6+3-bit angle/chaos pairs and a transient
+        // flag. Reserve the (worst-case: block-3 full refresh) true cost
+        // minus the modelled cost, with a small slop; over-reservation
+        // only pads the frame, under-reservation would overflow the
+        // hard bit-budget check below.
+        let ecpl_reserve_bits: u32 = match &ecpl_geom {
+            None => 0,
+            Some(g) => {
+                let nb = g.necplbnd as u32;
+                let nch = nfchans as u32;
+                let chincpl_bits = if sub.acmod == 0x2 { 0 } else { nch };
+                let strategy = 1 + chincpl_bits + 4 + 4 + 1;
+                // Coordinates: block 0 (implicit exist bits) + block 3
+                // (explicit, worst-case refresh) + 4 reuse blocks, plus
+                // one ecplangleintrp bit per block.
+                let blk0 = 5 * nb + (nch - 1) * (5 * nb + 9 * nb + 1);
+                let blk3 = (1 + 5 * nb) + (nch - 1) * (2 + 5 * nb + 9 * nb + 1);
+                let reuse = 4 * (1 + 3 * (nch - 1));
+                let true_coords = 6 + blk0 + blk3 + reuse;
+                // Modelled by `overhead_bits_for_ends` with cpl.in_use:
+                let modelled_strategy = 2
+                    * (nch
+                        + 8
+                        + u32::from(sub.acmod == 0x2)
+                        + (g.end_subbnd - g.begin_subbnd - 1) as u32);
+                let modelled_coords = 6 * nch + nch * (2 + 8 * nb);
+                (strategy + true_coords + 16).saturating_sub(modelled_strategy + modelled_coords)
+            }
+        };
         let tuner_frame_bytes = sub.frame_bytes.saturating_sub(
-            (snr_reserve_bits + spx_reserve_bits + aht_reserve_bits).div_ceil(8) as usize,
+            (snr_reserve_bits + spx_reserve_bits + aht_reserve_bits + ecpl_reserve_bits).div_ceil(8)
+                as usize,
         );
         // Pass chexpstr_plan so the overhead calculator accounts for
         // D25/D45 exponent savings when sizing the mantissa budget.
@@ -1229,6 +1461,48 @@ impl Eac3Encoder {
                 );
             }
         }
+        if let Some(g) = &ecpl_geom {
+            // Enhanced-coupling carrier bap — the §7.2.2.4 coupling
+            // excitation path with the tuner's coupling fine offset
+            // (tied to the fbw fine offset) and the default fast gain,
+            // exactly what the decoder derives from `frmfsnroffst` +
+            // `fgaincode == 0` + `cplfleak = cplsleak = 0`.
+            let cpl_ba = BitAllocParams {
+                fsnroffst: frame_ba.cplfsnroffst,
+                fgaincod: frame_ba.cplfgaincod,
+                ..frame_ba
+            };
+            let cpl_idx = nfchans;
+            for blk in 0..BLOCKS_PER_FRAME {
+                compute_bap_cpl(
+                    &exps[cpl_idx][blk],
+                    g.start_bin,
+                    g.end_bin,
+                    self.fscod,
+                    &cpl_ba,
+                    &mut baps[cpl_idx][blk],
+                    Some((&dba_plan, crate::audblk::MAX_FBW)),
+                );
+            }
+        }
+        // Enhanced-coupling coordinates (pass 2) — measured against the
+        // carrier the decoder will actually reconstruct: this frame's
+        // carrier run through the exponent + bap + mantissa quantiser
+        // (bap = 0 bins are true zeros — the coupling channel is never
+        // dithered), with the previous frame's carried QUANTISED last
+        // block at the frame head. Band-level carrier coding loss then
+        // folds into the transmitted amplitudes.
+        let ecpl_plan: Option<EcplCoordPlan> = match (&ecpl_geom, &ecpl_carrier_plan) {
+            (Some(g), Some(cp)) => Some(plan_ecpl_coords(
+                g,
+                cp,
+                &exps[nfchans],
+                &baps[nfchans],
+                nfchans,
+                self.ecpl_carry.get(sub_idx).and_then(|c| c.as_ref()),
+            )),
+            _ => None,
+        };
 
         // -------- Pack syncframe --------
         let mut bw = BitWriter::with_capacity(sub.frame_bytes);
@@ -1279,9 +1553,12 @@ impl Eac3Encoder {
         let spx_atten: Option<u8> = self.spx.as_ref().and_then(|p| p.atten_code);
         bw.write_u32(u32::from(spx_atten.is_some()), 1); // spxattene (§2.3.2.23)
         if sub.acmod > 1 {
-            bw.write_u32(0, 1); // cplinu[0] = 0
+            // cplinu[0] — 1 when enhanced coupling is on (the coupling
+            // strategy then rides block 0's implicit cplstre = 1 and is
+            // reused by every later block via cplstre[blk] = 0).
+            bw.write_u32(u32::from(ecpl_on), 1);
             for _blk in 1..BLOCKS_PER_FRAME {
-                bw.write_u32(0, 1); // cplstre[blk] = 0
+                bw.write_u32(0, 1); // cplstre[blk] = 0 (strategy reuse)
             }
         }
         // §E.1.2.3 / Table E1.3 — exponent strategy data.
@@ -1305,6 +1582,13 @@ impl Eac3Encoder {
         // never fires. We emit per-channel chexpstr from the adaptive
         // D15/D25/D45 plan selected above (chexpstr_plan[ch][blk]).
         for blk in 0..BLOCKS_PER_FRAME {
+            // §E.1.2.3: `cplexpstr[blk]` (2 bits) precedes the
+            // per-channel codes on every block where cplinu[blk] == 1.
+            // The carrier follows the frame-wide anchor cadence
+            // (D15 on blocks 0/3, REUSE elsewhere).
+            if ecpl_on {
+                bw.write_u32(exp_strategies[blk] as u32, 2);
+            }
             for ch in 0..nfchans {
                 bw.write_u32(chexpstr_plan[ch][blk] as u32, 2);
             }
@@ -1445,9 +1729,67 @@ impl Eac3Encoder {
                 }
             }
 
-            // Coupling: cplinu always 0 — block 0 hits the "else"
-            // branch with no body; later blocks have cplstre=0 so
-            // skip entirely.
+            // Coupling strategy (§E.2.3.3.14-19). Only with enhanced
+            // coupling: block 0 (implicit cplstre = 1, cplinu = 1 from
+            // audfrm) carries `ecplinu` + `chincpl[ch]` (implicit for
+            // 2/0) + the begin/end frequency codes + `ecplbndstrce = 0`
+            // (Table E2.14 default banding). Later blocks have
+            // cplstre = 0 in audfrm, so no strategy bits at all.
+            // Without coupling: cplinu[0] = 0 in audfrm — no audblk
+            // bits either way.
+            if let (Some(g), 0) = (&ecpl_geom, blk) {
+                bw.write_u32(1, 1); // ecplinu = 1
+                if sub.acmod != 0x2 {
+                    for _ch in 0..nfchans {
+                        bw.write_u32(1, 1); // chincpl[ch] = 1
+                    }
+                }
+                bw.write_u32(g.ecplbegf as u32, 4); // §E.2.3.3.16
+                bw.write_u32(g.ecplendf as u32, 4); // §E.2.3.3.17 (SPX off)
+                bw.write_u32(0, 1); // ecplbndstrce = 0 → default banding
+            }
+
+            // Enhanced-coupling coordinates (§E.2.3.3.20-26) — present
+            // on every block where cplinu[blk] == 1. Coordinates
+            // refresh on the exponent anchor blocks: block 0 has
+            // implicit exist bits (`firstcplcos`), block 3 re-emits
+            // them explicitly unless the span-1 codes quantised
+            // identically to span 0 (thrift: `ecplparam1e = 0` — the
+            // decoder's §2.3.3.21-22 reuse path reconstructs the same
+            // coordinates), and blocks 1/2/4/5 always reuse. Chaos is
+            // 0 (no random de-correlation) and `ecpltrans` is 0.
+            if let Some(plan) = &ecpl_plan {
+                bw.write_u32(0, 1); // ecplangleintrp = 0
+                for ch in 0..nfchans {
+                    let is_first = ch == 0;
+                    let span = usize::from(blk >= 3);
+                    let (p1, p2) = match blk {
+                        0 => (true, !is_first),
+                        3 => (!plan.reuse1_amp[ch], !is_first && !plan.reuse1_ang[ch]),
+                        _ => (false, false),
+                    };
+                    if blk != 0 {
+                        bw.write_u32(u32::from(p1), 1); // ecplparam1e[ch]
+                        if !is_first {
+                            bw.write_u32(u32::from(p2), 1); // ecplparam2e[ch]
+                        }
+                    }
+                    if p1 {
+                        for &code in &plan.amp[ch][span] {
+                            bw.write_u32(code as u32, 5); // ecplamp
+                        }
+                    }
+                    if p2 {
+                        for &code in &plan.angle[ch][span] {
+                            bw.write_u32(code as u32, 6); // ecplangle
+                            bw.write_u32(0, 3); // ecplchaos = 0
+                        }
+                    }
+                    if !is_first {
+                        bw.write_u32(0, 1); // ecpltrans[ch] = 0
+                    }
+                }
+            }
 
             // Rematrixing — only acmod==2. The flag-field size folds in
             // SPX per §E.3.3.2 (spxbegf < 2 → 3 bands, else 4; 4 when
@@ -1455,10 +1797,10 @@ impl Eac3Encoder {
             // keeps rematrixing disabled (all flags 0).
             if sub.acmod == 2 {
                 let nrematbd = remat_band_count_spx(
-                    false,
+                    ecpl_on,
                     0,
-                    false,
-                    0,
+                    ecpl_on,
+                    ecpl_geom.as_ref().map_or(0, |g| g.ecplbegf),
                     spx_geom.is_some(),
                     spx_geom.as_ref().map_or(0, |g| g.begin_subbnd),
                 );
@@ -1486,15 +1828,23 @@ impl Eac3Encoder {
             // frequency instead (§E.3.3.3); with mixed chinspx the
             // full-bandwidth channels still carry their chbwcod.
             for ch in 0..nfchans {
-                if !in_spx[ch] && chexpstr_plan[ch][blk] != 0 {
+                if !ecpl_on && !in_spx[ch] && chexpstr_plan[ch][blk] != 0 {
                     bw.write_u32(chbwcod as u32, 6);
                 }
             }
-            // §E.1.2.4 fbw exponents (cplexps section is skipped:
-            // cplinu=0). After each channel's grouped exponents, the
-            // spec emits `gainrng[ch]` (2 bits) — same as base AC-3
-            // §5.4.2.20. Emit exponents using the per-channel strategy
-            // (D15/D25/D45 from chexpstr_plan).
+            // §E.1.3.4.4 coupling-channel exponents — cplabsexp (4 bits)
+            // + D15 groups over [ecplstartmant, ecplendmant), emitted on
+            // the blocks whose audfrm `cplexpstr[blk]` is non-REUSE
+            // (anchors 0 and 3). No gainrng for the coupling channel.
+            if let Some(g) = &ecpl_geom {
+                if exp_strategies[blk] == 1 {
+                    write_exponents_cpl(&mut bw, &exps[nfchans][blk], g.start_bin, g.end_bin);
+                }
+            }
+            // §E.1.2.4 fbw exponents. After each channel's grouped
+            // exponents, the spec emits `gainrng[ch]` (2 bits) — same as
+            // base AC-3 §5.4.2.20. Emit exponents using the per-channel
+            // strategy (D15/D25/D45 from chexpstr_plan).
             for ch in 0..nfchans {
                 let strat = chexpstr_plan[ch][blk];
                 if strat != 0 {
@@ -1561,11 +1911,29 @@ impl Eac3Encoder {
             if sub.strmtyp == 0 {
                 bw.write_u32(0, 1); // convsnroffste = 0
             }
-            // cplleak block skipped: cplinu=0 for every block.
+            // §E.1.3.5.4 cplleak — only when cplinu[blk]. The first
+            // coupling block of the frame has `cplleake = 1` implicit
+            // (no gate bit): emit cplfleak = cplsleak = 0 directly,
+            // matching the 768 + 0 leak init `compute_bap_cpl` assumes.
+            // Later blocks emit an explicit `cplleake = 0` (reuse).
+            if ecpl_on {
+                if blk == 0 {
+                    bw.write_u32(0, 3); // cplfleak = 0
+                    bw.write_u32(0, 3); // cplsleak = 0
+                } else {
+                    bw.write_u32(0, 1); // cplleake = 0
+                }
+            }
 
             let any_fbw_dba = (0..nfchans).any(|c| dba_plan.nseg[c] > 0);
             if blk == 0 && any_fbw_dba {
                 bw.write_u32(1, 1); // deltbaie = 1
+                if ecpl_on {
+                    // cpldeltbae precedes the per-channel codes when
+                    // cplinu[blk] == 1; 2 = "perform no delta bit
+                    // allocation" for the coupling channel.
+                    bw.write_u32(2, 2);
+                }
                 for ch in 0..nfchans {
                     let code = if dba_plan.nseg[ch] > 0 { 1 } else { 2 };
                     bw.write_u32(code as u32, 2);
@@ -1665,6 +2033,23 @@ impl Eac3Encoder {
                         let mant = quantise_mantissa(coeffs[ch][blk][bin], e, bap);
                         codes.push((bap, mant));
                     }
+                    // §5.4.3.49 order: the coupling-channel mantissas
+                    // follow the FIRST coupled channel's own mantissas
+                    // (ch 0 — every fbw channel is coupled here), then
+                    // the remaining channels and the LFE. The grouped
+                    // bap-1/2/4 buffers are shared across the whole
+                    // walk, which the single `codes` stream preserves.
+                    if let (Some(g), Some(plan), 0) = (&ecpl_geom, &ecpl_carrier_plan, ch) {
+                        for bin in g.start_bin..g.end_bin {
+                            let bap = baps[nfchans][blk][bin];
+                            if bap == 0 {
+                                continue;
+                            }
+                            let e = exps[nfchans][blk][bin] as i32;
+                            let mant = quantise_mantissa(plan.carrier[blk][bin], e, bap);
+                            codes.push((bap, mant));
+                        }
+                    }
                 }
             }
             if sub.lfeon && !self.aht {
@@ -1679,6 +2064,23 @@ impl Eac3Encoder {
                 }
             }
             write_mantissa_stream(&mut bw, &codes);
+        }
+
+        // Thread the cross-frame enhanced-coupling analysis carry: the
+        // next frame's block-0 carrier (and per-channel analysis) uses
+        // this frame's last block as its "previous block" (§E.3.5.5.1),
+        // exactly as the decoder's `EcplState::prev_frame_last_mant`
+        // does on its side.
+        if sub_idx < self.ecpl_carry.len() {
+            self.ecpl_carry[sub_idx] = match (&ecpl_carrier_plan, &ecpl_plan) {
+                (Some(cp), Some(plan)) => Some(EcplCarry {
+                    carrier: plan.carrier_hat_last,
+                    channels: (0..nfchans)
+                        .map(|ch| cp.restricted[ch][BLOCKS_PER_FRAME - 1])
+                        .collect(),
+                }),
+                _ => None,
+            };
         }
 
         // auxdata + errorcheck.
@@ -1723,6 +2125,200 @@ impl Eac3Encoder {
             "E-AC-3 crc2 emit produced a non-zero post-syncword residue"
         );
         Ok(frame)
+    }
+}
+
+/// Phase A of the enhanced-coupling encode (§E.3.5.5, encode
+/// direction): the carrier MDCT buffers + the per-channel
+/// region-restricted analysis inputs. Built before the SNR tuner so
+/// the carrier's exponents ride the shared coupling-channel
+/// accounting; the coordinates ([`plan_ecpl_coords`]) wait until the
+/// bit allocation is final.
+struct EcplCarrierPlan {
+    /// Region-restricted carrier MDCT per block (what the coupling
+    /// pseudo-channel codes).
+    carrier: Vec<[f32; 256]>,
+    /// Region-restricted per-channel MDCT buffers
+    /// (`restricted[ch][blk]`) — the §E.3.5.5.1 analysis inputs for the
+    /// coordinate targets.
+    restricted: Vec<Vec<[f32; 256]>>,
+}
+
+/// Phase B: the quantised per-span coordinate codes.
+struct EcplCoordPlan {
+    /// Quantised Table E3.10 amplitude codes: `amp[ch][span][bnd]`
+    /// (span 0 = blocks 0..3, span 1 = blocks 3..6).
+    amp: Vec<[Vec<u8>; 2]>,
+    /// Quantised Table E3.11 angle codes: `angle[ch][span][bnd]`.
+    /// Empty for the first coupled channel (spec-fixed to 0, never
+    /// transmitted).
+    angle: Vec<[Vec<u8>; 2]>,
+    /// Per channel: span 1's amplitude codes quantised identically to
+    /// span 0's — block 3 emits `ecplparam1e = 0` (reuse thrift).
+    reuse1_amp: Vec<bool>,
+    /// Per channel: span 1's angle codes match span 0's — block 3
+    /// emits `ecplparam2e = 0`.
+    reuse1_ang: Vec<bool>,
+    /// Last block's QUANTISED carrier (the decoder-faithful buffer the
+    /// next frame's block-0 analysis uses as its "previous block").
+    carrier_hat_last: [f32; 256],
+}
+
+/// Carrier-headroom margin: the carrier is scaled ~3 dB above the
+/// loudest coupled channel per band so the Table E3.10 amplitude
+/// ceiling of 1.0 can absorb band-level carrier *coding* loss (bap = 0
+/// bins reconstruct as true zeros; the amplitude coordinate re-scales
+/// what survives back to the channel's band energy, but only downward
+/// from 1.0).
+const ECPL_CARRIER_MARGIN: f32 = std::f32::consts::SQRT_2;
+
+/// Build the enhanced-coupling carrier for one frame: the first
+/// coupled channel's MDCT restricted to the active region, scaled per
+/// band (per coordinate span) so the loudest coupled channel's
+/// amplitude coordinate lands ~3 dB under the Table E3.10 ceiling
+/// ([`carrier_band_gains`] × [`ECPL_CARRIER_MARGIN`]). Using channel
+/// 0's own coefficients keeps the carrier's phase locked to the first
+/// coupled channel, whose angle is spec-fixed to 0 and never
+/// transmitted.
+fn build_ecpl_carrier(
+    geom: &EcplGeometry,
+    coeffs: &[Vec<[f32; N_COEFFS]>],
+    nfchans: usize,
+) -> EcplCarrierPlan {
+    const SPAN: usize = 3;
+    let mut gains: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+    for (span, g) in gains.iter_mut().enumerate() {
+        let energies: Vec<Vec<f64>> = (0..nfchans)
+            .map(|ch| {
+                let blocks: Vec<&[f32; N_COEFFS]> = (span * SPAN..(span + 1) * SPAN)
+                    .map(|blk| &coeffs[ch][blk])
+                    .collect();
+                band_mdct_energies(&blocks, geom)
+            })
+            .collect();
+        *g = carrier_band_gains(&energies, geom.necplbnd);
+        for v in g.iter_mut() {
+            *v = (*v * ECPL_CARRIER_MARGIN).min(32.0);
+        }
+    }
+    let carrier: Vec<[f32; 256]> = (0..BLOCKS_PER_FRAME)
+        .map(|blk| build_carrier_block(&coeffs[0][blk], &gains[blk / SPAN], geom))
+        .collect();
+    let restricted: Vec<Vec<[f32; 256]>> = (0..nfchans)
+        .map(|ch| {
+            (0..BLOCKS_PER_FRAME)
+                .map(|blk| region_restrict(&coeffs[ch][blk], geom))
+                .collect()
+        })
+        .collect();
+    EcplCarrierPlan {
+        carrier,
+        restricted,
+    }
+}
+
+/// Measure + quantise the enhanced-coupling coordinates against the
+/// decoder-faithful carrier.
+///
+/// Per block, `Z = reconstruct_carrier(prev, curr, next)` over the
+/// QUANTISED carrier (each bin run through the final exponent + bap
+/// mantissa quantiser via `quantise_reconstruct`; bap = 0 bins are true
+/// zeros — the coupling channel is never dithered), with the previous
+/// frame's carried quantised last block at the frame head and a zero
+/// spectrum after the frame tail (the decoder's streaming edge). The
+/// same analysis applied to each coupled channel's region-restricted
+/// (unquantised — they are the *targets*) MDCT gives `X`; band
+/// statistics accumulate over each 3-block coordinate span and
+/// quantise through [`quantise_amp`] / [`quantise_angle`]. Measuring
+/// against the quantised carrier folds band-level carrier coding loss
+/// into the transmitted amplitudes.
+fn plan_ecpl_coords(
+    geom: &EcplGeometry,
+    cp: &EcplCarrierPlan,
+    cpl_exps: &[[u8; N_COEFFS]],
+    cpl_baps: &[[u8; N_COEFFS]],
+    nfchans: usize,
+    carry: Option<&EcplCarry>,
+) -> EcplCoordPlan {
+    const SPAN: usize = 3;
+    let zeros = [0.0f32; 256];
+
+    // Decoder-faithful (quantised) carrier per block.
+    let carrier_hat: Vec<[f32; 256]> = (0..BLOCKS_PER_FRAME)
+        .map(|blk| {
+            let mut out = [0.0f32; 256];
+            for bin in geom.start_bin..geom.end_bin.min(256) {
+                out[bin] = crate::encoder::quantise_reconstruct(
+                    cp.carrier[blk][bin],
+                    cpl_exps[blk][bin] as i32,
+                    cpl_baps[blk][bin],
+                );
+            }
+            out
+        })
+        .collect();
+
+    let carry_carrier = carry.map_or(&zeros, |c| &c.carrier);
+    let z: Vec<_> = (0..BLOCKS_PER_FRAME)
+        .map(|blk| {
+            let prev = if blk == 0 {
+                carry_carrier
+            } else {
+                &carrier_hat[blk - 1]
+            };
+            let next = if blk + 1 < BLOCKS_PER_FRAME {
+                &carrier_hat[blk + 1]
+            } else {
+                &zeros
+            };
+            reconstruct_carrier(prev, &carrier_hat[blk], next)
+        })
+        .collect();
+
+    let mut amp: Vec<[Vec<u8>; 2]> = Vec::with_capacity(nfchans);
+    let mut angle: Vec<[Vec<u8>; 2]> = Vec::with_capacity(nfchans);
+    let mut reuse1_amp = vec![false; nfchans];
+    let mut reuse1_ang = vec![false; nfchans];
+    for ch in 0..nfchans {
+        let carry_ch = carry.and_then(|c| c.channels.get(ch)).unwrap_or(&zeros);
+        let mut amp_spans: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+        let mut ang_spans: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+        for span in 0..2 {
+            let mut stats = vec![BandStats::default(); geom.necplbnd];
+            for blk in span * SPAN..(span + 1) * SPAN {
+                let prev = if blk == 0 {
+                    carry_ch
+                } else {
+                    &cp.restricted[ch][blk - 1]
+                };
+                let next = if blk + 1 < BLOCKS_PER_FRAME {
+                    &cp.restricted[ch][blk + 1]
+                } else {
+                    &zeros
+                };
+                let x = reconstruct_carrier(prev, &cp.restricted[ch][blk], next);
+                band_cross_stats(&x, &z[blk], geom, &mut stats);
+            }
+            amp_spans[span] = stats.iter().map(|st| quantise_amp(st.amp())).collect();
+            if ch != 0 {
+                ang_spans[span] = stats
+                    .iter()
+                    .map(|st| quantise_angle(st.angle_units()))
+                    .collect();
+            }
+        }
+        reuse1_amp[ch] = amp_spans[1] == amp_spans[0];
+        reuse1_ang[ch] = ch == 0 || ang_spans[1] == ang_spans[0];
+        amp.push(amp_spans);
+        angle.push(ang_spans);
+    }
+
+    EcplCoordPlan {
+        amp,
+        angle,
+        reuse1_amp,
+        reuse1_ang,
+        carrier_hat_last: carrier_hat[BLOCKS_PER_FRAME - 1],
     }
 }
 
@@ -2135,7 +2731,7 @@ mod tests {
     /// Mean per-bin MDCT energy of one channel of interleaved PCM,
     /// using the encoder's own window + long transform, skipping the
     /// first / last few blocks (codec priming + flush edges).
-    fn mdct_energy_profile(pcm: &[f32], channels: usize, ch: usize) -> [f64; N_COEFFS] {
+    pub(crate) fn mdct_energy_profile(pcm: &[f32], channels: usize, ch: usize) -> [f64; N_COEFFS] {
         use crate::mdct::mdct_512;
         use crate::tables::WINDOW;
         let n = pcm.len() / channels;
@@ -2180,7 +2776,7 @@ mod tests {
         out
     }
 
-    fn to_f32_interleaved(pcm: &[i16]) -> Vec<f32> {
+    pub(crate) fn to_f32_interleaved(pcm: &[i16]) -> Vec<f32> {
         pcm.iter().map(|&v| v as f32 / 32767.0).collect()
     }
 
@@ -3044,6 +3640,317 @@ mod aht_tests {
         assert!(make_encoder(&params).is_err());
         // Bad value rejected too.
         params.options = oxideav_core::CodecOptions::new().set("aht", "maybe");
+        assert!(make_encoder(&params).is_err());
+    }
+}
+
+#[cfg(test)]
+mod ecpl_tests {
+    use super::tests::{decode_all, mdct_energy_profile, to_f32_interleaved};
+    use super::*;
+
+    // ---- enhanced coupling (§E.2.3.3.16-26 / §E.3.5.5) round-trip ----
+    //
+    // Enhanced coupling is parametric above the begin frequency: the
+    // decoder rebuilds each coupled channel from one shared carrier via
+    // per-band amplitude + angle coordinates, so the quality contract
+    // is (a) per-ecpl-band decoded ENERGY within a small tolerance of
+    // the original (the §E.3.5.5.2 amplitude semantics), (b) unchanged
+    // fidelity of the independently-coded low band, and (c) waveform-
+    // level accuracy for phase-locked content (the carrier is phase-
+    // locked to the first coupled channel; other channels' phases ride
+    // the Table E3.11 angle coordinates — a broken angle path turns a
+    // quadrature-shifted tone into 100 % error energy, which the PSNR
+    // floor catches).
+
+    fn encode_ecpl(pcm: &[f32], channels: usize, bit_rate: u64, ecpl: EcplParams) -> Vec<u8> {
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(channels as u16);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(bit_rate);
+        let mut enc = make_encoder_with_ecpl(&params, ecpl).expect("eac3 make_encoder_with_ecpl");
+        let n_samp = pcm.len() / channels;
+        let mut s16 = Vec::with_capacity(pcm.len() * 2);
+        for &v in pcm {
+            let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            s16.extend_from_slice(&q.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: n_samp as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut out = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => out.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("eac3 ecpl encode error: {e:?}"),
+            }
+        }
+        out
+    }
+
+    /// Per-enhanced-coupling-band decoded-vs-original energy deltas in
+    /// dB, walking the geometry's band structure.
+    fn ecpl_band_db_deltas(
+        orig: &[f64; N_COEFFS],
+        dec: &[f64; N_COEFFS],
+        geom: &EcplGeometry,
+    ) -> Vec<f64> {
+        let mut out = Vec::new();
+        let mut lo = geom.start_bin;
+        for &nb in &geom.band_bins {
+            let hi = (lo + nb).min(N_COEFFS);
+            let eo: f64 = orig[lo..hi].iter().sum();
+            let ed: f64 = dec[lo..hi].iter().sum();
+            out.push(10.0 * (ed.max(1e-30) / eo.max(1e-30)).log10());
+            lo = hi;
+        }
+        out
+    }
+
+    /// Correlated multitone spanning the coupled region (bins 37..253 ≈
+    /// 3.5-23.7 kHz at 48 kHz) plus a shared LF tone below it. Each
+    /// channel carries the SAME tone complex, level-panned, with an
+    /// optional per-channel phase offset on the in-region tones (to
+    /// exercise the §E.2.3.3.24 angle coordinates).
+    fn build_ecpl_multitone(channels: usize, frames: usize, phase_step: f32) -> Vec<f32> {
+        let n = frames * SAMPLES_PER_FRAME as usize;
+        let mut pcm = vec![0.0f32; n * channels];
+        // In-region tones (all above tc 37 ≈ 3.5 kHz).
+        let hf_tones: [(f32, f32); 4] = [
+            (4_300.0, 0.16),
+            (6_700.0, 0.13),
+            (9_800.0, 0.10),
+            (14_500.0, 0.07),
+        ];
+        for i in 0..n {
+            let t = i as f32 / 48_000.0;
+            let lf = 0.20 * (2.0 * std::f32::consts::PI * 700.0 * t).sin();
+            for ch in 0..channels {
+                let phase = phase_step * ch as f32;
+                let mut s = lf;
+                for (f, a) in hf_tones {
+                    s += a * (2.0 * std::f32::consts::PI * f * t + phase).sin();
+                }
+                pcm[i * channels + ch] = s * (1.0 - 0.12 * ch as f32);
+            }
+        }
+        pcm
+    }
+
+    /// Interior PSNR between the original PCM and the decoded stream
+    /// for one channel, searching over the codec's fixed small latency
+    /// (the MDCT overlap delay) and skipping the priming / flush edges.
+    fn interior_psnr_ch(orig: &[f32], dec: &[i16], channels: usize, ch: usize) -> f64 {
+        let n = (orig.len() / channels).min(dec.len() / channels);
+        let skip = 4 * SAMPLES_PER_BLOCK; // priming edge
+        let tail = 2 * SAMPLES_PER_BLOCK; // flush edge
+        let mut best = f64::MIN;
+        for lag in 0..=512usize {
+            let mut se = 0.0f64;
+            let mut count = 0usize;
+            let mut i = skip;
+            while i + lag < n - tail {
+                let o = (orig[i * channels + ch] * 32767.0) as f64;
+                let d = dec[(i + lag) * channels + ch] as f64;
+                se += (o - d) * (o - d);
+                count += 1;
+                i += 1;
+            }
+            if count == 0 {
+                continue;
+            }
+            let mse = se / count as f64;
+            let psnr = 10.0 * (32768.0f64 * 32768.0 / mse.max(1e-12)).log10();
+            if psnr > best {
+                best = psnr;
+            }
+        }
+        best
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_ecpl_roundtrip(
+        channels: usize,
+        bit_rate: u64,
+        frame_bytes: usize,
+        phase_step: f32,
+        band_tol_db: f64,
+        lf_tol_db: f64,
+        psnr_floor_db: f64,
+    ) {
+        let ecpl = EcplParams::default();
+        let geom = EcplGeometry::derive(&ecpl, &DEFAULT_ECPL_BNDSTRC).unwrap();
+        let pcm = build_ecpl_multitone(channels, 8, phase_step);
+        let stream = encode_ecpl(&pcm, channels, bit_rate, ecpl);
+        assert_eq!(
+            stream.len() % frame_bytes,
+            0,
+            "stream not a whole number of {frame_bytes}-byte frames"
+        );
+        let dec = decode_all(&stream, frame_bytes);
+        assert_eq!(
+            dec.len() / channels,
+            (stream.len() / frame_bytes) * SAMPLES_PER_FRAME as usize,
+            "sample-count mismatch"
+        );
+        let dec_f = to_f32_interleaved(&dec);
+        let nfchans = if channels == 6 { 5 } else { channels };
+        for ch in 0..nfchans {
+            let orig_prof = mdct_energy_profile(&pcm, channels, ch);
+            let dec_prof = mdct_energy_profile(&dec_f, channels, ch);
+            // (a) per-band energy match across the coupled region.
+            // Bands more than 40 dB below the loudest coupled band
+            // carry no signal (fixture noise floor) — their ratio is
+            // quantiser-noise-vs-noise and meaningless, so skip them.
+            let deltas = ecpl_band_db_deltas(&orig_prof, &dec_prof, &geom);
+            let band_energies: Vec<f64> = {
+                let mut out = Vec::new();
+                let mut lo = geom.start_bin;
+                for &nb in &geom.band_bins {
+                    let hi = (lo + nb).min(N_COEFFS);
+                    out.push(orig_prof[lo..hi].iter().sum());
+                    lo = hi;
+                }
+                out
+            };
+            let peak = band_energies.iter().cloned().fold(0.0f64, f64::max);
+            for (bnd, d) in deltas.iter().enumerate() {
+                if band_energies[bnd] < peak * 1e-4 {
+                    continue; // > 40 dB below the loudest band
+                }
+                assert!(
+                    d.abs() <= band_tol_db,
+                    "ch{ch} ecpl band {bnd}: energy delta {d:+.2} dB exceeds ±{band_tol_db} dB \
+                     (all deltas: {deltas:?})"
+                );
+            }
+            // (b) coded low-band fidelity.
+            let eo: f64 = orig_prof[..geom.start_bin].iter().sum();
+            let ed: f64 = dec_prof[..geom.start_bin].iter().sum();
+            let lf_delta: f64 = 10.0 * (ed / eo).log10();
+            assert!(
+                lf_delta.abs() <= lf_tol_db,
+                "ch{ch}: coded-band energy delta {lf_delta:+.2} dB exceeds ±{lf_tol_db} dB"
+            );
+            // (c) waveform-level accuracy (amplitude AND phase).
+            let psnr = interior_psnr_ch(&pcm, &dec, channels, ch);
+            assert!(
+                psnr >= psnr_floor_db,
+                "ch{ch}: interior PSNR {psnr:.1} dB below the {psnr_floor_db} dB floor"
+            );
+        }
+    }
+
+    #[test]
+    fn ecpl_roundtrip_stereo_band_energy() {
+        // 2/0 exercises the implicit-chincpl arm. 192 kbps ⇒ 768-byte
+        // frames. In-phase panned content: the carrier is (a scaled)
+        // channel 0, so both channels reconstruct with angle ≈ 0.
+        assert_ecpl_roundtrip(2, 192_000, 768, 0.0, 3.0, 1.5, 20.0);
+    }
+
+    #[test]
+    fn ecpl_roundtrip_stereo_quadrature_angles() {
+        // Channel 1's in-region tones are 90° out of phase with the
+        // carrier source: without the §E.2.3.3.24 angle coordinates the
+        // reconstruction would be in quadrature (≈ 3 dB PSNR against
+        // the original); with them the waveform floor holds.
+        assert_ecpl_roundtrip(2, 192_000, 768, std::f32::consts::FRAC_PI_2, 3.0, 1.5, 18.0);
+    }
+
+    #[test]
+    fn ecpl_roundtrip_51_explicit_chincpl() {
+        // acmod = 7 (5 fbw channels) transmits explicit chincpl[ch]
+        // bits — this pins the §E.1.3.3.7 field ORDER (chincpl before
+        // the enhanced-coupling strategy fields; the pre-r406 decoder
+        // read them swapped, which desyncs every multichannel ecpl
+        // frame) and the LFE integrity behind the coupling fields.
+        // 384 kbps ⇒ 1536-byte frames.
+        assert_ecpl_roundtrip(6, 384_000, 1536, 0.35, 3.5, 2.0, 15.0);
+    }
+
+    #[test]
+    fn ecpl_registry_options_build_identical_encoder() {
+        let pcm = build_ecpl_multitone(2, 3, 0.0);
+        let typed = encode_ecpl(&pcm, 2, 192_000, EcplParams::default());
+
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(2);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(192_000);
+        params.options = oxideav_core::CodecOptions::new().set("ecpl", "1");
+        let mut enc = make_encoder(&params).expect("options ecpl encoder");
+        let n_samp = pcm.len() / 2;
+        let mut s16 = Vec::with_capacity(pcm.len() * 2);
+        for &v in &pcm {
+            let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            s16.extend_from_slice(&q.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: n_samp as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut from_options = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => from_options.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("options encode error: {e:?}"),
+            }
+        }
+        assert_eq!(
+            typed, from_options,
+            "options-driven and typed ecpl constructors must emit identical bytes"
+        );
+    }
+
+    #[test]
+    fn ecpl_options_validation_and_gating() {
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(2);
+        // Bad values → rejected at construction.
+        params.options = oxideav_core::CodecOptions::new().set("ecpl_begf", "16");
+        assert!(make_encoder(&params).is_err());
+        params.options = oxideav_core::CodecOptions::new().set("ecpl", "maybe");
+        assert!(make_encoder(&params).is_err());
+        // Below the supported begin grid (begf 0/1 → begin sub-band < 4).
+        params.options = oxideav_core::CodecOptions::new().set("ecpl_begf", "1");
+        assert!(make_encoder(&params).is_err());
+        // Inverted range.
+        params.options = oxideav_core::CodecOptions::new()
+            .set("ecpl_begf", "13")
+            .set("ecpl_endf", "0");
+        assert!(make_encoder(&params).is_err());
+        // ecpl=0 disables even with sub-keys present.
+        params.options = oxideav_core::CodecOptions::new()
+            .set("ecpl", "0")
+            .set("ecpl_begf", "3");
+        assert!(make_encoder(&params).is_ok());
+        // Plain enable works; mutual exclusions fire.
+        params.options = oxideav_core::CodecOptions::new().set("ecpl", "1");
+        assert!(make_encoder(&params).is_ok());
+        params.options = oxideav_core::CodecOptions::new()
+            .set("ecpl", "1")
+            .set("aht", "1");
+        assert!(make_encoder(&params).is_err());
+        params.options = oxideav_core::CodecOptions::new()
+            .set("ecpl", "1")
+            .set("spx", "1");
+        assert!(make_encoder(&params).is_err());
+        // Mono cannot couple.
+        params.channels = Some(1);
+        params.options = oxideav_core::CodecOptions::new().set("ecpl", "1");
         assert!(make_encoder(&params).is_err());
     }
 }
