@@ -67,6 +67,20 @@ use crate::tables::{
 /// kbps, 5.1=448 kbps); callers may override via `bit_rate` on
 /// [`CodecParameters`] if it maps to a valid row of Table 5.18.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let meta = metadata_from_options(params)?;
+    make_encoder_with_metadata(params, meta)
+}
+
+/// [`make_encoder`] with a typed [`MetadataParams`] — the encoder-side
+/// bitstream-metadata surface (§5.4.2 BSI advisory words, the
+/// §5.4.2.9-10 heavy-compression word, and the §5.4.3.3-4 per-block
+/// dynamic-range word). The registry path reaches the same surface via
+/// `CodecParameters::options` keys (see [`MetadataParams`]).
+pub fn make_encoder_with_metadata(
+    params: &CodecParameters,
+    meta: MetadataParams,
+) -> Result<Box<dyn Encoder>> {
+    meta.validate()?;
     let sample_rate = params.sample_rate.ok_or_else(|| {
         Error::invalid("ac3 encoder: sample_rate is required (48000/44100/32000)")
     })?;
@@ -153,6 +167,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         channels: nfchans,
         lfeon,
         acmod,
+        meta,
         input_sample_format,
         fscod,
         frmsizecod,
@@ -203,6 +218,241 @@ fn pick_frmsizecod(kbps: u32) -> Option<u8> {
     None
 }
 
+/// §5.4.2.13-15 audio-production information for encoder-side emission
+/// (`audprodie = 1`): the 5-bit `mixlevel` (peak mixing-session SPL is
+/// `80 + mixlevel` dB SPL) and the 2-bit `roomtyp` code (Table 5.12:
+/// 0 = not indicated, 1 = large room / X-curve, 2 = small room / flat).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioProductionParams {
+    /// `mixlevel` (5 bits, 0..=31) — §5.4.2.14.
+    pub mixlevel: u8,
+    /// `roomtyp` (2 bits, 0..=2; 3 is reserved) — §5.4.2.15.
+    pub roomtyp: u8,
+}
+
+/// Encoder-side bitstream-metadata surface: the §5.4.2 BSI advisory
+/// words plus the §5.4.3.3-4 per-block dynamic-range word.
+///
+/// None of these change the coded audio — they steer downstream
+/// consumer behaviour (downmix levels, DRC, dialogue normalisation)
+/// and are all decoded back by [`crate::bsi::parse`] /
+/// [`crate::decoder`]'s §7.7 gain layer. Fields whose syntax slot is
+/// acmod-gated (`cmixlev` / `surmixlev` / `dsurmod`) are only emitted
+/// for the acmods that carry them (§5.4.2.4-6); the configured value
+/// is ignored otherwise.
+///
+/// Registry path: `CodecParameters::options` keys `dialnorm` (1..=31),
+/// `compr` / `dynrng` (8-bit gain words, decimal or `0x`-hex),
+/// `bsmod` (0..=7), `cmixlev` / `surmixlev` (0..=2), `dsurmod`
+/// (0..=2), `langcod` (8-bit, spec says `0xFF` when present),
+/// `mixlevel` (0..=31) + `roomtyp` (0..=2) (setting either emits
+/// `audprodie = 1`), `copyright` and `origbs` (`1`/`true`/`0`/`false`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataParams {
+    /// `dialnorm` (5 bits, §5.4.2.8) — dB of dialogue headroom below
+    /// digital 100%, valid `1..=31` (`0` is reserved on the wire).
+    pub dialnorm: u8,
+    /// §5.4.2.9-10 heavy-compression word: `Some` emits `compre = 1` +
+    /// the 8-bit Table 7.30 `compr` gain word every syncframe.
+    pub compr: Option<u8>,
+    /// §5.4.3.3-4 dynamic-range word: `Some` emits `dynrnge = 1` + the
+    /// 8-bit §7.7.1.2 gain word in EVERY audio block (unambiguous
+    /// under the block-to-block reuse rule; 48 bits/frame).
+    pub dynrng: Option<u8>,
+    /// `bsmod` (3 bits, §5.4.2.2 / Table 5.7) — bit-stream mode
+    /// (0 = complete main).
+    pub bsmod: u8,
+    /// `cmixlev` (2 bits, Table 5.9: 0 = −3.0 dB, 1 = −4.5 dB,
+    /// 2 = −6.0 dB) — emitted only when acmod carries a centre channel
+    /// (acmod ∈ {3, 5, 7}).
+    pub cmixlev: u8,
+    /// `surmixlev` (2 bits, Table 5.10: 0 = −3 dB, 1 = −6 dB,
+    /// 2 = 0 (mute)) — emitted only when acmod carries surrounds
+    /// (acmod ∈ {4, 5, 6, 7}).
+    pub surmixlev: u8,
+    /// `dsurmod` (2 bits, Table 5.11: 0 = not indicated, 1 = NOT Dolby
+    /// Surround encoded, 2 = Dolby Surround encoded) — emitted only in
+    /// 2/0 (acmod == 2).
+    pub dsurmod: u8,
+    /// §5.4.2.11-12 deprecated language-code slot: `Some` emits
+    /// `langcode = 1` + the byte (the current spec says the slot
+    /// "shall be set to 0xFF if present").
+    pub langcod: Option<u8>,
+    /// §5.4.2.13-15 audio-production information (`audprodie`).
+    pub audprod: Option<AudioProductionParams>,
+    /// `copyrightb` (§5.4.2.24).
+    pub copyrightb: bool,
+    /// `origbs` (§5.4.2.25).
+    pub origbs: bool,
+}
+
+impl Default for MetadataParams {
+    /// The encoder's historical fixed words: dialnorm −27 dB, no
+    /// compr/dynrng/langcod/audprod, complete-main bsmod, −4.5 dB
+    /// centre + −6 dB surround downmix codes, Dolby-Surround "not
+    /// indicated", not copyright-flagged, original bitstream.
+    fn default() -> Self {
+        Self {
+            dialnorm: 27,
+            compr: None,
+            dynrng: None,
+            bsmod: 0,
+            cmixlev: 1,
+            surmixlev: 1,
+            dsurmod: 0,
+            langcod: None,
+            audprod: None,
+            copyrightb: false,
+            origbs: true,
+        }
+    }
+}
+
+impl MetadataParams {
+    /// Range-check every codepoint against its syntax slot.
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.dialnorm == 0 || self.dialnorm > 31 {
+            return Err(Error::invalid(format!(
+                "ac3 encoder: dialnorm {} out of range (1..=31; 0 is reserved)",
+                self.dialnorm
+            )));
+        }
+        if self.bsmod > 7 {
+            return Err(Error::invalid(format!(
+                "ac3 encoder: bsmod {} out of range (0..=7)",
+                self.bsmod
+            )));
+        }
+        for (name, v) in [
+            ("cmixlev", self.cmixlev),
+            ("surmixlev", self.surmixlev),
+            ("dsurmod", self.dsurmod),
+        ] {
+            if v > 2 {
+                return Err(Error::invalid(format!(
+                    "ac3 encoder: {name} {v} out of range (0..=2; 3 is reserved)"
+                )));
+            }
+        }
+        if let Some(a) = self.audprod {
+            if a.mixlevel > 31 {
+                return Err(Error::invalid(format!(
+                    "ac3 encoder: mixlevel {} out of range (0..=31)",
+                    a.mixlevel
+                )));
+            }
+            if a.roomtyp > 2 {
+                return Err(Error::invalid(format!(
+                    "ac3 encoder: roomtyp {} out of range (0..=2; 3 is reserved)",
+                    a.roomtyp
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Bits the optional metadata adds on top of the fixed BSI +
+    /// per-block layout `overhead_bits_for_ends` models: `compr` (8) +
+    /// `langcod` (8) + `audprodie` body (5 + 2) in BSI, plus the
+    /// 8-bit `dynrng` word in each of the 6 audio blocks.
+    pub(crate) fn frame_extra_bits(&self) -> u32 {
+        let mut bits = 0u32;
+        if self.compr.is_some() {
+            bits += 8;
+        }
+        if self.langcod.is_some() {
+            bits += 8;
+        }
+        if self.audprod.is_some() {
+            bits += 7;
+        }
+        if self.dynrng.is_some() {
+            bits += 8 * BLOCKS_PER_FRAME as u32;
+        }
+        bits
+    }
+
+    /// The frame-byte budget handed to the SNR-offset tuners: the real
+    /// frame size less the (byte-rounded-up) optional-metadata bits,
+    /// so the mantissa budget the tuner maximises still fits after the
+    /// extra words are written.
+    pub(crate) fn tuner_frame_bytes(&self, frame_bytes: usize) -> usize {
+        frame_bytes - self.frame_extra_bits().div_ceil(8) as usize
+    }
+}
+
+/// Parse a `1`/`true`/`0`/`false` option value.
+fn parse_bool_opt(key: &str, v: &str) -> Result<bool> {
+    match v {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => Err(Error::invalid(format!(
+            "ac3 encoder: option {key}={v} (expected 1/true/0/false)"
+        ))),
+    }
+}
+
+/// Parse an 8-bit option value, decimal or `0x`-prefixed hex (gain
+/// words like `dynrng`/`compr` are bit patterns, so hex is natural).
+fn parse_u8_opt(key: &str, v: &str) -> Result<u8> {
+    let parsed = if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        u8::from_str_radix(hex, 16).ok()
+    } else {
+        v.parse::<u8>().ok()
+    };
+    parsed.ok_or_else(|| {
+        Error::invalid(format!(
+            "ac3 encoder: option {key}={v} (expected 0..=255, decimal or 0x-hex)"
+        ))
+    })
+}
+
+/// Assemble [`MetadataParams`] from `CodecParameters::options` (keys
+/// documented on [`MetadataParams`]); absent keys keep the defaults.
+fn metadata_from_options(params: &CodecParameters) -> Result<MetadataParams> {
+    let opts = &params.options;
+    let mut meta = MetadataParams::default();
+    if let Some(v) = opts.get("dialnorm") {
+        meta.dialnorm = parse_u8_opt("dialnorm", v)?;
+    }
+    if let Some(v) = opts.get("compr") {
+        meta.compr = Some(parse_u8_opt("compr", v)?);
+    }
+    if let Some(v) = opts.get("dynrng") {
+        meta.dynrng = Some(parse_u8_opt("dynrng", v)?);
+    }
+    if let Some(v) = opts.get("bsmod") {
+        meta.bsmod = parse_u8_opt("bsmod", v)?;
+    }
+    if let Some(v) = opts.get("cmixlev") {
+        meta.cmixlev = parse_u8_opt("cmixlev", v)?;
+    }
+    if let Some(v) = opts.get("surmixlev") {
+        meta.surmixlev = parse_u8_opt("surmixlev", v)?;
+    }
+    if let Some(v) = opts.get("dsurmod") {
+        meta.dsurmod = parse_u8_opt("dsurmod", v)?;
+    }
+    if let Some(v) = opts.get("langcod") {
+        meta.langcod = Some(parse_u8_opt("langcod", v)?);
+    }
+    let mixlevel = opts.get("mixlevel").map(|v| parse_u8_opt("mixlevel", v));
+    let roomtyp = opts.get("roomtyp").map(|v| parse_u8_opt("roomtyp", v));
+    if mixlevel.is_some() || roomtyp.is_some() {
+        meta.audprod = Some(AudioProductionParams {
+            mixlevel: mixlevel.transpose()?.unwrap_or(0),
+            roomtyp: roomtyp.transpose()?.unwrap_or(0),
+        });
+    }
+    if let Some(v) = opts.get("copyright") {
+        meta.copyrightb = parse_bool_opt("copyright", v)?;
+    }
+    if let Some(v) = opts.get("origbs") {
+        meta.origbs = parse_bool_opt("origbs", v)?;
+    }
+    Ok(meta)
+}
+
 struct Ac3Encoder {
     codec_id: CodecId,
     out_params: CodecParameters,
@@ -217,6 +467,9 @@ struct Ac3Encoder {
     /// AC-3 audio coding mode (Table 5.8). One of {1,2,3,6,7} for the
     /// channel counts we accept.
     acmod: u8,
+    /// Encoder-side bitstream metadata (§5.4.2 BSI words + per-block
+    /// `dynrng`). Validated at construction.
+    meta: MetadataParams,
     /// Input PCM sample format. Defaults to `S16` when params don't
     /// declare one. Accepts `S16` and `F32`.
     input_sample_format: SampleFormat,
@@ -1041,13 +1294,18 @@ impl Ac3Encoder {
         // bits + side-info fit the frame payload. This is the minimal
         // loop §8.2.12 describes. Pass the per-channel chexpstr plan so
         // the budget calculation accounts for D25/D45 savings.
+        // Optional metadata words (compr/langcod/audprod/dynrng) are
+        // not modelled inside `overhead_bits_for_ends`; shrink the
+        // byte budget the tuners see instead so the mantissa payload
+        // still fits after those words are written.
+        let tuner_frame_bytes = self.meta.tuner_frame_bytes(self.frame_bytes);
         let tuned_ba = tune_snroffst_with_plan(
             &ba,
             &exps,
             ch_end_mant,
             self.channels,
             self.fscod,
-            self.frame_bytes,
+            tuner_frame_bytes,
             &exp_strategies,
             Some(&chexpstr_plan),
             &cpl,
@@ -1075,7 +1333,7 @@ impl Ac3Encoder {
                 ch_end_mant,
                 self.channels,
                 self.fscod,
-                self.frame_bytes,
+                tuner_frame_bytes,
                 &exp_strategies,
                 Some(&chexpstr_plan),
                 &cpl,
@@ -1158,38 +1416,60 @@ impl Ac3Encoder {
         bw.write_u32(self.fscod as u32, 2);
         bw.write_u32(self.frmsizecod as u32, 6);
 
-        // BSI — bsid=8, bsmod=0, dialnorm=27, no optional fields.
-        // §5.4.2.3 acmod (3 bits) per Table 5.8 — supplied at make-encoder
-        // time. The optional `cmixlev` / `surmixlev` / `dsurmod` fields
-        // are only present for the acmods that actually carry a centre
-        // channel / surround channel / 2-front-only respectively
-        // (§5.4.2.4-7); we emit them with a neutral default per Tables
-        // 5.9, 5.10 (`01` = -3 dB).
+        // BSI — bsid=8 plus the §5.4.2 metadata words from `self.meta`.
+        // §5.4.2.3 acmod (3 bits) per Table 5.8 — supplied at
+        // make-encoder time. The optional `cmixlev` / `surmixlev` /
+        // `dsurmod` fields are only present for the acmods that
+        // actually carry a centre channel / surround channel /
+        // 2-front-only respectively (§5.4.2.4-6).
         bw.write_u32(8, 5); // bsid
-        bw.write_u32(0, 3); // bsmod
+        bw.write_u32(self.meta.bsmod as u32, 3);
         bw.write_u32(self.acmod as u32, 3);
         // §5.4.2.4 cmixlev — present when the 3 LSBs of acmod include a
         // centre channel: `(acmod & 0x1) != 0 && acmod != 0x1` (i.e.
-        // acmod ∈ {3, 5, 7}). Value 1 = -3 dB centre downmix.
+        // acmod ∈ {3, 5, 7}). Table 5.9 codes (default 1 = -4.5 dB).
         if (self.acmod & 0x1) != 0 && self.acmod != 0x1 {
-            bw.write_u32(1, 2);
+            bw.write_u32(self.meta.cmixlev as u32, 2);
         }
         // §5.4.2.5 surmixlev — present when a surround channel exists
-        // (acmod & 0x4 set, i.e. acmod ∈ {4, 5, 6, 7}). Value 1 = -3 dB.
+        // (acmod & 0x4 set, i.e. acmod ∈ {4, 5, 6, 7}). Table 5.10
+        // codes (default 1 = -6 dB).
         if (self.acmod & 0x4) != 0 {
-            bw.write_u32(1, 2);
+            bw.write_u32(self.meta.surmixlev as u32, 2);
         }
         // §5.4.2.6 dsurmod — Dolby Surround flag, only in 2/0.
         if self.acmod == 0x2 {
-            bw.write_u32(0, 2);
+            bw.write_u32(self.meta.dsurmod as u32, 2);
         }
         bw.write_u32(self.lfeon as u32, 1);
-        bw.write_u32(27, 5); // dialnorm = -27 dB
-        bw.write_u32(0, 1); // compre
-        bw.write_u32(0, 1); // langcode
-        bw.write_u32(0, 1); // audprodie
-        bw.write_u32(0, 1); // copyrightb
-        bw.write_u32(1, 1); // origbs
+        bw.write_u32(self.meta.dialnorm as u32, 5);
+        match self.meta.compr {
+            // §5.4.2.9-10 — heavy-compression gain word.
+            Some(c) => {
+                bw.write_u32(1, 1); // compre
+                bw.write_u32(c as u32, 8);
+            }
+            None => bw.write_u32(0, 1),
+        }
+        match self.meta.langcod {
+            // §5.4.2.11-12 — deprecated language-code slot.
+            Some(l) => {
+                bw.write_u32(1, 1); // langcode
+                bw.write_u32(l as u32, 8);
+            }
+            None => bw.write_u32(0, 1),
+        }
+        match self.meta.audprod {
+            // §5.4.2.13-15 — mixlevel(5) + roomtyp(2).
+            Some(a) => {
+                bw.write_u32(1, 1); // audprodie
+                bw.write_u32(a.mixlevel as u32, 5);
+                bw.write_u32(a.roomtyp as u32, 2);
+            }
+            None => bw.write_u32(0, 1),
+        }
+        bw.write_u32(u32::from(self.meta.copyrightb), 1);
+        bw.write_u32(u32::from(self.meta.origbs), 1);
         bw.write_u32(0, 1); // timecod1e
         bw.write_u32(0, 1); // timecod2e
         bw.write_u32(0, 1); // addbsie
@@ -1215,8 +1495,17 @@ impl Ac3Encoder {
             for _ in 0..self.channels {
                 bw.write_u32(1, 1);
             }
-            // dynrnge = 0 (no dynrng transmitted; block 0 sets gain=1).
-            bw.write_u32(0, 1);
+            // §5.4.3.3-4 dynrnge + dynrng. When metadata configures a
+            // dynamic-range word it is transmitted in EVERY block
+            // (unambiguous under the reuse rule); otherwise dynrnge=0
+            // (block 0 then sets gain=1).
+            match self.meta.dynrng {
+                Some(w) => {
+                    bw.write_u32(1, 1);
+                    bw.write_u32(w as u32, 8);
+                }
+                None => bw.write_u32(0, 1),
+            }
             // §5.4.3.7-13 cplstre + cplinu + (when cplinu) the
             // chincpl[ch] / phsflginu / cplbegf / cplendf / cplbndstrc
             // sequence. The encoder commits to a single cpl
@@ -7384,5 +7673,292 @@ mod tests {
             "ffmpeg cross-decoded our per-block-snroffst stream: {} bytes",
             decoded_bytes.len()
         );
+    }
+
+    // ---- §5.4.2 / §5.4.3.3-4 encoder-side metadata surface ----
+
+    /// Interleaved stereo/multichannel test tone, `frames` syncframes
+    /// long, as S16LE bytes.
+    fn meta_tone_bytes(channels: usize, frames: usize) -> (Vec<u8>, usize) {
+        let n = frames * SAMPLES_PER_FRAME as usize;
+        let mut bytes = Vec::with_capacity(n * channels * 2);
+        for i in 0..n {
+            let t = i as f32 / 48_000.0;
+            for ch in 0..channels {
+                let s = 0.30
+                    * (2.0 * std::f32::consts::PI * (440.0 + 60.0 * ch as f32) * t).sin()
+                    * (1.0 - 0.05 * ch as f32);
+                let q = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                bytes.extend_from_slice(&q.to_le_bytes());
+            }
+        }
+        (bytes, n)
+    }
+
+    /// Encode `frames` syncframes of tone with either a typed
+    /// [`MetadataParams`] or `CodecParameters::options` pairs.
+    fn meta_encode(
+        channels: u16,
+        meta: Option<MetadataParams>,
+        options: &[(&str, &str)],
+        frames: usize,
+    ) -> Vec<Packet> {
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(channels);
+        params.sample_format = Some(SampleFormat::S16);
+        let mut opts = oxideav_core::CodecOptions::new();
+        for (k, v) in options {
+            opts = opts.set(*k, *v);
+        }
+        params.options = opts;
+        let mut enc = match meta {
+            Some(m) => make_encoder_with_metadata(&params, m).expect("typed metadata encoder"),
+            None => make_encoder(&params).expect("options encoder"),
+        };
+        let (bytes, n) = meta_tone_bytes(channels as usize, frames);
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![bytes],
+        }))
+        .unwrap();
+        let _ = enc.flush();
+        let mut pkts = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => pkts.push(p),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        assert!(!pkts.is_empty(), "no packets produced");
+        pkts
+    }
+
+    /// Decode packets with our own decoder, returning interleaved i16.
+    fn meta_decode(pkts: &[Packet]) -> Vec<i16> {
+        let dparams = CodecParameters::audio(CodecId::new("ac3"));
+        let mut dec = crate::decoder::make_decoder(&dparams).expect("make_decoder");
+        let mut out = Vec::new();
+        for p in pkts {
+            dec.send_packet(p).unwrap();
+            while let Ok(Frame::Audio(a)) = dec.receive_frame() {
+                for s in a.data[0].chunks_exact(2) {
+                    out.push(i16::from_le_bytes([s[0], s[1]]));
+                }
+            }
+        }
+        out
+    }
+
+    /// Every §5.4.2 word configured through [`MetadataParams`] must
+    /// read back through the typed BSI surface on EVERY syncframe —
+    /// 5.1 exercises the cmixlev + surmixlev slots.
+    #[test]
+    fn metadata_bsi_words_roundtrip_51() {
+        let meta = MetadataParams {
+            dialnorm: 24,
+            compr: Some(0xC5),
+            dynrng: None,
+            bsmod: 2, // visually impaired service
+            cmixlev: 2,
+            surmixlev: 0,
+            dsurmod: 0,
+            langcod: Some(0xFF),
+            audprod: Some(AudioProductionParams {
+                mixlevel: 21, // 101 dB SPL peak
+                roomtyp: 2,   // small room, flat
+            }),
+            copyrightb: true,
+            origbs: false,
+        };
+        let pkts = meta_encode(6, Some(meta), &[], 4);
+        for p in &pkts {
+            let bsi = crate::bsi::parse(&p.data[5..]).expect("bsi");
+            assert_eq!(bsi.dialnorm, 24);
+            assert_eq!(bsi.bsmod, 2);
+            assert_eq!(bsi.cmixlev, 2);
+            assert_eq!(bsi.surmixlev, 0);
+            assert_eq!(bsi.compr.expect("compr present").raw(), 0xC5);
+            assert_eq!(bsi.language_code().expect("langcod present").raw(), 0xFF);
+            let ap = bsi.audio_production.expect("audprod present");
+            assert_eq!(ap.mixlevel, 21);
+            assert_eq!(ap.roomtyp.raw(), 2);
+            let ci = bsi.copyright_info;
+            assert!(ci.is_copyright_protected());
+            assert!(!ci.is_original_bitstream());
+        }
+        // The metadata-bearing stream still decodes.
+        let dec = meta_decode(&pkts);
+        assert!(!dec.is_empty());
+    }
+
+    /// 2/0 exercises the dsurmod slot (absent in every other acmod).
+    #[test]
+    fn metadata_bsi_dsurmod_stereo_roundtrip() {
+        let meta = MetadataParams {
+            dsurmod: 2, // Dolby Surround encoded
+            ..MetadataParams::default()
+        };
+        let pkts = meta_encode(2, Some(meta), &[], 2);
+        for p in &pkts {
+            let bsi = crate::bsi::parse(&p.data[5..]).expect("bsi");
+            assert_eq!(bsi.dsurmod, 2);
+            // Defaults still hold.
+            assert_eq!(bsi.dialnorm, 27);
+            assert!(bsi.compr.is_none());
+            assert!(bsi.language_code().is_none());
+        }
+    }
+
+    /// The §5.4.3.4 dynrng word must be APPLIED by the decoder's
+    /// mandatory §7.7.1 line-out path: an identical tone encoded with a
+    /// −12.04 dB dynrng word decodes at one quarter the amplitude of
+    /// the word-less stream.
+    #[test]
+    fn metadata_dynrng_word_scales_decoded_output() {
+        let word = 0xC0u8; // X=-2, Y=0 → 2^-1 · 0.5 = 0.25 (−12.04 dB)
+        let expected = crate::drc::dynrng_to_linear(word) as f64;
+        assert!((expected - 0.25).abs() < 1e-6);
+        let plain = meta_decode(&meta_encode(2, Some(MetadataParams::default()), &[], 4));
+        let cut = meta_decode(&meta_encode(
+            2,
+            Some(MetadataParams {
+                dynrng: Some(word),
+                ..MetadataParams::default()
+            }),
+            &[],
+            4,
+        ));
+        assert_eq!(plain.len(), cut.len());
+        let rms = |v: &[i16]| -> f64 {
+            let n = v.len().max(1);
+            (v.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / n as f64).sqrt()
+        };
+        // Skip the priming edge (first two blocks of the first frame).
+        let skip = 2 * SAMPLES_PER_BLOCK * 2;
+        let ratio = rms(&cut[skip..]) / rms(&plain[skip..]).max(1e-9);
+        let delta_db = 20.0 * (ratio / expected).log10().abs();
+        assert!(
+            delta_db < 0.5,
+            "decoded dynrng gain {ratio:.4} vs expected {expected:.4} (off by {delta_db:.2} dB)"
+        );
+    }
+
+    /// Registry `options` and the typed constructor must build the
+    /// same encoder — pinned byte-identical.
+    #[test]
+    fn metadata_options_build_identical_encoder() {
+        let meta = MetadataParams {
+            dialnorm: 20,
+            compr: Some(0x9A),
+            dynrng: Some(0xC0),
+            bsmod: 1,
+            dsurmod: 1,
+            langcod: Some(0xFF),
+            audprod: Some(AudioProductionParams {
+                mixlevel: 15,
+                roomtyp: 1,
+            }),
+            copyrightb: true,
+            origbs: false,
+            ..MetadataParams::default()
+        };
+        let typed: Vec<u8> = meta_encode(2, Some(meta), &[], 2)
+            .iter()
+            .flat_map(|p| p.data.clone())
+            .collect();
+        let from_options: Vec<u8> = meta_encode(
+            2,
+            None,
+            &[
+                ("dialnorm", "20"),
+                ("compr", "0x9A"),
+                ("dynrng", "0xC0"),
+                ("bsmod", "1"),
+                ("dsurmod", "1"),
+                ("langcod", "255"),
+                ("mixlevel", "15"),
+                ("roomtyp", "1"),
+                ("copyright", "true"),
+                ("origbs", "0"),
+            ],
+            2,
+        )
+        .iter()
+        .flat_map(|p| p.data.clone())
+        .collect();
+        assert_eq!(
+            typed, from_options,
+            "options-driven and typed metadata constructors must emit identical bytes"
+        );
+    }
+
+    /// Out-of-range codepoints are rejected at construction, both
+    /// through the typed path and the options path.
+    #[test]
+    fn metadata_validation_rejects_out_of_range() {
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(2);
+        for bad in [
+            MetadataParams {
+                dialnorm: 0,
+                ..MetadataParams::default()
+            },
+            MetadataParams {
+                dialnorm: 32,
+                ..MetadataParams::default()
+            },
+            MetadataParams {
+                cmixlev: 3,
+                ..MetadataParams::default()
+            },
+            MetadataParams {
+                surmixlev: 3,
+                ..MetadataParams::default()
+            },
+            MetadataParams {
+                dsurmod: 3,
+                ..MetadataParams::default()
+            },
+            MetadataParams {
+                bsmod: 8,
+                ..MetadataParams::default()
+            },
+            MetadataParams {
+                audprod: Some(AudioProductionParams {
+                    mixlevel: 32,
+                    roomtyp: 0,
+                }),
+                ..MetadataParams::default()
+            },
+            MetadataParams {
+                audprod: Some(AudioProductionParams {
+                    mixlevel: 0,
+                    roomtyp: 3,
+                }),
+                ..MetadataParams::default()
+            },
+        ] {
+            assert!(
+                make_encoder_with_metadata(&params, bad).is_err(),
+                "expected rejection: {bad:?}"
+            );
+        }
+        // Options-path parse failures.
+        for (k, v) in [
+            ("dynrng", "0x1G"),
+            ("compr", "256"),
+            ("copyright", "maybe"),
+            ("dialnorm", "0"),
+        ] {
+            params.options = oxideav_core::CodecOptions::new().set(k, v);
+            assert!(
+                make_encoder(&params).is_err(),
+                "expected rejection: {k}={v}"
+            );
+        }
     }
 }
