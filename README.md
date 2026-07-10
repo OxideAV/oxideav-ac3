@@ -286,7 +286,19 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   decode 6 dB low and the loudest coupled channel would need the
   unrepresentable amplitude 2.0; the Table E3.10 ceiling of exactly
   1.0 pins the intended identity at unity, and the factor of 2 is
-  applied in the carrier reconstruction (identity CI-gated).
+  applied in the carrier reconstruction. All three notes are codified
+  as clean-room errata entries (`docs/audio/ac3/ac3-errata.md` E2 /
+  E1 / E3 respectively; E3 also records that the ETSI TS 102 366
+  V1.4.1 copy omits the enhanced-coupling channel-processing clause
+  entirely, so A/52:2018 is the operative text). The E3 correction is
+  regression-pinned in both directions: a decode-side least-squares
+  identity fit (corrected chain gain 1.0 vs exactly 0.5 as printed)
+  and a full encode→decode bitstream round-trip gating the aggregate
+  coupling-region energy within ±1.5 dB of unity (the as-printed
+  reading sits at −6.02 dB). A real Dolby-encoded `ecplinu = 1`
+  stream remains a recorded fixture GAP
+  (`docs/audio/ac3/fixtures/eac3-ecpl-enhanced-coupling/GAP.md`), so
+  ecpl validation stays in-tree round-trip + spec-text.
 
 ### CRC
 

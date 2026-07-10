@@ -1124,20 +1124,26 @@ pub fn reconstruct_carrier(prev: &[f32; 256], curr: &[f32; 256], next: &[f32; 25
 
     // Step 3 — overlap-add into a single 512-sample pcm buffer.
     //
-    // **Spec note (erratum):** §E.3.5.5.1 step 3 prints the overlap-add
-    // without the §7.9.4.1 step-6 factor of 2 ("the factor of 2 scaling
-    // undoes headroom scaling performed in the encoder"), because step 2
-    // references only "steps 1 to 5" of §7.9.4.1. Taken literally, the
-    // whole analysis → §E.3.5.5.4 synthesis chain then returns exactly
-    // HALF the original MDCT coefficients (measured: a region-interior
-    // multi-tone reconstructs bin-for-bin at ratio 0.5000), which would
-    // decode every enhanced-coupling channel 6 dB low. The Table E3.10
-    // amplitude ceiling of exactly 1.0 (code 0 = 0 dB) shows the design
-    // intent is a unity identity — the loudest coupled channel maps to
-    // amp ≈ 1 — so the headroom-restoring factor of 2 must apply to the
-    // carrier path too. Applying it here makes analysis → synthesis an
-    // identity at amp = 1 / angle = 0 (pinned by
-    // `ecplenc::tests::analysis_synthesis_identity_amp1_angle0`).
+    // **Spec erratum (codified as `docs/audio/ac3/ac3-errata.md` entry
+    // E3):** as printed, §E.3.5.5.1 step 3 omits the §7.9.4.1 step-6
+    // factor of 2 ("the factor of 2 scaling undoes headroom scaling
+    // performed in the encoder"): step 2 references only "steps 1 to 5"
+    // of §7.9.4.1, and step 3 — the direct analogue of step 6, an
+    // overlap-add over the same windowed samples — prints
+    // `pcm[n] = xPREV[n+N/2] + xCURR[n]` with no multiplier. Taken
+    // literally, the whole analysis → §E.3.5.5.4 synthesis chain
+    // returns exactly HALF the original MDCT coefficients (measured
+    // identity gain exactly 0.5 — every enhanced-coupling channel would
+    // decode 6 dB low), while the Table E3.10 amplitude ceiling of
+    // exactly 1.0 (`ecplamp = 0` is 0 dB per §E.3.5.4) pins the design
+    // intent at a unity identity. The corrected reading applies the
+    // same factor of 2 as §7.9.4.1 step 6. (The ETSI TS 102 366 V1.4.1
+    // copy carries no counterpart clause — its §E.2.5.5 is
+    // amplitude-only and omits the channel-processing subclause
+    // entirely — so A/52:2018 §E.3.5.5.1 is the operative text.)
+    // Pinned by `tests::carrier_overlap_add_factor2_erratum_identity`
+    // (corrected fit gain 1.0 vs exactly 0.5 as printed) and
+    // `ecplenc::tests::analysis_synthesis_identity_amp1_angle0`.
     let mut pcm = [0.0f32; 512];
     for n in 0..256 {
         pcm[n] = 2.0 * (xprev[256 + n] + xcurr[n]);
@@ -2206,6 +2212,126 @@ mod tests {
                 "Zi[{k}] non-linear"
             );
         }
+    }
+
+    /// `docs/audio/ac3/ac3-errata.md` entry E3 discriminator — the
+    /// §E.3.5.5.1 step-3 overlap-add must carry the §7.9.4.1 step-6
+    /// factor of 2. Drives a continuous multi-tone through the full
+    /// analysis (steps 2-5) → §E.3.5.5.4 synthesis chain at amplitude 1
+    /// / angle 0 and least-squares-fits the identity gain over the
+    /// region interior:
+    ///
+    /// * the corrected chain ([`reconstruct_carrier`], with the factor
+    ///   of 2) fits gain `1.0` — a unity coordinate reproduces the
+    ///   coupling channel at unit scale, matching the Table E3.10
+    ///   `ecplamp = 0` = 0 dB ceiling; and
+    /// * a local re-implementation of the overlap-add *as printed*
+    ///   (steps 2-5 identical, step 3 without the multiplier) fits gain
+    ///   exactly `0.5` — the erratum's measured −6 dB defect.
+    #[test]
+    fn carrier_overlap_add_factor2_erratum_identity() {
+        use crate::mdct::mdct_512;
+
+        // Three consecutive windowed-MDCT blocks (256-sample hop) of a
+        // continuous multi-tone with energy across the ecpl region
+        // (bins ~40-240 of a 512-point MDCT).
+        let sig = |n: usize| -> f32 {
+            let t = n as f32;
+            0.4 * (2.0 * std::f32::consts::PI * 0.08 * t).sin()
+                + 0.3 * (2.0 * std::f32::consts::PI * 0.24 * t).sin()
+                + 0.2 * (2.0 * std::f32::consts::PI * 0.31 * t + 0.4).sin()
+                + 0.15 * (2.0 * std::f32::consts::PI * 0.45 * t + 1.1).sin()
+        };
+        let mut blocks = Vec::new();
+        for blk in 0..3usize {
+            let mut win = [0.0f32; 512];
+            for n in 0..512 {
+                win[n] = sig(blk * 256 + n);
+            }
+            for n in 0..256 {
+                win[n] *= WINDOW[n];
+                win[511 - n] *= WINDOW[n];
+            }
+            let mut c = [0.0f32; 256];
+            mdct_512(&win, &mut c);
+            // Region-restrict to the full ecpl span (step 1's XCURR
+            // definition: zero outside [ecplstartmant, ecplendmant)).
+            c[..ECPL_SUBBND_TAB[0]].fill(0.0);
+            blocks.push(c);
+        }
+        let (prev, curr, next) = (&blocks[0], &blocks[1], &blocks[2]);
+
+        // Steps 2-5 with the overlap-add AS PRINTED (no factor of 2);
+        // everything else identical to `reconstruct_carrier`.
+        let windowed = |x: &[f32; 256]| -> [f32; 512] {
+            let mut t = [0.0f32; 512];
+            imdct_512_fft(x, &mut t);
+            for n in 0..256 {
+                t[n] *= WINDOW[n];
+                t[511 - n] *= WINDOW[n];
+            }
+            t
+        };
+        let (xprev, xcurr, xnext) = (windowed(prev), windowed(curr), windowed(next));
+        let mut pcm = [0.0f32; 512];
+        for n in 0..256 {
+            pcm[n] = xprev[256 + n] + xcurr[n]; // as printed: no `2 *`
+            pcm[256 + n] = xcurr[256 + n] + xnext[n];
+        }
+        let mut re = [0.0f32; 512];
+        let mut im = [0.0f32; 512];
+        for n in 0..256 {
+            let wl = WINDOW[n];
+            let wu = WINDOW[256 - n - 1];
+            re[n] = pcm[n] * wl * xcos3(n);
+            re[256 + n] = pcm[256 + n] * wu * xcos3(256 + n);
+            im[n] = pcm[n] * wl * xsin3(n);
+            im[256 + n] = pcm[256 + n] * wu * xsin3(256 + n);
+        }
+        let (zr_p, zi_p) = dft_512_forward(&re, &im);
+
+        // Corrected carrier (the shipping implementation).
+        let z = reconstruct_carrier(prev, curr, next);
+
+        // §E.3.5.5.4 synthesis at amp = 1 / angle = 0 for both.
+        let begin = ECPL_SUBBND_TAB[0]; // 13
+        let end = ECPL_SUBBND_TAB[N_ECPL_SUBBND]; // 253
+        let amp = vec![1.0f32; end - begin];
+        let ang = vec![0.0f32; end - begin];
+        let mut out_corr = [0.0f32; 256];
+        generate_channel_coeffs(&z.zr, &z.zi, &amp, &ang, begin, 512, &mut out_corr);
+        let mut out_printed = [0.0f32; 256];
+        generate_channel_coeffs(&zr_p, &zi_p, &amp, &ang, begin, 512, &mut out_printed);
+
+        // Least-squares identity-gain fit over the region interior
+        // (skip 12 bins at each edge: the brick-wall region restriction
+        // rings there).
+        let fit = |out: &[f32; 256]| -> f64 {
+            let mut num = 0.0f64;
+            let mut den = 0.0f64;
+            for bin in (begin + 12)..(end - 12) {
+                num += out[bin] as f64 * curr[bin] as f64;
+                den += curr[bin] as f64 * curr[bin] as f64;
+            }
+            assert!(den > 1e-3, "test signal has no in-region energy");
+            num / den
+        };
+        let g_corr = fit(&out_corr);
+        let g_printed = fit(&out_printed);
+        assert!(
+            (g_corr - 1.0).abs() < 5e-3,
+            "corrected overlap-add identity gain {g_corr:.4} != 1.0"
+        );
+        assert!(
+            (g_printed - 0.5).abs() < 2.5e-3,
+            "as-printed overlap-add identity gain {g_printed:.4} != 0.5"
+        );
+        // The ONLY processing difference is the step-3 multiplier, so
+        // the two fits differ by exactly that factor.
+        assert!(
+            (g_corr - 2.0 * g_printed).abs() < 1e-6,
+            "printed/corrected chains differ by more than the factor of 2"
+        );
     }
 
     // ---- §E.3.5.5 deferred-synthesis orchestration ----

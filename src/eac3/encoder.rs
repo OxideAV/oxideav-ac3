@@ -3971,6 +3971,39 @@ mod ecpl_tests {
         assert_ecpl_roundtrip(2, 192_000, 768, std::f32::consts::FRAC_PI_2, 3.0, 1.5, 18.0);
     }
 
+    /// `docs/audio/ac3/ac3-errata.md` entry E3, encode→decode
+    /// direction: the full bitstream round-trip through the corrected
+    /// §E.3.5.5.1 overlap-add reproduces the enhanced-coupling region
+    /// at unity level. The erratum's as-printed reading (step 3 without
+    /// the §7.9.4.1 step-6 factor of 2) reconstructs the carrier at
+    /// half scale; the loudest coupled channel would then need the
+    /// unrepresentable amplitude coordinate 2.0 (Table E3.10 ceiling is
+    /// exactly 1.0, §E.3.5.4 code 0 = 0 dB), so the region decodes at a
+    /// systematic −6 dB. Gate the aggregate in-region energy delta well
+    /// inside that discriminator, per channel.
+    #[test]
+    fn ecpl_roundtrip_unity_level_pins_factor2_erratum() {
+        let ecpl = EcplParams::default();
+        let geom = EcplGeometry::derive(&ecpl, &DEFAULT_ECPL_BNDSTRC).unwrap();
+        let pcm = build_ecpl_multitone(2, 8, 0.0);
+        let stream = encode_ecpl(&pcm, 2, 192_000, ecpl);
+        let dec = decode_all(&stream, 768);
+        let dec_f = to_f32_interleaved(&dec);
+        let (lo, hi) = (geom.start_bin, geom.end_bin.min(N_COEFFS));
+        for ch in 0..2 {
+            let orig = mdct_energy_profile(&pcm, 2, ch);
+            let decp = mdct_energy_profile(&dec_f, 2, ch);
+            let eo: f64 = orig[lo..hi].iter().sum();
+            let ed: f64 = decp[lo..hi].iter().sum();
+            let delta = 10.0 * (ed / eo.max(1e-30)).log10();
+            assert!(
+                delta.abs() <= 1.5,
+                "ch{ch}: aggregate ecpl-region energy delta {delta:+.2} dB is not unity \
+                 (the as-printed §E.3.5.5.1 overlap-add sits at −6.02 dB)"
+            );
+        }
+    }
+
     #[test]
     fn ecpl_roundtrip_51_explicit_chincpl() {
         // acmod = 7 (5 fbw channels) transmits explicit chincpl[ch]
