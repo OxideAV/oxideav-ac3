@@ -123,6 +123,7 @@ pub mod chanmap;
 pub mod decoder;
 pub mod dsp;
 pub mod ecpl;
+pub mod ecplenc;
 pub mod encoder;
 pub mod spxenc;
 pub mod tables;

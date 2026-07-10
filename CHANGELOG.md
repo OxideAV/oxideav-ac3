@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- eac3 r406: encoder-side enhanced-coupling primitives (`eac3::ecplenc`) — Table E3.10/E3.11 inverse quantisers, §E.3.5.5.1 band cross-spectrum statistics, first-coupled-channel-phase-locked carrier construction with per-band gains; plus a §E.3.5.5.1 erratum fix in the decoder's carrier reconstruction: the printed step-3 overlap-add omits the §7.9.4.1 step-6 headroom-restoring factor of 2, which made the whole analysis→synthesis chain return exactly half the original coefficients (every enhanced-coupling channel would decode 6 dB low; the Table E3.10 amp ceiling of 1.0 pins the intended identity at unity). Analysis→synthesis identity now gated in CI.
+
 - eac3 r390: document the encoder-side AHT subsystem + mixed chinspx (README / module docs)
 
 - eac3 r390: rate/quality instrumentation — eac3_rate_curves example (standard/AHT/SPX PSNR ladder) + AHT rate-monotonicity regression gate

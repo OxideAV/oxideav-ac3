@@ -1082,10 +1082,25 @@ pub fn reconstruct_carrier(prev: &[f32; 256], curr: &[f32; 256], next: &[f32; 25
     let xnext = windowed(next);
 
     // Step 3 — overlap-add into a single 512-sample pcm buffer.
+    //
+    // **Spec note (erratum):** §E.3.5.5.1 step 3 prints the overlap-add
+    // without the §7.9.4.1 step-6 factor of 2 ("the factor of 2 scaling
+    // undoes headroom scaling performed in the encoder"), because step 2
+    // references only "steps 1 to 5" of §7.9.4.1. Taken literally, the
+    // whole analysis → §E.3.5.5.4 synthesis chain then returns exactly
+    // HALF the original MDCT coefficients (measured: a region-interior
+    // multi-tone reconstructs bin-for-bin at ratio 0.5000), which would
+    // decode every enhanced-coupling channel 6 dB low. The Table E3.10
+    // amplitude ceiling of exactly 1.0 (code 0 = 0 dB) shows the design
+    // intent is a unity identity — the loudest coupled channel maps to
+    // amp ≈ 1 — so the headroom-restoring factor of 2 must apply to the
+    // carrier path too. Applying it here makes analysis → synthesis an
+    // identity at amp = 1 / angle = 0 (pinned by
+    // `ecplenc::tests::analysis_synthesis_identity_amp1_angle0`).
     let mut pcm = [0.0f32; 512];
     for n in 0..256 {
-        pcm[n] = xprev[256 + n] + xcurr[n];
-        pcm[256 + n] = xcurr[256 + n] + xnext[n];
+        pcm[n] = 2.0 * (xprev[256 + n] + xcurr[n]);
+        pcm[256 + n] = 2.0 * (xcurr[256 + n] + xnext[n]);
     }
 
     // Step 4 — oddly-stacked complex rotation. The window is `w[n]` over
