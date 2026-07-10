@@ -74,8 +74,12 @@ impl Default for EcplParams {
 pub struct EcplGeometry {
     /// Raw begin-frequency code (re-emitted in the strategy block).
     pub ecplbegf: u8,
-    /// Raw end-frequency code (re-emitted in the strategy block).
+    /// Raw end-frequency code (re-emitted in the strategy block). Not
+    /// transmitted when the region is SPX-bounded (`spx_bounded`).
     pub ecplendf: u8,
+    /// The region's end is derived from the SPX begin frequency
+    /// (§E.2.3.3.17 SPX-in-use arm) — `ecplendf` is NOT transmitted.
+    pub spx_bounded: bool,
     /// `ecpl_begin_subbnd` (Table E3.8).
     pub begin_subbnd: usize,
     /// `ecpl_end_subbnd` (Table E3.8).
@@ -134,6 +138,56 @@ impl EcplGeometry {
             start_bin: begin_bin(begin),
             end_bin: end_bin(end),
             band_bins,
+            spx_bounded: false,
+        })
+    }
+
+    /// Derive the geometry for the **SPX co-active** configuration
+    /// (§E.2.3.3.17 SPX-in-use arm / §3.6.1 "coupling for a mid-range
+    /// portion ... spectral extension for the higher-range portion"):
+    /// the enhanced-coupling region ends where the SPX region begins,
+    /// `ecplendf` is not transmitted, and `spxbegf` (the raw 3-bit SPX
+    /// begin code) drives the end sub-band — `spxbegf + 5` for
+    /// `spxbegf < 6`, else `spxbegf * 2` — so the two regions abut
+    /// exactly (`ecplsubbndtab[end] == spxbandtable[spx_begin]`).
+    pub fn derive_with_spx(
+        params: &EcplParams,
+        spxbegf: u8,
+        bndstrc: &[bool; N_ECPL_SUBBND],
+    ) -> oxideav_core::Result<Self> {
+        if params.ecplbegf > 15 {
+            return Err(oxideav_core::Error::invalid(
+                "eac3 ecpl encoder: ecplbegf is a 4-bit code (0..=15)",
+            ));
+        }
+        let begin = super::ecpl::begin_subbnd(params.ecplbegf);
+        let end = super::ecpl::end_subbnd(true, 0, spxbegf as usize);
+        if begin < 4 {
+            return Err(oxideav_core::Error::invalid(
+                "eac3 ecpl encoder: ecplbegf < 2 (begin sub-band < 4) is not \
+                 supported — the region must start at transform coefficient 37 \
+                 or above",
+            ));
+        }
+        if begin >= end || end > N_ECPL_SUBBND {
+            return Err(oxideav_core::Error::invalid(
+                "eac3 ecpl encoder: SPX begin frequency leaves an empty or \
+                 out-of-grid enhanced-coupling region (need begin < end <= 22)",
+            ));
+        }
+        let necplbnd = super::ecpl::necplbnd(begin, end, bndstrc);
+        let band_bins = band_bin_counts(begin, end, bndstrc);
+        Ok(Self {
+            ecplbegf: params.ecplbegf,
+            ecplendf: 0,
+            begin_subbnd: begin,
+            end_subbnd: end,
+            bndstrc: *bndstrc,
+            necplbnd,
+            start_bin: begin_bin(begin),
+            end_bin: end_bin(end),
+            band_bins,
+            spx_bounded: true,
         })
     }
 }

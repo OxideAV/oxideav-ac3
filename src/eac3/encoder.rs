@@ -135,11 +135,57 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             "eac3 encoder: aht and spx cannot be combined (single-subsystem scope)".into(),
         ));
     }
-    if concrete.ecpl.is_some() && (concrete.aht || concrete.spx.is_some()) {
+    if concrete.ecpl.is_some() && concrete.aht {
         return Err(Error::Unsupported(
-            "eac3 encoder: ecpl cannot be combined with aht or spx (single-subsystem scope)".into(),
+            "eac3 encoder: ecpl cannot be combined with aht (single-subsystem scope)".into(),
         ));
     }
+    if let (Some(ecpl), Some(spx)) = (&concrete.ecpl, &concrete.spx) {
+        validate_spx_ecpl(spx, ecpl)?;
+    }
+    Ok(Box::new(concrete))
+}
+
+/// SPX + enhanced coupling co-active (§3.6.1: "coupling for a mid-range
+/// portion of the frequency spectrum and spectral extension for the
+/// higher-range portion"): the enhanced-coupling region ends at the SPX
+/// begin frequency (`ecplendf` is not transmitted). Every fbw channel
+/// must participate in BOTH tools — a coupled channel outside SPX would
+/// have no content above the coupling region at all (its coded
+/// mantissas stop at the coupling begin), so a mixed `channel_mask` is
+/// rejected in this configuration.
+fn validate_spx_ecpl(spx: &SpxParams, ecpl: &EcplParams) -> Result<()> {
+    if spx.channel_mask.is_some() {
+        return Err(Error::Unsupported(
+            "eac3 encoder: spx channel_mask cannot be combined with ecpl — \
+             every coupled channel must also be in SPX"
+                .into(),
+        ));
+    }
+    // The combined geometry must be valid (non-empty coupling region
+    // below the SPX begin).
+    EcplGeometry::derive_with_spx(ecpl, spx.spxbegf, &DEFAULT_ECPL_BNDSTRC)?;
+    Ok(())
+}
+
+/// Build an E-AC-3 encoder with **spectral extension AND enhanced
+/// coupling co-active** (§3.6.1): channels are waveform-coded below the
+/// enhanced-coupling begin frequency, carried by the shared coupling
+/// channel + coordinates from there to the SPX begin frequency, and
+/// SPX-synthesized above it. See [`make_encoder_with_spx`] and
+/// [`make_encoder_with_ecpl`] for the individual tools.
+pub fn make_encoder_with_spx_ecpl(
+    params: &CodecParameters,
+    spx: SpxParams,
+    ecpl: EcplParams,
+) -> Result<Box<dyn Encoder>> {
+    SpxGeometry::derive(&spx, &DEFAULT_SPX_BNDSTRC)?;
+    validate_spx_channel_mask(&spx, params.channels.unwrap_or(0))?;
+    validate_ecpl(&ecpl, params.channels.unwrap_or(0))?;
+    validate_spx_ecpl(&spx, &ecpl)?;
+    let mut concrete = build_concrete_encoder(params)?;
+    concrete.spx = Some(spx);
+    concrete.ecpl = Some(ecpl);
     Ok(Box::new(concrete))
 }
 
@@ -809,7 +855,13 @@ impl Eac3Encoder {
         // at least two fbw channels to couple.
         let ecpl_on = self.ecpl.is_some() && sub.strmtyp == 0 && nfchans >= 2;
         let ecpl_geom: Option<EcplGeometry> = match (&self.ecpl, ecpl_on) {
-            (Some(p), true) => Some(EcplGeometry::derive(p, &DEFAULT_ECPL_BNDSTRC)?),
+            (Some(p), true) => Some(match &self.spx {
+                // SPX co-active: the coupling region is bounded by the
+                // SPX begin frequency and `ecplendf` is not transmitted
+                // (§E.2.3.3.17).
+                Some(spx) => EcplGeometry::derive_with_spx(p, spx.spxbegf, &DEFAULT_ECPL_BNDSTRC)?,
+                None => EcplGeometry::derive(p, &DEFAULT_ECPL_BNDSTRC)?,
+            }),
             _ => None,
         };
 
@@ -1363,7 +1415,7 @@ impl Eac3Encoder {
                 let nb = g.necplbnd as u32;
                 let nch = nfchans as u32;
                 let chincpl_bits = if sub.acmod == 0x2 { 0 } else { nch };
-                let strategy = 1 + chincpl_bits + 4 + 4 + 1;
+                let strategy = 1 + chincpl_bits + 4 + if g.spx_bounded { 0 } else { 4 } + 1;
                 // Coordinates: block 0 (implicit exist bits) + block 3
                 // (explicit, worst-case refresh) + 4 reuse blocks, plus
                 // one ecplangleintrp bit per block.
@@ -1745,7 +1797,12 @@ impl Eac3Encoder {
                     }
                 }
                 bw.write_u32(g.ecplbegf as u32, 4); // §E.2.3.3.16
-                bw.write_u32(g.ecplendf as u32, 4); // §E.2.3.3.17 (SPX off)
+                if !g.spx_bounded {
+                    // §E.2.3.3.17 — transmitted only when SPX is off;
+                    // with SPX co-active the end sub-band is derived
+                    // from spxbegf and the field is absent.
+                    bw.write_u32(g.ecplendf as u32, 4);
+                }
                 bw.write_u32(0, 1); // ecplbndstrce = 0 → default banding
             }
 
@@ -3944,10 +4001,12 @@ mod ecpl_tests {
             .set("ecpl", "1")
             .set("aht", "1");
         assert!(make_encoder(&params).is_err());
+        // spx + ecpl is the §3.6.1 co-active configuration — allowed
+        // (see `spx_ecpl_coactive_stereo_band_energy`).
         params.options = oxideav_core::CodecOptions::new()
             .set("ecpl", "1")
             .set("spx", "1");
-        assert!(make_encoder(&params).is_err());
+        assert!(make_encoder(&params).is_ok());
         // Mono cannot couple.
         params.channels = Some(1);
         params.options = oxideav_core::CodecOptions::new().set("ecpl", "1");
@@ -4002,5 +4061,220 @@ mod ecpl_tests {
                 "output channel {ch} is near-silent (rms {rms:.1})"
             );
         }
+    }
+    // ---- SPX + enhanced coupling co-active (§3.6.1) ----
+
+    fn encode_spx_ecpl(pcm: &[f32], channels: usize, bit_rate: u64) -> Vec<u8> {
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(channels as u16);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(bit_rate);
+        let mut enc =
+            make_encoder_with_spx_ecpl(&params, SpxParams::default(), EcplParams::default())
+                .expect("eac3 make_encoder_with_spx_ecpl");
+        let n_samp = pcm.len() / channels;
+        let mut s16 = Vec::with_capacity(pcm.len() * 2);
+        for &v in pcm {
+            let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            s16.extend_from_slice(&q.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: n_samp as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut out = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => out.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("eac3 spx+ecpl encode error: {e:?}"),
+            }
+        }
+        out
+    }
+
+    /// Three-region fixture: an LF tone below the coupling begin
+    /// (bins < 37), phase-offset tones inside the coupling region
+    /// (37..109 — 4.3 / 6.7 / 9.2 kHz), HF tones + a noise bed inside
+    /// the SPX region (109..229 — 12.2 / 15.4 kHz).
+    fn build_spx_ecpl_multitone(channels: usize, frames: usize) -> Vec<f32> {
+        let n = frames * SAMPLES_PER_FRAME as usize;
+        let mut pcm = vec![0.0f32; n * channels];
+        let cpl_tones: [(f32, f32); 3] = [(4_300.0, 0.16), (6_700.0, 0.13), (9_200.0, 0.10)];
+        let spx_tones: [(f32, f32); 2] = [(12_200.0, 0.05), (15_400.0, 0.035)];
+        let mut lfsr: u32 = 0x2545_F491;
+        for i in 0..n {
+            let t = i as f32 / 48_000.0;
+            let lf = 0.20 * (2.0 * std::f32::consts::PI * 700.0 * t).sin();
+            lfsr ^= lfsr << 13;
+            lfsr ^= lfsr >> 17;
+            lfsr ^= lfsr << 5;
+            let noise = ((lfsr as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.012;
+            for ch in 0..channels {
+                let phase = 0.6 * ch as f32;
+                let mut s = lf + noise;
+                for (f, a) in cpl_tones {
+                    s += a * (2.0 * std::f32::consts::PI * f * t + phase).sin();
+                }
+                for (f, a) in spx_tones {
+                    s += a * (2.0 * std::f32::consts::PI * f * t).sin();
+                }
+                pcm[i * channels + ch] = s * (1.0 - 0.1 * ch as f32);
+            }
+        }
+        pcm
+    }
+
+    #[test]
+    fn spx_ecpl_coactive_stereo_band_energy() {
+        let spx = SpxParams::default();
+        let spx_geom = SpxGeometry::derive(&spx, &DEFAULT_SPX_BNDSTRC).unwrap();
+        let ecpl_geom = EcplGeometry::derive_with_spx(
+            &EcplParams::default(),
+            spx.spxbegf,
+            &DEFAULT_ECPL_BNDSTRC,
+        )
+        .unwrap();
+        // The two regions abut exactly: ecplsubbndtab[end] == SPX begin tc.
+        assert_eq!(ecpl_geom.end_bin, spx_geom.begin_tc);
+        assert!(ecpl_geom.spx_bounded);
+
+        let pcm = build_spx_ecpl_multitone(2, 8);
+        let stream = encode_spx_ecpl(&pcm, 2, 192_000);
+        assert_eq!(stream.len() % 768, 0);
+        let dec = decode_all(&stream, 768);
+        assert_eq!(
+            dec.len() / 2,
+            (stream.len() / 768) * SAMPLES_PER_FRAME as usize
+        );
+        let dec_f = to_f32_interleaved(&dec);
+        for ch in 0..2 {
+            let orig_prof = mdct_energy_profile(&pcm, 2, ch);
+            let dec_prof = mdct_energy_profile(&dec_f, 2, ch);
+            // (a) coupling-region band energies (37..109).
+            let deltas = ecpl_band_db_deltas(&orig_prof, &dec_prof, &ecpl_geom);
+            let mut lo = ecpl_geom.start_bin;
+            let mut energies = Vec::new();
+            for &nb in &ecpl_geom.band_bins {
+                let hi = (lo + nb).min(N_COEFFS);
+                energies.push(orig_prof[lo..hi].iter().sum::<f64>());
+                lo = hi;
+            }
+            let peak = energies.iter().cloned().fold(0.0f64, f64::max);
+            for (bnd, d) in deltas.iter().enumerate() {
+                if energies[bnd] < peak * 1e-4 {
+                    continue;
+                }
+                assert!(
+                    d.abs() <= 3.0,
+                    "ch{ch} coupling band {bnd}: energy delta {d:+.2} dB (all: {deltas:?})"
+                );
+            }
+            // (b) SPX-region band energies (109..229, §3.6.4.3).
+            let mut lo = spx_geom.begin_tc;
+            for bnd in 0..spx_geom.nbnds {
+                let hi = lo + spx_geom.bndsztab[bnd];
+                let eo: f64 = orig_prof[lo..hi].iter().sum();
+                let ed: f64 = dec_prof[lo..hi].iter().sum();
+                let d = 10.0 * (ed.max(1e-30) / eo.max(1e-30)).log10();
+                assert!(
+                    d.abs() <= 3.5,
+                    "ch{ch} SPX band {bnd}: energy delta {d:+.2} dB"
+                );
+                lo = hi;
+            }
+            // (c) coded low band (< 37) fidelity.
+            let eo: f64 = orig_prof[..ecpl_geom.start_bin].iter().sum();
+            let ed: f64 = dec_prof[..ecpl_geom.start_bin].iter().sum();
+            let lf_delta: f64 = 10.0 * (ed / eo).log10();
+            assert!(
+                lf_delta.abs() <= 1.5,
+                "ch{ch}: coded-band energy delta {lf_delta:+.2} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn spx_ecpl_constructor_rules() {
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(2);
+        params.bit_rate = Some(192_000);
+        // chmask + ecpl rejected (a coupled channel outside SPX would
+        // have no content above the coupling region).
+        let masked = SpxParams {
+            channel_mask: Some(1),
+            ..SpxParams::default()
+        };
+        assert!(make_encoder_with_spx_ecpl(&params, masked, EcplParams::default()).is_err());
+        // aht + ecpl still rejected via options.
+        params.options = oxideav_core::CodecOptions::new()
+            .set("ecpl", "1")
+            .set("aht", "1");
+        assert!(make_encoder(&params).is_err());
+        // spx + ecpl now allowed via options.
+        params.options = oxideav_core::CodecOptions::new()
+            .set("ecpl", "1")
+            .set("spx", "1");
+        assert!(make_encoder(&params).is_ok());
+        // An SPX begin low enough to empty the coupling region is
+        // rejected: spxbegf = 0 → ecpl end sub-band 5 > begin 4 is
+        // still valid, so use a begin code above it (ecplbegf 4 →
+        // begin sub-band 6 >= end 5).
+        let spx_low = SpxParams {
+            spxbegf: 0,
+            ..SpxParams::default()
+        };
+        params.options = oxideav_core::CodecOptions::new();
+        let ecpl_high = EcplParams {
+            ecplbegf: 4,
+            ecplendf: 15,
+        };
+        assert!(make_encoder_with_spx_ecpl(&params, spx_low, ecpl_high).is_err());
+    }
+
+    #[test]
+    fn spx_ecpl_registry_options_build_identical_encoder() {
+        let pcm = build_spx_ecpl_multitone(2, 3);
+        let typed = encode_spx_ecpl(&pcm, 2, 192_000);
+
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(2);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(192_000);
+        params.options = oxideav_core::CodecOptions::new()
+            .set("spx", "1")
+            .set("ecpl", "1");
+        let mut enc = make_encoder(&params).expect("options spx+ecpl encoder");
+        let n_samp = pcm.len() / 2;
+        let mut s16 = Vec::with_capacity(pcm.len() * 2);
+        for &v in &pcm {
+            let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            s16.extend_from_slice(&q.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: n_samp as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut from_options = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => from_options.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("options encode error: {e:?}"),
+            }
+        }
+        assert_eq!(
+            typed, from_options,
+            "options-driven and typed spx+ecpl constructors must emit identical bytes"
+        );
     }
 }

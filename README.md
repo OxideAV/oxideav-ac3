@@ -243,8 +243,16 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   **not possible for this tool**: the external validator binary
   reports enhanced coupling as not implemented and mutes (probed
   r406) — our decoder is ahead of the validator here, so validation
-  is round-trip + spec-text only. AHT / SPX / enhanced coupling are
-  mutually exclusive per encoder instance (single-subsystem scope).
+  is round-trip + spec-text only. **SPX and enhanced coupling can be
+  co-active** (`make_encoder_with_spx_ecpl` / options `spx=1` +
+  `ecpl=1`) per §3.6.1: channels are waveform-coded below the
+  coupling begin, carried by the shared carrier + coordinates from
+  there to the SPX begin frequency (the coupling region is
+  SPX-bounded — `ecplendf` is not transmitted, §E.2.3.3.17), and
+  SPX-synthesized above it; a stereo three-region round-trip gates
+  all three regions' energies (coupling bands ±3 dB, SPX bands
+  ±3.5 dB, coded low band ±1.5 dB). AHT remains mutually exclusive
+  with both.
 
   Three spec-fidelity notes from this work: (1) GAQ dequantisation now
   uses the literal Table E3.5/E3.6 characteristics — the `Gk = 2`

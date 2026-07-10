@@ -43,11 +43,17 @@
 //!   derivations, Table E3.9 `ecplsubbndtab[]`, Table E2.14 default
 //!   banding, the §E.2.3.3.19 `necplbnd` band count, and the
 //!   §E.3.5.5.1 per-band bin counts; the §E.2.3.3.16-26 bitstream-syntax
-//!   parse; and the §E.3.5.5.2 / §E.3.5.5.3 parameter-processing layer
+//!   parse; the §E.3.5.5.2 / §E.3.5.5.3 parameter-processing layer
 //!   (Table E3.10-E3.12 amplitude / angle / chaos decode, the chaos
 //!   amplitude modification, per-band→per-bin expansion, the
-//!   angle-interpolation path). The §E.3.5.5.1 FFT channel processing +
-//!   §E.3.5.5.4 complex synthesis are still deferred.
+//!   angle-interpolation path); and the full §E.3.5.5.1 carrier
+//!   reconstruction + §E.3.5.5.4 complex synthesis
+//!   ([`ecpl::synthesize_block`] / [`ecpl::EcplState`]).
+//! * **[`ecplenc`]** — encoder-side enhanced coupling (§E.2.3.3.16-26 /
+//!   §E.3.5.5, encode direction): Table E3.10 / E3.11 inverse
+//!   quantisers, §E.3.5.5.1 band cross-spectrum statistics, and the
+//!   first-coupled-channel-phase-locked carrier construction with
+//!   per-band gains.
 //! * **[`dsp`]** — per-frame DSP: §7.4 decouple, AHT mantissa cache,
 //!   §3.6 spectral extension (translate → noise-blend → coordinate
 //!   scale + §3.6.4.2.3 SPXATTEN border notch), §3.7.2 transient
@@ -63,10 +69,12 @@
 //!   with chanmap bit 6 set per §E.2.3.1.7-8 / §E.3.8.2). Spectral
 //!   extension is available opt-in via [`encoder::make_encoder_with_spx`]
 //!   (incl. mixed per-channel `chinspx` via
-//!   `SpxParams::channel_mask`), and the Adaptive Hybrid Transform
+//!   `SpxParams::channel_mask`), the Adaptive Hybrid Transform
 //!   via [`encoder::make_encoder_with_aht`] (fbw + LFE channels,
-//!   §3.4 — mutually exclusive with SPX). Encoder-side enhanced
-//!   coupling remains out of scope.
+//!   §3.4 — mutually exclusive with the others), enhanced coupling
+//!   via [`encoder::make_encoder_with_ecpl`], and the §3.6.1
+//!   mid-range-coupling + high-range-SPX combination via
+//!   [`encoder::make_encoder_with_spx_ecpl`].
 //! * **[`spxenc`]** — encoder-side spectral extension (§E.2.3.3 /
 //!   §E.3.6): geometry derivation + validation, the §3.6.4.3
 //!   energy-matching coordinate targets (through the decoder-shared
@@ -140,6 +148,6 @@ pub use decoder::{decode_eac3_packet, Eac3DecoderState};
 pub use ecplenc::EcplParams;
 pub use encoder::{
     make_encoder, make_encoder_with_aht, make_encoder_with_ecpl, make_encoder_with_spx,
-    CODEC_ID_STR,
+    make_encoder_with_spx_ecpl, CODEC_ID_STR,
 };
 pub use spxenc::SpxParams;
