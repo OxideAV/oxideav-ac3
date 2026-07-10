@@ -7961,4 +7961,127 @@ mod tests {
             );
         }
     }
+
+    /// Decode an AC-3 elementary stream through the external decoder
+    /// binary with extra decoder args, returning the interior RMS of
+    /// the s16le output (priming edge skipped). `None` when the binary
+    /// is unavailable.
+    fn ffmpeg_decode_rms(stream: &[u8], tag: &str, dec_args: &[&str]) -> Option<f64> {
+        use std::process::Command;
+        let in_path = std::env::temp_dir().join(format!("oxideav_ac3_meta_{tag}.ac3"));
+        let out_path = std::env::temp_dir().join(format!("oxideav_ac3_meta_{tag}.pcm"));
+        std::fs::write(&in_path, stream).expect("write ac3");
+        let _ = std::fs::remove_file(&out_path);
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-f", "ac3"]);
+        cmd.args(dec_args);
+        cmd.arg("-i").arg(&in_path);
+        cmd.args(["-f", "s16le", "-acodec", "pcm_s16le"]);
+        cmd.arg(&out_path);
+        let status = cmd.status();
+        let _ = std::fs::remove_file(&in_path);
+        let Ok(status) = status else {
+            eprintln!("ffmpeg unavailable — skipping metadata black-box gate");
+            return None;
+        };
+        assert!(status.success(), "ffmpeg failed to decode ({tag})");
+        let bytes = std::fs::read(&out_path).expect("ffmpeg output");
+        let _ = std::fs::remove_file(&out_path);
+        let samples: Vec<i16> = bytes
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        // Skip the first frame's worth of samples (priming edge).
+        let skip = (SAMPLES_PER_FRAME as usize * 2).min(samples.len() / 2);
+        let tail = &samples[skip..];
+        assert!(!tail.is_empty(), "ffmpeg decode too short ({tag})");
+        Some(
+            (tail.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / tail.len() as f64).sqrt(),
+        )
+    }
+
+    /// Black-box semantics of the emitted §5.4.3.4 `dynrng` and
+    /// §5.4.2.10 `compr` words: the external decoder's DRC controls
+    /// must reproduce exactly the Table 7.29/7.30 gains our encoder
+    /// authored. `drc_scale 0` vs `drc_scale 1` isolates `dynrng`;
+    /// `heavy_compr` swaps in the `compr` word (§7.7.2).
+    #[test]
+    fn metadata_dynrng_compr_black_box_gain_semantics() {
+        let dynrng_word = 0xC0u8; // −12.04 dB
+        let compr_word = 0xDFu8; // X=-3, Y=15 → 2^-2·(31/32) ≈ −12.32 dB
+        let meta = MetadataParams {
+            dynrng: Some(dynrng_word),
+            compr: Some(compr_word),
+            ..MetadataParams::default()
+        };
+        let stream: Vec<u8> = meta_encode(2, Some(meta), &[], 6)
+            .iter()
+            .flat_map(|p| p.data.clone())
+            .collect();
+        let Some(rms_off) = ffmpeg_decode_rms(&stream, "drc0", &["-drc_scale", "0"]) else {
+            return;
+        };
+        let rms_dyn = ffmpeg_decode_rms(&stream, "drc1", &["-drc_scale", "1"]).unwrap();
+        let rms_compr =
+            ffmpeg_decode_rms(&stream, "heavy", &["-drc_scale", "1", "-heavy_compr", "1"]).unwrap();
+        assert!(rms_off > 100.0, "baseline decode suspiciously quiet");
+        let dyn_gain = rms_dyn / rms_off;
+        let expected_dyn = crate::drc::dynrng_to_linear(dynrng_word) as f64;
+        let dyn_err_db = 20.0 * (dyn_gain / expected_dyn).log10().abs();
+        assert!(
+            dyn_err_db < 0.5,
+            "black-box dynrng gain {dyn_gain:.4} vs authored {expected_dyn:.4} \
+             (off by {dyn_err_db:.2} dB)"
+        );
+        let compr_gain = rms_compr / rms_off;
+        let expected_compr = crate::drc::compr_to_linear(compr_word) as f64;
+        let compr_err_db = 20.0 * (compr_gain / expected_compr).log10().abs();
+        assert!(
+            compr_err_db < 0.5,
+            "black-box compr gain {compr_gain:.4} vs authored {expected_compr:.4} \
+             (off by {compr_err_db:.2} dB)"
+        );
+        eprintln!(
+            "black-box DRC words: dynrng {dyn_gain:.4} (authored {expected_dyn:.4}, \
+             Δ{dyn_err_db:.3} dB), compr {compr_gain:.4} (authored {expected_compr:.4}, \
+             Δ{compr_err_db:.3} dB)"
+        );
+    }
+
+    /// Black-box semantics of the emitted `dialnorm` word: two streams
+    /// identical except for dialnorm (21 vs 31), decoded with the
+    /// external decoder's target-level normalisation, must differ by
+    /// exactly the 10 dB dialnorm delta.
+    #[test]
+    fn metadata_dialnorm_black_box_target_level() {
+        let enc = |dialnorm: u8| -> Vec<u8> {
+            meta_encode(
+                2,
+                Some(MetadataParams {
+                    dialnorm,
+                    ..MetadataParams::default()
+                }),
+                &[],
+                6,
+            )
+            .iter()
+            .flat_map(|p| p.data.clone())
+            .collect()
+        };
+        let s21 = enc(21);
+        let s31 = enc(31);
+        let args = ["-drc_scale", "0", "-target_level", "-31"];
+        let Some(rms21) = ffmpeg_decode_rms(&s21, "dn21", &args) else {
+            return;
+        };
+        let rms31 = ffmpeg_decode_rms(&s31, "dn31", &args).unwrap();
+        assert!(rms31 > 100.0, "dialnorm-31 decode suspiciously quiet");
+        // dialnorm 31 at target −31 → 0 dB; dialnorm 21 → −10 dB.
+        let ratio_db = 20.0 * (rms21 / rms31).log10();
+        assert!(
+            (ratio_db + 10.0).abs() < 0.5,
+            "black-box dialnorm delta {ratio_db:+.2} dB (expected −10.00 dB)"
+        );
+        eprintln!("black-box dialnorm: authored 10 dB delta measured {ratio_db:+.3} dB");
+    }
 }
