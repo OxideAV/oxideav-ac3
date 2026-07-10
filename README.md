@@ -79,6 +79,16 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   detector (4th-order Butterworth 8 kHz split for short-block
   switching), per-channel `fsnroffst[ch]` tuning (§5.4.3.40), per-block
   SNR-offset bit-pool redistribution, and §7.10.1 dual-CRC emission.
+- **Bitstream-metadata surface** (`encoder::MetadataParams` /
+  `make_encoder_with_metadata`, or the registry options `dialnorm`,
+  `compr`, `dynrng`, `bsmod`, `cmixlev`, `surmixlev`, `dsurmod`,
+  `langcod`, `mixlevel`+`roomtyp`, `copyright`, `origbs`): every
+  §5.4.2 BSI advisory word plus the §5.4.3.3-4 per-block `dynrng`
+  dynamic-range word. Round-tripped through the typed `bsi::parse`
+  surface and black-box validated: the external decoder binary
+  reproduces the authored `dynrng` / `compr` gains exactly
+  (Δ0.000 dB at −12 dB words) and a 10 dB `dialnorm` delta measures
+  −10.03 dB under target-level normalisation.
 
 ### E-AC-3 (Annex E)
 
@@ -141,6 +151,22 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   channels a blind append would have appended.
 - Encoder — independent + dependent substream pairs for 1.0 / 2.0 / 5.1
   / 7.1 layouts, with adaptive / frame-based exponent strategies.
+  **Bitstream-metadata surface** (`eac3::Eac3Metadata` /
+  `eac3::make_encoder_with_metadata` + registry options): fixed-BSI
+  `dialnorm` and `compr`, the per-block `dynrng` word (every block of
+  every substream), the Table E1.2 **mixing-metadata block**
+  (`dmixmod`, LtRt/LoRo centre + surround mix levels, `lfemixlevcod`,
+  `pgmscl`, `extpgmscl`) and the §E.2.3.1.62+ **informational block**
+  (`bsmod`, copyright/original, 2/0 `dsurmod`+`dheadphonmod`,
+  ≥6-channel `dsurexmod`, audio-production info, `sourcefscod`) —
+  emitted on the independent substream (a 7.1 pair's dependent
+  substream keeps the blocks absent while sharing dialnorm/compr).
+  Round-tripped through the typed Annex E `bsi::parse` surface (which
+  now also surfaces `bsmod`); black-box validated: the external
+  decoder binary accepts the block-bearing syntax (decode level
+  within 0.004 dB of a block-less encode) and reproduces the authored
+  `dynrng` gain exactly. Metadata-bearing AC-3 and E-AC-3 streams are
+  swept through the corruption families in `tests/robustness.rs`.
   **Spectral extension is now available on the encoder side**
   (`eac3::make_encoder_with_spx(params, SpxParams)`, §E.2.3.3 / §E.3.6):
   every fbw channel is coded only up to the SPX begin frequency

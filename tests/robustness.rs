@@ -308,3 +308,94 @@ fn eac3_ecpl_encoded_stream_survives_corruption() {
     // Same three corruption families as the corpus sweep.
     sweep_one("eac3", &stream);
 }
+
+/// r409: metadata-bearing streams (the encoder-side §5.4.2 / Table E1.2
+/// metadata surfaces) swept through the same three corruption families.
+/// The optional BSI words open parse paths the corpus never reaches —
+/// the base compr/langcod/audprodie chains, the Annex E mixing-metadata
+/// walk (mix levels, pgmscl chains, `mixdef` bodies including the
+/// variable-length `mixdef == 3` arm a bit flip can select) and the
+/// informational block — so bit flips here reach field combinations no
+/// other robustness input produces.
+#[test]
+fn metadata_bearing_streams_survive_corruption() {
+    use oxideav_core::{AudioFrame, Encoder, Error, Frame};
+
+    let encode = |codec: &str, channels: u16, enc: &mut Box<dyn Encoder>| -> Vec<u8> {
+        let n = 3 * 1536usize;
+        let nch = channels as usize;
+        let mut pcm_s16 = Vec::with_capacity(n * nch * 2);
+        for i in 0..n {
+            let t = i as f32 / 48_000.0;
+            for ch in 0..nch {
+                let s = 0.25 * (2.0 * std::f32::consts::PI * (300.0 + 150.0 * ch as f32) * t).sin();
+                let q = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                pcm_s16.extend_from_slice(&q.to_le_bytes());
+            }
+        }
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![pcm_s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut stream = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => stream.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("{codec} metadata encode error: {e:?}"),
+            }
+        }
+        assert!(!stream.is_empty(), "{codec}: no metadata stream produced");
+        stream
+    };
+
+    // Base AC-3 5.1 with every optional word live.
+    let mut params = CodecParameters::audio(CodecId::new("ac3"));
+    params.sample_rate = Some(48_000);
+    params.channels = Some(6);
+    params.options = oxideav_core::CodecOptions::new()
+        .set("dialnorm", "24")
+        .set("compr", "0xC5")
+        .set("dynrng", "0xC0")
+        .set("bsmod", "2")
+        .set("langcod", "255")
+        .set("mixlevel", "21")
+        .set("roomtyp", "2")
+        .set("copyright", "1");
+    let mut aenc: Box<dyn Encoder> =
+        oxideav_ac3::encoder::make_encoder(&params).expect("ac3 metadata encoder");
+    let ac3_stream = encode("ac3", 6, &mut aenc);
+    sweep_one("ac3", &ac3_stream);
+
+    // E-AC-3 5.1 with the mixing + informational blocks live.
+    let mut params = CodecParameters::audio(CodecId::new("eac3"));
+    params.sample_rate = Some(48_000);
+    params.channels = Some(6);
+    params.bit_rate = Some(384_000);
+    params.options = oxideav_core::CodecOptions::new()
+        .set("dialnorm", "22")
+        .set("compr", "0xB3")
+        .set("dynrng", "0xC0")
+        .set("dmixmod", "2")
+        .set("ltrtcmixlev", "5")
+        .set("lorocmixlev", "4")
+        .set("ltrtsurmixlev", "6")
+        .set("lorosurmixlev", "5")
+        .set("lfemixlevcod", "15")
+        .set("pgmscl", "51")
+        .set("extpgmscl", "45")
+        .set("bsmod", "2")
+        .set("dsurexmod", "2")
+        .set("mixlevel", "18")
+        .set("roomtyp", "1")
+        .set("adconvtyp", "1")
+        .set("copyright", "1")
+        .set("origbs", "0");
+    let mut eenc: Box<dyn Encoder> =
+        oxideav_ac3::eac3::make_encoder(&params).expect("eac3 metadata encoder");
+    let eac3_stream = encode("eac3", 6, &mut eenc);
+    sweep_one("eac3", &eac3_stream);
+}

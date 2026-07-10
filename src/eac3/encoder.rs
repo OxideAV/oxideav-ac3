@@ -5500,4 +5500,104 @@ mod meta_tests {
         params.options = oxideav_core::CodecOptions::new().set("dmixmod", "3");
         assert!(make_encoder(&params).is_err());
     }
+
+    /// Decode an E-AC-3 elementary stream through the external decoder
+    /// binary, returning the s16le samples. `None` when the binary is
+    /// unavailable.
+    fn ffmpeg_decode(stream: &[u8], tag: &str, dec_args: &[&str]) -> Option<Vec<i16>> {
+        use std::process::Command;
+        let in_path = std::env::temp_dir().join(format!("oxideav_eac3_meta_{tag}.ec3"));
+        let out_path = std::env::temp_dir().join(format!("oxideav_eac3_meta_{tag}.pcm"));
+        std::fs::write(&in_path, stream).expect("write ec3");
+        let _ = std::fs::remove_file(&out_path);
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-y", "-hide_banner", "-loglevel", "error", "-f", "eac3"]);
+        cmd.args(dec_args);
+        cmd.arg("-i").arg(&in_path);
+        cmd.args(["-f", "s16le", "-acodec", "pcm_s16le"]);
+        cmd.arg(&out_path);
+        let status = cmd.status();
+        let _ = std::fs::remove_file(&in_path);
+        let Ok(status) = status else {
+            eprintln!("ffmpeg unavailable — skipping eac3 metadata black-box gate");
+            return None;
+        };
+        assert!(status.success(), "ffmpeg failed to decode ({tag})");
+        let bytes = std::fs::read(&out_path).expect("ffmpeg output");
+        let _ = std::fs::remove_file(&out_path);
+        Some(
+            bytes
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+        )
+    }
+
+    fn interior_rms(samples: &[i16], channels: usize) -> f64 {
+        let skip = (SAMPLES_PER_FRAME as usize * channels).min(samples.len() / 2);
+        let tail = &samples[skip..];
+        (tail.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / tail.len().max(1) as f64)
+            .sqrt()
+    }
+
+    /// Black-box cross-validation of the metadata emission syntax and
+    /// the eac3-path dynrng semantics:
+    ///
+    /// 1. The external decoder binary accepts a 5.1 stream carrying the
+    ///    full mixing + informational blocks and decodes it at the same
+    ///    level as the block-less encode of the same PCM — a single
+    ///    misaligned bit anywhere in the Table E1.2 walk would corrupt
+    ///    every downstream field and collapse the decode.
+    /// 2. The per-block dynrng word decodes at exactly its Table 7.29
+    ///    gain (DRC on vs off).
+    #[test]
+    fn metadata_black_box_syntax_and_dynrng() {
+        let pcm = build_sine_pcm(6, 4);
+        let plain = encode_meta(&pcm, 6, 384_000, Some(Eac3Metadata::default()), &[]);
+        let meta = encode_meta(&pcm, 6, 384_000, Some(full_meta()), &[]);
+        let Some(dec_plain) = ffmpeg_decode(&plain, "plain", &["-drc_scale", "0"]) else {
+            return;
+        };
+        let dec_meta = ffmpeg_decode(&meta, "blocks", &["-drc_scale", "0"]).unwrap();
+        assert_eq!(
+            dec_plain.len(),
+            dec_meta.len(),
+            "metadata blocks changed the decoded sample count"
+        );
+        let rms_plain = interior_rms(&dec_plain, 6);
+        let rms_meta = interior_rms(&dec_meta, 6);
+        assert!(rms_plain > 100.0, "plain decode suspiciously quiet");
+        let level_db = 20.0 * (rms_meta / rms_plain).log10().abs();
+        assert!(
+            level_db < 0.5,
+            "metadata-bearing stream decodes {level_db:.2} dB off the plain encode"
+        );
+
+        // dynrng word gain, eac3 path.
+        let word = 0xC0u8;
+        let dyn_stream = encode_meta(
+            &pcm,
+            6,
+            384_000,
+            Some(Eac3Metadata {
+                dynrng: Some(word),
+                ..Eac3Metadata::default()
+            }),
+            &[],
+        );
+        let off = ffmpeg_decode(&dyn_stream, "dyn0", &["-drc_scale", "0"]).unwrap();
+        let on = ffmpeg_decode(&dyn_stream, "dyn1", &["-drc_scale", "1"]).unwrap();
+        let gain = interior_rms(&on, 6) / interior_rms(&off, 6).max(1e-9);
+        let expected = crate::drc::dynrng_to_linear(word) as f64;
+        let err_db = 20.0 * (gain / expected).log10().abs();
+        assert!(
+            err_db < 0.5,
+            "black-box eac3 dynrng gain {gain:.4} vs authored {expected:.4} \
+             (off by {err_db:.2} dB)"
+        );
+        eprintln!(
+            "black-box eac3 metadata: block-bearing level delta {level_db:.3} dB, \
+             dynrng gain {gain:.4} (authored {expected:.4}, delta {err_db:.3} dB)"
+        );
+    }
 }
