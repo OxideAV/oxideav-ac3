@@ -622,6 +622,11 @@ pub struct Bsi {
     /// Ch2 heavy compression gain word for 1+1 dual-mono only. `None`
     /// outside `acmod == 0`, or inside `acmod == 0` when `compr2e == 0`.
     pub compr_ch2: Option<CompressionGain>,
+    /// Bit-stream mode (`bsmod`, 3 bits, Table 5.7 semantics). In the
+    /// Annex E syntax this word lives inside the informational-metadata
+    /// block, so it is `Some` only when `infomdate == 1`; `None` means
+    /// "not transmitted" (treat as `0` = complete main).
+    pub bsmod: Option<u8>,
     /// Dolby Surround EX mode (§E.2.3.1.x informational metadata, gated
     /// by `infomdate==1` AND `acmod >= 6`). Carries the same semantics
     /// as Annex D §2.3.1.8 / Table D2.7 — see
@@ -896,6 +901,7 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
     // §E.2.3.1.62 ff — informational meta-data.
     let infomdate = br.read_u32(1)? != 0;
     let (
+        bsmod,
         dsurexmod,
         dheadphonmod,
         dolby_surround_mode,
@@ -907,6 +913,7 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
     ) = if infomdate {
         let info = parse_informational_metadata(br, acmod, fscod, strmtyp, numblkscod)?;
         (
+            Some(info.bsmod),
             info.dsurexmod,
             info.dheadphonmod,
             info.dolby_surround_mode,
@@ -917,7 +924,7 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
             Some(info.copyright_info),
         )
     } else {
-        (None, None, None, None, None, None, None, None)
+        (None, None, None, None, None, None, None, None, None)
     };
 
     // addbsi — §5.4.2.29-31 trailer of 1..=64 encoder-defined bytes
@@ -970,6 +977,7 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         premix_compression,
         compr,
         compr_ch2,
+        bsmod,
         dsurexmod,
         dheadphonmod,
         dolby_surround_mode,
@@ -1301,6 +1309,7 @@ fn parse_mixdata3_block(br: &mut BitReader<'_>) -> Result<u32> {
 /// when the spec's per-acmod / per-audprodie guard kept its codepoint
 /// off the wire.
 struct InformationalMetadata {
+    bsmod: u8,
     dsurexmod: Option<DolbySurroundExMode>,
     dheadphonmod: Option<DolbyHeadphoneMode>,
     dolby_surround_mode: Option<DolbySurroundMode>,
@@ -1333,7 +1342,7 @@ fn parse_informational_metadata(
     strmtyp: StreamType,
     numblkscod: u8,
 ) -> Result<InformationalMetadata> {
-    let _bsmod = br.read_u32(3)?;
+    let bsmod = br.read_u32(3)? as u8;
     let copyrightb = br.read_u32(1)? != 0;
     let origbs = br.read_u32(1)? != 0;
     let copyright_info = CopyrightInfo::from_bits(copyrightb, origbs);
@@ -1404,6 +1413,7 @@ fn parse_informational_metadata(
         let _frmsizecod = br.read_u32(6)?;
     }
     Ok(InformationalMetadata {
+        bsmod,
         dsurexmod,
         dheadphonmod,
         dolby_surround_mode,

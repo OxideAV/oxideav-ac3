@@ -112,6 +112,7 @@ use super::bsi::EAC3_BSID;
 /// The sub-keys imply `spx` unless it is explicitly `0`/`false`.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let mut concrete = build_concrete_encoder(params)?;
+    concrete.meta = eac3_metadata_from_options(params)?;
     if let Some(spx) = spx_params_from_options(params)? {
         // Same construction-time validation as make_encoder_with_spx.
         SpxGeometry::derive(&spx, &DEFAULT_SPX_BNDSTRC)?;
@@ -275,6 +276,420 @@ fn ecpl_params_from_options(params: &CodecParameters) -> Result<Option<EcplParam
     };
     EcplGeometry::derive(&p, &DEFAULT_ECPL_BNDSTRC)?;
     Ok(Some(p))
+}
+
+/// Table E1.2 mixing-metadata block (`mixmdate = 1`) for encoder-side
+/// emission on the independent substream. The acmod-gated arms
+/// (`dmixmod` needs > 2 channels, the centre / surround mix levels
+/// need those channels present, `lfemixlevcod` needs `lfeon`) are only
+/// emitted when their guard holds; configured values are ignored
+/// otherwise. The advisory `mixdef` body, pan information and
+/// per-block mixing configuration are emitted as absent
+/// (`mixdef = 0`, `paninfoe = 0`, `frmmixcfginfoe = 0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Eac3MixMetadata {
+    /// `dmixmod` (2 bits, §E.2.3.1.11) — preferred stereo downmix
+    /// (0 = not indicated, 1 = LtRt, 2 = LoRo; 3 is reserved).
+    pub dmixmod: u8,
+    /// `ltrtcmixlev` (3 bits, Table D2.3 scale: 0 = +3 dB … 6 = −6 dB,
+    /// 7 = mute).
+    pub ltrtcmixlev: u8,
+    /// `lorocmixlev` (3 bits, Table D2.5 — same scale).
+    pub lorocmixlev: u8,
+    /// `ltrtsurmixlev` (3 bits, Table D2.4: 3 = −1.5 dB … 6 = −6 dB,
+    /// 7 = mute; 0..=2 are reserved).
+    pub ltrtsurmixlev: u8,
+    /// `lorosurmixlev` (3 bits, Table D2.6 — same scale).
+    pub lorosurmixlev: u8,
+    /// `lfemixlevcode`/`lfemixlevcod` (5 bits, §E.2.3.1.x): LFE mix
+    /// level is `10 − lfemixlevcod` dB.
+    pub lfemixlevcod: Option<u8>,
+    /// `pgmscle`/`pgmscl` (6 bits, §E.2.3.1.12-13): program scale
+    /// factor `code − 51` dB (`0` = mute).
+    pub pgmscl: Option<u8>,
+    /// `extpgmscle`/`extpgmscl` (6 bits, §E.2.3.1.16-17) — external
+    /// program scale, same wire scale as `pgmscl`.
+    pub extpgmscl: Option<u8>,
+}
+
+impl Default for Eac3MixMetadata {
+    /// −3 dB centre / −3 dB surround downmix levels on both LtRt and
+    /// LoRo targets, downmix preference not indicated, no LFE mix
+    /// level, no program scale factors.
+    fn default() -> Self {
+        Self {
+            dmixmod: 0,
+            ltrtcmixlev: 4,
+            lorocmixlev: 4,
+            ltrtsurmixlev: 4,
+            lorosurmixlev: 4,
+            lfemixlevcod: None,
+            pgmscl: None,
+            extpgmscl: None,
+        }
+    }
+}
+
+/// §E.2.3.1.62+ informational-metadata block (`infomdate = 1`) for
+/// encoder-side emission on the independent substream. The 2/0-only
+/// (`dsurmod` / `dheadphonmod`) and ≥ 6-channel (`dsurexmod`) arms are
+/// emitted only when acmod carries them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Eac3InfoMetadata {
+    /// `bsmod` (3 bits, Table 5.7) — bit-stream mode.
+    pub bsmod: u8,
+    /// `copyrightb` (§5.4.2.24 semantics).
+    pub copyrightb: bool,
+    /// `origbs` (§5.4.2.25 semantics).
+    pub origbs: bool,
+    /// `dsurmod` (2 bits, Table 5.11; 2/0 only; 3 is reserved).
+    pub dsurmod: u8,
+    /// `dheadphonmod` (2 bits; 2/0 only; 0 = not indicated, 1 = not
+    /// encoded, 2 = encoded, 3 reserved).
+    pub dheadphonmod: u8,
+    /// `dsurexmod` (2 bits; acmod ≥ 6 only; 3 is reserved).
+    pub dsurexmod: u8,
+    /// `audprodie` body: `mixlevel` (5 bits), `roomtyp` (2 bits,
+    /// 0..=2), `adconvtyp` (1 bit, HDCD A/D converter).
+    pub audprod: Option<Eac3AudioProduction>,
+    /// `sourcefscod` (1 bit) — source was sampled at twice the rate.
+    pub sourcefscod: bool,
+}
+
+/// `audprodie` body for [`Eac3InfoMetadata`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Eac3AudioProduction {
+    /// `mixlevel` (5 bits, 0..=31) — peak SPL is `80 + mixlevel`.
+    pub mixlevel: u8,
+    /// `roomtyp` (2 bits, 0..=2; 3 is reserved) — Table 5.12.
+    pub roomtyp: u8,
+    /// `adconvtyp` (1 bit) — HDCD-type A/D conversion.
+    pub adconvtyp: bool,
+}
+
+impl Default for Eac3InfoMetadata {
+    fn default() -> Self {
+        Self {
+            bsmod: 0,
+            copyrightb: false,
+            origbs: true,
+            dsurmod: 0,
+            dheadphonmod: 0,
+            dsurexmod: 0,
+            audprod: None,
+            sourcefscod: false,
+        }
+    }
+}
+
+/// Encoder-side E-AC-3 bitstream-metadata surface: the fixed-BSI
+/// `dialnorm` + `compr` words, the per-block §5.4.3.3-4 `dynrng` word
+/// (emitted in every block of every substream), and the optional
+/// Table E1.2 mixing / informational metadata blocks (emitted on the
+/// independent substream; a 7.1 pair's dependent substream keeps
+/// `mixmdate = infomdate = 0`).
+///
+/// Registry option keys: `dialnorm` (1..=31), `compr` / `dynrng`
+/// (8-bit gain words, decimal or `0x`-hex); mixing block — `dmixmod`,
+/// `ltrtcmixlev`, `lorocmixlev`, `ltrtsurmixlev`, `lorosurmixlev`,
+/// `lfemixlevcod`, `pgmscl`, `extpgmscl`; informational block —
+/// `bsmod`, `copyright`, `origbs`, `dsurmod`, `dheadphonmod`,
+/// `dsurexmod`, `mixlevel` + `roomtyp` + `adconvtyp`, `sourcefscod`.
+/// Setting any key of a block emits that block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Eac3Metadata {
+    /// `dialnorm` (5 bits, §5.4.2.8 semantics) — valid 1..=31.
+    pub dialnorm: u8,
+    /// §5.4.2.9-10 heavy-compression word (Table 7.30), per substream.
+    pub compr: Option<u8>,
+    /// §5.4.3.3-4 dynamic-range word (§7.7.1.2), emitted in every
+    /// audio block of every substream.
+    pub dynrng: Option<u8>,
+    /// Table E1.2 mixing-metadata block (`mixmdate = 1`).
+    pub mixmd: Option<Eac3MixMetadata>,
+    /// §E.2.3.1.62+ informational-metadata block (`infomdate = 1`).
+    pub infomd: Option<Eac3InfoMetadata>,
+}
+
+impl Default for Eac3Metadata {
+    /// The encoder's historical fixed words: dialnorm −27 dB, nothing
+    /// else emitted.
+    fn default() -> Self {
+        Self {
+            dialnorm: 27,
+            compr: None,
+            dynrng: None,
+            mixmd: None,
+            infomd: None,
+        }
+    }
+}
+
+impl Eac3Metadata {
+    /// Range-check every codepoint against its syntax slot.
+    fn validate(&self) -> Result<()> {
+        if self.dialnorm == 0 || self.dialnorm > 31 {
+            return Err(Error::invalid(format!(
+                "eac3 encoder: dialnorm {} out of range (1..=31; 0 is reserved)",
+                self.dialnorm
+            )));
+        }
+        if let Some(m) = &self.mixmd {
+            if m.dmixmod > 2 {
+                return Err(Error::invalid(format!(
+                    "eac3 encoder: dmixmod {} out of range (0..=2; 3 is reserved)",
+                    m.dmixmod
+                )));
+            }
+            for (name, v) in [
+                ("ltrtcmixlev", m.ltrtcmixlev),
+                ("lorocmixlev", m.lorocmixlev),
+            ] {
+                if v > 7 {
+                    return Err(Error::invalid(format!(
+                        "eac3 encoder: {name} {v} out of range (0..=7)"
+                    )));
+                }
+            }
+            for (name, v) in [
+                ("ltrtsurmixlev", m.ltrtsurmixlev),
+                ("lorosurmixlev", m.lorosurmixlev),
+            ] {
+                if !(3..=7).contains(&v) {
+                    return Err(Error::invalid(format!(
+                        "eac3 encoder: {name} {v} out of range (3..=7; 0..=2 are reserved)"
+                    )));
+                }
+            }
+            if let Some(l) = m.lfemixlevcod {
+                if l > 31 {
+                    return Err(Error::invalid(format!(
+                        "eac3 encoder: lfemixlevcod {l} out of range (0..=31)"
+                    )));
+                }
+            }
+            for (name, v) in [("pgmscl", m.pgmscl), ("extpgmscl", m.extpgmscl)] {
+                if let Some(v) = v {
+                    if v > 63 {
+                        return Err(Error::invalid(format!(
+                            "eac3 encoder: {name} {v} out of range (0..=63)"
+                        )));
+                    }
+                }
+            }
+        }
+        if let Some(i) = &self.infomd {
+            if i.bsmod > 7 {
+                return Err(Error::invalid(format!(
+                    "eac3 encoder: bsmod {} out of range (0..=7)",
+                    i.bsmod
+                )));
+            }
+            for (name, v) in [
+                ("dsurmod", i.dsurmod),
+                ("dheadphonmod", i.dheadphonmod),
+                ("dsurexmod", i.dsurexmod),
+            ] {
+                if v > 2 {
+                    return Err(Error::invalid(format!(
+                        "eac3 encoder: {name} {v} out of range (0..=2; 3 is reserved)"
+                    )));
+                }
+            }
+            if let Some(a) = i.audprod {
+                if a.mixlevel > 31 {
+                    return Err(Error::invalid(format!(
+                        "eac3 encoder: mixlevel {} out of range (0..=31)",
+                        a.mixlevel
+                    )));
+                }
+                if a.roomtyp > 2 {
+                    return Err(Error::invalid(format!(
+                        "eac3 encoder: roomtyp {} out of range (0..=2; 3 is reserved)",
+                        a.roomtyp
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Bits this metadata adds to one substream's syncframe on top of
+    /// the fixed layout (which already spends the 1-bit `compre` /
+    /// `mixmdate` / `infomdate` / per-block `dynrnge` flags).
+    fn reserve_bits(&self, acmod: u8, lfeon: bool, indep: bool) -> u32 {
+        let mut bits = 0u32;
+        if self.compr.is_some() {
+            bits += 8;
+        }
+        if self.dynrng.is_some() {
+            bits += 8 * BLOCKS_PER_FRAME as u32;
+        }
+        if !indep {
+            return bits;
+        }
+        if let Some(m) = &self.mixmd {
+            if acmod > 0x2 {
+                bits += 2; // dmixmod
+            }
+            if (acmod & 0x1) != 0 && acmod > 0x2 {
+                bits += 6; // ltrtcmixlev + lorocmixlev
+            }
+            if (acmod & 0x4) != 0 {
+                bits += 6; // ltrtsurmixlev + lorosurmixlev
+            }
+            if lfeon {
+                bits += 1 + if m.lfemixlevcod.is_some() { 5 } else { 0 };
+            }
+            bits += 1 + if m.pgmscl.is_some() { 6 } else { 0 };
+            bits += 1 + if m.extpgmscl.is_some() { 6 } else { 0 };
+            bits += 2; // mixdef = 0
+            if acmod < 0x2 {
+                bits += 1; // paninfoe = 0
+            }
+            bits += 1; // frmmixcfginfoe = 0
+        }
+        if let Some(i) = &self.infomd {
+            bits += 3 + 1 + 1; // bsmod + copyrightb + origbs
+            if acmod == 0x2 {
+                bits += 4; // dsurmod + dheadphonmod
+            }
+            if acmod >= 0x6 {
+                bits += 2; // dsurexmod
+            }
+            bits += 1 + if i.audprod.is_some() { 8 } else { 0 };
+            bits += 1; // sourcefscod (fscod < 0x3 always here)
+        }
+        bits
+    }
+}
+
+/// Parse the metadata codec options (see [`Eac3Metadata`]) from
+/// `CodecParameters::options`; absent keys keep the defaults.
+fn eac3_metadata_from_options(params: &CodecParameters) -> Result<Eac3Metadata> {
+    let opts = &params.options;
+    let get_u8 = |key: &str| -> Result<Option<u8>> {
+        match opts.get(key) {
+            None => Ok(None),
+            Some(v) => {
+                let parsed =
+                    if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+                        u8::from_str_radix(hex, 16).ok()
+                    } else {
+                        v.parse::<u8>().ok()
+                    };
+                parsed.map(Some).ok_or_else(|| {
+                    Error::invalid(format!(
+                        "eac3 encoder: option {key}={v} (expected 0..=255, decimal or 0x-hex)"
+                    ))
+                })
+            }
+        }
+    };
+    let get_bool = |key: &str| -> Result<Option<bool>> {
+        match opts.get(key) {
+            None => Ok(None),
+            Some("1") | Some("true") => Ok(Some(true)),
+            Some("0") | Some("false") => Ok(Some(false)),
+            Some(v) => Err(Error::invalid(format!(
+                "eac3 encoder: option {key}={v} (expected 1/true/0/false)"
+            ))),
+        }
+    };
+    let mut meta = Eac3Metadata::default();
+    if let Some(v) = get_u8("dialnorm")? {
+        meta.dialnorm = v;
+    }
+    meta.compr = get_u8("compr")?;
+    meta.dynrng = get_u8("dynrng")?;
+    // Mixing block — any key present emits the block.
+    let dmixmod = get_u8("dmixmod")?;
+    let ltrtc = get_u8("ltrtcmixlev")?;
+    let loroc = get_u8("lorocmixlev")?;
+    let ltrts = get_u8("ltrtsurmixlev")?;
+    let loros = get_u8("lorosurmixlev")?;
+    let lfemix = get_u8("lfemixlevcod")?;
+    let pgmscl = get_u8("pgmscl")?;
+    let extpgmscl = get_u8("extpgmscl")?;
+    if dmixmod.is_some()
+        || ltrtc.is_some()
+        || loroc.is_some()
+        || ltrts.is_some()
+        || loros.is_some()
+        || lfemix.is_some()
+        || pgmscl.is_some()
+        || extpgmscl.is_some()
+    {
+        let d = Eac3MixMetadata::default();
+        meta.mixmd = Some(Eac3MixMetadata {
+            dmixmod: dmixmod.unwrap_or(d.dmixmod),
+            ltrtcmixlev: ltrtc.unwrap_or(d.ltrtcmixlev),
+            lorocmixlev: loroc.unwrap_or(d.lorocmixlev),
+            ltrtsurmixlev: ltrts.unwrap_or(d.ltrtsurmixlev),
+            lorosurmixlev: loros.unwrap_or(d.lorosurmixlev),
+            lfemixlevcod: lfemix,
+            pgmscl,
+            extpgmscl,
+        });
+    }
+    // Informational block — any key present emits the block.
+    let bsmod = get_u8("bsmod")?;
+    let copyright = get_bool("copyright")?;
+    let origbs = get_bool("origbs")?;
+    let dsurmod = get_u8("dsurmod")?;
+    let dheadphonmod = get_u8("dheadphonmod")?;
+    let dsurexmod = get_u8("dsurexmod")?;
+    let mixlevel = get_u8("mixlevel")?;
+    let roomtyp = get_u8("roomtyp")?;
+    let adconvtyp = get_bool("adconvtyp")?;
+    let sourcefscod = get_bool("sourcefscod")?;
+    if bsmod.is_some()
+        || copyright.is_some()
+        || origbs.is_some()
+        || dsurmod.is_some()
+        || dheadphonmod.is_some()
+        || dsurexmod.is_some()
+        || mixlevel.is_some()
+        || roomtyp.is_some()
+        || adconvtyp.is_some()
+        || sourcefscod.is_some()
+    {
+        let d = Eac3InfoMetadata::default();
+        let audprod = if mixlevel.is_some() || roomtyp.is_some() || adconvtyp.is_some() {
+            Some(Eac3AudioProduction {
+                mixlevel: mixlevel.unwrap_or(0),
+                roomtyp: roomtyp.unwrap_or(0),
+                adconvtyp: adconvtyp.unwrap_or(false),
+            })
+        } else {
+            None
+        };
+        meta.infomd = Some(Eac3InfoMetadata {
+            bsmod: bsmod.unwrap_or(d.bsmod),
+            copyrightb: copyright.unwrap_or(d.copyrightb),
+            origbs: origbs.unwrap_or(d.origbs),
+            dsurmod: dsurmod.unwrap_or(d.dsurmod),
+            dheadphonmod: dheadphonmod.unwrap_or(d.dheadphonmod),
+            dsurexmod: dsurexmod.unwrap_or(d.dsurexmod),
+            audprod,
+            sourcefscod: sourcefscod.unwrap_or(d.sourcefscod),
+        });
+    }
+    meta.validate()?;
+    Ok(meta)
+}
+
+/// [`make_encoder`] with a typed [`Eac3Metadata`] — the encoder-side
+/// bitstream-metadata surface (fixed-BSI `dialnorm`/`compr`, per-block
+/// `dynrng`, and the Table E1.2 mixing / informational blocks).
+pub fn make_encoder_with_metadata(
+    params: &CodecParameters,
+    meta: Eac3Metadata,
+) -> Result<Box<dyn Encoder>> {
+    meta.validate()?;
+    let mut concrete = build_concrete_encoder(params)?;
+    concrete.meta = meta;
+    Ok(Box::new(concrete))
 }
 
 /// Enhanced coupling needs at least two coupled fbw channels in the
@@ -560,6 +975,7 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
         spx: None,
         aht: false,
         ecpl: None,
+        meta: Eac3Metadata::default(),
         ecpl_carry: vec![None, None],
     })
 }
@@ -740,6 +1156,10 @@ struct Eac3Encoder {
     /// is on. Mutually exclusive with `spx` and `aht`
     /// (single-subsystem scope).
     ecpl: Option<EcplParams>,
+    /// Encoder-side bitstream metadata (fixed-BSI dialnorm/compr,
+    /// per-block dynrng, Table E1.2 mixing / informational blocks).
+    /// Validated at construction.
+    meta: Eac3Metadata,
     /// Per-substream cross-frame enhanced-coupling analysis carry: the
     /// previous frame's last-block carrier + per-channel
     /// region-restricted MDCT buffers, mirroring the decoder's
@@ -1445,9 +1865,18 @@ impl Eac3Encoder {
                 (strategy + true_coords + 16).saturating_sub(modelled_strategy + modelled_coords)
             }
         };
+        // Optional metadata words (compr / mixing / informational
+        // blocks / per-block dynrng) on top of the fixed layout.
+        let meta_reserve_bits: u32 = self
+            .meta
+            .reserve_bits(sub.acmod, sub.lfeon, sub.strmtyp == 0);
         let tuner_frame_bytes = sub.frame_bytes.saturating_sub(
-            (snr_reserve_bits + spx_reserve_bits + aht_reserve_bits + ecpl_reserve_bits).div_ceil(8)
-                as usize,
+            (snr_reserve_bits
+                + spx_reserve_bits
+                + aht_reserve_bits
+                + ecpl_reserve_bits
+                + meta_reserve_bits)
+                .div_ceil(8) as usize,
         );
         // Pass chexpstr_plan so the overhead calculator accounts for
         // D25/D45 exponent savings when sizing the mantissa budget.
@@ -1586,11 +2015,18 @@ impl Eac3Encoder {
         bw.write_u32(sub.acmod as u32, 3);
         bw.write_u32(u32::from(sub.lfeon), 1);
         bw.write_u32(EAC3_BSID as u32, 5);
-        bw.write_u32(27, 5); // dialnorm = -27 dB
-        bw.write_u32(0, 1); // compre = 0
-                            // acmod != 0 → no dialnorm2/compr2e (we never produce 1+1).
-                            // §E.2.2.2 / E.2.3.1.7-8: dependent substreams emit chanmape
-                            // (and chanmap when chanmape=1) immediately after compre.
+        bw.write_u32(self.meta.dialnorm as u32, 5);
+        match self.meta.compr {
+            // §5.4.2.9-10 semantics — Table 7.30 heavy compression.
+            Some(c) => {
+                bw.write_u32(1, 1); // compre = 1
+                bw.write_u32(c as u32, 8);
+            }
+            None => bw.write_u32(0, 1), // compre = 0
+        }
+        // acmod != 0 → no dialnorm2/compr2e (we never produce 1+1).
+        // §E.2.2.2 / E.2.3.1.7-8: dependent substreams emit chanmape
+        // (and chanmap when chanmape=1) immediately after compre.
         if sub.strmtyp == 1 {
             if let Some(map) = sub.chanmap {
                 bw.write_u32(1, 1); // chanmape = 1
@@ -1599,9 +2035,86 @@ impl Eac3Encoder {
                 bw.write_u32(0, 1); // chanmape = 0
             }
         }
-        bw.write_u32(0, 1); // mixmdate = 0
-        bw.write_u32(0, 1); // infomdate = 0
-                            // numblkscod == 0x3 → no convsync / blkid / frmsizecod fields.
+        // §E.2.3.1.9-61 mixing metadata (independent substream only;
+        // a paired dependent substream keeps mixmdate = 0).
+        match (&self.meta.mixmd, sub.strmtyp) {
+            (Some(m), 0) => {
+                bw.write_u32(1, 1); // mixmdate = 1
+                if sub.acmod > 0x2 {
+                    bw.write_u32(m.dmixmod as u32, 2);
+                }
+                if (sub.acmod & 0x1) != 0 && sub.acmod > 0x2 {
+                    bw.write_u32(m.ltrtcmixlev as u32, 3);
+                    bw.write_u32(m.lorocmixlev as u32, 3);
+                }
+                if (sub.acmod & 0x4) != 0 {
+                    bw.write_u32(m.ltrtsurmixlev as u32, 3);
+                    bw.write_u32(m.lorosurmixlev as u32, 3);
+                }
+                if sub.lfeon {
+                    match m.lfemixlevcod {
+                        Some(l) => {
+                            bw.write_u32(1, 1); // lfemixlevcode = 1
+                            bw.write_u32(l as u32, 5);
+                        }
+                        None => bw.write_u32(0, 1),
+                    }
+                }
+                // strmtyp == 0 arm: pgmscle / extpgmscle / mixdef /
+                // (acmod < 2: paninfoe) / frmmixcfginfoe.
+                match m.pgmscl {
+                    Some(p) => {
+                        bw.write_u32(1, 1);
+                        bw.write_u32(p as u32, 6);
+                    }
+                    None => bw.write_u32(0, 1),
+                }
+                match m.extpgmscl {
+                    Some(p) => {
+                        bw.write_u32(1, 1);
+                        bw.write_u32(p as u32, 6);
+                    }
+                    None => bw.write_u32(0, 1),
+                }
+                bw.write_u32(0, 2); // mixdef = 0 (no further mixdata)
+                if sub.acmod < 0x2 {
+                    bw.write_u32(0, 1); // paninfoe = 0
+                }
+                bw.write_u32(0, 1); // frmmixcfginfoe = 0
+            }
+            _ => bw.write_u32(0, 1), // mixmdate = 0
+        }
+        // §E.2.3.1.62+ informational metadata (independent substream
+        // only).
+        match (&self.meta.infomd, sub.strmtyp) {
+            (Some(i), 0) => {
+                bw.write_u32(1, 1); // infomdate = 1
+                bw.write_u32(i.bsmod as u32, 3);
+                bw.write_u32(u32::from(i.copyrightb), 1);
+                bw.write_u32(u32::from(i.origbs), 1);
+                if sub.acmod == 0x2 {
+                    bw.write_u32(i.dsurmod as u32, 2);
+                    bw.write_u32(i.dheadphonmod as u32, 2);
+                }
+                if sub.acmod >= 0x6 {
+                    bw.write_u32(i.dsurexmod as u32, 2);
+                }
+                match i.audprod {
+                    Some(a) => {
+                        bw.write_u32(1, 1); // audprodie = 1
+                        bw.write_u32(a.mixlevel as u32, 5);
+                        bw.write_u32(a.roomtyp as u32, 2);
+                        bw.write_u32(u32::from(a.adconvtyp), 1);
+                    }
+                    None => bw.write_u32(0, 1),
+                }
+                // fscod < 0x3 always holds here (48/44.1/32 kHz).
+                bw.write_u32(u32::from(i.sourcefscod), 1);
+                // numblkscod == 0x3 → no convsync field.
+            }
+            _ => bw.write_u32(0, 1), // infomdate = 0
+        }
+        // numblkscod == 0x3 → no convsync / blkid / frmsizecod fields.
         bw.write_u32(0, 1); // addbsie = 0
 
         // audfrm (§E.2.2.3 / §E.2.3.2)
@@ -1724,7 +2237,15 @@ impl Eac3Encoder {
                 // decoders from substituting dither there.
                 bw.write_u32(u32::from(!self.aht), 1); // dithflag
             }
-            bw.write_u32(0, 1); // dynrnge = 0
+            // §5.4.3.3-4 dynrnge + dynrng: when metadata configures a
+            // dynamic-range word it is transmitted in EVERY block.
+            match self.meta.dynrng {
+                Some(w) => {
+                    bw.write_u32(1, 1);
+                    bw.write_u32(w as u32, 8);
+                }
+                None => bw.write_u32(0, 1), // dynrnge = 0
+            }
 
             // SPX strategy (§E.2.3.3.1-8). Block 0 has implicit
             // `spxstre = 1` and emits `spxinu` directly; later blocks
@@ -4652,5 +5173,331 @@ mod ecpl_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod meta_tests {
+    use super::tests::{build_sine_pcm, decode_all};
+    use super::*;
+
+    fn encode_meta(
+        pcm: &[f32],
+        channels: usize,
+        bit_rate: u64,
+        meta: Option<Eac3Metadata>,
+        options: &[(&str, &str)],
+    ) -> Vec<u8> {
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(channels as u16);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(bit_rate);
+        let mut opts = oxideav_core::CodecOptions::new();
+        for (k, v) in options {
+            opts = opts.set(*k, *v);
+        }
+        params.options = opts;
+        let mut enc: Box<dyn Encoder> = match meta {
+            Some(m) => make_encoder_with_metadata(&params, m).expect("typed metadata encoder"),
+            None => make_encoder(&params).expect("options encoder"),
+        };
+        let n_samp = pcm.len() / channels;
+        let mut s16 = Vec::with_capacity(pcm.len() * 2);
+        for &v in pcm {
+            let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            s16.extend_from_slice(&q.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: n_samp as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut out = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => out.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("eac3 encode error: {e:?}"),
+            }
+        }
+        assert!(!out.is_empty(), "no packets produced");
+        out
+    }
+
+    fn full_meta() -> Eac3Metadata {
+        Eac3Metadata {
+            dialnorm: 22,
+            compr: Some(0xB3),
+            dynrng: None,
+            mixmd: Some(Eac3MixMetadata {
+                dmixmod: 2, // LoRo preferred
+                ltrtcmixlev: 5,
+                lorocmixlev: 4,
+                ltrtsurmixlev: 6,
+                lorosurmixlev: 5,
+                lfemixlevcod: Some(15),
+                pgmscl: Some(51), // 0 dB
+                extpgmscl: Some(45),
+            }),
+            infomd: Some(Eac3InfoMetadata {
+                bsmod: 2,
+                copyrightb: true,
+                origbs: false,
+                dsurmod: 0,
+                dheadphonmod: 0,
+                dsurexmod: 2,
+                audprod: Some(Eac3AudioProduction {
+                    mixlevel: 18,
+                    roomtyp: 1,
+                    adconvtyp: true,
+                }),
+                sourcefscod: false,
+            }),
+        }
+    }
+
+    /// Every Table E1.2 mixing + informational word configured through
+    /// [`Eac3Metadata`] must read back through the typed Annex E BSI
+    /// surface on every syncframe — 5.1 exercises the dmixmod,
+    /// centre/surround mix-level, LFE-mix-level and dsurexmod arms.
+    #[test]
+    fn metadata_bsi_words_roundtrip_51() {
+        let pcm = build_sine_pcm(6, 3);
+        let stream = encode_meta(&pcm, 6, 384_000, Some(full_meta()), &[]);
+        let fb = 1536usize; // 384 kbps @ 48 kHz
+        assert_eq!(stream.len() % fb, 0);
+        for off in (0..stream.len()).step_by(fb) {
+            let bsi = crate::eac3::bsi::parse(&stream[off + 2..]).expect("eac3 bsi");
+            assert_eq!(bsi.dialnorm, 22);
+            assert_eq!(bsi.compr.expect("compr present").raw(), 0xB3);
+            assert_eq!(bsi.dmixmod, 2);
+            let ml = bsi.annex_e_mix_levels.expect("mix levels present");
+            assert_eq!(ml.ltrtcmixlev, 5);
+            assert_eq!(ml.lorocmixlev, 4);
+            assert_eq!(ml.ltrtsurmixlev, 6);
+            assert_eq!(ml.lorosurmixlev, 5);
+            assert_eq!(bsi.lfemixlevcod, Some(15));
+            let pg = bsi.pgmscl.expect("pgmscl present");
+            assert_eq!(pg.raw(), 51);
+            assert_eq!(pg.decibels(), Some(0));
+            assert_eq!(bsi.extpgmscl.expect("extpgmscl present").raw(), 45);
+            assert_eq!(bsi.bsmod, Some(2));
+            assert!(bsi.dsurexmod.is_some(), "dsurexmod absent (acmod 7)");
+            let ap = bsi.audio_production.expect("audprod present");
+            assert_eq!(ap.mixlevel, 18);
+            assert_eq!(ap.roomtyp.raw(), 1);
+            assert!(bsi.adconvtyp.is_some());
+            let ci = bsi.copyright_info.expect("copyright info present");
+            assert!(ci.is_copyright_protected());
+            assert!(!ci.is_original_bitstream());
+        }
+        // The metadata-bearing stream still decodes.
+        let dec = decode_all(&stream, fb);
+        assert!(!dec.is_empty());
+    }
+
+    /// 2/0 exercises the dsurmod + dheadphonmod informational arm and
+    /// the front/surround-less mixing block (pgmscl only).
+    #[test]
+    fn metadata_stereo_dsurmod_dheadphon_roundtrip() {
+        let meta = Eac3Metadata {
+            mixmd: Some(Eac3MixMetadata {
+                pgmscl: Some(40), // −11 dB
+                ..Eac3MixMetadata::default()
+            }),
+            infomd: Some(Eac3InfoMetadata {
+                dsurmod: 2,
+                dheadphonmod: 2,
+                ..Eac3InfoMetadata::default()
+            }),
+            ..Eac3Metadata::default()
+        };
+        let pcm = build_sine_pcm(2, 2);
+        let stream = encode_meta(&pcm, 2, 192_000, Some(meta), &[]);
+        let fb = 768usize;
+        assert_eq!(stream.len() % fb, 0);
+        for off in (0..stream.len()).step_by(fb) {
+            let bsi = crate::eac3::bsi::parse(&stream[off + 2..]).expect("eac3 bsi");
+            // 2/0: no dmixmod / mix-level arms.
+            assert_eq!(bsi.dmixmod, 0xFF);
+            assert!(bsi.annex_e_mix_levels.is_none());
+            assert_eq!(bsi.pgmscl.expect("pgmscl").decibels(), Some(-11));
+            assert!(bsi.dolby_surround_mode.is_some(), "dsurmod absent");
+            assert!(bsi.dheadphonmod.is_some(), "dheadphonmod absent");
+            assert_eq!(bsi.bsmod, Some(0));
+        }
+    }
+
+    /// A 7.1 indep+dep pair carries the metadata blocks on the
+    /// INDEPENDENT substream only; the dependent substream keeps
+    /// `mixmdate = infomdate = 0` but shares dialnorm/compr.
+    #[test]
+    fn metadata_71_pair_blocks_on_indep_only() {
+        let meta = Eac3Metadata {
+            compr: Some(0x77),
+            ..full_meta()
+        };
+        let pcm = build_sine_pcm(8, 3);
+        let stream = encode_meta(&pcm, 8, 576_000, Some(meta), &[]);
+        let pair = 1536 + 768;
+        assert_eq!(stream.len() % pair, 0, "not a whole pair stream");
+        for off in (0..stream.len()).step_by(pair) {
+            let indep = crate::eac3::bsi::parse(&stream[off + 2..]).expect("indep bsi");
+            assert_eq!(indep.frame_bytes, 1536);
+            assert_eq!(indep.dialnorm, 22);
+            assert_eq!(indep.compr.expect("indep compr").raw(), 0x77);
+            assert_eq!(indep.dmixmod, 2);
+            assert_eq!(indep.bsmod, Some(2));
+            let dep = crate::eac3::bsi::parse(&stream[off + 1536 + 2..]).expect("dep bsi");
+            assert_eq!(dep.frame_bytes, 768);
+            assert_eq!(dep.dialnorm, 22);
+            assert_eq!(dep.compr.expect("dep compr").raw(), 0x77);
+            // Blocks absent on the dependent substream.
+            assert_eq!(dep.dmixmod, 0xFF);
+            assert!(dep.annex_e_mix_levels.is_none());
+            assert!(dep.pgmscl.is_none());
+            assert_eq!(dep.bsmod, None);
+            assert!(dep.copyright_info.is_none());
+        }
+    }
+
+    /// The per-block §5.4.3.4 dynrng word is applied by the E-AC-3
+    /// decode path's mandatory §7.7.1 line-out gain: −12.04 dB word ⇒
+    /// 0.25× output.
+    #[test]
+    fn metadata_dynrng_scales_eac3_decode() {
+        let word = 0xC0u8;
+        let expected = crate::drc::dynrng_to_linear(word) as f64; // 0.25
+        let pcm = build_sine_pcm(2, 4);
+        let fb = 768usize;
+        let plain = decode_all(&encode_meta(&pcm, 2, 192_000, None, &[]), fb);
+        let cut = decode_all(
+            &encode_meta(
+                &pcm,
+                2,
+                192_000,
+                Some(Eac3Metadata {
+                    dynrng: Some(word),
+                    ..Eac3Metadata::default()
+                }),
+                &[],
+            ),
+            fb,
+        );
+        assert_eq!(plain.len(), cut.len());
+        let rms = |v: &[i16]| -> f64 {
+            let n = v.len().max(1);
+            (v.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / n as f64).sqrt()
+        };
+        let skip = 2 * SAMPLES_PER_BLOCK * 2;
+        let ratio = rms(&cut[skip..]) / rms(&plain[skip..]).max(1e-9);
+        let delta_db = 20.0 * (ratio / expected).log10().abs();
+        assert!(
+            delta_db < 0.5,
+            "eac3 decoded dynrng gain {ratio:.4} vs authored {expected:.4} \
+             (off by {delta_db:.2} dB)"
+        );
+    }
+
+    /// Registry `options` and the typed constructor must build the
+    /// same encoder — pinned byte-identical.
+    #[test]
+    fn metadata_options_build_identical_encoder() {
+        let pcm = build_sine_pcm(6, 2);
+        let typed = encode_meta(&pcm, 6, 384_000, Some(full_meta()), &[]);
+        let from_options = encode_meta(
+            &pcm,
+            6,
+            384_000,
+            None,
+            &[
+                ("dialnorm", "22"),
+                ("compr", "0xB3"),
+                ("dmixmod", "2"),
+                ("ltrtcmixlev", "5"),
+                ("lorocmixlev", "4"),
+                ("ltrtsurmixlev", "6"),
+                ("lorosurmixlev", "5"),
+                ("lfemixlevcod", "15"),
+                ("pgmscl", "51"),
+                ("extpgmscl", "45"),
+                ("bsmod", "2"),
+                ("copyright", "1"),
+                ("origbs", "false"),
+                ("dsurexmod", "2"),
+                ("mixlevel", "18"),
+                ("roomtyp", "1"),
+                ("adconvtyp", "true"),
+            ],
+        );
+        assert_eq!(
+            typed, from_options,
+            "options-driven and typed metadata constructors must emit identical bytes"
+        );
+    }
+
+    /// Out-of-range codepoints are rejected at construction.
+    #[test]
+    fn metadata_validation_rejects_out_of_range() {
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(2);
+        let bad_metas = [
+            Eac3Metadata {
+                dialnorm: 0,
+                ..Eac3Metadata::default()
+            },
+            Eac3Metadata {
+                mixmd: Some(Eac3MixMetadata {
+                    dmixmod: 3,
+                    ..Eac3MixMetadata::default()
+                }),
+                ..Eac3Metadata::default()
+            },
+            Eac3Metadata {
+                mixmd: Some(Eac3MixMetadata {
+                    ltrtsurmixlev: 2, // 0..=2 reserved
+                    ..Eac3MixMetadata::default()
+                }),
+                ..Eac3Metadata::default()
+            },
+            Eac3Metadata {
+                mixmd: Some(Eac3MixMetadata {
+                    pgmscl: Some(64),
+                    ..Eac3MixMetadata::default()
+                }),
+                ..Eac3Metadata::default()
+            },
+            Eac3Metadata {
+                infomd: Some(Eac3InfoMetadata {
+                    dsurmod: 3,
+                    ..Eac3InfoMetadata::default()
+                }),
+                ..Eac3Metadata::default()
+            },
+            Eac3Metadata {
+                infomd: Some(Eac3InfoMetadata {
+                    audprod: Some(Eac3AudioProduction {
+                        mixlevel: 0,
+                        roomtyp: 3,
+                        adconvtyp: false,
+                    }),
+                    ..Eac3InfoMetadata::default()
+                }),
+                ..Eac3Metadata::default()
+            },
+        ];
+        for bad in bad_metas {
+            assert!(
+                make_encoder_with_metadata(&params, bad).is_err(),
+                "expected rejection: {bad:?}"
+            );
+        }
+        // Options-path rejection.
+        params.options = oxideav_core::CodecOptions::new().set("dmixmod", "3");
+        assert!(make_encoder(&params).is_err());
     }
 }

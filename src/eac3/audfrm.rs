@@ -625,6 +625,7 @@ mod tests {
             bsid: 16,
             dialnorm: 27,
             dialnorm_ch2: None,
+            bsmod: None,
             chanmap: None,
             annex_e_mix_levels: None,
             dmixmod: 0xFF,
