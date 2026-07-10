@@ -1,6 +1,7 @@
 //! E-AC-3 rate/quality curves — encode a fixture at a ladder of bit
-//! rates with the standard, AHT, and SPX coding paths, decode with the
-//! in-tree decoder, and print the per-rate PSNR table.
+//! rates with the standard, AHT, SPX, and enhanced-coupling coding
+//! paths, decode with the in-tree decoder, and print the per-rate PSNR
+//! table.
 //!
 //! Each row exposes the outcome of the encoder's per-frame SNR-offset
 //! search: at every rate the tuner picks the largest `(csnroffst,
@@ -20,6 +21,7 @@ use std::env;
 
 use oxideav_ac3::eac3;
 use oxideav_ac3::eac3::decoder::{decode_eac3_packet, Eac3DecoderState};
+use oxideav_ac3::eac3::ecplenc::EcplParams;
 use oxideav_ac3::eac3::spxenc::SpxParams;
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Encoder, Error, Frame, SampleFormat};
 
@@ -77,6 +79,9 @@ fn encode(pcm: &[f32], kbps: u32, mode: &str) -> Vec<u8> {
     let mut enc: Box<dyn Encoder> = match mode {
         "aht" => eac3::make_encoder_with_aht(&params).expect("aht encoder"),
         "spx" => eac3::make_encoder_with_spx(&params, SpxParams::default()).expect("spx encoder"),
+        "ecpl" => {
+            eac3::make_encoder_with_ecpl(&params, EcplParams::default()).expect("ecpl encoder")
+        }
         _ => eac3::make_encoder(&params).expect("standard encoder"),
     };
     let n_samp = pcm.len() / CHANNELS;
@@ -139,14 +144,17 @@ fn main() {
     let pcm = build_pcm(&kind);
     println!("fixture: {kind} (stereo, {DUR} s @ {SR} Hz)");
     println!(
-        "{:>6} | {:>12} | {:>12} | {:>12}",
-        "kbps", "standard", "aht", "spx"
+        "{:>6} | {:>12} | {:>12} | {:>12} | {:>12}",
+        "kbps", "standard", "aht", "spx", "ecpl"
     );
-    println!("{:->6}-+-{:->12}-+-{:->12}-+-{:->12}", "", "", "", "");
+    println!(
+        "{:->6}-+-{:->12}-+-{:->12}-+-{:->12}-+-{:->12}",
+        "", "", "", "", ""
+    );
     for kbps in [96u32, 128, 160, 192, 256, 320, 384, 448] {
         let frame_bytes = (kbps * 4) as usize / 2 * 2;
         let mut row = format!("{kbps:>6}");
-        for mode in ["std", "aht", "spx"] {
+        for mode in ["std", "aht", "spx", "ecpl"] {
             let stream = encode(&pcm, kbps, mode);
             assert_eq!(stream.len() % frame_bytes, 0);
             let dec = decode(&stream, frame_bytes);

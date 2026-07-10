@@ -103,7 +103,15 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   enhanced-coupling block (carried on `EcplState`, §E.3.5.5.1), so the
   prior-frame edge no longer collapses to a zero carrier; the frame's
   last block's "next block" still uses a zero carrier (it lives in a
-  not-yet-decoded frame — streaming lookahead is out of scope). The
+  not-yet-decoded frame — streaming lookahead is out of scope). Two
+  enhanced-coupling conformance defects fixed in r406, both pinned by
+  the new encoder round-trips: `chincpl[ch]` is read directly after
+  `ecplinu` (BEFORE the standard/enhanced strategy split — the prior
+  order desynced every multichannel ecpl frame, invisibly in 2/0 where
+  the flags are implicit), and `ecplparam1e/2e == 0` now REUSE the
+  previously transmitted amplitudes / angle+chaos values per
+  §2.3.3.21-22 (previously each block's coordinate set was replaced
+  wholesale, silencing every band of a reusing channel). The
   §E.3.3.2 `nrematbd` derivation now folds in enhanced coupling: a 2/0
   `ecplinu` block sizes its rematrix-flag field from the raw `ecplbegf`
   code (0/1/2/<5 → 0/1/2/3 bands, else 4) rather than `cplbegf`, keeping
@@ -197,13 +205,48 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   +7 to +22 dB. Black-box: mono / stereo / 5.1 AHT streams decode
   through an external decoder binary at 28.1 / 28.1 / 33.4 dB
   (vs 22.3 dB non-AHT baseline through the same harness).
-  `examples/eac3_rate_curves.rs` prints the full standard/AHT/SPX
-  rate ladder; `aht_quality_scales_with_rate` gates the curve shape
-  in CI. AHT and SPX remain mutually exclusive per encoder instance
-  (single-subsystem scope); encoder-side enhanced coupling is still
-  out of scope.
+  `examples/eac3_rate_curves.rs` prints the full
+  standard/AHT/SPX/enhanced-coupling rate ladder;
+  `aht_quality_scales_with_rate` gates the curve shape in CI.
 
-  Two spec-fidelity notes from this work: (1) GAQ dequantisation now
+  **Enhanced coupling is now on the encoder side too**
+  (`eac3::make_encoder_with_ecpl(params, EcplParams)` / the `ecpl`,
+  `ecpl_begf`, `ecpl_endf` options; §E.2.3.3.16-26 / §E.3.5.5) — the
+  last Annex E encoder tool. Every fbw channel of the independent
+  substream is coupled: below the begin frequency (default tc# 37 ≈
+  3.5 kHz) channels are waveform-coded as usual; above it a single
+  shared **carrier** channel is coded through the standard coupling-
+  channel exponent / bit-allocation / mantissa path (cplexpstr anchors
+  on blocks 0/3, `cplabsexp` + D15 groups, implicit first-block
+  `cplleake` with zero leak inits, mantissas interleaved after the
+  first coupled channel) and each coupled channel is rebuilt from it
+  via per-band Table E3.10 amplitude + Table E3.11 angle coordinates
+  (chaos 0, `ecpltrans` 0 — deterministic decode). The carrier is the
+  first coupled channel's MDCT scaled per band ~3 dB above the loudest
+  coupled channel — phase-locked to channel 0, whose angle is
+  spec-fixed to 0 and never transmitted, with the margin letting the
+  1.0 amplitude ceiling absorb band-level carrier coding loss.
+  Coordinates are measured in the §E.3.5.5.1 complex analysis domain
+  against the carrier the decoder will actually reconstruct (each bin
+  through the final exponent + bap quantiser; the previous frame's
+  carried quantised last block at the frame head, zero after the
+  tail), refreshed on blocks 0/3 with §2.3.3.21-22 reuse thrift when
+  the block-3 refresh quantises identically. Validated in-tree:
+  stereo band-energy round-trip (±3 dB per signal band, ±1.5 dB coded
+  low band, 20 dB waveform floor), a stereo **quadrature** fixture
+  (channel 1's tones 90° off the carrier — pins the angle path at an
+  18 dB waveform floor; a broken angle path collapses to ~3 dB),
+  5.1 with explicit `chincpl` bits, a 7.1 indep(coupled)+dep(plain)
+  pair walk, registry-vs-typed byte-identical construction, and the
+  corruption families in `tests/robustness.rs`. Measured interior
+  PSNR 25.4-30.4 dB across channels. Black-box cross-validation is
+  **not possible for this tool**: the external validator binary
+  reports enhanced coupling as not implemented and mutes (probed
+  r406) — our decoder is ahead of the validator here, so validation
+  is round-trip + spec-text only. AHT / SPX / enhanced coupling are
+  mutually exclusive per encoder instance (single-subsystem scope).
+
+  Three spec-fidelity notes from this work: (1) GAQ dequantisation now
   uses the literal Table E3.5/E3.6 characteristics — the `Gk = 2`
   large mantissa is an `(m-1)`-bit codeword (2^(m-1) output points),
   and all scalar quantisers apply the exact Q15 `y = x + ax + b`
@@ -211,7 +254,15 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   as `√2` against an independent production decoder (a pure-DC and a
   40 Hz-modulated fixture both fit `external = ours(2·Σ)/√2` with
   ~89 dB residual); with `√2` the DC basis weight is exactly 1, and
-  both transforms follow the deployed constant.
+  both transforms follow the deployed constant. (3) §E.3.5.5.1's
+  step-3 overlap-add omits the §7.9.4.1 step-6 headroom-restoring
+  factor of 2 (step 2 references only "steps 1 to 5") — taken
+  literally the analysis→synthesis chain returns exactly half the
+  original coefficients, so every enhanced-coupling channel would
+  decode 6 dB low and the loudest coupled channel would need the
+  unrepresentable amplitude 2.0; the Table E3.10 ceiling of exactly
+  1.0 pins the intended identity at unity, and the factor of 2 is
+  applied in the carrier reconstruction (identity CI-gated).
 
 ### CRC
 

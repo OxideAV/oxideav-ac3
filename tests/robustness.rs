@@ -248,3 +248,63 @@ fn eac3_spx_encoded_stream_survives_corruption() {
     // Same three corruption families as the corpus sweep.
     sweep_one("eac3", &stream);
 }
+
+/// r406: an enhanced-coupling encoded stream (§E.2.3.3.16-26) swept
+/// through the same three corruption families. Enhanced coupling opens
+/// decode paths the corpus never reaches — the ecpl strategy /
+/// coordinate parse, the deferred §E.3.5.5 carrier synthesis and the
+/// coupling-channel exponent/bap walk over the ecpl region — so bit
+/// flips here reach field combinations (inverted sub-band ranges,
+/// stale coordinate reuse after a strategy mutation, corrupted
+/// carrier exponents) no other robustness input produces.
+#[test]
+fn eac3_ecpl_encoded_stream_survives_corruption() {
+    use oxideav_core::{AudioFrame, Encoder, Error, Frame, SampleFormat};
+
+    // ~4 frames of correlated in-region stereo content (the coupled
+    // region starts at tc 37 ≈ 3.5 kHz), phase-offset on the right
+    // channel so amplitude AND angle coordinates carry live values.
+    let n = 4 * 1536usize;
+    let mut pcm_s16 = Vec::with_capacity(n * 2 * 2);
+    for i in 0..n {
+        let t = i as f32 / 48_000.0;
+        let mk = |phase: f32| -> i16 {
+            let s = 0.18 * (2.0 * std::f32::consts::PI * 700.0 * t).sin()
+                + 0.15 * (2.0 * std::f32::consts::PI * 4_300.0 * t + phase).sin()
+                + 0.10 * (2.0 * std::f32::consts::PI * 9_800.0 * t + phase).sin()
+                + 0.06 * (2.0 * std::f32::consts::PI * 14_500.0 * t + phase).sin();
+            (s * 32767.0).clamp(-32768.0, 32767.0) as i16
+        };
+        pcm_s16.extend_from_slice(&mk(0.0).to_le_bytes()); // L
+        pcm_s16.extend_from_slice(&mk(0.7).to_le_bytes()); // R
+    }
+    let mut params = CodecParameters::audio(CodecId::new("eac3"));
+    params.sample_rate = Some(48_000);
+    params.channels = Some(2);
+    params.sample_format = Some(SampleFormat::S16);
+    params.bit_rate = Some(192_000);
+    let mut enc: Box<dyn Encoder> = oxideav_ac3::eac3::make_encoder_with_ecpl(
+        &params,
+        oxideav_ac3::eac3::EcplParams::default(),
+    )
+    .expect("ecpl encoder");
+    enc.send_frame(&Frame::Audio(AudioFrame {
+        samples: n as u32,
+        pts: Some(0),
+        data: vec![pcm_s16],
+    }))
+    .unwrap();
+    enc.flush().unwrap();
+    let mut stream = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => stream.extend_from_slice(&p.data),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("ecpl encode error: {e:?}"),
+        }
+    }
+    assert!(stream.len() >= 768, "expected at least one 768-byte frame");
+
+    // Same three corruption families as the corpus sweep.
+    sweep_one("eac3", &stream);
+}

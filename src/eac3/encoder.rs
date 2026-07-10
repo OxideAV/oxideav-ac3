@@ -3953,4 +3953,54 @@ mod ecpl_tests {
         params.options = oxideav_core::CodecOptions::new().set("ecpl", "1");
         assert!(make_encoder(&params).is_err());
     }
+    #[test]
+    fn ecpl_71_pair_couples_indep_only() {
+        // 7.1 emits an indep 5.1 substream (enhanced-coupled) + a
+        // plain dependent Lb/Rb substream in every packet — the two
+        // syntaxes must coexist: the dep substream carries no coupling
+        // bits (cplinu[0] = 0) while the indep one carries the full
+        // strategy/coordinate/carrier stack. A field-width error in
+        // either would desync the pair walk.
+        let pcm = build_ecpl_multitone(8, 6, 0.3);
+        let stream = encode_ecpl(&pcm, 8, 576_000, EcplParams::default());
+        // 384k indep (1536 B) + 192k dep (768 B) per packet.
+        let pair_bytes = 1536 + 768;
+        assert_eq!(stream.len() % pair_bytes, 0, "not a whole pair stream");
+
+        use crate::eac3::decoder::{decode_eac3_packet, Eac3DecoderState};
+        let mut st = Eac3DecoderState::default();
+        let mut out: Vec<i16> = Vec::new();
+        let mut channels = 0usize;
+        let mut off = 0usize;
+        while off + pair_bytes <= stream.len() {
+            let frame = decode_eac3_packet(&mut st, &stream[off..off + pair_bytes])
+                .expect("decode ecpl 7.1 indep+dep packet");
+            assert_eq!(frame.channels, 8, "expected 8 output channels");
+            channels = frame.channels as usize;
+            for c in frame.pcm_s16le.chunks_exact(2) {
+                out.push(i16::from_le_bytes([c[0], c[1]]));
+            }
+            off += pair_bytes;
+        }
+        assert!(!out.is_empty(), "no PCM decoded");
+        // Every output channel is live (the fixture feeds all 8 source
+        // channels; LFE gets the sub-120 Hz residue of the 700 Hz tone
+        // suppressed, so exempt slot 5's level check).
+        let n = out.len() / channels;
+        for ch in 0..channels {
+            if ch == 5 {
+                continue; // LFE — fixture has no sub-120 Hz content
+            }
+            let mut e = 0.0f64;
+            for i in n / 4..(3 * n / 4) {
+                let v = out[i * channels + ch] as f64;
+                e += v * v;
+            }
+            let rms = (e / (n / 2) as f64).sqrt();
+            assert!(
+                rms > 100.0,
+                "output channel {ch} is near-silent (rms {rms:.1})"
+            );
+        }
+    }
 }
