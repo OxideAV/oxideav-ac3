@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- docs: mark the crate's internal public surface `#[doc(hidden)]` so cargo-semver-checks no longer tracks test/fuzz-exposed internals as stable API (public API-item surface 753 → 278; 15 wholly-internal modules hidden at the declaration site, 29 internal items hidden in mixed modules). Decode/encode entry points, the dual-API `make_*` factories + `register`/`register_codecs`, the DRC control surface, the metadata/frame/param types in visible signatures, and `CrcStatus` stay visible. Attributes + comments only — no signature, visibility, or behaviour change.
+
 - eac3 r409: anchor the two AHT spec-deviation notes to the codified clean-room errata — the §3.4.5 IDCT leading-constant `2 → √2` correction (entry E1, incl. the `R_0 = 1/√2` DC-gain-1 corollary; pinned by `idct_inverse_of_dct_constants`) and the Table E3.5 `Gk = 2` large-codeword `(m−1)`-bit clarification (entry E2, with the `2^(m−1)` reconstruction-point cross-check; pinned by `scalar_gk2_small_and_large`) now cite `docs/audio/ac3/ac3-errata.md` at their implementation sites, completing the E1/E2/E3 reconciliation.
 
 - r409: metadata hardening + black-box syntax gates — metadata-bearing AC-3 (compr/langcod/audprod/dynrng) and E-AC-3 (mixing + informational blocks) streams join the truncation / bit-flip / sync-garbage corruption sweep (bit flips now reach the optional-BSI chains incl. the variable-length `mixdef == 3` arm); the external decoder binary accepts the E-AC-3 block-bearing syntax (decode level within 0.004 dB of a block-less encode of the same PCM) and reproduces the authored eac3-path `dynrng` gain at Δ0.000 dB; README documents both encoder metadata surfaces.

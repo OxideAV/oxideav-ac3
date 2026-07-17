@@ -47,18 +47,34 @@
 
 #![allow(clippy::needless_range_loop)]
 
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod audblk;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod bsi;
 pub mod crc;
 pub mod decoder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod downmix;
 pub mod drc;
 pub mod eac3;
 pub mod encoder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod imdct;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod mdct;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod syncinfo;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod tables;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod wave_order;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};

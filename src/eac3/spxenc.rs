@@ -117,6 +117,8 @@ impl Default for SpxParams {
 /// Derived SPX geometry (§E.2.3.3.5-8 + Table E3.13), the encoder-side
 /// mirror of the decoder's strategy-parse state.
 #[derive(Clone, Debug)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct SpxGeometry {
     /// First SPX sub-band (`spx_begin_subbnd`).
     pub begin_subbnd: usize,
@@ -140,6 +142,8 @@ pub struct SpxGeometry {
 
 /// Table E3.13 — lowest tc# of SPX sub-band `subbnd` (`25 + 12·s`).
 #[inline]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn spx_bandtable(subbnd: usize) -> usize {
     25 + 12 * subbnd
 }
@@ -232,6 +236,8 @@ impl SpxGeometry {
 /// Bands whose translated energy is (near) zero get coordinate 0 —
 /// there is nothing to scale; the decoder will synthesize silence
 /// (plus noise-blend fill scaled by the same zero RMS).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn band_coord_targets(coeffs: &[f32; N_COEFFS], geom: &SpxGeometry) -> [f32; 18] {
     band_coord_targets_span(&[coeffs], geom)
 }
@@ -242,6 +248,8 @@ pub fn band_coord_targets(coeffs: &[f32; N_COEFFS], geom: &SpxGeometry) -> [f32;
 /// per refresh span (`spxcoe[ch] == 1` block; the following
 /// `spxcoe == 0` blocks reuse it, §E.2.3.3.9), so the coordinate must
 /// energy-match the *whole span*, not just the refresh block.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn band_coord_targets_span(blocks: &[&[f32; N_COEFFS]], geom: &SpxGeometry) -> [f32; 18] {
     band_coord_targets_span_atten(blocks, geom, None)
 }
@@ -256,6 +264,8 @@ pub fn band_coord_targets_span(blocks: &[&[f32; N_COEFFS]], geom: &SpxGeometry) 
 /// extension-side taps affect the translated energy; the two
 /// coded-region bins below the border are attenuated in the decoder's
 /// output but are not part of any SPX band.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn band_coord_targets_span_atten(
     blocks: &[&[f32; N_COEFFS]],
     geom: &SpxGeometry,
@@ -341,6 +351,8 @@ pub fn band_coord_targets_span_atten(
 /// spxco = temp >> (spxcoexp + 3·mstrspxco)
 /// ```
 #[inline]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn decode_coord(exp: u8, mant: u8, mstr: u8) -> f32 {
     let temp = if exp == 15 {
         mant as f32 / 4.0
@@ -360,6 +372,8 @@ pub fn decode_coord(exp: u8, mant: u8, mstr: u8) -> f32 {
 /// represent saturate at (0, 3) — `0.875·2^(−3·mstr)` — and values too
 /// small collapse into the denormal form (rounding to zero when even
 /// that underflows).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn quantise_coord(target: f32, mstr: u8) -> (u8, u8) {
     let base_shift = 3 * mstr as i32;
     if !target.is_finite() || target <= 0.0 {
@@ -411,6 +425,8 @@ pub fn quantise_coord(target: f32, mstr: u8) -> (u8, u8) {
 /// `mstr ∈ 0..=3` that (a) the largest target still fits under without
 /// saturating and (b) actually helps the smallest non-zero target
 /// escape the low-precision `exp == 15` denormal form.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn choose_mstrspxco(targets: &[f32]) -> u8 {
     let mut max_t = 0.0f32;
     let mut min_shift: Option<i32> = None; // shift s of the smallest non-zero target

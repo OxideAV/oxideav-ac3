@@ -180,6 +180,8 @@ fn gauss_gf2_16(cols: &[u16; 16], b: u16) -> u16 {
 /// syncinfo + the implied 5/8 region (i.e. `frame_bytes < 4`); valid
 /// AC-3 frames per Table 5.18 are at least 128 bytes so this guard
 /// only fires on truncated input.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn crc1_boundary_bytes(frame_bytes: usize) -> Option<usize> {
     if frame_bytes < 4 {
         return None;
@@ -238,6 +240,8 @@ impl CrcStatus {
 /// Returns a [`CrcStatus`] populated with the two checks. A
 /// truncated `syncframe` (shorter than `frame_bytes`, or shorter
 /// than 4 bytes) reports both as failed.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn verify_ac3_syncframe(syncframe: &[u8], frame_bytes: usize) -> CrcStatus {
     if syncframe.len() < frame_bytes || frame_bytes < 4 {
         return CrcStatus {
@@ -276,6 +280,8 @@ pub fn verify_ac3_syncframe(syncframe: &[u8], frame_bytes: usize) -> CrcStatus {
 /// `syncframe` must start with the 0x0B77 syncword and span at
 /// least `frame_bytes`. The reported `crc1_ok` is `None` because
 /// E-AC-3 carries no `crc1` field.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn verify_eac3_syncframe(syncframe: &[u8], frame_bytes: usize) -> CrcStatus {
     if syncframe.len() < frame_bytes || frame_bytes < 4 {
         return CrcStatus {

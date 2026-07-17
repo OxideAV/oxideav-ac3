@@ -24,6 +24,8 @@ use crate::wave_order;
 /// Samples produced per AC-3 syncframe, per channel: 6 blocks × 256
 /// new samples each (each audio block is a 512-point TDAC transform
 /// overlapping by 256 samples with its neighbour — §2.2).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const SAMPLES_PER_FRAME: u32 = 1536;
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
@@ -66,6 +68,8 @@ pub fn make_eac3_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 /// surround information so a downstream matrix decoder (Pro Logic
 /// et al.) can recover Ls/Rs from the stereo pair; LoRo's
 /// straight-sum mix is unrecoverable in that sense.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn make_decoder_ltrt(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Ac3Decoder {
         codec_id: params.codec_id.clone(),

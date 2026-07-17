@@ -83,6 +83,8 @@ impl Default for EcplParams {
 
 /// Resolved enhanced-coupling geometry the encoder codes against.
 #[derive(Clone, Debug)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct EcplGeometry {
     /// Raw begin-frequency code (re-emitted in the strategy block).
     pub ecplbegf: u8,
@@ -233,6 +235,8 @@ impl EcplGeometry {
 /// ceiling); values more than half a grid step below the code-30 floor
 /// (≈ -45 dB) map to code 31 (-∞ dB, amplitude 0), as do non-positive
 /// inputs.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn quantise_amp(a: f32) -> u8 {
     if a.is_nan() || a <= 0.0 {
         return 31;
@@ -265,6 +269,8 @@ pub fn quantise_amp(a: f32) -> u8 {
 /// representing `-π ..= π`) to the nearest Table E3.11 `ecplangle`
 /// code (π/32 grid). The value wraps modulo 2.0 first, so any real
 /// phase difference maps onto the table's principal interval.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn quantise_angle(units: f32) -> u8 {
     if !units.is_finite() {
         return 0;
@@ -286,6 +292,8 @@ pub fn quantise_angle(units: f32) -> u8 {
 /// analysis spectrum `X[k]` and the carrier's `Z[k]` (both §E.3.5.5.1
 /// outputs), accumulated over one or more blocks.
 #[derive(Clone, Copy, Debug, Default)]
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub struct BandStats {
     /// `Σ |X[k]|²` — channel energy in the band.
     pub ex: f64,
@@ -340,6 +348,8 @@ impl BandStats {
 /// value `-code/7`): the incoherent fraction `1 - γ` scaled onto the
 /// 8-step grid. Fully coherent → code 0 (no de-correlation); fully
 /// incoherent → code 7 (angle jitter up to ±π, uniform phase).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn chaos_code_for(coherence: f32) -> u8 {
     let incoherent = (1.0 - coherence).clamp(0.0, 1.0);
     (incoherent * 7.0).round() as u8
@@ -350,6 +360,8 @@ pub fn chaos_code_for(coherence: f32) -> u8 {
 /// with `chaosval = -code/7` (Table E3.12) — always in `0.62 ..= 1.0`.
 /// The encoder divides its measured amplitude by this factor before
 /// quantisation so the decoded band energy stays matched.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn chaos_amp_factor(chaos_code: u8) -> f32 {
     let chaosval = -(chaos_code.min(7) as f32) / 7.0;
     1.0 + 0.38 * chaosval
@@ -362,6 +374,8 @@ pub fn chaos_amp_factor(chaos_code: u8) -> f32 {
 /// inside the active region contribute. `stats` has one slot per band
 /// (`geom.necplbnd`), accumulated in place so multi-block coordinate
 /// spans sum their statistics before quantisation.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn band_cross_stats(
     x: &EcplCarrier,
     z: &EcplCarrier,
@@ -391,6 +405,8 @@ pub fn band_cross_stats(
 
 /// Per-band MDCT-domain energies of one channel over a span of blocks
 /// (the coordinate-refresh span), used to size the carrier gains.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn band_mdct_energies(blocks: &[&[f32; N_COEFFS]], geom: &EcplGeometry) -> Vec<f64> {
     let mut out = vec![0.0f64; geom.necplbnd];
     for mdct in blocks {
@@ -415,6 +431,8 @@ pub fn band_mdct_energies(blocks: &[&[f32; N_COEFFS]], geom: &EcplGeometry) -> V
 /// band where the carrier source is silent but another channel is loud
 /// cannot be represented losslessly by a phase-locked carrier anyway,
 /// and an unbounded gain would blow up the carrier's exponent envelope.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn carrier_band_gains(energies: &[Vec<f64>], nbands: usize) -> Vec<f32> {
     let mut gains = vec![1.0f32; nbands];
     let Some(base) = energies.first() else {
@@ -437,6 +455,8 @@ pub fn carrier_band_gains(energies: &[Vec<f64>], nbands: usize) -> Vec<f32> {
 /// coefficients restricted to the active region, scaled per band by
 /// `gains`. Bins outside `[start_bin, end_bin)` are zero (the
 /// §E.3.5.5.1 step-1 `XCURR` definition).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn build_carrier_block(
     src_mdct: &[f32; N_COEFFS],
     gains: &[f32],
@@ -457,6 +477,8 @@ pub fn build_carrier_block(
 /// Restrict one block's MDCT coefficients to the active region (zero
 /// outside) — the per-channel analysis input mirroring the carrier's
 /// step-1 buffer definition.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn region_restrict(mdct: &[f32; N_COEFFS], geom: &EcplGeometry) -> [f32; 256] {
     let mut out = [0.0f32; 256];
     let end = geom.end_bin.min(256);

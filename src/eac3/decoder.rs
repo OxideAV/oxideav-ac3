@@ -50,6 +50,8 @@ use super::chanmap::{self, ChannelLocation};
 use super::dsp;
 
 /// E-AC-3 syncword — same value as base AC-3 (§E.2.2.1).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const SYNCWORD: u16 = 0x0B77;
 
 /// Per-decoder state that persists across packets.

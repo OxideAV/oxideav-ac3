@@ -123,17 +123,31 @@
 //!   decodes at ~85 dB+) and reflects the lossy floor at those budgets
 //!   rather than a decode defect (see crate `README.md`).
 
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod aht;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ahtenc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod audfrm;
 pub mod bsi;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod chanmap;
 pub mod decoder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod dsp;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod ecpl;
 pub mod ecplenc;
 pub mod encoder;
 pub mod spxenc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod tables;
 
 // Re-exports — keep the public surface identical to the old single-

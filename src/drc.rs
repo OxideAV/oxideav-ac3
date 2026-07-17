@@ -179,6 +179,8 @@ impl DrcSettings {
 ///
 /// The combined linear gain is `2^(X+1) · (32 + Y) / 64`. The all-zero
 /// word maps to unity.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn dynrng_to_linear(dynrng: u8) -> f32 {
     let x = ((dynrng >> 5) & 0x7) as i32;
     let x_signed = if x >= 4 { x - 8 } else { x };
@@ -204,6 +206,8 @@ pub fn dynrng_to_linear(dynrng: u8) -> f32 {
 ///
 /// `cut` and `boost` are assumed already clamped to `[0.0, 1.0]` (the
 /// [`DrcSettings::partial`] constructor enforces that).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn scale_dynrng_partial(dynrng: u8, cut: f32, boost: f32) -> u8 {
     // Reinterpret the raw byte as a signed 8-bit value: the §7.7.1.2
     // "signed fractional number" X0 . (X1 X2 Y3..Y7). The numeric ordering
@@ -234,6 +238,8 @@ pub fn scale_dynrng_partial(dynrng: u8, cut: f32, boost: f32) -> u8 {
 ///
 /// Combined linear gain is `2^(X+1) · (16 + Y) / 32`, spanning `+47.89 dB`
 /// down to `−48.16 dB`.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn compr_to_linear(compr: u8) -> f32 {
     let x = ((compr >> 4) & 0xF) as i32;
     let x_signed = if x >= 8 { x - 16 } else { x };
@@ -250,6 +256,8 @@ pub fn compr_to_linear(compr: u8) -> f32 {
 /// (`1..=31`; the reserved `0` codepoint is treated as a no-op / unity).
 /// Normalising a stream authored at `dialnorm` to a desired playback
 /// `target` is an attenuation of `target − dialnorm` dB.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn dialnorm_gain(dialnorm: u8, target: u8) -> f32 {
     if dialnorm == 0 {
         // Reserved codepoint — §5.4.2.8 maps it to the −31 dB default; a
