@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.10...v0.0.11) - 2026-07-17
+
+### Other
+
+- hide internal public surface from cargo-semver-checks
+- eac3 r409: anchor AHT spec-deviation notes to codified errata entries E1/E2
+- metadata hardening — corruption sweep + black-box syntax/gain gates + README
+- eac3 r409: encoder-side E-AC-3 metadata surface (mixing + informational blocks, dialnorm/compr/dynrng)
+- ac3 r409: black-box DRC/dialnorm gain-word semantics gates
+- ac3 r409: encoder-side bitstream-metadata surface (§5.4.2 BSI words + per-block dynrng)
+- eac3 r409: reconcile §E.3.5.5.1 factor-2 overlap-add with codified errata entry E3 + two-direction regression pins
+- eac3 r406: §E.2.3.3.19 leading-bndstrc mask (third ecpl decode-conformance fix) + narrow-geometry & 44.1 kHz round-trips
+- eac3 r406: coherence-driven chaos coordinates — per-band de-correlation signalling + amp pre-compensation + stereo-width gate
+- eac3 r406: SPX + enhanced coupling co-active (§3.6.1) — SPX-bounded coupling region + three-region round-trip
+- eac3 r406: ecpl hardening + instrumentation — corruption sweep, 7.1 pair walk, rate-curve column, README
+- eac3 r406: encoder-side enhanced coupling — carrier coding + quantised-carrier coordinate measurement + round-trips
+- eac3 r406: two enhanced-coupling decode-conformance fixes (chincpl field order + §2.3.3.21-22 coordinate reuse)
+- eac3 r406: encoder-side ecpl primitives (ecplenc) + §E.3.5.5.1 carrier headroom-factor erratum fix
+- eac3 r390: document the encoder-side AHT subsystem + mixed chinspx (README / CHANGELOG / module docs)
+- eac3 r390: rate/quality instrumentation — rate-curve example + AHT monotonicity gate
+- eac3 r390: mixed per-channel chinspx + per-channel end_mant through the SNR tuner (§E.2.3.3.3)
+- eac3 r390: LFE AHT — lfeahtinu signalling + front-loaded LFE-AHT block (§3.4.2)
+- eac3 r390: AHT black-box cross-validation + §3.4.5 leading-constant correction (2 → √2)
+- eac3 r390: AHT encoder — §3.4 6-block DCT-II + hebap + VQ/GAQ emission through the decoder round-trip
+- eac3 r390: encoder-side AHT primitives — forward DCT-II, VQ search, GAQ quantiser/planner (§3.4.4/§3.4.5)
+- eac3 r390: spec-exact GAQ dequantisation per Tables E3.5/E3.6
+- add CI / crates.io / docs.rs / MIT-license badges
+
 - docs: mark the crate's internal public surface `#[doc(hidden)]` so cargo-semver-checks no longer tracks test/fuzz-exposed internals as stable API (public API-item surface 753 → 278; 15 wholly-internal modules hidden at the declaration site, 29 internal items hidden in mixed modules). Decode/encode entry points, the dual-API `make_*` factories + `register`/`register_codecs`, the DRC control surface, the metadata/frame/param types in visible signatures, and `CrcStatus` stay visible. Attributes + comments only — no signature, visibility, or behaviour change.
 
 - eac3 r409: anchor the two AHT spec-deviation notes to the codified clean-room errata — the §3.4.5 IDCT leading-constant `2 → √2` correction (entry E1, incl. the `R_0 = 1/√2` DC-gain-1 corollary; pinned by `idct_inverse_of_dct_constants`) and the Table E3.5 `Gk = 2` large-codeword `(m−1)`-bit clarification (entry E2, with the `2^(m−1)` reconstruction-point cross-check; pinned by `scalar_gk2_small_and_large`) now cite `docs/audio/ac3/ac3-errata.md` at their implementation sites, completing the E1/E2/E3 reconciliation.
