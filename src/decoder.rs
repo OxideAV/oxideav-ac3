@@ -18,6 +18,7 @@ use crate::crc::{self, CrcStatus};
 use crate::downmix::{Downmix, DownmixMode};
 use crate::drc::DrcSettings;
 use crate::eac3;
+use crate::eac3::joc_renderer::JocRenderer;
 use crate::syncinfo::{self, SyncInfo};
 use crate::wave_order;
 
@@ -39,6 +40,8 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         requested_channels: params.channels,
         prefer_ltrt: false,
         drc: DrcSettings::default(),
+        render_joc_stereo: false,
+        joc_renderer: JocRenderer::default(),
     }))
 }
 
@@ -57,6 +60,32 @@ pub fn make_eac3_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         requested_channels: params.channels,
         prefer_ltrt: false,
         drc: DrcSettings::default(),
+        render_joc_stereo: false,
+        joc_renderer: JocRenderer::default(),
+    }))
+}
+
+/// Build an E-AC-3 decoder that prefers the reconstructed JOC object
+/// presentation when the caller requests stereo output.
+///
+/// Validated 5.X JOC/OAMD frames are rendered with the crate's reference
+/// stereo-speaker policy. Non-JOC streams and malformed, incomplete, or
+/// unsupported JOC presentations fall back to the same §7.8 compatibility
+/// downmix used by [`make_eac3_decoder`]. Existing factories deliberately
+/// keep their historical channel-presentation behaviour.
+pub fn make_eac3_decoder_with_joc(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    Ok(Box::new(Ac3Decoder {
+        codec_id: params.codec_id.clone(),
+        time_base: TimeBase::new(1, 48_000),
+        pending: None,
+        eof: false,
+        state: Ac3State::new(),
+        eac3_state: eac3::Eac3DecoderState::default(),
+        requested_channels: params.channels,
+        prefer_ltrt: false,
+        drc: DrcSettings::default(),
+        render_joc_stereo: true,
+        joc_renderer: JocRenderer::default(),
     }))
 }
 
@@ -81,6 +110,8 @@ pub fn make_decoder_ltrt(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         requested_channels: params.channels,
         prefer_ltrt: true,
         drc: DrcSettings::default(),
+        render_joc_stereo: false,
+        joc_renderer: JocRenderer::default(),
     }))
 }
 
@@ -107,6 +138,8 @@ pub fn make_decoder_with_drc(
         requested_channels: params.channels,
         prefer_ltrt: false,
         drc: DrcSettings::default(),
+        render_joc_stereo: false,
+        joc_renderer: JocRenderer::default(),
     };
     dec.set_drc(drc);
     Ok(Box::new(dec))
@@ -140,6 +173,11 @@ struct Ac3Decoder {
     /// default output is the mandatory §7.7.1 decode. Steered via
     /// [`Ac3Decoder::set_drc`].
     drc: DrcSettings,
+    /// Opt-in object-aware stereo presentation. Existing factories leave
+    /// this disabled so adding JOC support does not change their output.
+    render_joc_stereo: bool,
+    /// Stateful JOC matrices, OAMD properties, and QMF delay lines.
+    joc_renderer: JocRenderer,
 }
 
 impl Decoder for Ac3Decoder {
@@ -181,6 +219,7 @@ impl Decoder for Ac3Decoder {
         self.eof = false;
         self.state = Ac3State::new();
         self.eac3_state = eac3::Eac3DecoderState::default();
+        self.joc_renderer.reset();
         // Preserve the configured DRC regime across a flush/reset — it is
         // a decoder-lifetime listener setting, not per-frame state.
         self.state.drc = self.drc;
@@ -277,7 +316,43 @@ impl Ac3Decoder {
         // frame from the indep substream's dialnorm word.
         let dn_gain = self.drc.dialnorm_gain(decoded.dialnorm);
 
-        let (pcm, out_channels) = if matches!(dmx_mode, DownmixMode::Passthrough) {
+        // The JOC presentation is deliberately opt-in and stereo-only.
+        // Metadata or rendering failures are non-fatal: reset all object/QMF
+        // history and continue through the existing compatibility downmix.
+        let joc_stereo = if self.render_joc_stereo && self.requested_channels == Some(2) {
+            match decoded.joc_metadata.as_ref() {
+                Some(metadata) => match self.joc_renderer.render_stereo(
+                    metadata,
+                    self.eac3_state.indep_pcm_f32(),
+                    channels as usize,
+                    decoded.acmod,
+                    decoded.lfeon,
+                ) {
+                    Ok(mut samples) => {
+                        if dn_gain != 1.0 {
+                            for sample in &mut samples {
+                                *sample *= dn_gain;
+                            }
+                        }
+                        Some((pack_f32_to_s16le(&samples), 2_u16))
+                    }
+                    Err(_) => {
+                        self.joc_renderer.reset();
+                        None
+                    }
+                },
+                None => {
+                    self.joc_renderer.reset();
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let (pcm, out_channels) = if let Some(rendered) = joc_stereo {
+            rendered
+        } else if matches!(dmx_mode, DownmixMode::Passthrough) {
             let mut pcm = decoded.pcm_s16le;
             if dn_gain != 1.0 {
                 // Scale the already-quantised S16 samples in place.
@@ -376,6 +451,9 @@ impl Ac3Decoder {
     }
 
     fn process_ac3_frame(&mut self, pkt: &Packet, si: SyncInfo) -> Result<Frame> {
+        // A codec/presentation change is a discontinuity for the stateful
+        // JOC reconstruction matrix and QMF filter banks.
+        self.joc_renderer.reset();
         let data = &pkt.data[..];
         if (si.frame_length as usize) > data.len() {
             return Err(Error::invalid(format!(
@@ -501,6 +579,17 @@ impl Ac3Decoder {
     }
 }
 
+/// Pack interleaved normalized f32 PCM into the decoder's S16LE output
+/// format. Values outside the nominal range saturate instead of wrapping.
+fn pack_f32_to_s16le(samples: &[f32]) -> Vec<u8> {
+    let mut bytes = vec![0_u8; samples.len() * 2];
+    for (index, sample) in samples.iter().enumerate() {
+        let value = (*sample * 32_767.0).clamp(-32_768.0, 32_767.0) as i16;
+        bytes[index * 2..index * 2 + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
 /// Verify the §7.10.1 CRC fields of a single AC-3 or E-AC-3
 /// syncframe.
 ///
@@ -583,6 +672,16 @@ mod tests {
         params.channels = Some(2);
         let dec = make_decoder_ltrt(&params).unwrap();
         assert_eq!(dec.codec_id().as_str(), "ac3");
+    }
+
+    /// The JOC factory is an explicit opt-in and accepts the same E-AC-3
+    /// stereo target used by the compatibility decoder.
+    #[test]
+    fn joc_stereo_decoder_builds() {
+        let mut params = CodecParameters::audio(CodecId::new(eac3::CODEC_ID_STR));
+        params.channels = Some(2);
+        let dec = make_eac3_decoder_with_joc(&params).unwrap();
+        assert_eq!(dec.codec_id().as_str(), eac3::CODEC_ID_STR);
     }
 
     /// E-AC-3 5.1 encoded packet → decode with `channels = Some(2)`
@@ -673,6 +772,8 @@ mod tests {
         dec_params.channels = Some(2);
         dec_params.sample_format = Some(SampleFormat::S16);
         let mut dec = make_eac3_decoder(&dec_params).expect("make_eac3_decoder");
+        let mut joc_dec =
+            make_eac3_decoder_with_joc(&dec_params).expect("make_eac3_decoder_with_joc");
 
         // The decoder expects one full packet per `send_packet` call.
         // The E-AC-3 encoder produces fixed 1536-byte frames at 384
@@ -680,12 +781,19 @@ mod tests {
         let frame_bytes = 1536usize;
         assert!(all_bytes.len() >= frame_bytes);
         let mut got_any = false;
+        let mut compatibility_pcm = Vec::<Vec<u8>>::new();
+        let mut joc_pcm = Vec::<Vec<u8>>::new();
         for off in (0..all_bytes.len()).step_by(frame_bytes) {
             let end = (off + frame_bytes).min(all_bytes.len());
-            let pkt = Packet::new(0, TB::new(1, 48_000), all_bytes[off..end].to_vec());
+            let packet_data = all_bytes[off..end].to_vec();
+            let pkt = Packet::new(0, TB::new(1, 48_000), packet_data.clone());
             if dec.send_packet(&pkt).is_err() {
                 continue;
             }
+            let joc_pkt = Packet::new(0, TB::new(1, 48_000), packet_data);
+            joc_dec
+                .send_packet(&joc_pkt)
+                .expect("JOC decoder must accept ordinary E-AC-3");
             loop {
                 match dec.receive_frame() {
                     Ok(Frame::Audio(af)) => {
@@ -698,16 +806,29 @@ mod tests {
                             expected_len,
                             af.data[0].len()
                         );
+                        compatibility_pcm.push(af.data[0].clone());
                     }
                     Ok(_) => {}
                     Err(Error::NeedMore) | Err(Error::Eof) => break,
                     Err(e) => panic!("eac3 decoder error: {e}"),
                 }
             }
+            loop {
+                match joc_dec.receive_frame() {
+                    Ok(Frame::Audio(af)) => joc_pcm.push(af.data[0].clone()),
+                    Ok(_) => {}
+                    Err(Error::NeedMore) | Err(Error::Eof) => break,
+                    Err(e) => panic!("JOC decoder compatibility fallback error: {e}"),
+                }
+            }
         }
         assert!(
             got_any,
             "decoder produced no audio frames from 5.1 → stereo path"
+        );
+        assert_eq!(
+            joc_pcm, compatibility_pcm,
+            "a stream without JOC metadata must use the compatibility downmix"
         );
     }
 

@@ -35,7 +35,8 @@
 //!    audfrm (Tables E1.2 / E1.3), audblk DSP, §3.4 Adaptive Hybrid
 //!    Transform on fbw / LFE / coupling channels, §3.6 spectral
 //!    extension with §3.6.4.2.3 SPXATTEN border notch, and §3.7.2
-//!    transient pre-noise processing. Encoder covers
+//!    transient pre-noise processing, plus opt-in TS 103 420 JOC/OAMD
+//!    object reconstruction and stereo speaker rendering. Encoder covers
 //!    indep+dep-substream pairs for 1.0 / 2.0 / 5.1 / 7.1 layouts,
 //!    fractional syncframes (§E.2.3.1.5 `numblkscod` 0/1/2), and the
 //!    full Annex E tool set: SPX, AHT, enhanced coupling, and

@@ -262,19 +262,76 @@ const DEFCPLBNDSTRC: [bool; 18] = {
     t
 };
 
+/// Read one §E.1.3.5.6 skip field at the current bit position. The
+/// payload is deliberately returned rather than discarded because
+/// TS 103 420 carries JOC/OAMD EMDF data in this reserved region.
+fn read_skip_field(br: &mut BitReader<'_>) -> Result<Option<Vec<u8>>> {
+    if br.read_u32(1)? == 0 {
+        return Ok(None);
+    }
+    let skipl = br.read_u32(9)? as usize;
+    let mut bytes = Vec::with_capacity(skipl);
+    for _ in 0..skipl {
+        bytes.push(br.read_u32(8)? as u8);
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(test)]
+mod skip_field_tests {
+    use super::*;
+    use oxideav_core::bits::BitWriter;
+
+    #[test]
+    fn captures_bit_unaligned_skip_field_bytes_exactly() {
+        const PREFIX_BITS: u32 = 13;
+        const PAYLOAD: [u8; 7] = [0x58, 0x38, 0x00, 0x03, 0xa5, 0x00, 0xff];
+
+        let mut writer = BitWriter::new();
+        writer.write_u32(0x155, PREFIX_BITS);
+        writer.write_u32(1, 1); // skiple
+        writer.write_u32(PAYLOAD.len() as u32, 9);
+        for byte in PAYLOAD {
+            writer.write_u32(u32::from(byte), 8);
+        }
+        let data = writer.into_bytes();
+
+        let mut reader = BitReader::new(&data);
+        reader.skip(PREFIX_BITS).expect("skip synthetic prefix");
+        assert_eq!(
+            read_skip_field(&mut reader).expect("read skip field"),
+            Some(PAYLOAD.to_vec())
+        );
+        assert_eq!(reader.bit_position(), u64::from(PREFIX_BITS + 10 + 56));
+    }
+
+    #[test]
+    fn absent_skip_field_consumes_only_the_exists_flag() {
+        let data = [0_u8];
+        let mut reader = BitReader::new(&data);
+        assert_eq!(read_skip_field(&mut reader).expect("read flag"), None);
+        assert_eq!(reader.bit_position(), 1);
+    }
+}
+
 /// Decode one E-AC-3 independent substream's audblks into interleaved
 /// f32 PCM. Returns `Ok(())` on a successful clean walk, or `Err(...)`
 /// if any block hits a feature we don't support (caller substitutes
 /// silence).
 ///
 /// `out` length must equal `bsi.num_blocks * 256 * bsi.nchans`.
+/// Every declared audio-block `skipfld` is returned in `skip_fields` in
+/// block order. The bytes are read through the existing bit cursor, so
+/// bit-unaligned reserved-data payloads are preserved exactly.
 pub fn decode_indep_audblks(
     bsi: &Eac3Bsi,
     audfrm: &AudFrm,
     br: &mut BitReader<'_>,
     state: &mut Ac3State,
     out: &mut [f32],
+    skip_fields: &mut Vec<Vec<u8>>,
 ) -> Result<()> {
+    skip_fields.clear();
     // Phase-B audfrm finalisation when AHT is in use. The audfrm parser
     // stopped at the AHT anchor so the dsp can compute the §3.4.2 helper
     // variables `nchregs[ch]` / `ncplregs` / `nlferegs` — the number of
@@ -1307,10 +1364,8 @@ pub fn decode_indep_audblks(
 
         // ---- §E.1.3.5.6 skip ----
         if audfrm.skipflde {
-            let skiple = br.read_u32(1)? != 0;
-            if skiple {
-                let skipl = br.read_u32(9)?;
-                br.skip(skipl * 8)?;
+            if let Some(skip_field) = read_skip_field(br)? {
+                skip_fields.push(skip_field);
             }
         }
 

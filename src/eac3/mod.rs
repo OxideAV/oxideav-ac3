@@ -58,6 +58,11 @@
 //!   §3.6 spectral extension (translate → noise-blend → coordinate
 //!   scale + §3.6.4.2.3 SPXATTEN border notch), §3.7.2 transient
 //!   pre-noise processing (PCM-domain time-scaling synthesis).
+//! * **[`joc`]** / **[`oamd`]** — TS 103 420 EC-3 Extension Type A,
+//!   EMDF/JOC sparse-matrix metadata, and dynamic object-position
+//!   parsing. [`joc_reconstruct`] and [`joc_qmf`] rebuild up to 16
+//!   object signals in the QMF domain; [`joc_renderer`] produces an
+//!   opt-in stereo speaker presentation with compatibility fallback.
 //! * **[`decoder`]** — top-level per-substream decode. Routes packets
 //!   with `bsid ∈ {11..=16}` through BSI → audfrm phase-A → dsp
 //!   pre-walk → audfrm phase-B → audblk DSP → IMDCT → overlap-add →
@@ -145,6 +150,30 @@ pub mod dsp;
 pub mod ecpl;
 pub mod ecplenc;
 pub mod encoder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod joc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod joc_qmf;
+// internal — normative table data used by the JOC QMF implementation
+#[doc(hidden)]
+pub mod joc_qmf_table;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod joc_reconstruct;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod joc_renderer;
+// internal — normative JOC Huffman tables
+#[doc(hidden)]
+pub mod joc_sparse_tables;
+// internal — normative JOC Huffman tables
+#[doc(hidden)]
+pub mod joc_tables;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub mod oamd;
 pub mod spxenc;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]

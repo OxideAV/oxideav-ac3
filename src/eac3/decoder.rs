@@ -48,6 +48,7 @@ use super::audfrm::{self, AudFrm};
 use super::bsi::{self, Bsi as Eac3Bsi, StreamType};
 use super::chanmap::{self, ChannelLocation};
 use super::dsp;
+use super::joc::{parse_ec3_extension_type_a, parse_joc_emdf, JocMetadata};
 
 /// E-AC-3 syncword — same value as base AC-3 (§E.2.2.1).
 // internal — exposed for tests/fuzz; not part of the stable API
@@ -93,6 +94,10 @@ pub struct Eac3DecoderState {
     indep_locations: Vec<ChannelLocation>,
     /// Samples-per-frame (per channel) of [`Self::indep_pcm_f32`].
     indep_samples_per_frame: u32,
+    /// Declared `skipfld` byte payloads captured while decoding the most
+    /// recent substream. JOC carriage is parsed from this typed boundary
+    /// instead of probing arbitrary compressed packet bytes.
+    skip_fields: Vec<Vec<u8>>,
     /// Per-frame error string (last seen). Diagnostic only.
     pub last_error: Option<String>,
     /// Physical channel locations of dep-substream channels that were
@@ -274,6 +279,10 @@ pub struct DecodedFrame {
     /// chosen target level. Advisory — the core decode does not scale by
     /// it (the spec leaves dialnorm to the reproduction system).
     pub dialnorm: u8,
+    /// Validated JOC/OAMD metadata for this packet, when present. Kept
+    /// crate-private until a standalone metadata API is designed; the
+    /// opt-in stereo presentation consumes it internally.
+    pub(crate) joc_metadata: Option<JocMetadata>,
 }
 
 /// Decode one or more concatenated E-AC-3 syncframes contained in a
@@ -288,6 +297,7 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
         return Err(Error::invalid("eac3: packet too short for syncinfo"));
     }
     let mut indep_pcm: Option<DecodedFrame> = None;
+    let mut joc_metadata: Option<JocMetadata> = None;
     let mut off = 0usize;
     state.last_error = None;
     state.dep_locations.clear();
@@ -303,6 +313,7 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
         let bsi_data = &data[off + 2..];
         let mut br = BitReader::new(bsi_data);
         let bsi = bsi::parse_with(&mut br)?;
+        state.skip_fields.clear();
         let frame_bytes = bsi.frame_bytes as usize;
         if off + frame_bytes > data.len() {
             return Err(Error::invalid(format!(
@@ -339,6 +350,9 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
         match bsi.strmtyp {
             StreamType::Independent | StreamType::Ac3Convert => {
                 let pcm = decode_indep_substream(state, &bsi, &audfrm, &mut br)?;
+                if let Some(metadata) = decode_substream_joc(&bsi, &state.skip_fields) {
+                    joc_metadata = Some(metadata);
+                }
                 state.last_indep = Some(IndepProgramShape {
                     nchans: pcm.channels,
                     sample_rate: pcm.sample_rate,
@@ -350,7 +364,11 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
                 // Round 3: decode + splice into indep_pcm_f32. On
                 // failure (Unsupported / parse error) we keep the
                 // indep PCM as-is so output is still meaningful.
-                let _ = decode_dep_substream(state, &bsi, &audfrm, &mut br);
+                if decode_dep_substream(state, &bsi, &audfrm, &mut br).is_ok() {
+                    if let Some(metadata) = decode_substream_joc(&bsi, &state.skip_fields) {
+                        joc_metadata = Some(metadata);
+                    }
+                }
             }
             StreamType::Reserved => {
                 return Err(Error::invalid("eac3: strmtyp '11' is reserved"));
@@ -380,7 +398,23 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
     // re-parsing the chanmap. Empty when no dep substream
     // contributed.
     pcm.dep_locations.clone_from(&state.dep_locations);
+    pcm.joc_metadata = joc_metadata;
     Ok(pcm)
+}
+
+/// Decode the Extension Type A signal and a matching JOC/OAMD EMDF
+/// container carried by a declared audio-block skip field. Optional
+/// metadata never makes the compatibility presentation fail: malformed or
+/// unsupported payloads simply return `None` and the caller keeps the
+/// channel-based decode.
+fn decode_substream_joc(bsi: &Eac3Bsi, skip_fields: &[Vec<u8>]) -> Option<JocMetadata> {
+    let signal = parse_ec3_extension_type_a(bsi.addbsi.as_ref()?.payload())
+        .ok()
+        .flatten()?;
+    skip_fields
+        .iter()
+        .filter(|field| field.starts_with(&[0x58, 0x38]))
+        .find_map(|field| parse_joc_emdf(field, signal).ok())
 }
 
 /// Decode one independent substream's audblks. Tries the round-2 DSP
@@ -397,14 +431,21 @@ fn decode_indep_substream(
     let nchans = bsi.nchans as usize;
     let mut floats = vec![0.0f32; samples as usize * nchans];
 
-    let dsp_result =
-        dsp::decode_indep_audblks(bsi, audfrm, br, &mut state.indep_state, &mut floats);
+    let dsp_result = dsp::decode_indep_audblks(
+        bsi,
+        audfrm,
+        br,
+        &mut state.indep_state,
+        &mut floats,
+        &mut state.skip_fields,
+    );
     if let Err(e) = &dsp_result {
         // Silent fallback. Reset the per-channel exponent reuse state
         // so the next frame's reuse-strategy blocks don't pick up
         // garbage from a half-decoded prior frame.
         state.last_error = Some(format!("{e}"));
         state.indep_state = Ac3State::new();
+        state.skip_fields.clear();
         for v in floats.iter_mut() {
             *v = 0.0;
         }
@@ -441,6 +482,7 @@ fn decode_indep_substream(
         // `state.dep_locations` if dep substreams follow.
         dep_locations: Vec::new(),
         dialnorm: bsi.dialnorm,
+        joc_metadata: None,
     })
 }
 
@@ -497,13 +539,19 @@ fn decode_dep_substream(
     // substream's audblks have the same syntax (Table E1.4 doesn't
     // branch on strmtyp).
     let mut dep_floats = vec![0.0f32; samples as usize * dep_nchans];
-    if let Err(e) =
-        dsp::decode_indep_audblks(bsi, audfrm, br, &mut state.dep_state, &mut dep_floats)
-    {
+    if let Err(e) = dsp::decode_indep_audblks(
+        bsi,
+        audfrm,
+        br,
+        &mut state.dep_state,
+        &mut dep_floats,
+        &mut state.skip_fields,
+    ) {
         // Silent fallback for the dep substream — leave indep PCM
         // untouched so the indep program is still audible.
         state.last_error = Some(format!("{e}"));
         state.dep_state = Ac3State::new();
+        state.skip_fields.clear();
         return Err(e);
     }
 
@@ -674,6 +722,7 @@ fn build_silent_indep(bsi: &Eac3Bsi) -> Result<DecodedFrame> {
         // dep channels were spliced.
         dep_locations: Vec::new(),
         dialnorm: bsi.dialnorm,
+        joc_metadata: None,
     })
 }
 
