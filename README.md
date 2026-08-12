@@ -31,7 +31,8 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
 6. [`wave_order`] — channel reorder for front-centre-bearing layouts
    (`acmod ∈ {3, 5, 7}`).
 7. [`encoder`] — base AC-3 encoder.
-8. [`eac3`] — Annex E decoder + encoder.
+8. [`eac3`] — Annex E decoder + encoder, including opt-in JOC/OAMD
+   object reconstruction and stereo speaker rendering.
 9. [`crc`] — §7.10.1 CRC-16 over poly 0x8005, shared between the encoder
    and the opt-in `decoder::verify_packet_crc` residue check.
 10. [`drc`] — §6.1.9 / §7.6 / §7.7 dynamic-range-control + dialogue-
@@ -149,6 +150,16 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   locations — so a real greater-than-5.1 broadcast program reassembles
   spatially correctly rather than duplicating and decorrelating the shared
   channels a blind append would have appended.
+- **Opt-in JOC object presentation**
+  (`decoder::make_eac3_decoder_with_joc`) parses EC-3 Extension Type A
+  and EMDF metadata from declared E-AC-3 skip fields, reconstructs up to
+  16 object signals with the TS 103 420 sparse/QMF pipeline, applies
+  dynamic OAMD updates, and renders a stereo speaker presentation. The
+  existing decoder factories retain their compatibility downmix, and the
+  opt-in decoder falls back to that path on absent, malformed, or
+  unsupported metadata. This is a standards-derived speaker renderer,
+  not Dolby's proprietary binaural/headphone renderer; encoding JOC is
+  outside its scope.
 - Encoder — independent + dependent substream pairs for 1.0 / 2.0 / 5.1
   / 7.1 layouts, with adaptive / frame-based exponent strategies.
   **Bitstream-metadata surface** (`eac3::Eac3Metadata` /

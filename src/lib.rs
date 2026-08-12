@@ -35,7 +35,8 @@
 //!    audfrm (Tables E1.2 / E1.3), audblk DSP, §3.4 Adaptive Hybrid
 //!    Transform on fbw / LFE / coupling channels, §3.6 spectral
 //!    extension with §3.6.4.2.3 SPXATTEN border notch, and §3.7.2
-//!    transient pre-noise processing. Encoder covers
+//!    transient pre-noise processing, plus opt-in TS 103 420 JOC/OAMD
+//!    object reconstruction and stereo speaker rendering. Encoder covers
 //!    indep+dep-substream pairs for 1.0 / 2.0 / 5.1 / 7.1 layouts;
 //!    SPX and AHT are out of scope on the encoder side.
 //! 9. [`crc`] — §7.10.1 CRC-16 over poly 0x8005, shared between
