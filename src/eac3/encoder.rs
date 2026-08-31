@@ -44,11 +44,14 @@ use oxideav_core::{
 };
 
 use crate::audblk::{remat_band_count_spx, BLOCKS_PER_FRAME, N_COEFFS, SAMPLES_PER_BLOCK};
+// The 6-block frame constant (1536) only survives in the test suites'
+// fixture builders; the library paths are block-count-generic now.
+#[cfg(test)]
 use crate::decoder::SAMPLES_PER_FRAME;
 use crate::encoder::{
     ac3_crc_update, build_dba_plan, compute_bap, compute_bap_cpl, decode_input_samples,
-    extract_exponent, mantissa_bits_total, overhead_bits_for, pick_strategy_for_block,
-    preprocess_d15, quantise_exponents_to_grpsize, quantise_mantissa,
+    extract_exponent, mantissa_bits_total, overhead_bits_for, overhead_bits_for_ends,
+    pick_strategy_for_block, preprocess_d15, quantise_exponents_to_grpsize, quantise_mantissa,
     select_exp_strategies_per_end, tune_snroffst_with_plan_ends, write_exponents_cpl,
     write_exponents_grouped, write_mantissa_stream, BitAllocParams, CouplingPlan, DbaPlan,
     TransientDetector, LFE_END_MANT,
@@ -110,6 +113,10 @@ use super::bsi::EAC3_BSID;
 /// | `spx_explicit_band_structure` | `1`/`true` | emit `spxbndstrce = 1` |
 ///
 /// The sub-keys imply `spx` unless it is explicitly `0`/`false`.
+///
+/// Fractional syncframes (§E.2.3.1.5 / Table E2.4) via the `blocks`
+/// option = `1`/`2`/`3`/`6` — audio blocks per syncframe (the typed
+/// alternative is [`make_encoder_with_blocks`]).
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let mut concrete = build_concrete_encoder(params)?;
     concrete.meta = eac3_metadata_from_options(params)?;
@@ -145,7 +152,130 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     if let (Some(ecpl), Some(spx)) = (&concrete.ecpl, &concrete.spx) {
         validate_spx_ecpl(spx, ecpl)?;
     }
+    validate_num_blocks_tools(&concrete)?;
     Ok(Box::new(concrete))
+}
+
+/// Build an E-AC-3 encoder emitting fractional syncframes
+/// (§E.2.3.1.5 `numblkscod`, Table E2.4): `blocks` audio blocks —
+/// 256 PCM samples each — per syncframe. 1, 2, and 3 give the
+/// low-latency fractional-frame shapes (`numblkscod` 0/1/2, with the
+/// §E.2.3.1.64 `convsync` cadence marking each 6-block AC-3
+/// conversion-group head); 6 is the [`make_encoder`] default. The
+/// syncframe byte budget scales by `blocks / 6` so the bit rate is
+/// unchanged. Fractional frames use the standard coding path: AHT is
+/// spec-implicit-off (`ahte = 0` when `numblkscod != 0x3`, Table
+/// E1.3), and this encoder's SPX / enhanced coupling stay 6-block
+/// scope (their coordinate anchors ride blocks 0/3).
+///
+/// Also reachable through the registry path via the
+/// `CodecParameters::options` key `blocks` = `1`/`2`/`3`/`6`.
+pub fn make_encoder_with_blocks(
+    params: &CodecParameters,
+    blocks: usize,
+) -> Result<Box<dyn Encoder>> {
+    if !matches!(blocks, 1 | 2 | 3 | 6) {
+        return Err(Error::invalid(format!(
+            "eac3 encoder: blocks={blocks} (expected 1, 2, 3, or 6 — Table E2.4)"
+        )));
+    }
+    let mut concrete = build_concrete_encoder(params)?;
+    concrete.num_blocks = blocks;
+    // Recompute the per-substream frame size for the new block count
+    // (build_concrete_encoder sized it from the options-derived count).
+    let fscod = concrete.fscod;
+    match &mut concrete.layout {
+        Layout::Indep(s) => {
+            s.frame_bytes = ac3_frame_bytes_blocks(fscod, s.kbps, blocks).ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "eac3 encoder: bit rate {} kbps has no {blocks}-block frame-size mapping",
+                    s.kbps
+                ))
+            })? as usize;
+        }
+        Layout::Pair { indep, dep } => {
+            for s in [&mut *indep, &mut *dep] {
+                s.frame_bytes = ac3_frame_bytes_blocks(fscod, s.kbps, blocks).ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "eac3 encoder: bit rate {} kbps has no {blocks}-block frame-size mapping",
+                        s.kbps
+                    ))
+                })? as usize;
+            }
+        }
+    }
+    match &concrete.layout {
+        Layout::Indep(s) => validate_min_rate(s, blocks)?,
+        Layout::Pair { indep, dep } => {
+            validate_min_rate(indep, blocks)?;
+            validate_min_rate(dep, blocks)?;
+        }
+    }
+    validate_num_blocks_tools(&concrete)?;
+    Ok(Box::new(concrete))
+}
+
+/// Construction-time floor for the (frame size × layout × block
+/// count) combination: even with every anchor demoted to D45 (the
+/// cheapest legal exponent strategy), the per-frame fixed syntax +
+/// exponent payload must fit the syncframe with room to spare for at
+/// least a token mantissa payload. Fractional frames concentrate the
+/// per-frame overhead onto fewer samples, so low rates that are fine
+/// at 6 blocks become impossible at 1 block — reject those up front
+/// instead of erroring on the first frame.
+fn validate_min_rate(sub: &SubstreamLayout, nblks: usize) -> Result<()> {
+    let frame_strat: Vec<u8> = (0..nblks).map(|b| u8::from(b == 0)).collect();
+    let d45_anchor = {
+        let mut a = [0u8; BLOCKS_PER_FRAME];
+        a[0] = 3;
+        a
+    };
+    let plan = vec![d45_anchor; sub.nfchans];
+    let floor = overhead_bits_for_ends(
+        &frame_strat,
+        Some(&plan),
+        253, // full coded bandwidth (chbwcod = 60)
+        None,
+        sub.nfchans,
+        &crate::encoder::CouplingPlan::default(),
+        &crate::encoder::DbaPlan::default(),
+        sub.acmod,
+        sub.lfeon,
+    ) + 64;
+    if floor as usize >= sub.frame_bytes * 8 {
+        return Err(Error::Unsupported(format!(
+            "eac3 encoder: {} kbps is too low for a {nblks}-block acmod={} frame — \
+             the fixed syntax + minimum exponent payload ({floor} bits) exceeds the \
+             {}-bit syncframe; raise the bit rate or the block count",
+            sub.kbps,
+            sub.acmod,
+            sub.frame_bytes * 8,
+        )));
+    }
+    Ok(())
+}
+
+/// Fractional frames (§E.2.3.1.5 `numblkscod != 0x3`) use the
+/// standard coding path only: `ahte` is implicit-0 on the wire (Table
+/// E1.3), and this encoder's SPX / enhanced-coupling coordinate
+/// planning anchors on blocks 0/3 (6-block scope).
+fn validate_num_blocks_tools(enc: &Eac3Encoder) -> Result<()> {
+    if enc.num_blocks == BLOCKS_PER_FRAME {
+        return Ok(());
+    }
+    if enc.aht {
+        return Err(Error::Unsupported(
+            "eac3 encoder: aht requires 6-block syncframes (Table E1.3 — \
+             ahte is implicit 0 when numblkscod != 0x3)"
+                .into(),
+        ));
+    }
+    if enc.spx.is_some() || enc.ecpl.is_some() {
+        return Err(Error::Unsupported(
+            "eac3 encoder: spx / ecpl require 6-block syncframes (blocks = 6)".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// SPX + enhanced coupling co-active (§3.6.1: "coupling for a mid-range
@@ -188,6 +318,7 @@ pub fn make_encoder_with_spx_ecpl(
     let mut concrete = build_concrete_encoder(params)?;
     concrete.spx = Some(spx);
     concrete.ecpl = Some(ecpl);
+    validate_num_blocks_tools(&concrete)?;
     Ok(Box::new(concrete))
 }
 
@@ -219,6 +350,7 @@ pub fn make_encoder_with_ecpl(
     validate_ecpl(&ecpl, params.channels.unwrap_or(0))?;
     let mut concrete = build_concrete_encoder(params)?;
     concrete.ecpl = Some(ecpl);
+    validate_num_blocks_tools(&concrete)?;
     Ok(Box::new(concrete))
 }
 
@@ -720,6 +852,7 @@ fn validate_ecpl(_ecpl: &EcplParams, channels: u16) -> Result<()> {
 pub fn make_encoder_with_aht(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let mut concrete = build_concrete_encoder(params)?;
     concrete.aht = true;
+    validate_num_blocks_tools(&concrete)?;
     Ok(Box::new(concrete))
 }
 
@@ -812,6 +945,7 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
         }
     };
     let target_kbps: Option<u32> = params.bit_rate.map(|b| (b / 1000) as u32);
+    let num_blocks = num_blocks_from_options(params)?;
 
     // Build per-substream layout descriptors. For 1/2/6 channel input
     // we emit one independent substream; for 8 we emit indep+dep.
@@ -910,7 +1044,7 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
     let total_kbps_reported: u32;
     let layout_resolved = match layout {
         Layout::Indep(mut s) => {
-            let bytes = ac3_frame_bytes(fscod, s.kbps).ok_or_else(|| {
+            let bytes = ac3_frame_bytes_blocks(fscod, s.kbps, num_blocks).ok_or_else(|| {
                 Error::Unsupported(format!(
                     "eac3 encoder: bit rate {} kbps has no frame-size mapping",
                     s.kbps
@@ -921,13 +1055,14 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
             Layout::Indep(s)
         }
         Layout::Pair { mut indep, mut dep } => {
-            let i_bytes = ac3_frame_bytes(fscod, indep.kbps).ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "eac3 encoder: indep bit rate {} kbps has no frame-size mapping",
-                    indep.kbps
-                ))
-            })? as usize;
-            let d_bytes = ac3_frame_bytes(fscod, dep.kbps).ok_or_else(|| {
+            let i_bytes =
+                ac3_frame_bytes_blocks(fscod, indep.kbps, num_blocks).ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "eac3 encoder: indep bit rate {} kbps has no frame-size mapping",
+                        indep.kbps
+                    ))
+                })? as usize;
+            let d_bytes = ac3_frame_bytes_blocks(fscod, dep.kbps, num_blocks).ok_or_else(|| {
                 Error::Unsupported(format!(
                     "eac3 encoder: dep bit rate {} kbps has no frame-size mapping",
                     dep.kbps
@@ -939,6 +1074,14 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
             Layout::Pair { indep, dep }
         }
     };
+
+    match &layout_resolved {
+        Layout::Indep(s) => validate_min_rate(s, num_blocks)?,
+        Layout::Pair { indep, dep } => {
+            validate_min_rate(indep, num_blocks)?;
+            validate_min_rate(dep, num_blocks)?;
+        }
+    }
 
     let total_pcm_chans = channels as usize;
     let out_params = {
@@ -976,6 +1119,8 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
         aht: false,
         ecpl: None,
         meta: Eac3Metadata::default(),
+        num_blocks,
+        frames_emitted: 0,
         ecpl_carry: vec![None, None],
     })
 }
@@ -1026,6 +1171,7 @@ pub fn make_encoder_with_spx(params: &CodecParameters, spx: SpxParams) -> Result
     validate_spx_channel_mask(&spx, params.channels.unwrap_or(0))?;
     let mut concrete = build_concrete_encoder(params)?;
     concrete.spx = Some(spx);
+    validate_num_blocks_tools(&concrete)?;
     Ok(Box::new(concrete))
 }
 
@@ -1043,21 +1189,23 @@ pub(crate) fn make_encoder_with_snroffststr(
     Ok(Box::new(concrete))
 }
 
-/// Pick a syncframe size in bytes for a given (fscod, target kbps).
-/// Returns `None` for unsupported bit rates.
+/// Pick a syncframe size in bytes for a given (fscod, target kbps)
+/// and block count.
 ///
-/// Formula matches AC-3's Table 5.18 row size:
-///   `bytes = round((kbps * 1000 * SAMPLES_PER_FRAME) / (sample_rate * 8))`
-/// For 48 kHz this collapses to `kbps * 4` exactly.
-fn ac3_frame_bytes(fscod: u8, kbps: u32) -> Option<u32> {
+/// For the 6-block shape the formula matches AC-3's Table 5.18 row
+/// size: `bytes = round((kbps * 1000 * 1536) / (sample_rate * 8))` —
+/// at 48 kHz this collapses to `kbps * 4` exactly. Fractional frames
+/// (§E.2.3.1.5 — 256 samples per block) scale the byte budget by
+/// `nblks / 6`. Returns `None` for unsupported bit rates.
+fn ac3_frame_bytes_blocks(fscod: u8, kbps: u32, nblks: usize) -> Option<u32> {
     let sample_rate: u32 = match fscod {
         0 => 48_000,
         1 => 44_100,
         2 => 32_000,
         _ => return None,
     };
-    // 1536 samples per syncframe; 8 bits per byte.
-    let numerator = kbps as u64 * 1000 * (SAMPLES_PER_FRAME as u64);
+    // 256·nblks samples per syncframe; 8 bits per byte.
+    let numerator = kbps as u64 * 1000 * (SAMPLES_PER_BLOCK as u64 * nblks as u64);
     let denom = sample_rate as u64 * 8;
     // AC-3 spec rounds toward the table value; we round down so the
     // bit-rate is a hard upper bound. Even byte counts only: round to
@@ -1069,6 +1217,20 @@ fn ac3_frame_bytes(fscod: u8, kbps: u32) -> Option<u32> {
         Some(rounded as u32)
     } else {
         None
+    }
+}
+
+/// Parse the `blocks` codec option (§E.2.3.1.5 `numblkscod`): audio
+/// blocks per syncframe — 1, 2, 3 (fractional frames) or 6 (default).
+fn num_blocks_from_options(params: &CodecParameters) -> Result<usize> {
+    match params.options.get("blocks") {
+        None => Ok(BLOCKS_PER_FRAME),
+        Some(v) => match v.parse::<usize>() {
+            Ok(n @ (1 | 2 | 3 | 6)) => Ok(n),
+            _ => Err(Error::invalid(format!(
+                "eac3 encoder: option blocks={v} (expected 1, 2, 3, or 6 — Table E2.4)"
+            ))),
+        },
     }
 }
 
@@ -1160,6 +1322,18 @@ struct Eac3Encoder {
     /// per-block dynrng, Table E1.2 mixing / informational blocks).
     /// Validated at construction.
     meta: Eac3Metadata,
+    /// Audio blocks per syncframe (§E.2.3.1.5 `numblkscod`, Table
+    /// E2.4): 1, 2, 3 (fractional frames — `numblkscod` 0/1/2) or 6
+    /// (the default, `numblkscod = 0x3`). Fractional frames use the
+    /// standard coding path only: AHT is spec-implicit-off
+    /// (`ahte = 0` when `numblkscod != 0x3`, Table E1.3) and SPX /
+    /// enhanced coupling are 6-block-scope in this encoder (their
+    /// coordinate anchors ride blocks 0/3).
+    num_blocks: usize,
+    /// Syncframes emitted so far — drives the §E.2.3.1.64 `convsync`
+    /// cadence on fractional frames (the flag marks the syncframe
+    /// that starts a 6-block AC-3 conversion group).
+    frames_emitted: u64,
     /// Per-substream cross-frame enhanced-coupling analysis carry: the
     /// previous frame's last-block carrier + per-channel
     /// region-restricted MDCT buffers, mirroring the decoder's
@@ -1199,7 +1373,7 @@ impl Encoder for Eac3Encoder {
         for ch in 0..self.total_pcm_chans {
             self.pending_samples[ch].extend_from_slice(&per_chan[ch]);
         }
-        while self.pending_samples[0].len() as u32 >= SAMPLES_PER_FRAME {
+        while self.pending_samples[0].len() >= self.frame_samples() {
             self.emit_syncframe()?;
         }
         Ok(())
@@ -1214,7 +1388,7 @@ impl Encoder for Eac3Encoder {
         if self.pending_samples[0].is_empty() {
             return Ok(());
         }
-        let missing = SAMPLES_PER_FRAME as usize - self.pending_samples[0].len();
+        let missing = self.frame_samples() - self.pending_samples[0].len();
         if missing > 0 {
             for ch in 0..self.total_pcm_chans {
                 self.pending_samples[ch].extend(std::iter::repeat(0.0).take(missing));
@@ -1230,7 +1404,7 @@ impl Eac3Encoder {
     /// emit one packet whose payload is the indep substream — or the
     /// indep+dep concatenation for the 7.1 pair layout.
     fn emit_syncframe(&mut self) -> Result<()> {
-        let n_per = SAMPLES_PER_FRAME as usize;
+        let n_per = self.frame_samples();
 
         // Drain `n_per` samples per input channel into a per-input
         // PCM matrix, *advance* the per-input delay-line + transient
@@ -1260,8 +1434,14 @@ impl Eac3Encoder {
         self.packet_queue.push(
             Packet::new(0, TimeBase::new(1, self.sample_rate as i64), payload).with_pts(self.pts),
         );
-        self.pts += SAMPLES_PER_FRAME as i64;
+        self.pts += n_per as i64;
+        self.frames_emitted += 1;
         Ok(())
+    }
+
+    /// PCM samples per input channel per syncframe (256 per block).
+    fn frame_samples(&self) -> usize {
+        SAMPLES_PER_BLOCK * self.num_blocks
     }
 
     /// Total syncframe-pair size in bytes.
@@ -1282,6 +1462,10 @@ impl Eac3Encoder {
     ) -> Result<Vec<u8>> {
         let nfchans = sub.nfchans;
         let total_chans = nfchans + usize::from(sub.lfeon);
+        // Audio blocks this syncframe (§E.2.3.1.5). 6 by default;
+        // 1/2/3 for fractional frames (standard coding path only —
+        // AHT/SPX/ecpl are rejected at construction for nblks != 6).
+        let nblks = self.num_blocks;
         // Enhanced coupling applies to the independent substream only
         // (the 7.1 pair's dependent Lb/Rb stream stays plain) and needs
         // at least two fbw channels to couple.
@@ -1298,14 +1482,13 @@ impl Eac3Encoder {
         };
 
         // -------- DSP: window + MDCT per substream channel per block --------
-        let mut coeffs: Vec<Vec<[f32; N_COEFFS]>> =
-            vec![vec![[0.0; N_COEFFS]; BLOCKS_PER_FRAME]; total_chans];
+        let mut coeffs: Vec<Vec<[f32; N_COEFFS]>> = vec![vec![[0.0; N_COEFFS]; nblks]; total_chans];
         // blksw exists only for fbw channels (LFE never short-blocks).
         let mut blksw: Vec<[bool; BLOCKS_PER_FRAME]> = vec![[false; BLOCKS_PER_FRAME]; nfchans];
         for ch in 0..total_chans {
             let src_idx = sub.src_indices[ch];
             let drain = &frame_pcm[src_idx];
-            for blk in 0..BLOCKS_PER_FRAME {
+            for blk in 0..nblks {
                 let mut in_buf = [0.0f32; 512];
                 in_buf[..256].copy_from_slice(&self.delay_line[src_idx]);
                 in_buf[256..].copy_from_slice(
@@ -1349,8 +1532,7 @@ impl Eac3Encoder {
         //   nfchans     → coupling pseudo-channel (unused — cplinu=0)
         //   nfchans + 1 → LFE pseudo-channel (when lfeon)
         let lfe_idx_in_exps = nfchans + 1;
-        let mut exps: Vec<Vec<[u8; N_COEFFS]>> =
-            vec![vec![[24u8; N_COEFFS]; BLOCKS_PER_FRAME]; nfchans + 2];
+        let mut exps: Vec<Vec<[u8; N_COEFFS]>> = vec![vec![[24u8; N_COEFFS]; nblks]; nfchans + 2];
         let chbwcod: u8 = 60;
         // §E.2.3.3 / §E.3.3.3 — with SPX in use, every fbw channel's
         // coded bandwidth ends at the SPX begin frequency
@@ -1441,7 +1623,7 @@ impl Eac3Encoder {
             .collect();
         let ch_end_mant = end_mant;
         for ch in 0..nfchans {
-            for blk in 0..BLOCKS_PER_FRAME {
+            for blk in 0..nblks {
                 for k in 0..end_mant_ch[ch] {
                     exps[ch][blk][k] = extract_exponent(coeffs[ch][blk][k]);
                 }
@@ -1455,7 +1637,7 @@ impl Eac3Encoder {
             for ch in 0..nfchans {
                 for k in 0..ch_end_mant {
                     let mut mx = 0.0f32;
-                    for blk in 0..BLOCKS_PER_FRAME {
+                    for blk in 0..nblks {
                         mx = mx.max(coeffs[ch][blk][k].abs());
                     }
                     exps[ch][0][k] = extract_exponent(mx);
@@ -1477,7 +1659,7 @@ impl Eac3Encoder {
                 32_000 => 2usize,
                 _ => 2usize,
             };
-            for blk in 0..BLOCKS_PER_FRAME {
+            for blk in 0..nblks {
                 for k in lfe_cutoff..LFE_END_MANT {
                     coeffs[nfchans][blk][k] = 0.0;
                 }
@@ -1518,7 +1700,7 @@ impl Eac3Encoder {
                     let grpsize = if strat == 2 { 2 } else { 4 };
                     quantise_exponents_to_grpsize(&mut exps[ch][0][..ch_end_mant], grpsize);
                 }
-                for blk in 1..BLOCKS_PER_FRAME {
+                for blk in 1..nblks {
                     let src: [u8; N_COEFFS] = exps[ch][0];
                     exps[ch][blk][..ch_end_mant].copy_from_slice(&src[..ch_end_mant]);
                 }
@@ -1528,7 +1710,7 @@ impl Eac3Encoder {
             // D15-preprocess every anchor block first so the strategy
             // picker sees legalised exponents.
             for ch in 0..nfchans {
-                for blk in 0..BLOCKS_PER_FRAME {
+                for blk in 0..nblks {
                     if exp_strategies[blk] == 1 {
                         preprocess_d15(&mut exps[ch][blk][..end_mant_ch[ch]]);
                     }
@@ -1541,13 +1723,57 @@ impl Eac3Encoder {
                         out[ch] = exp_strategies;
                     }
                     out
-                } else {
+                } else if nblks == BLOCKS_PER_FRAME {
                     select_exp_strategies_per_end(&exps, nfchans, &end_mant_ch)
+                } else {
+                    // Fractional frames (1/2/3 blocks) anchor on block
+                    // 0 only — there is no block 3 for the second
+                    // anchor of the [1,0,0,1,0,0] pattern.
+                    let mut out = vec![[0u8; BLOCKS_PER_FRAME]; nfchans];
+                    for (ch, plan) in out.iter_mut().enumerate() {
+                        plan[0] = pick_strategy_for_block(&exps[ch][0], end_mant_ch[ch]);
+                    }
+                    out
                 };
+            // Budget-floor guard for fractional frames: a 1-3-block
+            // syncframe re-anchors exponents every frame while its
+            // byte budget scales by nblks/6, so the picker's
+            // smoothness-preferred strategy (often D15) can exceed the
+            // whole frame on its own — the tuner then bails and the
+            // packer overflows. When the chosen plan's overhead cannot
+            // fit, demote every anchor to D45 (the cheapest legal
+            // strategy) before committing exponent quantisation.
+            let plan = {
+                let mut plan = plan;
+                if nblks != BLOCKS_PER_FRAME {
+                    let budget = (sub.frame_bytes * 8) as u32;
+                    let probe = overhead_bits_for_ends(
+                        &exp_strategies[..nblks],
+                        Some(&plan),
+                        ch_end_mant,
+                        Some(&end_mant_ch),
+                        nfchans,
+                        &CouplingPlan::default(),
+                        &DbaPlan::default(),
+                        sub.acmod,
+                        sub.lfeon,
+                    ) + 64;
+                    if probe >= budget {
+                        for p in plan.iter_mut() {
+                            for blk in 0..nblks {
+                                if p[blk] != 0 {
+                                    p[blk] = 3; // D45
+                                }
+                            }
+                        }
+                    }
+                }
+                plan
+            };
             // Apply grpsize quantisation for D25/D45 anchor blocks.
             for ch in 0..nfchans {
                 let ch_end = end_mant_ch[ch];
-                for blk in 0..BLOCKS_PER_FRAME {
+                for blk in 0..nblks {
                     let strat = plan[ch][blk];
                     if strat >= 2 {
                         let grpsize = if strat == 2 { 2 } else { 4 };
@@ -1556,7 +1782,7 @@ impl Eac3Encoder {
                 }
                 // REUSE blocks get the most-recent anchor's exponents.
                 let mut last = 0usize;
-                for blk in 0..BLOCKS_PER_FRAME {
+                for blk in 0..nblks {
                     if plan[ch][blk] != 0 {
                         last = blk;
                     } else {
@@ -1573,7 +1799,7 @@ impl Eac3Encoder {
             if self.aht {
                 for k in 0..LFE_END_MANT {
                     let mut mx = 0.0f32;
-                    for blk in 0..BLOCKS_PER_FRAME {
+                    for blk in 0..nblks {
                         mx = mx.max(coeffs[nfchans][blk][k].abs());
                     }
                     exps[lfe_idx_in_exps][0][k] = extract_exponent(mx);
@@ -1582,13 +1808,13 @@ impl Eac3Encoder {
             // LFE strategy: D15 on anchor blocks, REUSE elsewhere. The
             // 1-bit lfeexpstr field only supports D15 or REUSE (§5.4.3.23
             // / §E.1.2.3).
-            for blk in 0..BLOCKS_PER_FRAME {
+            for blk in 0..nblks {
                 if lfe_exp_strategies[blk] == 1 {
                     preprocess_d15(&mut exps[lfe_idx_in_exps][blk][..LFE_END_MANT]);
                 }
             }
             let mut last = 0usize;
-            for blk in 0..BLOCKS_PER_FRAME {
+            for blk in 0..nblks {
                 if lfe_exp_strategies[blk] == 1 {
                     last = blk;
                 } else {
@@ -1617,7 +1843,7 @@ impl Eac3Encoder {
             // mirroring the fbw handling so the decoder's exponent state
             // matches the encoder's `exps[]` bin-for-bin.
             let cpl_idx = nfchans;
-            for blk in 0..BLOCKS_PER_FRAME {
+            for blk in 0..nblks {
                 for k in g.start_bin..g.end_bin {
                     exps[cpl_idx][blk][k] = extract_exponent(plan.carrier[blk][k]);
                 }
@@ -1626,7 +1852,7 @@ impl Eac3Encoder {
                 }
             }
             let mut last = 0usize;
-            for blk in 0..BLOCKS_PER_FRAME {
+            for blk in 0..nblks {
                 if exp_strategies[blk] == 1 {
                     last = blk;
                 } else {
@@ -1785,8 +2011,8 @@ impl Eac3Encoder {
             0
         } else {
             let per_block_fine = 4 * nfchans as u32 + if sub.lfeon { 4 } else { 0 };
-            let explicit_snroffste = (BLOCKS_PER_FRAME as u32) - 1; // blk 0 implicit
-            let per_block = BLOCKS_PER_FRAME as u32 * (6 + per_block_fine);
+            let explicit_snroffste = (nblks as u32) - 1; // blk 0 implicit
+            let per_block = nblks as u32 * (6 + per_block_fine);
             (per_block + explicit_snroffste).saturating_sub(10)
         };
         // SPX header bits over the SPX-off baseline (which spends one
@@ -1905,7 +2131,7 @@ impl Eac3Encoder {
                 nfchans,
                 self.fscod,
                 tuner_frame_bytes,
-                &exp_strategies,
+                &exp_strategies[..nblks],
                 Some(&chexpstr_plan),
                 &cpl,
                 &dba_plan,
@@ -1913,14 +2139,13 @@ impl Eac3Encoder {
                 sub.lfeon,
             )
         };
-        let mut baps: Vec<Vec<[u8; N_COEFFS]>> =
-            vec![vec![[0u8; N_COEFFS]; BLOCKS_PER_FRAME]; nfchans + 2];
+        let mut baps: Vec<Vec<[u8; N_COEFFS]>> = vec![vec![[0u8; N_COEFFS]; nblks]; nfchans + 2];
         let frame_ba = tuned_ba;
         if !self.aht {
             // AHT channels use hebap[] (computed at emission) instead
             // of bap[]; only non-AHT frames need the fbw bap arrays.
             for ch in 0..nfchans {
-                for blk in 0..BLOCKS_PER_FRAME {
+                for blk in 0..nblks {
                     compute_bap(
                         &exps[ch][blk],
                         end_mant_ch[ch],
@@ -1943,7 +2168,7 @@ impl Eac3Encoder {
                 fgaincod: tuned_ba.lfefgaincod,
                 ..frame_ba
             };
-            for blk in 0..BLOCKS_PER_FRAME {
+            for blk in 0..nblks {
                 compute_bap(
                     &exps[lfe_idx_in_exps][blk],
                     LFE_END_MANT,
@@ -1966,7 +2191,7 @@ impl Eac3Encoder {
                 ..frame_ba
             };
             let cpl_idx = nfchans;
-            for blk in 0..BLOCKS_PER_FRAME {
+            for blk in 0..nblks {
                 compute_bap_cpl(
                     &exps[cpl_idx][blk],
                     g.start_bin,
@@ -2010,8 +2235,14 @@ impl Eac3Encoder {
         let frmsiz = (sub.frame_bytes / 2 - 1) as u32;
         bw.write_u32(frmsiz, 11);
         bw.write_u32(self.fscod as u32, 2);
-        // fscod != 0x3, so emit numblkscod (2 bits). 0x3 = 6 blocks.
-        bw.write_u32(0x3, 2);
+        // fscod != 0x3, so emit numblkscod (2 bits; Table E2.4 —
+        // 0/1/2 = 1/2/3 blocks per syncframe, 0x3 = 6 blocks).
+        let numblkscod: u32 = if nblks == BLOCKS_PER_FRAME {
+            0x3
+        } else {
+            nblks as u32 - 1
+        };
+        bw.write_u32(numblkscod, 2);
         bw.write_u32(sub.acmod as u32, 3);
         bw.write_u32(u32::from(sub.lfeon), 1);
         bw.write_u32(EAC3_BSID as u32, 5);
@@ -2110,16 +2341,28 @@ impl Eac3Encoder {
                 }
                 // fscod < 0x3 always holds here (48/44.1/32 kHz).
                 bw.write_u32(u32::from(i.sourcefscod), 1);
-                // numblkscod == 0x3 → no convsync field.
             }
             _ => bw.write_u32(0, 1), // infomdate = 0
         }
-        // numblkscod == 0x3 → no convsync / blkid / frmsizecod fields.
+        // §E.2.3.1.64 convsync — present when strmtyp == 0 and
+        // numblkscod != 0x3: set on the syncframe that starts a
+        // 6-block AC-3 conversion group (every (6/nblks)-th frame).
+        // With numblkscod == 0x3 the field is absent; strmtyp == 2
+        // (blkid / frmsizecod) is never emitted by this encoder.
+        if sub.strmtyp == 0 && nblks != BLOCKS_PER_FRAME {
+            let group = (BLOCKS_PER_FRAME / nblks) as u64;
+            let convsync = u32::from(self.frames_emitted % group == 0);
+            bw.write_u32(convsync, 1);
+        }
         bw.write_u32(0, 1); // addbsie = 0
 
-        // audfrm (§E.2.2.3 / §E.2.3.2)
-        bw.write_u32(1, 1); // expstre = 1
-        bw.write_u32(u32::from(self.aht), 1); // ahte (§2.3.2.2)
+        // audfrm (§E.2.2.3 / §E.2.3.2). Table E1.3: expstre and ahte
+        // are transmitted only on 6-block frames; fractional frames
+        // have expstre = 1 and ahte = 0 implicit.
+        if nblks == BLOCKS_PER_FRAME {
+            bw.write_u32(1, 1); // expstre = 1
+            bw.write_u32(u32::from(self.aht), 1); // ahte (§2.3.2.2)
+        }
         bw.write_u32(self.snroffststr as u32, 2); // snroffststr
         bw.write_u32(0, 1); // transproce = 0
         bw.write_u32(1, 1); // blkswe = 1
@@ -2135,7 +2378,7 @@ impl Eac3Encoder {
             // strategy then rides block 0's implicit cplstre = 1 and is
             // reused by every later block via cplstre[blk] = 0).
             bw.write_u32(u32::from(ecpl_on), 1);
-            for _blk in 1..BLOCKS_PER_FRAME {
+            for _blk in 1..nblks {
                 bw.write_u32(0, 1); // cplstre[blk] = 0 (strategy reuse)
             }
         }
@@ -2159,7 +2402,7 @@ impl Eac3Encoder {
         // emit, so the `if (cplinu[blk] == 1) {cplexpstr[blk]}` branch
         // never fires. We emit per-channel chexpstr from the adaptive
         // D15/D25/D45 plan selected above (chexpstr_plan[ch][blk]).
-        for blk in 0..BLOCKS_PER_FRAME {
+        for blk in 0..nblks {
             // §E.1.2.3: `cplexpstr[blk]` (2 bits) precedes the
             // per-channel codes on every block where cplinu[blk] == 1.
             // The carrier follows the frame-wide anchor cadence
@@ -2175,7 +2418,7 @@ impl Eac3Encoder {
         // OUTSIDE the `if (expstre)` gate (always present when LFE is
         // on, regardless of expstre). LFE always D15 or REUSE.
         if sub.lfeon {
-            for blk in 0..BLOCKS_PER_FRAME {
+            for blk in 0..nblks {
                 bw.write_u32(lfe_exp_strategies[blk] as u32, 1);
             }
         }
@@ -2183,8 +2426,14 @@ impl Eac3Encoder {
         // (independent substream) and numblkscod == 0x3 ⇒ convexpstre
         // implicit = 1, followed by per-channel convexpstr (5 bits each).
         if sub.strmtyp == 0 {
-            for _ in 0..nfchans {
-                bw.write_u32(0, 5); // convexpstr = 0 (REUSE codeword)
+            if nblks == BLOCKS_PER_FRAME {
+                for _ in 0..nfchans {
+                    bw.write_u32(0, 5); // convexpstr = 0 (REUSE codeword)
+                }
+            } else {
+                // numblkscod != 0x3 → explicit convexpstre flag; 0
+                // skips the per-channel convexpstr codes.
+                bw.write_u32(0, 1); // convexpstre = 0
             }
         }
         // §3.4.2 / Table E1.3 AHT in-use flags. Presence is gated by
@@ -2223,10 +2472,12 @@ impl Eac3Encoder {
                 }
             }
         }
-        bw.write_u32(0, 1); // blkstrtinfoe = 0
+        if nblks != 1 {
+            bw.write_u32(0, 1); // blkstrtinfoe = 0 (absent on 1-block frames)
+        }
 
         // -------- audio blocks --------
-        for blk in 0..BLOCKS_PER_FRAME {
+        for blk in 0..nblks {
             for ch in 0..nfchans {
                 bw.write_u32(blksw[ch][blk] as u32, 1);
             }
@@ -2668,7 +2919,7 @@ impl Eac3Encoder {
                 (Some(cp), Some(plan)) => Some(EcplCarry {
                     carrier: plan.carrier_hat_last,
                     channels: (0..nfchans)
-                        .map(|ch| cp.restricted[ch][BLOCKS_PER_FRAME - 1])
+                        .map(|ch| cp.restricted[ch][nblks - 1])
                         .collect(),
                 }),
                 _ => None,
@@ -3070,13 +3321,303 @@ mod tests {
     #[test]
     fn frame_bytes_lookup_48k() {
         // 192 kbps @ 48 kHz ⇒ 768 bytes (matches AC-3's frmsizecod=20).
-        assert_eq!(ac3_frame_bytes(0, 192), Some(768));
+        assert_eq!(ac3_frame_bytes_blocks(0, 192, 6), Some(768));
         // 96 kbps @ 48 kHz ⇒ 384 bytes.
-        assert_eq!(ac3_frame_bytes(0, 96), Some(384));
+        assert_eq!(ac3_frame_bytes_blocks(0, 96, 6), Some(384));
         // 32 kbps lower bound — even, in range.
-        assert_eq!(ac3_frame_bytes(0, 32), Some(128));
+        assert_eq!(ac3_frame_bytes_blocks(0, 32, 6), Some(128));
         // 640 kbps @ 48 kHz ⇒ 2560 bytes (largest A/52 row).
-        assert_eq!(ac3_frame_bytes(0, 640), Some(2560));
+        assert_eq!(ac3_frame_bytes_blocks(0, 640, 6), Some(2560));
+        // Fractional frames scale the byte budget by nblks/6 (even
+        // byte counts — frmsiz is in 16-bit words).
+        assert_eq!(ac3_frame_bytes_blocks(0, 192, 3), Some(384));
+        assert_eq!(ac3_frame_bytes_blocks(0, 192, 2), Some(256));
+        assert_eq!(ac3_frame_bytes_blocks(0, 192, 1), Some(128));
+        // 1-block frames at very low rates fall below the 32-byte
+        // frmsiz floor.
+        assert_eq!(ac3_frame_bytes_blocks(0, 32, 1), None);
+    }
+
+    // ---- fractional syncframes (§E.2.3.1.5 numblkscod 0/1/2) ----
+    //
+    // A syncframe may carry 1, 2, or 3 audio blocks instead of 6
+    // (Table E2.4); the byte budget scales by nblks/6 so the bit rate
+    // is unchanged. The round-trips below gate three invariants:
+    // syntax (numblkscod / frame size / §E.2.3.1.64 convsync cadence
+    // through the typed BSI parse), decode alignment (PSNR vs the
+    // 6-block encode of the same PCM at the same rate — a single-bit
+    // audfrm/bsi misalignment collapses this to ~0 dB), and the
+    // options-vs-typed construction parity pin.
+
+    fn encode_blocks(
+        pcm: &[f32],
+        channels: usize,
+        bit_rate: u64,
+        blocks: usize,
+        via_option: bool,
+    ) -> Vec<u8> {
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(channels as u16);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(bit_rate);
+        let mut enc: Box<dyn Encoder> = if via_option {
+            params.options = oxideav_core::CodecOptions::new().set("blocks", blocks.to_string());
+            make_encoder(&params).expect("options-driven blocks encoder")
+        } else {
+            make_encoder_with_blocks(&params, blocks).expect("typed blocks encoder")
+        };
+        let n_samp = pcm.len() / channels;
+        let mut s16 = Vec::with_capacity(pcm.len() * 2);
+        for &v in pcm {
+            let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            s16.extend_from_slice(&q.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: n_samp as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut out = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => out.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("blocks encode error: {e:?}"),
+            }
+        }
+        out
+    }
+
+    /// Walk a single-substream stream and assert the per-frame BSI
+    /// syntax: frame size, numblkscod/num_blocks, and the convsync
+    /// cadence (set on every (6/nblks)-th frame, starting at frame 0).
+    fn assert_fractional_syntax(stream: &[u8], frame_bytes: usize, blocks: usize) {
+        assert!(!stream.is_empty(), "encoder produced no bytes");
+        assert_eq!(
+            stream.len() % frame_bytes,
+            0,
+            "stream should be whole {frame_bytes}-byte syncframes"
+        );
+        let group = BLOCKS_PER_FRAME / blocks;
+        for (idx, frame) in stream.chunks_exact(frame_bytes).enumerate() {
+            assert_eq!(&frame[..2], &[0x0B, 0x77], "syncword at frame {idx}");
+            let bsi = super::super::bsi::parse(&frame[2..]).expect("fractional BSI parse");
+            assert_eq!(bsi.num_blocks as usize, blocks, "num_blocks at frame {idx}");
+            assert_eq!(
+                bsi.numblkscod,
+                if blocks == 6 { 3 } else { blocks as u8 - 1 },
+                "numblkscod at frame {idx}"
+            );
+            assert_eq!(
+                bsi.frame_bytes as usize, frame_bytes,
+                "frmsiz at frame {idx}"
+            );
+            if blocks == 6 {
+                assert_eq!(bsi.convsync, None, "convsync absent on 6-block frames");
+            } else {
+                assert_eq!(
+                    bsi.convsync,
+                    Some(idx % group == 0),
+                    "convsync cadence at frame {idx} (group = {group})"
+                );
+            }
+        }
+    }
+
+    fn assert_fractional_roundtrip(channels: usize, bit_rate: u64, blocks: usize, floor_db: f64) {
+        let pcm = build_sine_pcm(channels, 4);
+        let frame_bytes =
+            ac3_frame_bytes_blocks(0, (bit_rate / 1000) as u32, blocks).unwrap() as usize;
+        let stream = encode_blocks(&pcm, channels, bit_rate, blocks, false);
+        assert_fractional_syntax(&stream, frame_bytes, blocks);
+
+        // Decode alignment gate: the fractional decode must track the
+        // 6-block decode of the same PCM at the same rate. The two are
+        // different lossy codings (fractional frames amortise their
+        // header overhead over fewer samples and re-anchor exponents
+        // every frame), so this is a gross-desync floor, not a
+        // bit-exactness claim — a cursor misalignment anywhere in the
+        // fractional bsi/audfrm/audblk walk collapses it to ~0 dB.
+        let dec = decode_all(&stream, frame_bytes);
+        let base_frame_bytes = ac3_frame_bytes_blocks(0, (bit_rate / 1000) as u32, 6).unwrap();
+        let base = decode_all(
+            &encode_with(&pcm, channels, bit_rate, 0),
+            base_frame_bytes as usize,
+        );
+        assert_eq!(
+            dec.len(),
+            base.len(),
+            "fractional decode must cover the same sample count"
+        );
+        let psnr = psnr_vs(&dec, &base);
+        eprintln!(
+            "fractional {blocks}-block {}ch @ {} kbps: PSNR vs 6-block decode = {psnr:.2} dB",
+            channels,
+            bit_rate / 1000
+        );
+        assert!(
+            psnr >= floor_db,
+            "{blocks}-block decode diverged from the 6-block reference: \
+             {psnr:.2} dB < {floor_db} dB"
+        );
+    }
+
+    // Floors are gross-desync guards, not fidelity claims: a cursor
+    // misalignment collapses the mutual PSNR to ~0 dB, while the
+    // honest efficiency cost of the shape (per-frame BSI/audfrm
+    // overhead + a full exponent re-anchor every 256·nblks samples at
+    // an unchanged bit rate) measures ~24-28 dB for 3-block, ~24 dB
+    // for 2-block, and ~13 dB for the 1-block extreme at these rates.
+    #[test]
+    fn fractional_frames_roundtrip_stereo_3blocks() {
+        assert_fractional_roundtrip(2, 192_000, 3, 22.0);
+    }
+
+    #[test]
+    fn fractional_frames_roundtrip_stereo_2blocks() {
+        assert_fractional_roundtrip(2, 192_000, 2, 18.0);
+    }
+
+    #[test]
+    fn fractional_frames_roundtrip_mono_1block() {
+        assert_fractional_roundtrip(1, 96_000, 1, 10.0);
+    }
+
+    #[test]
+    fn fractional_frames_roundtrip_51_2blocks() {
+        assert_fractional_roundtrip(6, 448_000, 2, 16.0);
+    }
+
+    #[test]
+    fn fractional_frames_options_vs_typed_byte_identical() {
+        let pcm = build_sine_pcm(2, 2);
+        let typed = encode_blocks(&pcm, 2, 192_000, 3, false);
+        let via_option = encode_blocks(&pcm, 2, 192_000, 3, true);
+        assert_eq!(
+            typed, via_option,
+            "registry `blocks` option and make_encoder_with_blocks must build the same encoder"
+        );
+    }
+
+    #[test]
+    fn fractional_frames_71_pair_2blocks() {
+        // 7.1 emits an indep(5.1) + dep(Lb/Rb) pair per syncframe;
+        // both substreams share the block count. 576 kbps splits
+        // 384 + 192, so a 2-block pair is 512 + 256 bytes.
+        let pcm = build_sine_pcm(8, 3);
+        let stream = encode_blocks(&pcm, 8, 576_000, 2, false);
+        let pair_bytes = 512 + 256;
+        assert_eq!(stream.len() % pair_bytes, 0, "whole 2-block pairs");
+        for (idx, pair) in stream.chunks_exact(pair_bytes).enumerate() {
+            let indep = super::super::bsi::parse(&pair[2..]).expect("indep BSI");
+            assert_eq!(indep.num_blocks, 2, "indep num_blocks at pair {idx}");
+            assert_eq!(indep.convsync, Some(idx % 3 == 0), "indep convsync cadence");
+            assert_eq!(&pair[512..514], &[0x0B, 0x77], "dep syncword");
+            let dep = super::super::bsi::parse(&pair[514..]).expect("dep BSI");
+            assert_eq!(dep.num_blocks, 2, "dep num_blocks at pair {idx}");
+            // Dependent substreams never carry convsync (§E.2.3.1.64).
+            assert_eq!(dep.convsync, None, "dep convsync absent");
+        }
+        let dec = decode_all(&stream, pair_bytes);
+        assert_eq!(
+            dec.len(),
+            pcm.len(),
+            "7.1 fractional pair decode must cover the full sample count"
+        );
+    }
+
+    #[test]
+    fn fractional_frames_flush_pads_to_frame_multiple() {
+        // 300 samples at blocks=1 → two 256-sample frames (the tail
+        // frame zero-padded by flush).
+        let pcm: Vec<f32> = (0..300)
+            .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48_000.0).sin())
+            .collect();
+        let stream = encode_blocks(&pcm, 1, 96_000, 1, false);
+        let frame_bytes = ac3_frame_bytes_blocks(0, 96, 1).unwrap() as usize;
+        assert_fractional_syntax(&stream, frame_bytes, 1);
+        assert_eq!(stream.len() / frame_bytes, 2, "two 1-block frames");
+        let dec = decode_all(&stream, frame_bytes);
+        assert_eq!(dec.len(), 512, "2 × 256 decoded samples");
+    }
+
+    #[test]
+    fn fractional_frames_reject_six_block_tools() {
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(2);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(192_000);
+        // AHT is implicit-off on the wire for numblkscod != 0x3
+        // (Table E1.3) — construction must fail, not silently emit.
+        params.options = oxideav_core::CodecOptions::new()
+            .set("blocks", "3")
+            .set("aht", "1");
+        assert!(make_encoder(&params).is_err(), "blocks=3 + aht must fail");
+        // SPX / ecpl are 6-block scope in this encoder.
+        params.options = oxideav_core::CodecOptions::new()
+            .set("blocks", "2")
+            .set("spx", "1");
+        assert!(make_encoder(&params).is_err(), "blocks=2 + spx must fail");
+        params.options = oxideav_core::CodecOptions::new()
+            .set("blocks", "2")
+            .set("ecpl", "1");
+        assert!(make_encoder(&params).is_err(), "blocks=2 + ecpl must fail");
+        // Out-of-range block counts are rejected in both APIs.
+        params.options = oxideav_core::CodecOptions::new().set("blocks", "4");
+        assert!(make_encoder(&params).is_err(), "blocks=4 must fail");
+        // Minimum-rate floor: a 1-block stereo frame at 96 kbps is 64
+        // bytes — the fixed syntax + D45 exponent payload alone
+        // exceeds it, so construction must reject rather than
+        // overflow on the first frame.
+        params.options = oxideav_core::CodecOptions::new().set("blocks", "1");
+        params.bit_rate = Some(96_000);
+        assert!(
+            make_encoder(&params).is_err(),
+            "blocks=1 stereo @ 96 kbps must fail the minimum-rate floor"
+        );
+        params.bit_rate = Some(192_000);
+        params.options = oxideav_core::CodecOptions::new();
+        assert!(
+            make_encoder_with_blocks(&params, 5).is_err(),
+            "typed blocks=5 must fail"
+        );
+        // Metadata co-exists with fractional frames (dynrng is
+        // per-block regardless of the block count).
+        params.options = oxideav_core::CodecOptions::new()
+            .set("blocks", "3")
+            .set("dynrng", "0xC0")
+            .set("dialnorm", "24");
+        let pcm = build_sine_pcm(2, 1);
+        let stream = {
+            let mut enc = make_encoder(&params).expect("blocks=3 + metadata");
+            let mut s16 = Vec::with_capacity(pcm.len() * 2);
+            for &v in &pcm {
+                let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                s16.extend_from_slice(&q.to_le_bytes());
+            }
+            enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+                samples: (pcm.len() / 2) as u32,
+                pts: Some(0),
+                data: vec![s16],
+            }))
+            .unwrap();
+            enc.flush().unwrap();
+            let mut out = Vec::new();
+            while let Ok(p) = enc.receive_packet() {
+                out.extend_from_slice(&p.data);
+            }
+            out
+        };
+        let frame_bytes = ac3_frame_bytes_blocks(0, 192, 3).unwrap() as usize;
+        assert_fractional_syntax(&stream, frame_bytes, 3);
+        let bsi = super::super::bsi::parse(&stream[2..]).expect("metadata BSI");
+        assert_eq!(bsi.dialnorm, 24, "dialnorm rides fractional frames");
+        let dec = decode_all(&stream, frame_bytes);
+        assert!(!dec.is_empty(), "metadata-bearing fractional decode");
     }
 
     #[test]

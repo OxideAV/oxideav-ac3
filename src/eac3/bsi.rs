@@ -484,6 +484,12 @@ pub struct Bsi {
     /// Number of audio blocks per syncframe (= 256 PCM samples each).
     /// Derived from `numblkscod`. Always 6 on reduced-rate streams.
     pub num_blocks: u8,
+    /// §E.2.3.1.64 `convsync` — Converter Synchronization Flag.
+    /// Present only on independent substreams with fractional frames
+    /// (`strmtyp == 0 && numblkscod != 0x3`), where it marks the
+    /// syncframe that starts a 6-block AC-3 conversion group; `None`
+    /// when the field is absent from the syntax.
+    pub convsync: Option<bool>,
     /// AC-3 audio coding mode (Table 5.8, §5.4.2.3) — channel layout.
     pub acmod: u8,
     /// Number of full-bandwidth channels (`acmod_nfchans(acmod)`).
@@ -911,7 +917,7 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         audio_production_ch2,
         copyright_info,
     ) = if infomdate {
-        let info = parse_informational_metadata(br, acmod, fscod, strmtyp, numblkscod)?;
+        let info = parse_informational_metadata(br, acmod, fscod)?;
         (
             Some(info.bsmod),
             info.dsurexmod,
@@ -926,6 +932,31 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
     } else {
         (None, None, None, None, None, None, None, None, None)
     };
+
+    // §E.2.3.1.64-65 — convsync (independent substream, fractional
+    // frames) and the strmtyp == 2 blkid / frmsizecod tail sit
+    // OUTSIDE the if(infomdate) block (Table E1.2): they are present
+    // whether or not the informational block is. (They were
+    // previously read inside parse_informational_metadata, desyncing
+    // the BSI tail of every fractional-frame stream without an
+    // informational block by 1 bit.)
+    let convsync = if matches!(strmtyp, StreamType::Independent) && numblkscod != 0x3 {
+        Some(br.read_u32(1)? != 0)
+    } else {
+        None
+    };
+    if matches!(strmtyp, StreamType::Ac3Convert) {
+        // §E.2.3.1.65: blkid = 1 implicit on 6-block frames;
+        // frmsizecod follows only when blkid is set.
+        let blkid = if numblkscod != 0x3 {
+            br.read_u32(1)? != 0
+        } else {
+            true
+        };
+        if blkid {
+            let _frmsizecod = br.read_u32(6)?;
+        }
+    }
 
     // addbsi — §5.4.2.29-31 trailer of 1..=64 encoder-defined bytes
     // (Table E1.2 reuses base AC-3's syntax). Per §5.4.2.30 the
@@ -957,6 +988,7 @@ pub fn parse_with(br: &mut BitReader<'_>) -> Result<Bsi> {
         sample_rate,
         numblkscod,
         num_blocks,
+        convsync,
         acmod,
         nfchans,
         lfeon,
@@ -1331,16 +1363,15 @@ struct InformationalMetadata {
 /// `adconvtyp_ch2` (inside the `audprodie` / `audprodi2e` chain), and
 /// the §5.4.2.13-15 audio-production info (`mixlevel` + `roomtyp`,
 /// reused verbatim per §E.2.3.1.x) for the main channel and the Ch2
-/// 1+1 dual-mono mirror. The remaining service-metadata fields
-/// (`bsmod` is parsed in the body `Bsi`, source fscod, conv sync,
-/// AC-3-convert blkid / frmsizecod) are still parsed bit-accurately
-/// and discarded — they do not drive playback policy.
+/// 1+1 dual-mono mirror. `sourcefscod` is still parsed bit-accurately
+/// and discarded — it does not drive playback policy. (`convsync` and
+/// the AC-3-convert `blkid` / `frmsizecod` tail live OUTSIDE the
+/// `if (infomdate)` block per Table E1.2 and are handled by the main
+/// parse.)
 fn parse_informational_metadata(
     br: &mut BitReader<'_>,
     acmod: u8,
     fscod: u8,
-    strmtyp: StreamType,
-    numblkscod: u8,
 ) -> Result<InformationalMetadata> {
     let bsmod = br.read_u32(3)? as u8;
     let copyrightb = br.read_u32(1)? != 0;
@@ -1398,19 +1429,6 @@ fn parse_informational_metadata(
     };
     if fscod < 0x3 {
         let _sourcefscod = br.read_u32(1)?;
-    }
-    // convsync is present only for indep substream (strmtyp == 0) when
-    // numblkscod != 0x3 (i.e. fewer than 6 blocks per syncframe).
-    if matches!(strmtyp, StreamType::Independent) && numblkscod != 0x3 {
-        let _convsync = br.read_u32(1)?;
-    }
-    // strmtyp == 0x2 → AC-3 wrapped in E-AC-3 syncframe; carries
-    // `blkid` (only if numblkscod != 0x3) + `frmsizecod` (6 bits).
-    if matches!(strmtyp, StreamType::Ac3Convert) {
-        if numblkscod != 0x3 {
-            let _blkid = br.read_u32(1)?;
-        }
-        let _frmsizecod = br.read_u32(6)?;
     }
     Ok(InformationalMetadata {
         bsmod,

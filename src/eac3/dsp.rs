@@ -2530,6 +2530,7 @@ mod aht_regs_tests {
             fscod2: 0xFF,
             sample_rate: 48_000,
             numblkscod: 3,
+            convsync: None,
             num_blocks: 6,
             acmod,
             nfchans,

@@ -617,6 +617,7 @@ mod tests {
             fscod2: 0xFF,
             sample_rate: 48_000,
             numblkscod: if num_blocks == 6 { 3 } else { num_blocks - 1 },
+            convsync: None,
             num_blocks,
             acmod,
             nfchans: crate::tables::acmod_nfchans(acmod),

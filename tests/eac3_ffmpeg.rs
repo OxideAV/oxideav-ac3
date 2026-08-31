@@ -78,9 +78,20 @@ fn ffmpeg_decode(eac3_bytes: &[u8], channels: usize) -> Option<Vec<f32>> {
     if !ffmpeg_present() {
         return None;
     }
+    // Unique per call, not just per process: the harness runs tests
+    // concurrently in one process, and a shared pid-keyed name lets
+    // one test delete another's input mid-decode.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uniq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir();
-    let in_path: PathBuf = dir.join(format!("oxideav_eac3_test_{}.ec3", std::process::id()));
-    let out_path: PathBuf = dir.join(format!("oxideav_eac3_test_{}.pcm", std::process::id()));
+    let in_path: PathBuf = dir.join(format!(
+        "oxideav_eac3_test_{}_{uniq}.ec3",
+        std::process::id()
+    ));
+    let out_path: PathBuf = dir.join(format!(
+        "oxideav_eac3_test_{}_{uniq}.pcm",
+        std::process::id()
+    ));
     {
         let mut f = fs::File::create(&in_path).unwrap();
         f.write_all(eac3_bytes).unwrap();
@@ -222,6 +233,86 @@ fn eac3_mono_96k_decodes_through_ffmpeg() {
         psnr >= 18.0,
         "PSNR {psnr:.2} dB below 18 dB acceptance floor"
     );
+}
+
+fn encode_eac3_blocks(pcm: &[f32], channels: usize, bit_rate: u64, blocks: usize) -> Vec<u8> {
+    let mut params = CodecParameters::audio(CodecId::new(eac3::CODEC_ID_STR));
+    params.sample_rate = Some(SR);
+    params.channels = Some(channels as u16);
+    params.sample_format = Some(SampleFormat::S16);
+    params.bit_rate = Some(bit_rate);
+    let mut enc =
+        eac3::make_encoder_with_blocks(&params, blocks).expect("eac3 make_encoder_with_blocks");
+    let n_samp = pcm.len() / channels;
+    let mut s16 = Vec::with_capacity(pcm.len() * 2);
+    for &v in pcm {
+        let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        s16.extend_from_slice(&q.to_le_bytes());
+    }
+    enc.send_frame(&Frame::Audio(AudioFrame {
+        samples: n_samp as u32,
+        pts: Some(0),
+        data: vec![s16],
+    }))
+    .unwrap();
+    enc.flush().unwrap();
+    let mut out = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => out.extend_from_slice(&p.data),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("eac3 blocks encode error: {e:?}"),
+        }
+    }
+    out
+}
+
+/// Fractional syncframes (§E.2.3.1.5 `numblkscod` 0/1/2 — 1/2/3
+/// audio blocks per frame, byte budget scaled by nblks/6) through the
+/// black-box reference decoder. The binary must accept every shape
+/// (incl. the §E.2.3.1.64 convsync flag and the explicit
+/// `convexpstre` audfrm arm) and decode to comparable PCM. Floors
+/// step down with the shape's honest efficiency cost — per-frame
+/// header overhead and a full exponent re-anchor every 256·nblks
+/// samples at an unchanged bit rate.
+#[test]
+fn eac3_fractional_frames_decode_through_ffmpeg() {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg not in PATH — skipping interop test");
+        return;
+    }
+    let pcm = build_sine_pcm(2, 440.0);
+    // blocks=1 runs at a higher rate: a 1-block 192 kbps stereo frame
+    // (1024 bits) sits under the construction-time minimum-rate floor
+    // (the D45 exponent payload alone nearly fills it).
+    for (blocks, bit_rate, frame_bytes, floor) in [
+        (3usize, 192_000u64, 384usize, 14.0f64),
+        (2, 192_000, 256, 12.0),
+        (1, 384_000, 256, 8.0),
+    ] {
+        let stream = encode_eac3_blocks(&pcm, 2, bit_rate, blocks);
+        assert!(
+            !stream.is_empty(),
+            "blocks={blocks}: encoder produced no bytes"
+        );
+        assert_eq!(
+            stream.len() % frame_bytes,
+            0,
+            "blocks={blocks}: whole {frame_bytes}-byte syncframes"
+        );
+        let decoded = ffmpeg_decode(&stream, 2)
+            .unwrap_or_else(|| panic!("blocks={blocks}: ffmpeg rejected the fractional stream"));
+        assert!(decoded.len() >= 1024, "blocks={blocks}: trivial decode");
+        let psnr = psnr_min(&pcm, &decoded, 2);
+        eprintln!(
+            "E-AC-3 stereo {}k blocks={blocks} → ffmpeg PSNR = {psnr:.2} dB",
+            bit_rate / 1000
+        );
+        assert!(
+            psnr >= floor,
+            "blocks={blocks}: PSNR {psnr:.2} dB below {floor} dB acceptance floor"
+        );
+    }
 }
 
 #[test]
