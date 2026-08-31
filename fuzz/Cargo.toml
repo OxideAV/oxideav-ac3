@@ -1,0 +1,79 @@
+[package]
+name = "oxideav-ac3-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Coverage-guided libfuzzer harnesses for the clean-room AC-3 /
+# E-AC-3 decoder + encoder. The in-tree `tests/robustness.rs` audit
+# drives the decoders through deterministic truncation / bit-flip /
+# sync-garbage corruption of the real fixture corpus; these targets
+# add coverage-guided exploration of the same surfaces so the corpus
+# minimiser can find branches the hand-built families don't reach:
+#
+# - `parse_headers` — the syncinfo (§5.3.1) + base-AC-3 BSI (§5.4.2)
+#   + Annex E BSI (Table E1.2) header parsers on raw bytes, including
+#   the Annex D alternate-syntax / mixing / informational metadata
+#   opt-in chains and the fractional-frame convsync tail.
+# - `decode_frames` — the top-level packet → PCM path through the
+#   registry decoders (AC-3 and E-AC-3), fed multiple consecutive
+#   carved packets on one stateful decoder (cross-frame ecpl carrier
+#   threading, TPNP clamps, downmix state).
+# - `eac3_substream_walk` — the Annex E per-syncframe walker on a
+#   persistent `Eac3DecoderState`: substream accumulation, dependent-
+#   substream chanmap channel combination (§E.3.8.2), fractional
+#   numblkscod shapes.
+# - `encode_decode_roundtrip` — structure-aware differential testing
+#   of the encoder: the input picks a contract-valid configuration
+#   (layout × rate × blocks × SPX/AHT/ecpl × metadata words) and the
+#   PCM payload; every stream the encoder emits MUST decode cleanly
+#   through our own E-AC-3 decoder with the exact sample count.
+#
+# A crash in any target is a structural bug in the decoder (or an
+# encoder/decoder mismatch), never an acceptable "malformed input"
+# outcome: every byte sequence must produce Ok(..) or Err(..) without
+# panicking, overflowing, or indexing out of bounds.
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-ac3]
+path = ".."
+
+[dependencies.oxideav-core]
+version = "0.1"
+
+# Prevent the cargo-fuzz crate from being pulled into the umbrella
+# workspace; libfuzzer-sys needs nightly + has its own deps that
+# don't belong in the umbrella resolve graph.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse_headers"
+path = "fuzz_targets/parse_headers.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_frames"
+path = "fuzz_targets/decode_frames.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "eac3_substream_walk"
+path = "fuzz_targets/eac3_substream_walk.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encode_decode_roundtrip"
+path = "fuzz_targets/encode_decode_roundtrip.rs"
+test = false
+doc = false
