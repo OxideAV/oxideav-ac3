@@ -315,6 +315,67 @@ fn eac3_fractional_frames_decode_through_ffmpeg() {
     }
 }
 
+/// TPNP-bearing syntax (§3.7 / §2.3.2.21-23) through the black-box
+/// reference decoder: transproce = 1 frames with per-channel
+/// location/length words must be accepted and decode to comparable
+/// PCM (whether or not the binary applies the §3.7.2 synthesis, the
+/// audfrm parse must stay aligned across the TPNP fields).
+#[test]
+fn eac3_tpnp_frames_decode_through_ffmpeg() {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg not in PATH — skipping interop test");
+        return;
+    }
+    let mut pcm = build_sine_pcm(2, 440.0);
+    // Scale the tone down and add one hard impulse per frame so every
+    // frame carries TPNP data.
+    for v in pcm.iter_mut() {
+        *v *= 0.15;
+    }
+    let n = pcm.len() / 2;
+    let mut off = 612usize;
+    while off + 4 < n {
+        for k in 0..4 {
+            pcm[(off + k) * 2] = if k % 2 == 0 { 0.9 } else { -0.9 };
+        }
+        off += 1536;
+    }
+    let mut params = CodecParameters::audio(CodecId::new(eac3::CODEC_ID_STR));
+    params.sample_rate = Some(SR);
+    params.channels = Some(2);
+    params.sample_format = Some(SampleFormat::S16);
+    params.bit_rate = Some(192_000);
+    let mut enc = eac3::make_encoder_with_tpnp(&params).expect("tpnp encoder");
+    let mut s16 = Vec::with_capacity(pcm.len() * 2);
+    for &v in &pcm {
+        let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        s16.extend_from_slice(&q.to_le_bytes());
+    }
+    enc.send_frame(&Frame::Audio(AudioFrame {
+        samples: n as u32,
+        pts: Some(0),
+        data: vec![s16],
+    }))
+    .unwrap();
+    enc.flush().unwrap();
+    let mut stream = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => stream.extend_from_slice(&p.data),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("tpnp encode error: {e:?}"),
+        }
+    }
+    let decoded = ffmpeg_decode(&stream, 2).expect("ffmpeg rejected the TPNP stream");
+    assert!(decoded.len() >= 1024, "trivial TPNP decode");
+    let psnr = psnr_min(&pcm, &decoded, 2);
+    eprintln!("E-AC-3 stereo 192k TPNP → ffmpeg PSNR = {psnr:.2} dB");
+    // Impulse-train content codes worse than a pure tone; this floor
+    // is a gross parse-misalignment guard (a desync across the TPNP
+    // fields collapses every downstream frame).
+    assert!(psnr >= 10.0, "PSNR {psnr:.2} dB below 10 dB floor");
+}
+
 #[test]
 fn eac3_first_frame_is_syncframe() {
     let pcm = build_sine_pcm(2, 440.0);

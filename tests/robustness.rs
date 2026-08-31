@@ -249,6 +249,63 @@ fn eac3_spx_encoded_stream_survives_corruption() {
     sweep_one("eac3", &stream);
 }
 
+/// r454: a TPNP-bearing stream (§3.7 / §2.3.2.21-23) swept through
+/// the same three corruption families. Transient pre-noise emission
+/// opens the audfrm chintransproc/transprocloc/transproclen parse and
+/// the decoder's §3.7.2 PCM-domain time-scaling synthesis (region
+/// clamps at frame edges, degenerate locations) to corrupted field
+/// values the corpus never carries.
+#[test]
+fn eac3_tpnp_encoded_stream_survives_corruption() {
+    use oxideav_core::{AudioFrame, Encoder, Error, Frame, SampleFormat};
+
+    // 4 frames of quiet tone with one hard impulse per frame (at a
+    // different intra-frame offset each time) so every frame carries
+    // transproce = 1 with varying loc/len words.
+    let n = 4 * 1536usize;
+    let mut pcm = vec![0.0f32; n * 2];
+    for i in 0..n {
+        let t = i as f32 / 48_000.0;
+        let s = 0.05 * (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+        pcm[i * 2] = s;
+        pcm[i * 2 + 1] = s;
+    }
+    for (f, off) in [(0usize, 612usize), (1, 300), (2, 1100), (3, 777)] {
+        for k in 0..4 {
+            pcm[(f * 1536 + off + k) * 2] = if k % 2 == 0 { 0.9 } else { -0.9 };
+        }
+    }
+    let mut s16 = Vec::with_capacity(pcm.len() * 2);
+    for &v in &pcm {
+        let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        s16.extend_from_slice(&q.to_le_bytes());
+    }
+    let mut params = CodecParameters::audio(CodecId::new("eac3"));
+    params.sample_rate = Some(48_000);
+    params.channels = Some(2);
+    params.sample_format = Some(SampleFormat::S16);
+    params.bit_rate = Some(192_000);
+    let mut enc: Box<dyn Encoder> =
+        oxideav_ac3::eac3::make_encoder_with_tpnp(&params).expect("tpnp encoder");
+    enc.send_frame(&Frame::Audio(AudioFrame {
+        samples: n as u32,
+        pts: Some(0),
+        data: vec![s16],
+    }))
+    .unwrap();
+    enc.flush().unwrap();
+    let mut stream = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => stream.extend_from_slice(&p.data),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("tpnp encode error: {e:?}"),
+        }
+    }
+    assert!(stream.len() >= 768, "expected at least one 768-byte frame");
+    sweep_one("eac3", &stream);
+}
+
 /// r406: an enhanced-coupling encoded stream (§E.2.3.3.16-26) swept
 /// through the same three corruption families. Enhanced coupling opens
 /// decode paths the corpus never reaches — the ecpl strategy /

@@ -135,6 +135,15 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
             )))
         }
     }
+    match params.options.get("tpnp") {
+        None | Some("0") | Some("false") => {}
+        Some("1") | Some("true") => concrete.tpnp = true,
+        Some(v) => {
+            return Err(Error::invalid(format!(
+                "eac3 encoder: option tpnp={v} (expected 1/true/0/false)"
+            )))
+        }
+    }
     if let Some(ecpl) = ecpl_params_from_options(params)? {
         validate_ecpl(&ecpl, params.channels.unwrap_or(0))?;
         concrete.ecpl = Some(ecpl);
@@ -256,6 +265,56 @@ fn validate_min_rate(sub: &SubstreamLayout, nblks: usize, meta_bits: u32) -> Res
         )));
     }
     Ok(())
+}
+
+/// §3.7.1 transient-location analysis for one channel's frame of PCM.
+///
+/// Scans 4-sample group energies for the first group that jumps a
+/// factor of 16 above the running average of the preceding groups
+/// (with an absolute floor so noise-level content never triggers).
+/// Returns `(transprocloc, transproclen)` — the group index (already
+/// in the §2.3.2.22 4-sample units) and the time-scaling length in
+/// samples (the pre-noise gap between the containing coding block's
+/// leading edge and the transient, capped at the 8-bit field) — or
+/// `None` when the frame carries no usable transient (none found, or
+/// the transient sits on a block boundary where no pre-noise gap
+/// exists).
+fn detect_tpnp_transient(pcm: &[f32]) -> Option<(u16, u16)> {
+    const GROUP: usize = 4;
+    const WARMUP_GROUPS: usize = 16;
+    const RATIO: f32 = 16.0;
+    const ABS_FLOOR: f32 = 1e-4;
+    let ngroups = pcm.len() / GROUP;
+    if ngroups <= WARMUP_GROUPS {
+        return None;
+    }
+    let energy = |g: usize| -> f32 {
+        pcm[g * GROUP..(g + 1) * GROUP]
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+    };
+    let mut avg = 0.0f32;
+    for g in 0..WARMUP_GROUPS {
+        avg += energy(g);
+    }
+    avg /= WARMUP_GROUPS as f32;
+    for g in WARMUP_GROUPS..ngroups {
+        let e = energy(g);
+        if e > ABS_FLOOR && e > RATIO * avg.max(ABS_FLOOR / RATIO) {
+            let transloc = g * GROUP;
+            let pnlen = transloc % SAMPLES_PER_BLOCK;
+            if pnlen == 0 {
+                return None;
+            }
+            return Some((g as u16, pnlen.min(255) as u16));
+        }
+        // Exponential running average (¼ new) tracks slow level
+        // changes without letting the transient itself dilute the
+        // reference before it is tested.
+        avg = 0.75 * avg + 0.25 * e;
+    }
+    None
 }
 
 /// Construction-time dry run: encode one syncframe of deterministic
@@ -921,6 +980,31 @@ pub fn make_encoder_with_aht(params: &CodecParameters) -> Result<Box<dyn Encoder
     Ok(Box::new(concrete))
 }
 
+/// Build an E-AC-3 encoder with **transient pre-noise processing**
+/// analysis enabled (§3.7 / §2.3.2.21-23 / Table E1.3 `transproce`).
+///
+/// Per frame and per full-bandwidth channel the encoder locates the
+/// first sharp onset in the PCM and transmits the §2.3.2.22 transient
+/// location (4-sample resolution, relative to the frame's first
+/// sample) plus the §2.3.2.23 time-scaling-synthesis length; the
+/// decoder's §3.7.2 synthesis then overwrites the coding pre-noise
+/// ahead of the transient with time-scaled clean audio from before
+/// it. Long transforms are forced while TPNP is on — the tool exists
+/// to fix the pre-noise of long-transform coding, which
+/// block-switching would otherwise avoid. Frames without a detected
+/// transient emit `transproce = 0` and are byte-identical to the
+/// default encoder's long-transform output.
+///
+/// Also reachable through the registry path via the
+/// `CodecParameters::options` key `tpnp` = `1`/`true`.
+pub fn make_encoder_with_tpnp(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let mut concrete = build_concrete_encoder(params)?;
+    concrete.tpnp = true;
+    validate_num_blocks_tools(&concrete)?;
+    validate_frame_fit(&mut concrete)?;
+    Ok(Box::new(concrete))
+}
+
 /// Parse the `spx*` codec options (see [`make_encoder`]) into an
 /// [`SpxParams`], or `None` when SPX is not requested.
 fn spx_params_from_options(params: &CodecParameters) -> Result<Option<SpxParams>> {
@@ -1186,6 +1270,7 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
         meta: Eac3Metadata::default(),
         num_blocks,
         frames_emitted: 0,
+        tpnp: false,
         ecpl_carry: vec![None, None],
     })
 }
@@ -1400,6 +1485,15 @@ struct Eac3Encoder {
     /// cadence on fractional frames (the flag marks the syncframe
     /// that starts a 6-block AC-3 conversion group).
     frames_emitted: u64,
+    /// Transient pre-noise processing (§3.7 / §2.3.2.21-23). When
+    /// `true` (via [`make_encoder_with_tpnp`] or the `tpnp` option)
+    /// the encoder performs the §3.7.1 transient-location analysis
+    /// per fbw channel per frame and emits `transproce` +
+    /// `chintransproc`/`transprocloc`/`transproclen` in audfrm; long
+    /// transforms are forced (TPNP is the pre-noise tool for
+    /// long-transform coding — with block switching active the
+    /// pre-noise TPNP corrects is largely absent).
+    tpnp: bool,
     /// Per-substream cross-frame enhanced-coupling analysis carry: the
     /// previous frame's last-block carrier + per-channel
     /// region-restricted MDCT buffers, mirroring the decoder's
@@ -1567,6 +1661,7 @@ impl Eac3Encoder {
                 let is_short = if is_lfe_chan
                     || self.aht
                     || ecpl_on
+                    || self.tpnp
                     || std::env::var("EAC3_DISABLE_BLKSW").is_ok()
                 {
                     false
@@ -1591,6 +1686,32 @@ impl Eac3Encoder {
                 }
             }
         }
+
+        // ---- Transient pre-noise processing analysis (§3.7.1) ----
+        //
+        // Per fbw channel of this substream, locate the first sharp
+        // onset in the frame's PCM. `transprocloc` is the transient
+        // location relative to the frame's first PCM sample in
+        // 4-sample units (§2.3.2.22); `transproclen` is the
+        // time-scaling-synthesis length in samples (§2.3.2.23 — the
+        // exact analysis is encoder tuning, only sketched by Figure
+        // E3.2; we scale over the pre-noise gap between the
+        // containing block's leading edge and the transient, which is
+        // precisely the region the decoder's §3.7.2 synthesis
+        // overwrites). A transient on a block boundary carries no
+        // pre-noise gap, so the channel is skipped.
+        let tpnp_plan: Option<Vec<Option<(u16, u16)>>> = if self.tpnp {
+            Some(
+                (0..nfchans)
+                    .map(|ch| detect_tpnp_transient(&frame_pcm[sub.src_indices[ch]]))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        let transproce = tpnp_plan
+            .as_ref()
+            .is_some_and(|p| p.iter().any(Option::is_some));
 
         // -------- Exponents --------
         // Layout (matches the AC-3 helpers' expectation):
@@ -2171,12 +2292,21 @@ impl Eac3Encoder {
         let meta_reserve_bits: u32 = self
             .meta
             .reserve_bits(sub.acmod, sub.lfeon, sub.strmtyp == 0);
+        // §2.3.2.21-23 transient pre-noise data on top of the
+        // baseline (which spends one transproce bit either way):
+        // chintransproc per fbw channel + loc/len words per carrier.
+        let tpnp_reserve_bits: u32 = if transproce {
+            nfchans as u32 * (1 + 10 + 8)
+        } else {
+            0
+        };
         let tuner_frame_bytes = sub.frame_bytes.saturating_sub(
             (snr_reserve_bits
                 + spx_reserve_bits
                 + aht_reserve_bits
                 + ecpl_reserve_bits
-                + meta_reserve_bits)
+                + meta_reserve_bits
+                + tpnp_reserve_bits)
                 .div_ceil(8) as usize,
         );
         // Pass chexpstr_plan so the overhead calculator accounts for
@@ -2439,7 +2569,7 @@ impl Eac3Encoder {
             bw.write_u32(u32::from(self.aht), 1); // ahte (§2.3.2.2)
         }
         bw.write_u32(self.snroffststr as u32, 2); // snroffststr
-        bw.write_u32(0, 1); // transproce = 0
+        bw.write_u32(u32::from(transproce), 1); // transproce (§2.3.2.4)
         bw.write_u32(1, 1); // blkswe = 1
         bw.write_u32(1, 1); // dithflage = 1
         bw.write_u32(1, 1); // bamode = 1
@@ -2531,6 +2661,24 @@ impl Eac3Encoder {
         if self.snroffststr == 0 {
             bw.write_u32(tuned_ba.csnroffst as u32, 6); // frmcsnroffst
             bw.write_u32(tuned_ba.fsnroffst as u32, 4); // frmfsnroffst
+        }
+        // §2.3.2.21-23 — transient pre-noise processing data, between
+        // the SNR-offset tail and the SPX-attenuation data per Table
+        // E1.3: one chintransproc[ch] bit per fbw channel, plus
+        // transprocloc[ch] (10 bits) + transproclen[ch] (8 bits) for
+        // each channel carrying a transient this frame.
+        if transproce {
+            let plan = tpnp_plan.as_ref().expect("tpnp plan when transproce");
+            for entry in plan.iter().take(nfchans) {
+                match entry {
+                    Some((loc, len)) => {
+                        bw.write_u32(1, 1); // chintransproc[ch] = 1
+                        bw.write_u32(*loc as u32, 10); // transprocloc[ch]
+                        bw.write_u32(*len as u32, 8); // transproclen[ch]
+                    }
+                    None => bw.write_u32(0, 1), // chintransproc[ch] = 0
+                }
+            }
         }
         // §2.3.2.24-25 — spectral extension attenuation data: one
         // chinspxatten[ch] bit per fbw channel, + spxattencod[ch]
@@ -3695,6 +3843,200 @@ mod tests {
         assert_eq!(bsi.dialnorm, 24, "dialnorm rides fractional frames");
         let dec = decode_all(&stream, frame_bytes);
         assert!(!dec.is_empty(), "metadata-bearing fractional decode");
+    }
+
+    // ---- transient pre-noise processing emission (§3.7) ----
+
+    /// Quiet stereo tone with a hard impulse on channel 0 at
+    /// `impulse_at` (absolute sample index). Channel 1 stays smooth.
+    fn build_impulse_pcm(frames: usize, impulse_at: usize) -> Vec<f32> {
+        let n = frames * SAMPLES_PER_FRAME as usize;
+        let mut pcm = vec![0.0f32; n * 2];
+        for i in 0..n {
+            let t = i as f32 / 48_000.0;
+            let s = 0.05 * (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+            pcm[i * 2] = s;
+            pcm[i * 2 + 1] = s;
+        }
+        // A 4-sample burst so the whole 4-sample analysis group jumps.
+        for k in 0..4 {
+            pcm[(impulse_at + k) * 2] = if k % 2 == 0 { 0.9 } else { -0.9 };
+        }
+        pcm
+    }
+
+    fn encode_tpnp(pcm: &[f32], via_option: bool) -> Vec<u8> {
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(2);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(192_000);
+        let mut enc: Box<dyn Encoder> = if via_option {
+            params.options = oxideav_core::CodecOptions::new().set("tpnp", "1");
+            make_encoder(&params).expect("options-driven tpnp encoder")
+        } else {
+            make_encoder_with_tpnp(&params).expect("typed tpnp encoder")
+        };
+        let n_samp = pcm.len() / 2;
+        let mut s16 = Vec::with_capacity(pcm.len() * 2);
+        for &v in pcm {
+            let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            s16.extend_from_slice(&q.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: n_samp as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut out = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            out.extend_from_slice(&p.data);
+        }
+        out
+    }
+
+    /// Parse frame 0's audfrm and return it.
+    fn parse_first_audfrm(stream: &[u8]) -> (super::super::bsi::Bsi, crate::eac3::audfrm::AudFrm) {
+        assert_eq!(&stream[..2], &[0x0B, 0x77]);
+        let mut br = oxideav_core::bits::BitReader::new(&stream[2..]);
+        let bsi = super::super::bsi::parse_with(&mut br).expect("tpnp BSI parse");
+        let af = crate::eac3::audfrm::parse_with(&mut br, &bsi).expect("tpnp audfrm parse");
+        (bsi, af)
+    }
+
+    #[test]
+    fn tpnp_impulse_detected_and_parsed() {
+        // Impulse at sample 612 = block 2, offset 100: transprocloc =
+        // 612 / 4 = 153 (§2.3.2.22 4-sample units), pre-noise gap =
+        // 612 % 256 = 100 samples (the emitted time-scaling length).
+        let pcm = build_impulse_pcm(2, 612);
+        let stream = encode_tpnp(&pcm, false);
+        let (_bsi, af) = parse_first_audfrm(&stream);
+        assert!(af.transproce, "frame 0 must signal transproce");
+        assert!(af.chintransproc[0], "impulse channel carries TPNP data");
+        assert!(
+            !af.chintransproc[1],
+            "smooth channel must not carry TPNP data"
+        );
+        assert!(
+            (af.transprocloc[0] as i32 - 153).abs() <= 4,
+            "transprocloc {} not within 4 groups of 153",
+            af.transprocloc[0]
+        );
+        assert_eq!(
+            af.transproclen[0], 100,
+            "time-scaling length = pre-noise gap"
+        );
+        // Frame 1 carries no transient.
+        let frame1 = &stream[768..];
+        let (_b1, af1) = parse_first_audfrm(&{
+            let mut v = frame1.to_vec();
+            v.truncate(768);
+            v
+        });
+        assert!(
+            !af1.transproce,
+            "transient-free frame signals transproce = 0"
+        );
+    }
+
+    #[test]
+    fn tpnp_stationary_matches_long_transform_baseline() {
+        // With no transient anywhere, the TPNP encoder emits
+        // transproce = 0 in every frame and its output is
+        // byte-identical to the plain encoder's (long transforms are
+        // forced either way on this smooth signal).
+        let pcm = build_sine_pcm(2, 2);
+        let tpnp = encode_tpnp(&pcm, false);
+        let base = encode_with(&pcm, 2, 192_000, 0);
+        assert_eq!(
+            tpnp, base,
+            "stationary TPNP stream must match the baseline byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn tpnp_options_vs_typed_byte_identical() {
+        let pcm = build_impulse_pcm(2, 612);
+        assert_eq!(
+            encode_tpnp(&pcm, false),
+            encode_tpnp(&pcm, true),
+            "registry `tpnp` option and make_encoder_with_tpnp must build the same encoder"
+        );
+    }
+
+    #[test]
+    fn tpnp_roundtrip_decodes_with_synthesis() {
+        // End-to-end through our own decoder: the §3.7.2 synthesis
+        // path runs (transproce = 1 with a real pre-noise gap), the
+        // sample count is exact, and the decode stays comparable to
+        // the TPNP-less decode of the same PCM — the synthesis only
+        // rewrites the pre-noise region ahead of the transient.
+        let pcm = build_impulse_pcm(3, 612 + 1536);
+        let stream = encode_tpnp(&pcm, false);
+        let dec = decode_all(&stream, 768);
+        assert_eq!(dec.len(), pcm.len(), "sample count through TPNP decode");
+        let base = decode_all(&encode_with(&pcm, 2, 192_000, 0), 768);
+        let psnr = psnr_vs(&dec, &base);
+        eprintln!("tpnp decode vs baseline decode: {psnr:.2} dB");
+        assert!(
+            psnr >= 15.0,
+            "TPNP decode diverged wholesale from the baseline: {psnr:.2} dB"
+        );
+    }
+
+    #[test]
+    fn tpnp_rides_fractional_frames() {
+        // TPNP is block-count-agnostic: a 2-block frame (512 samples)
+        // with an impulse at sample 300 (block 1, offset 44) signals
+        // transprocloc = 75 and a 44-sample gap.
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(2);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(192_000);
+        params.options = oxideav_core::CodecOptions::new()
+            .set("tpnp", "1")
+            .set("blocks", "2");
+        let mut enc = make_encoder(&params).expect("tpnp + blocks encoder");
+        let n = 1024usize;
+        let mut pcm = vec![0.0f32; n * 2];
+        for i in 0..n {
+            let t = i as f32 / 48_000.0;
+            let s = 0.05 * (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+            pcm[i * 2] = s;
+            pcm[i * 2 + 1] = s;
+        }
+        for k in 0..4 {
+            pcm[(300 + k) * 2] = if k % 2 == 0 { 0.9 } else { -0.9 };
+        }
+        let mut s16 = Vec::with_capacity(pcm.len() * 2);
+        for &v in &pcm {
+            let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            s16.extend_from_slice(&q.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut stream = Vec::new();
+        while let Ok(p) = enc.receive_packet() {
+            stream.extend_from_slice(&p.data);
+        }
+        let (bsi, af) = parse_first_audfrm(&stream);
+        assert_eq!(bsi.num_blocks, 2);
+        assert!(af.transproce);
+        assert!(af.chintransproc[0]);
+        assert!((af.transprocloc[0] as i32 - 75).abs() <= 4);
+        assert_eq!(af.transproclen[0], 44);
+        let frame_bytes = ac3_frame_bytes_blocks(0, 192, 2).unwrap() as usize;
+        let dec = decode_all(&stream, frame_bytes);
+        assert_eq!(dec.len(), pcm.len());
     }
 
     #[test]

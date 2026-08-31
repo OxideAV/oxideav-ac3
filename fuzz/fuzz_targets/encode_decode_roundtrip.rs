@@ -42,6 +42,9 @@ fuzz_target!(|data: &[u8]| {
     if c3 & 2 == 2 {
         opts = opts.set("dialnorm", (c2 & 31).to_string());
     }
+    if c3 & 4 == 4 {
+        opts = opts.set("tpnp", "1");
+    }
     let mut params = CodecParameters::audio(CodecId::new("eac3"));
     params.sample_rate = Some([48_000u32, 44_100, 32_000][(((c1 >> 3) & 3) % 3) as usize]);
     params.channels = Some(channels);

@@ -162,6 +162,6 @@ pub use decoder::{decode_eac3_packet, Eac3DecoderState};
 pub use ecplenc::EcplParams;
 pub use encoder::{
     make_encoder, make_encoder_with_aht, make_encoder_with_blocks, make_encoder_with_ecpl,
-    make_encoder_with_spx, make_encoder_with_spx_ecpl, CODEC_ID_STR,
+    make_encoder_with_spx, make_encoder_with_spx_ecpl, make_encoder_with_tpnp, CODEC_ID_STR,
 };
 pub use spxenc::SpxParams;
