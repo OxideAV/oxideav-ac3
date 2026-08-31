@@ -3071,7 +3071,7 @@ pub(crate) fn mantissa_bits_total_ends(
 /// (every fbw channel uses the same strategy).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn overhead_bits_for(
-    exp_strategies: &[u8; BLOCKS_PER_FRAME],
+    exp_strategies: &[u8],
     chexpstr_per_ch: Option<&[[u8; BLOCKS_PER_FRAME]]>,
     end: usize,
     nchan: usize,
@@ -3098,7 +3098,7 @@ pub(crate) fn overhead_bits_for(
 /// payload).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn overhead_bits_for_ends(
-    exp_strategies: &[u8; BLOCKS_PER_FRAME],
+    exp_strategies: &[u8],
     chexpstr_per_ch: Option<&[[u8; BLOCKS_PER_FRAME]]>,
     end: usize,
     end_ch: Option<&[usize]>,
@@ -3333,7 +3333,7 @@ pub(crate) fn tune_snroffst(
     nchan: usize,
     fscod: u8,
     frame_bytes: usize,
-    exp_strategies: &[u8; BLOCKS_PER_FRAME],
+    exp_strategies: &[u8],
     cpl: &CouplingPlan,
     dba: &DbaPlan,
     acmod: u8,
@@ -3367,7 +3367,7 @@ pub(crate) fn tune_snroffst_with_plan(
     nchan: usize,
     fscod: u8,
     frame_bytes: usize,
-    exp_strategies: &[u8; BLOCKS_PER_FRAME],
+    exp_strategies: &[u8],
     chexpstr_per_ch: Option<&[[u8; BLOCKS_PER_FRAME]]>,
     cpl: &CouplingPlan,
     dba: &DbaPlan,
@@ -3406,7 +3406,7 @@ pub(crate) fn tune_snroffst_with_plan_ends(
     nchan: usize,
     fscod: u8,
     frame_bytes: usize,
-    exp_strategies: &[u8; BLOCKS_PER_FRAME],
+    exp_strategies: &[u8],
     chexpstr_per_ch: Option<&[[u8; BLOCKS_PER_FRAME]]>,
     cpl: &CouplingPlan,
     dba: &DbaPlan,
@@ -3893,7 +3893,7 @@ pub(crate) fn tune_per_block_snroffst(
     nchan: usize,
     fscod: u8,
     frame_bytes: usize,
-    exp_strategies: &[u8; BLOCKS_PER_FRAME],
+    exp_strategies: &[u8],
     cpl: &CouplingPlan,
     dba: &DbaPlan,
     acmod: u8,
@@ -3923,7 +3923,7 @@ pub(crate) fn tune_per_block_snroffst_with_plan(
     nchan: usize,
     fscod: u8,
     frame_bytes: usize,
-    exp_strategies: &[u8; BLOCKS_PER_FRAME],
+    exp_strategies: &[u8],
     chexpstr_per_ch: Option<&[[u8; BLOCKS_PER_FRAME]]>,
     cpl: &CouplingPlan,
     dba: &DbaPlan,
