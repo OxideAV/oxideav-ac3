@@ -153,6 +153,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         validate_spx_ecpl(spx, ecpl)?;
     }
     validate_num_blocks_tools(&concrete)?;
+    validate_frame_fit(&mut concrete)?;
     Ok(Box::new(concrete))
 }
 
@@ -205,13 +206,14 @@ pub fn make_encoder_with_blocks(
         }
     }
     match &concrete.layout {
-        Layout::Indep(s) => validate_min_rate(s, blocks)?,
+        Layout::Indep(s) => validate_min_rate(s, blocks, 0)?,
         Layout::Pair { indep, dep } => {
-            validate_min_rate(indep, blocks)?;
-            validate_min_rate(dep, blocks)?;
+            validate_min_rate(indep, blocks, 0)?;
+            validate_min_rate(dep, blocks, 0)?;
         }
     }
     validate_num_blocks_tools(&concrete)?;
+    validate_frame_fit(&mut concrete)?;
     Ok(Box::new(concrete))
 }
 
@@ -223,7 +225,7 @@ pub fn make_encoder_with_blocks(
 /// per-frame overhead onto fewer samples, so low rates that are fine
 /// at 6 blocks become impossible at 1 block — reject those up front
 /// instead of erroring on the first frame.
-fn validate_min_rate(sub: &SubstreamLayout, nblks: usize) -> Result<()> {
+fn validate_min_rate(sub: &SubstreamLayout, nblks: usize, meta_bits: u32) -> Result<()> {
     let frame_strat: Vec<u8> = (0..nblks).map(|b| u8::from(b == 0)).collect();
     let d45_anchor = {
         let mut a = [0u8; BLOCKS_PER_FRAME];
@@ -241,12 +243,13 @@ fn validate_min_rate(sub: &SubstreamLayout, nblks: usize) -> Result<()> {
         &crate::encoder::DbaPlan::default(),
         sub.acmod,
         sub.lfeon,
-    ) + 64;
+    ) + meta_bits
+        + 192;
     if floor as usize >= sub.frame_bytes * 8 {
         return Err(Error::Unsupported(format!(
             "eac3 encoder: {} kbps is too low for a {nblks}-block acmod={} frame — \
-             the fixed syntax + minimum exponent payload ({floor} bits) exceeds the \
-             {}-bit syncframe; raise the bit rate or the block count",
+             the fixed syntax + minimum exponent payload + metadata ({floor} bits) \
+             exceeds the {}-bit syncframe; raise the bit rate or the block count",
             sub.kbps,
             sub.acmod,
             sub.frame_bytes * 8,
@@ -255,11 +258,68 @@ fn validate_min_rate(sub: &SubstreamLayout, nblks: usize) -> Result<()> {
     Ok(())
 }
 
+/// Construction-time dry run: encode one syncframe of deterministic
+/// full-scale noise (the worst practical exponent-loudness case)
+/// through the real emission pipeline, then reset every state field
+/// the run touched. The analytical floor in [`validate_min_rate`]
+/// bounds the bare shape, but tool syntax (SPX / enhanced-coupling
+/// coordinates, AHT gain words) and content-driven strategy choices
+/// only surface in the actual packer — a config whose fixed syntax
+/// cannot fit its frame fails HERE instead of on the caller's first
+/// frame (found by the encode→decode fuzz target on a 7.1 96 kbps
+/// spx+ecpl config).
+fn validate_frame_fit(enc: &mut Eac3Encoder) -> Result<()> {
+    let n = enc.frame_samples();
+    let mut s = 0x1234_5678u32;
+    for ch in 0..enc.total_pcm_chans {
+        enc.pending_samples[ch] = (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((s >> 16) as u16 as i16 as f32) / 32768.0
+            })
+            .collect();
+    }
+    let r = enc.emit_syncframe();
+    for d in enc.delay_line.iter_mut() {
+        d.iter_mut().for_each(|x| *x = 0.0);
+    }
+    for p in enc.pending_samples.iter_mut() {
+        p.clear();
+    }
+    enc.transient_state = (0..enc.total_pcm_chans)
+        .map(|_| TransientDetector::default())
+        .collect();
+    enc.packet_queue.clear();
+    enc.pts = 0;
+    enc.frames_emitted = 0;
+    enc.ecpl_carry = vec![None, None];
+    r.map(|_| ()).map_err(|e| {
+        Error::Unsupported(format!(
+            "eac3 encoder: this configuration cannot fit its syncframe budget \
+             (worst-case dry-run failed: {e:?}); raise the bit rate, the block \
+             count, or drop a coding tool"
+        ))
+    })
+}
+
 /// Fractional frames (§E.2.3.1.5 `numblkscod != 0x3`) use the
 /// standard coding path only: `ahte` is implicit-0 on the wire (Table
 /// E1.3), and this encoder's SPX / enhanced-coupling coordinate
 /// planning anchors on blocks 0/3 (6-block scope).
 fn validate_num_blocks_tools(enc: &Eac3Encoder) -> Result<()> {
+    // Re-run the frame-budget floor with the ACTUAL metadata reserve:
+    // the per-block dynrng word and the mixing / informational blocks
+    // consume real frame bits, and a shape that fits bare can overflow
+    // once they ride along (found by the encode→decode fuzz target on
+    // a 1-block mono 96 kbps config with dynrng + dialnorm set).
+    let subs: [Option<&SubstreamLayout>; 2] = match &enc.layout {
+        Layout::Indep(s) => [Some(s), None],
+        Layout::Pair { indep, dep } => [Some(indep), Some(dep)],
+    };
+    for s in subs.into_iter().flatten() {
+        let meta_bits = enc.meta.reserve_bits(s.acmod, s.lfeon, s.strmtyp == 0);
+        validate_min_rate(s, enc.num_blocks, meta_bits)?;
+    }
     if enc.num_blocks == BLOCKS_PER_FRAME {
         return Ok(());
     }
@@ -319,6 +379,7 @@ pub fn make_encoder_with_spx_ecpl(
     concrete.spx = Some(spx);
     concrete.ecpl = Some(ecpl);
     validate_num_blocks_tools(&concrete)?;
+    validate_frame_fit(&mut concrete)?;
     Ok(Box::new(concrete))
 }
 
@@ -351,6 +412,7 @@ pub fn make_encoder_with_ecpl(
     let mut concrete = build_concrete_encoder(params)?;
     concrete.ecpl = Some(ecpl);
     validate_num_blocks_tools(&concrete)?;
+    validate_frame_fit(&mut concrete)?;
     Ok(Box::new(concrete))
 }
 
@@ -821,6 +883,8 @@ pub fn make_encoder_with_metadata(
     meta.validate()?;
     let mut concrete = build_concrete_encoder(params)?;
     concrete.meta = meta;
+    validate_num_blocks_tools(&concrete)?;
+    validate_frame_fit(&mut concrete)?;
     Ok(Box::new(concrete))
 }
 
@@ -853,6 +917,7 @@ pub fn make_encoder_with_aht(params: &CodecParameters) -> Result<Box<dyn Encoder
     let mut concrete = build_concrete_encoder(params)?;
     concrete.aht = true;
     validate_num_blocks_tools(&concrete)?;
+    validate_frame_fit(&mut concrete)?;
     Ok(Box::new(concrete))
 }
 
@@ -1076,10 +1141,10 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
     };
 
     match &layout_resolved {
-        Layout::Indep(s) => validate_min_rate(s, num_blocks)?,
+        Layout::Indep(s) => validate_min_rate(s, num_blocks, 0)?,
         Layout::Pair { indep, dep } => {
-            validate_min_rate(indep, num_blocks)?;
-            validate_min_rate(dep, num_blocks)?;
+            validate_min_rate(indep, num_blocks, 0)?;
+            validate_min_rate(dep, num_blocks, 0)?;
         }
     }
 
@@ -1172,6 +1237,7 @@ pub fn make_encoder_with_spx(params: &CodecParameters, spx: SpxParams) -> Result
     let mut concrete = build_concrete_encoder(params)?;
     concrete.spx = Some(spx);
     validate_num_blocks_tools(&concrete)?;
+    validate_frame_fit(&mut concrete)?;
     Ok(Box::new(concrete))
 }
 
@@ -1735,35 +1801,44 @@ impl Eac3Encoder {
                     }
                     out
                 };
-            // Budget-floor guard for fractional frames: a 1-3-block
-            // syncframe re-anchors exponents every frame while its
-            // byte budget scales by nblks/6, so the picker's
-            // smoothness-preferred strategy (often D15) can exceed the
-            // whole frame on its own — the tuner then bails and the
-            // packer overflows. When the chosen plan's overhead cannot
-            // fit, demote every anchor to D45 (the cheapest legal
+            // Budget-floor guard: the picker's smoothness-preferred
+            // strategy (often D15) can exceed a tight frame on its
+            // own — the tuner then bails and the packer overflows.
+            // Fractional frames hit this at ordinary rates (they
+            // re-anchor exponents every frame while the byte budget
+            // scales by nblks/6); 6-block frames hit it at rate
+            // floors, especially with tool/metadata overhead riding
+            // along. When the chosen plan's overhead cannot fit,
+            // demote every anchor to D45 (the cheapest legal
             // strategy) before committing exponent quantisation.
             let plan = {
                 let mut plan = plan;
-                if nblks != BLOCKS_PER_FRAME {
-                    let budget = (sub.frame_bytes * 8) as u32;
-                    let probe = overhead_bits_for_ends(
-                        &exp_strategies[..nblks],
-                        Some(&plan),
-                        ch_end_mant,
-                        Some(&end_mant_ch),
-                        nfchans,
-                        &CouplingPlan::default(),
-                        &DbaPlan::default(),
-                        sub.acmod,
-                        sub.lfeon,
-                    ) + 64;
-                    if probe >= budget {
-                        for p in plan.iter_mut() {
-                            for blk in 0..nblks {
-                                if p[blk] != 0 {
-                                    p[blk] = 3; // D45
-                                }
+                let budget = (sub.frame_bytes * 8) as u32;
+                let probe_cpl = match &ecpl_geom {
+                    Some(g) => {
+                        CouplingPlan::for_ecpl(g.begin_subbnd, g.end_subbnd, nfchans, g.necplbnd)
+                    }
+                    None => CouplingPlan::default(),
+                };
+                let probe = overhead_bits_for_ends(
+                    &exp_strategies[..nblks],
+                    Some(&plan),
+                    ch_end_mant,
+                    Some(&end_mant_ch),
+                    nfchans,
+                    &probe_cpl,
+                    &DbaPlan::default(),
+                    sub.acmod,
+                    sub.lfeon,
+                ) + 64
+                    + self
+                        .meta
+                        .reserve_bits(sub.acmod, sub.lfeon, sub.strmtyp == 0);
+                if probe >= budget {
+                    for p in plan.iter_mut() {
+                        for blk in 0..nblks {
+                            if p[blk] != 0 {
+                                p[blk] = 3; // D45
                             }
                         }
                     }
@@ -3292,9 +3367,11 @@ fn tune_snroffst_aht(
     };
 
     if used_at(0) > budget {
-        // Even the most negative SNR offset overflows — emit it anyway
-        // and let the frame packer surface the budget error.
-        return best;
+        // Even the most negative SNR offset overflows — degrade to the
+        // floor allocation (near-universal hebap 0) so the packer
+        // emits near-silence instead of overflowing with the default
+        // offsets.
+        return crate::encoder::floor_allocation(&best);
     }
     let (mut lo, mut hi) = (0i32, 63 * 16 + 15);
     while lo < hi {

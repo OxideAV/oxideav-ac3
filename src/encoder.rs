@@ -3398,6 +3398,24 @@ pub(crate) fn tune_snroffst_with_plan(
 /// channels stop at the SPX begin frequency while full-bandwidth
 /// channels run to the chbwcod-derived end.
 #[allow(clippy::too_many_arguments)]
+/// The all-minimum SNR-offset allocation: `csnroffst = 0` with zero
+/// fine offsets drives nearly every bap to 0 — the smallest mantissa
+/// payload the syntax can express. The tuners fall back to it when
+/// even the minimum offset cannot fit the frame, so degenerate
+/// budgets degrade to near-silence instead of overflowing the packer
+/// with the caller's default offsets.
+pub(crate) fn floor_allocation(ba: &BitAllocParams) -> BitAllocParams {
+    BitAllocParams {
+        csnroffst: 0,
+        fsnroffst: 0,
+        fsnroffst_ch: [0u8; MAX_FBW],
+        cplfsnroffst: 0,
+        lfefsnroffst: 0,
+        ..*ba
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn tune_snroffst_with_plan_ends(
     ba: &BitAllocParams,
     exps: &[Vec<[u8; N_COEFFS]>],
@@ -3426,7 +3444,11 @@ pub(crate) fn tune_snroffst_with_plan_ends(
     ) + 32 /* safety */;
     let total_bits = (frame_bytes * 8) as u32;
     if overhead >= total_bits {
-        return *ba;
+        // The fixed syntax alone exceeds the frame — fall back to the
+        // floor allocation (near-universal bap 0) rather than the
+        // caller's default offsets, whose mantissa payload would
+        // guarantee a packer overflow.
+        return floor_allocation(ba);
     }
     let budget = total_bits - overhead;
 
@@ -3510,6 +3532,12 @@ pub(crate) fn tune_snroffst_with_plan_ends(
                 }
             }
         }
+    }
+    if best_offset < 0 {
+        // Not even (csnroffst, fsnroffst) = (0, 0) fit the mantissa
+        // budget — degrade to the floor allocation instead of the
+        // caller's default offsets (which would overflow the packer).
+        best = floor_allocation(ba);
     }
     // Seed per-channel array with the chosen global fsnr so the
     // bitstream emitter has a populated `fsnroffst_ch` even when the
