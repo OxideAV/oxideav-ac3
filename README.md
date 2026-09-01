@@ -417,7 +417,7 @@ TPNP-bearing encoder outputs join the same three corruption families.
 
 ## Fuzzing
 
-`fuzz/` carries four coverage-guided libfuzzer harnesses (daily CI
+`fuzz/` carries five coverage-guided libfuzzer harnesses (daily CI
 runs via the `Fuzz` workflow; corpora seed from the fixture set):
 
 - **`parse_headers`** — syncinfo + base-AC-3 BSI + Annex E BSI on raw
@@ -428,6 +428,12 @@ runs via the `Fuzz` workflow; corpora seed from the fixture set):
 - **`eac3_substream_walk`** — a persistent `Eac3DecoderState` over
   syncinfo-split syncframes: substream accumulation + §E.3.8.2
   chanmap channel combination.
+- **`joc_oamd_parse`** — the TS 103 420 JOC/OAMD metadata surface
+  (added with the #15 JOC contribution): EC-3 Extension Type A
+  signalling, the EMDF container walk with its sparse / dense
+  Huffman matrix decode, the standalone OAMD object-element decoder,
+  and the QMF object reconstruction + stereo renderer on every
+  container that parses (corpus seeded with synthetic valid EMDF).
 - **`encode_decode_roundtrip`** — structure-aware differential
   testing: a fuzz-picked contract-valid configuration (layout × rate
   × blocks × SPX/AHT/ecpl/TPNP × metadata) encodes arbitrary PCM and

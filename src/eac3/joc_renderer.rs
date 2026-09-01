@@ -25,7 +25,9 @@ const LFE_STEREO_GAIN: f32 = 0.5;
 const DIFFUSE_STEREO_GAIN: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum JocRenderError {
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub enum JocRenderError {
     Invalid(&'static str),
     Unsupported(&'static str),
     Matrix(JocReconstructionError),
@@ -55,7 +57,9 @@ impl From<OamdParseError> for JocRenderError {
     }
 }
 
-pub(crate) struct JocRenderer {
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub struct JocRenderer {
     matrices: JocMatrixDecoder,
     oamd: OamdDecoder,
     analyses: Vec<QmfAnalysis>,
@@ -84,7 +88,8 @@ impl Default for JocRenderer {
 }
 
 impl JocRenderer {
-    pub(crate) fn reset(&mut self) {
+    #[doc(hidden)]
+    pub fn reset(&mut self) {
         self.matrices.reset();
         self.oamd.reset();
         self.analyses.clear();
@@ -100,7 +105,8 @@ impl JocRenderer {
     /// For the currently standardized five-channel JOC configurations, input
     /// order is `L, R, C, (LFE), Ls, Rs`.
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn render_stereo(
+    #[doc(hidden)]
+    pub fn render_stereo(
         &mut self,
         metadata: &JocMetadata,
         pcm: &[f32],

@@ -29,12 +29,16 @@ const MAX_JOC_OBJECTS: u8 = 16;
 const JOC_BAND_COUNTS: [usize; 8] = [1, 3, 5, 7, 9, 12, 15, 23];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct JocSignal {
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub struct JocSignal {
     pub(super) complexity_index: u8,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct JocMetadata {
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub struct JocMetadata {
     pub(super) complexity_index: u8,
     pub(super) group_id: u32,
     pub(super) oamd_payload: Vec<u8>,
@@ -65,7 +69,9 @@ pub(crate) enum JocObjectUpdate {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum JocParseError {
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub enum JocParseError {
     Truncated(&'static str),
     Invalid(&'static str),
     Limit(&'static str),
@@ -84,9 +90,9 @@ impl fmt::Display for JocParseError {
 }
 
 /// Parse the extension type A fields carried in E-AC-3 `addbsi`.
-pub(crate) fn parse_ec3_extension_type_a(
-    addbsi: &[u8],
-) -> Result<Option<JocSignal>, JocParseError> {
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub fn parse_ec3_extension_type_a(addbsi: &[u8]) -> Result<Option<JocSignal>, JocParseError> {
     let Some(&flags) = addbsi.first() else {
         return Ok(None);
     };
@@ -133,10 +139,9 @@ struct EmdfPayload {
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn parse_joc_emdf(
-    container: &[u8],
-    signal: JocSignal,
-) -> Result<JocMetadata, JocParseError> {
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub fn parse_joc_emdf(container: &[u8], signal: JocSignal) -> Result<JocMetadata, JocParseError> {
     if container.len() < EMDF_SYNC_HEADER_BYTES {
         return Err(JocParseError::Truncated("EMDF synchronization header"));
     }

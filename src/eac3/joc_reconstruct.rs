@@ -13,7 +13,9 @@ const MAX_JOC_OBJECTS: usize = 16;
 const MAX_JOC_CHANNELS: usize = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum JocReconstructionError {
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub enum JocReconstructionError {
     Invalid(&'static str),
     Limit(&'static str),
 }

@@ -88,7 +88,9 @@ pub(super) struct OamdUpdateBlock {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct OamdFrame {
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub struct OamdFrame {
     pub(super) kinds: Vec<OamdObjectKind>,
     pub(super) starting_objects: Vec<OamdObjectState>,
     pub(super) updates: Vec<OamdUpdateBlock>,
@@ -104,7 +106,9 @@ impl OamdFrame {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OamdParseError {
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub enum OamdParseError {
     Truncated(&'static str),
     Invalid(&'static str),
     Limit(&'static str),
@@ -123,19 +127,23 @@ impl fmt::Display for OamdParseError {
 }
 
 #[derive(Default)]
-pub(super) struct OamdDecoder {
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub struct OamdDecoder {
     kinds: Vec<OamdObjectKind>,
     objects: Vec<OamdObjectState>,
 }
 
 impl OamdDecoder {
-    pub(super) fn reset(&mut self) {
+    #[doc(hidden)]
+    pub fn reset(&mut self) {
         self.kinds.clear();
         self.objects.clear();
     }
 
     #[allow(clippy::too_many_lines)]
-    pub(super) fn decode(&mut self, payload: &[u8]) -> Result<OamdFrame, OamdParseError> {
+    #[doc(hidden)]
+    pub fn decode(&mut self, payload: &[u8]) -> Result<OamdFrame, OamdParseError> {
         let mut bits = BitCursor::new(payload);
         let mut version = bits.read(2, "OAMD version")?;
         if version == 3 {

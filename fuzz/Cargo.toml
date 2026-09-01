@@ -26,6 +26,11 @@ cargo-fuzz = true
 #   persistent `Eac3DecoderState`: substream accumulation, dependent-
 #   substream chanmap channel combination (§E.3.8.2), fractional
 #   numblkscod shapes.
+# - `joc_oamd_parse` — the TS 103 420 JOC/OAMD surface: EC-3
+#   Extension Type A signalling, the EMDF container walk with its
+#   sparse/dense Huffman matrix decode, the standalone OAMD
+#   object-element decoder, and the QMF reconstruction + stereo
+#   renderer on parsed containers.
 # - `encode_decode_roundtrip` — structure-aware differential testing
 #   of the encoder: the input picks a contract-valid configuration
 #   (layout × rate × blocks × SPX/AHT/ecpl × metadata words) and the
@@ -75,5 +80,11 @@ doc = false
 [[bin]]
 name = "encode_decode_roundtrip"
 path = "fuzz_targets/encode_decode_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "joc_oamd_parse"
+path = "fuzz_targets/joc_oamd_parse.rs"
 test = false
 doc = false
