@@ -36,8 +36,10 @@
 //!    Transform on fbw / LFE / coupling channels, §3.6 spectral
 //!    extension with §3.6.4.2.3 SPXATTEN border notch, and §3.7.2
 //!    transient pre-noise processing. Encoder covers
-//!    indep+dep-substream pairs for 1.0 / 2.0 / 5.1 / 7.1 layouts;
-//!    SPX and AHT are out of scope on the encoder side.
+//!    indep+dep-substream pairs for 1.0 / 2.0 / 5.1 / 7.1 layouts,
+//!    fractional syncframes (§E.2.3.1.5 `numblkscod` 0/1/2), and the
+//!    full Annex E tool set: SPX, AHT, enhanced coupling, and
+//!    §3.7 transient-pre-noise-processing emission.
 //! 9. [`crc`] — §7.10.1 CRC-16 over poly 0x8005, shared between
 //!    encoder (forward generation, augmented form for crc2) and the
 //!    opt-in [`decoder::verify_packet_crc`] residue check.
@@ -138,8 +140,9 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     // pair: indep substream carries a 5.1 program (acmod=7, lfeon=1)
     // and dep substream 0 carries Lb/Rb back surrounds with chanmap
     // bit 6 set (Lrs/Rrs pair) per ATSC A/52 Annex E §E.2.3.1.7-8 /
-    // §E.3.8.2. Encoder-side SPX and AHT are out of scope (decoder
-    // implements both).
+    // §E.3.8.2. Encoder-side tools: SPX, AHT, enhanced coupling,
+    // fractional syncframes (`blocks` option), and §3.7 TPNP
+    // emission (`tpnp` option).
     //
     // Decoder side: full Annex E DSP — §3.4 Adaptive Hybrid
     // Transform on fbw / LFE / coupling channels, §3.6 spectral

@@ -150,7 +150,9 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   spatially correctly rather than duplicating and decorrelating the shared
   channels a blind append would have appended.
 - Encoder — independent + dependent substream pairs for 1.0 / 2.0 / 5.1
-  / 7.1 layouts, with adaptive / frame-based exponent strategies.
+  / 7.1 layouts, with adaptive / frame-based exponent strategies,
+  fractional syncframes (§E.2.3.1.5 — see below) and the §3.7
+  transient-pre-noise-processing emission (see below).
   **Bitstream-metadata surface** (`eac3::Eac3Metadata` /
   `eac3::make_encoder_with_metadata` + registry options): fixed-BSI
   `dialnorm` and `compr`, the per-block `dynrng` word (every block of
@@ -326,6 +328,55 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   (`docs/audio/ac3/fixtures/eac3-ecpl-enhanced-coupling/GAP.md`), so
   ecpl validation stays in-tree round-trip + spec-text.
 
+  **Fractional syncframes** (§E.2.3.1.5 `numblkscod` 0/1/2, Table
+  E2.4 — `eac3::make_encoder_with_blocks` / the `blocks` option =
+  `1`/`2`/`3`/`6`): a syncframe carries 1, 2, or 3 audio blocks with
+  the byte budget scaled by nblks/6 (unchanged bit rate), the
+  §E.2.3.1.64 `convsync` flag marking each 6-block AC-3
+  conversion-group head (surfaced as the typed `Eac3Bsi::convsync`),
+  Table E1.3's implicit `expstre = 1` / `ahte = 0` + explicit
+  `convexpstre` audfrm arms, and `blkstrtinfoe` absent on 1-block
+  frames. Works across every layout including the 7.1 indep+dep pair;
+  AHT is spec-implicit-off and SPX / enhanced coupling stay 6-block
+  scope. Guard rails: a construction-time minimum-rate floor (fixed
+  syntax + D45 exponent payload + metadata reserve must fit the
+  shrunken frame), budget-aware D45 anchor demotion, and a worst-case
+  full-scale-noise dry-run through the real emission pipeline at
+  construction. Round-trips walk every frame's BSI syntax (numblkscod
+  / frmsiz / convsync cadence) and gate decode alignment against the
+  6-block encode of the same PCM (~24-28 dB for 3-block, ~24 dB
+  2-block, ~13 dB for the 1-block extreme — the honest
+  overhead-amortisation cost of re-anchoring exponents every 256·nblks
+  samples); the external decoder binary accepts all three shapes
+  (stereo 3/2-block @ 192 kbps at 23.4 / 26.0 dB vs the same
+  harness's 22.3 dB 6-block baseline, 1-block @ 384 kbps at
+  62.0 dB). Implementing the round-trip flushed out a decoder
+  conformance bug: the Annex E BSI parser read `convsync` / `blkid` /
+  `frmsizecod` inside the informational-metadata block, but Table
+  E1.2 places them OUTSIDE `if (infomdate)` — a fractional-frame
+  stream without an infomd block desynced the BSI tail by 1 bit
+  (fixed; `frmsizecod` is now also gated on `blkid`).
+
+  **Transient pre-noise processing emission** (§3.7 / §2.3.2.21-23 —
+  `eac3::make_encoder_with_tpnp` / the `tpnp` option): per frame and
+  per fbw channel the encoder runs the §3.7.1 transient-location
+  analysis (4-sample group-energy onset detector against a
+  running-average reference) and emits `transproce` +
+  `chintransproc[ch]` + `transprocloc[ch]` (frame-relative, 4-sample
+  units) + `transproclen[ch]` — the time-scaling length, set to the
+  pre-noise gap between the containing coding block's leading edge
+  and the transient (exactly the region the decoder's §3.7.2
+  synthesis overwrites; the precise length analysis is encoder
+  tuning — Figure E3.2 is the spec's only sketch). Long transforms
+  are forced while TPNP is on (the tool corrects long-transform
+  pre-noise; block switching avoids it instead), and transient-free
+  frames emit `transproce = 0`, byte-identical to the baseline
+  encoder. Validated: audfrm parse-back pins loc (±4 groups) and len
+  exactly on 6-block and fractional frames, options-vs-typed
+  byte-identical, end-to-end decode through our own §3.7.2 synthesis,
+  a TPNP corruption sweep, and the external decoder binary accepts
+  the syntax (27.4 dB on impulse-train content).
+
 ### CRC
 
 §7.10.1 CRC-16 (poly 0x8005), shared between the encoder (forward
@@ -350,7 +401,64 @@ floor so a regression fails CI; the rest log deltas without gating:
 Every corpus fixture is now CI-gated; none remain `ReportOnly`. The
 decoder is additionally fuzzed for panic-safety against
 truncation / bit-flip / sync-prefixed-garbage corruption of every
-fixture (`tests/robustness.rs`).
+fixture (`tests/robustness.rs`), and metadata- / SPX- / ecpl- /
+TPNP-bearing encoder outputs join the same three corruption families.
+
+## Fuzzing
+
+`fuzz/` carries four coverage-guided libfuzzer harnesses (daily CI
+runs via the `Fuzz` workflow; corpora seed from the fixture set):
+
+- **`parse_headers`** — syncinfo + base-AC-3 BSI + Annex E BSI on raw
+  bytes, incl. the metadata opt-in chains and the fractional-frame
+  `convsync` tail.
+- **`decode_frames`** — the registry AC-3 / E-AC-3 packet → PCM path,
+  multiple carved packets on one stateful decoder.
+- **`eac3_substream_walk`** — a persistent `Eac3DecoderState` over
+  syncinfo-split syncframes: substream accumulation + §E.3.8.2
+  chanmap channel combination.
+- **`encode_decode_roundtrip`** — structure-aware differential
+  testing: a fuzz-picked contract-valid configuration (layout × rate
+  × blocks × SPX/AHT/ecpl/TPNP × metadata) encodes arbitrary PCM and
+  every emitted packet must decode through our own decoder with the
+  exact sample count.
+
+The round-trip target found (and r454 fixed) three encoder
+bit-budget-overflow classes on construction-accepted configs: a
+metadata-blind minimum-rate floor, SNR tuners whose no-fit path
+returned the default (overflowing) allocation, and tool syntax that
+cannot fit its frame at all — now rejected by a construction-time
+worst-case dry-run. r454 campaign (bounded local runs, ~20 min per
+target, rss-limited): `parse_headers` 218.3M execs (182k/s, +167
+corpus units), `decode_frames` 3.59M execs (+7,420 units),
+`eac3_substream_walk` 2.85M execs (+2,041 units),
+`encode_decode_roundtrip` 7.5K full encode→decode configs (+371
+units) — zero outstanding findings.
+
+## Black-box encoder position
+
+Honest equal-rate PSNR on a shared 1 s two-tone fixture
+(0.3·sin 440 Hz + 0.18·sin 3517 Hz, lag-searched worst-channel PSNR
+through the external decoder binary): our position is measured, not
+implied:
+
+| fixture @ rate | external encoder | ours (standard) | ours (AHT) |
+| --- | --- | --- | --- |
+| mono @ 96 kbps | 74.3 dB | 24.1 dB | 58.6 dB |
+| mono @ 192 kbps | 87.8 dB | 24.1 dB | 74.6 dB |
+| stereo @ 96 kbps | 69.0 dB | 23.9 dB | 46.7 dB |
+| stereo @ 192 kbps | 86.9 dB | 24.1 dB | 58.7 dB |
+| stereo @ 384 kbps | 87.3 dB | 24.1 dB | 74.9 dB |
+
+The mature reference encoder is near-transparent on stationary tonal
+content; our AHT path scales correctly with rate (+28 dB across the
+ladder) while the standard path sits flat at ~24 dB regardless of
+rate — its SNR-offset tuner hits the csnroffst/bap ceiling on so
+sparse a spectrum and returns the surplus budget as padding (a
+recorded rate-distortion follow-up, not a conformance gap).
+The gap is rate-distortion maturity, not conformance: the external
+decoder accepts every stream shape this encoder emits (all tools,
+all frame shapes, metadata) at these rates.
 
 ## Installation
 
