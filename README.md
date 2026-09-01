@@ -150,6 +150,25 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   locations — so a real greater-than-5.1 broadcast program reassembles
   spatially correctly rather than duplicating and decorrelating the shared
   channels a blind append would have appended.
+  Real-broadcast decode conformance (issue #13): three audblk/audfrm
+  bit-accounting defects behind the reported "uncorrelated output +
+  second-long dropouts" class are fixed — the Table E1.4 NEGATIVE
+  derived `cplendf` when SPX and standard coupling are co-active with
+  `spxbegf < 2` (formerly clamped at 0, over-reading up to two coupling
+  sub-bands and desyncing the rest of the block), the §2.3.2.27
+  `blkstrtinfo` width (16-bit words through ceiling-log2, formerly
+  frame bits through floor-log2+1), and the per-block `fgaincod`
+  default reset. The class is pinned by hand-written spec-conformant
+  syncframes (SPX + coupling co-active — a geometry no available
+  encoder produces) that ffmpeg accepts and both decoders agree on at
+  ~92 dB, by a decode-side ffmpeg conformance harness
+  (`tests/eac3_decode_ffmpeg.rs`: ffmpeg-generated streams across
+  rates/modes/coupling/metadata + our-encoder broadcast BSI shapes,
+  ≥ 50 dB per channel), and by an env-gated local-vector gate
+  (`OXIDEAV_AC3_LOCAL_EAC3=/path` runs the same PSNR gate on captures
+  that cannot be committed). Zero-fill fallbacks are now countable via
+  `Eac3DecoderState::frames_zero_filled`, so callers can tell decoder
+  dropouts from silent program audio.
 - **Opt-in JOC object presentation**
   (`decoder::make_eac3_decoder_with_joc`) parses EC-3 Extension Type A
   and EMDF metadata from declared E-AC-3 skip fields, reconstructs up to
