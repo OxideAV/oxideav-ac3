@@ -778,11 +778,24 @@ pub fn decode_indep_audblks(
                     // SPX begin so the coupled region ends one bin below the
                     // SPX region (spxbegf < 6 → cplendf = spxbegf − 2, else
                     // spxbegf·2 − 7 — both equal spx_begin_subbnd − 4).
-                    state.cpl_endf = if state.spx_in_use {
-                        (state.spx_begin_subbnd as i32 - 4).max(0) as u8
+                    //
+                    // Table E1.4 note: "in this case the value of cplendf
+                    // may be negative" — spxbegf ∈ {0, 1} gives cplendf ∈
+                    // {−2, −1} (with cplbegf = 0 that is a 1- or 2-sub-band
+                    // coupling region). An earlier revision clamped the
+                    // derived value at 0, widening the region by up to two
+                    // sub-bands (24 bins): the coupling exponent groups,
+                    // band structure, coordinates and mantissas then all
+                    // over-read, desyncing the cursor for the rest of the
+                    // block — the issue-#13 broadcast-stream over-read
+                    // class (SPX + standard coupling co-active with a low
+                    // SPX begin frequency). Keep the value signed.
+                    let cplendf_signed: i32 = if state.spx_in_use {
+                        state.spx_begin_subbnd as i32 - 4
                     } else {
-                        br.read_u32(4)? as u8
+                        br.read_u32(4)? as i32
                     };
+                    state.cpl_endf = cplendf_signed.max(0) as u8;
                     // §5.4.3.12 spec envelope: the upper sub-band index is
                     // `cplendf + 2`, so `ncplsubnd = 3 + cplendf - cplbegf
                     // >= 1` is the actual validity test (equivalently
@@ -792,7 +805,7 @@ pub fn decode_indep_audblks(
                     // `(cplbegf=11, cplendf=10)` for high-bandwidth
                     // multichannel frames. Use signed arithmetic so the
                     // `3 + cplendf - cplbegf` term can't underflow.
-                    let ncplsubnd_signed = 3i32 + state.cpl_endf as i32 - state.cpl_begf as i32;
+                    let ncplsubnd_signed = 3i32 + cplendf_signed - state.cpl_begf as i32;
                     if ncplsubnd_signed < 1 {
                         return Err(Error::invalid(
                             "eac3 audblk: cplbegf > cplendf+2 — malformed coupling range",
@@ -841,9 +854,11 @@ pub fn decode_indep_audblks(
                     // previous block's `cpl_bndstrc[]` untouched.
                     first_cpl_strategy_block = false;
                     // Mantissa-domain coupling range: bins [37+12·begf,
-                    // 37+12·(endf+3)) per §7.4.2.
+                    // 37+12·(endf+3)) per §7.4.2. `cplendf + 3` is ≥ 1
+                    // even for the negative SPX-derived codes, so the
+                    // signed form can't go below bin 49.
                     state.cpl_begf_mant = 37 + 12 * state.cpl_begf as usize;
-                    state.cpl_endf_mant = 37 + 12 * (state.cpl_endf as usize + 3);
+                    state.cpl_endf_mant = (37 + 12 * (cplendf_signed + 3)) as usize;
                     // Derive ncplbnd by merging sub-bands whose
                     // cplbndstrc=1 (same algorithm as base AC-3).
                     // `cpl_bndstrc` is sized 18 (§7.4.2 max sub-bands); clamp
@@ -1260,19 +1275,33 @@ pub fn decode_indep_audblks(
         // Per Table E1.4, when `frmfgaincode == 1` a 1-bit `fgaincode`
         // field follows; if set, the per-channel fgaincod (3 bits each)
         // are emitted including the cpl-channel slot (only when
-        // cplinu[blk]).
-        if audfrm.frmfgaincode {
-            let fgaincode = br.read_u32(1)? != 0;
-            if fgaincode {
-                if cplinu {
-                    state.cpl_fgaincod = br.read_u32(3)? as u8;
-                }
-                for ch in 0..nfchans {
-                    state.fgaincod[ch] = br.read_u32(3)? as u8;
-                }
-                if lfeon {
-                    state.lfefgaincod = br.read_u32(3)? as u8;
-                }
+        // cplinu[blk]). The table's `else` arm resets every slot to the
+        // 0x4 default on EACH block where fgaincode == 0 — the codes do
+        // NOT persist from a previous block's override (an earlier
+        // revision carried a block-N override into blocks N+1.. when
+        // their fgaincode bit was 0, skewing the fast-gain leak values).
+        let fgaincode = if audfrm.frmfgaincode {
+            br.read_u32(1)? != 0
+        } else {
+            false
+        };
+        if fgaincode {
+            if cplinu {
+                state.cpl_fgaincod = br.read_u32(3)? as u8;
+            }
+            for ch in 0..nfchans {
+                state.fgaincod[ch] = br.read_u32(3)? as u8;
+            }
+            if lfeon {
+                state.lfefgaincod = br.read_u32(3)? as u8;
+            }
+        } else {
+            state.cpl_fgaincod = 0x4;
+            for ch in 0..nfchans {
+                state.fgaincod[ch] = 0x4;
+            }
+            if lfeon {
+                state.lfefgaincod = 0x4;
             }
         }
 
@@ -3161,5 +3190,447 @@ mod cpl_aht_tests {
             varies,
             "IDCT-II of a coupling VQ codeword must yield block-varying coeffs"
         );
+    }
+}
+
+/// Issue-#13 crafted-frame conformance tests.
+///
+/// Neither our encoder (enhanced coupling only) nor the reference
+/// binary's encoder (no SPX) can produce the broadcast configuration
+/// the issue-#13 report identified — **standard coupling and SPX
+/// co-active** — so these tests hand-write spec-conformant syncframes
+/// per Tables E1.2/E1.3/E1.4 with a bit writer. The interesting
+/// geometry is a low SPX begin frequency (`spxbegf < 2`): Table E1.4
+/// then derives a NEGATIVE `cplendf` ("note that in this case the
+/// value of cplendf may be negative"), which an earlier revision
+/// clamped at 0 — widening the coupling region by up to two sub-bands
+/// and desyncing every field after the coupling exponents (the
+/// reported ~700-bit block-0 over-read class). A second variant
+/// exercises `blkstrtinfoe = 1` (§2.3.2.27 block-start info sizing,
+/// also formerly mis-sized).
+///
+/// The crafted bytes are decoded by our decoder AND by ffmpeg (black-
+/// box reference); the two PCM outputs must agree to ≥ 50 dB per
+/// channel and our decoder must never zero-fill.
+#[cfg(test)]
+mod issue13_craft_tests {
+    use std::process::Command;
+
+    use oxideav_core::bits::BitWriter;
+
+    use super::super::decoder::{decode_eac3_packet, Eac3DecoderState};
+    use crate::audblk::{self, Ac3State, MAX_FBW};
+    use crate::crc::ac3_crc_update;
+    use crate::tables::QUANTIZATION_BITS;
+
+    /// Frame geometry shared by the crafted variants.
+    const WORDS_PER_FRAME: u32 = 1024; // frmsiz = 1023 → 2048-byte frame
+    const CSNROFFST: u8 = 18;
+    const FSNROFFST: u8 = 4;
+    const ABS_EXP: u32 = 8;
+
+    /// Grouped-mantissa writer state mirroring the §7.3.5 decode-side
+    /// buffers (bap 1/2/4 codes carry 3, 3, 2 mantissas shared across
+    /// channels within a block).
+    #[derive(Default)]
+    struct GroupState {
+        g1: usize,
+        g2: usize,
+        g4: usize,
+    }
+
+    /// Emit one mantissa of quantisation level `bap`, deterministic in
+    /// (`seed`, `bin`). Grouped baps use fixed mid-scale group codes.
+    fn write_mantissa(bw: &mut BitWriter, gs: &mut GroupState, bap: u8, seed: u32, bin: usize) {
+        match bap {
+            0 => {}
+            1 => {
+                if gs.g1 == 0 {
+                    bw.write_u32(13, 5); // (1,1,1) of 3 levels
+                    gs.g1 = 3;
+                }
+                gs.g1 -= 1;
+            }
+            2 => {
+                if gs.g2 == 0 {
+                    bw.write_u32(62, 7); // (2,2,2) of 5 levels
+                    gs.g2 = 3;
+                }
+                gs.g2 -= 1;
+            }
+            3 => {
+                bw.write_u32((seed.wrapping_add(bin as u32 * 5)) % 7, 3);
+            }
+            4 => {
+                if gs.g4 == 0 {
+                    bw.write_u32(60, 7); // (5,5) of 11 levels
+                    gs.g4 = 2;
+                }
+                gs.g4 -= 1;
+            }
+            5 => {
+                bw.write_u32((seed.wrapping_add(bin as u32 * 3)) % 15, 4);
+            }
+            b => {
+                let nbits = QUANTIZATION_BITS[b as usize] as u32;
+                let v = seed
+                    .wrapping_mul(2654435761)
+                    .wrapping_add(bin as u32 * 40503)
+                    & ((1u32 << nbits) - 1);
+                bw.write_u32(v, nbits);
+            }
+        }
+    }
+
+    /// Reproduce the decode-side bit allocation for the crafted frame's
+    /// flat-exponent layout so the writer knows each bin's mantissa
+    /// width. Returns (fbw ch bap[0..37], cpl bap[37..49]).
+    fn crafted_baps() -> ([u8; 37], [u8; 12]) {
+        let mut st = Ac3State::new();
+        st.sdcycod = 0x2;
+        st.fdcycod = 0x1;
+        st.sgaincod = 0x1;
+        st.dbpbcod = 0x2;
+        st.floorcod = 0x7;
+        st.snroffst_coarse = CSNROFFST;
+        st.cpl_fleak = 0;
+        st.cpl_sleak = 0;
+        for bin in 0..37 {
+            st.channels[0].exp[bin] = ABS_EXP as u8;
+        }
+        for bin in 37..49 {
+            st.channels[MAX_FBW].exp[bin] = ABS_EXP as u8;
+        }
+        audblk::run_bit_allocation(&mut st, 0, 0, 37, 0, FSNROFFST, 0x4, false);
+        audblk::run_bit_allocation(&mut st, MAX_FBW, 37, 49, 0, FSNROFFST, 0x4, true);
+        let mut ch = [0u8; 37];
+        ch.copy_from_slice(&st.channels[0].bap[0..37]);
+        let mut cpl = [0u8; 12];
+        cpl.copy_from_slice(&st.channels[MAX_FBW].bap[37..49]);
+        (ch, cpl)
+    }
+
+    /// Hand-write one 6-block 2/0 48 kHz E-AC-3 syncframe with SPX
+    /// (spxbegf = 0 → spx_begin_subbnd = 2) and standard coupling
+    /// co-active (derived cplendf = −2, ncplsubnd = 1), per Tables
+    /// E1.2/E1.3/E1.4. `blkstrtinfo` selects the §2.3.2.27 block-start
+    /// info variant. `seed` varies the mantissa payloads per frame.
+    fn build_cpl_spx_frame(seed: u32, blkstrtinfo: bool) -> Vec<u8> {
+        let (ch_bap, cpl_bap) = crafted_baps();
+        let mut bw = BitWriter::with_capacity(WORDS_PER_FRAME as usize * 2);
+
+        // ---- syncinfo + BSI (Table E1.2) ----
+        bw.write_u32(0x0B77, 16); // syncword
+        bw.write_u32(0, 2); // strmtyp = 0 (independent)
+        bw.write_u32(0, 3); // substreamid
+        bw.write_u32(WORDS_PER_FRAME - 1, 11); // frmsiz
+        bw.write_u32(0, 2); // fscod = 48 kHz
+        bw.write_u32(3, 2); // numblkscod = 6 blocks
+        bw.write_u32(2, 3); // acmod = 2/0
+        bw.write_u32(0, 1); // lfeon
+        bw.write_u32(16, 5); // bsid
+        bw.write_u32(27, 5); // dialnorm
+        bw.write_u32(1, 1); // compre = 1 (the reported frame-0 shape)
+        bw.write_u32(0x0B, 8); // compr
+        bw.write_u32(0, 1); // mixmdate
+        bw.write_u32(0, 1); // infomdate
+                            // strmtyp == 0 && numblkscod == 3 → no convsync
+        bw.write_u32(0, 1); // addbsie
+
+        // ---- audfrm (Table E1.3) ----
+        bw.write_u32(1, 1); // expstre
+        bw.write_u32(0, 1); // ahte
+        bw.write_u32(0, 2); // snroffststr = 0 (frame-level)
+        bw.write_u32(0, 1); // transproce
+        bw.write_u32(0, 1); // blkswe
+        bw.write_u32(1, 1); // dithflage (explicit → we turn dither OFF)
+        bw.write_u32(0, 1); // bamode (defaults)
+        bw.write_u32(0, 1); // frmfgaincode
+        bw.write_u32(0, 1); // dbaflde
+        bw.write_u32(0, 1); // skipflde
+        bw.write_u32(0, 1); // spxattene
+                            // coupling data (acmod > 1): cplinu[0] = 1; blocks 1-5 reuse.
+        bw.write_u32(1, 1); // cplinu[0]
+        for _ in 1..6 {
+            bw.write_u32(0, 1); // cplstre[blk] = 0 → cplinu carries
+        }
+        // exponent strategy: blk0 D15 everywhere, later blocks REUSE.
+        for blk in 0..6 {
+            let strat = if blk == 0 { 1 } else { 0 };
+            bw.write_u32(strat, 2); // cplexpstr[blk] (cplinu all-on)
+            bw.write_u32(strat, 2); // chexpstr[blk][0]
+            bw.write_u32(strat, 2); // chexpstr[blk][1]
+        }
+        // no lfe. converter exponent strategy (strmtyp == 0,
+        // numblkscod == 3 → convexpstre implicit 1).
+        bw.write_u32(0, 5); // convexpstr[0]
+        bw.write_u32(0, 5); // convexpstr[1]
+                            // snroffststr == 0 → frame-level SNR offsets.
+        bw.write_u32(CSNROFFST as u32, 6); // frmcsnroffst
+        bw.write_u32(FSNROFFST as u32, 4); // frmfsnroffst
+                                           // block start information (numblkscod != 0).
+        if blkstrtinfo {
+            bw.write_u32(1, 1); // blkstrtinfoe
+                                // §2.3.2.27: (numblks−1) × (4 + ceil(log2(words_per_frame)))
+            let bits_per = 4 + WORDS_PER_FRAME.next_power_of_two().trailing_zeros();
+            for _ in 0..5 {
+                bw.write_u32(0, bits_per); // informational; decoders skip
+            }
+        } else {
+            bw.write_u32(0, 1);
+        }
+
+        // ---- audblks (Table E1.4) ----
+        for blk in 0..6u32 {
+            // dithflag[ch] — dither OFF for determinism vs the oracle.
+            bw.write_u32(0, 1);
+            bw.write_u32(0, 1);
+            bw.write_u32(0, 1); // dynrnge
+                                // SPX strategy: blk0 implicit spxstre=1; later blocks 0.
+            if blk == 0 {
+                bw.write_u32(1, 1); // spxinu = 1
+                bw.write_u32(1, 1); // chinspx[0]
+                bw.write_u32(1, 1); // chinspx[1]
+                bw.write_u32(0, 2); // spxstrtf
+                bw.write_u32(0, 3); // spxbegf = 0 → spx_begin_subbnd 2
+                bw.write_u32(2, 3); // spxendf = 2 → spx_end_subbnd 7
+                bw.write_u32(0, 1); // spxbndstrce = 0 → default banding
+                                    // (5 bands: sub-bands 3..7 all split)
+                                    // SPX coordinates — firstspxcos → spxcoe implicit 1.
+                for _ch in 0..2 {
+                    bw.write_u32(31, 5); // spxblnd = 31 → zero noise blend
+                    bw.write_u32(0, 2); // mstrspxco
+                    for bnd in 0..5u32 {
+                        bw.write_u32(2 + (bnd & 1), 4); // spxcoexp
+                        bw.write_u32(1, 2); // spxcomant
+                    }
+                }
+                // Coupling strategy (cplstre[0] = 1 from audfrm).
+                bw.write_u32(0, 1); // ecplinu = 0 (standard coupling)
+                                    // acmod == 2 → chincpl implicit for both channels.
+                bw.write_u32(0, 1); // phsflginu
+                bw.write_u32(0, 4); // cplbegf = 0
+                                    // SPX in use → NO cplendf bits (derived = spxbegf−2 = −2).
+                bw.write_u32(0, 1); // cplbndstrce = 0 (1 sub-band anyway)
+                                    // Coupling coordinates — firstcplcos → cplcoe implicit 1.
+                for _ch in 0..2 {
+                    bw.write_u32(0, 2); // mstrcplco
+                                        // ncplbnd = 1 band.
+                    bw.write_u32(1, 4); // cplcoexp
+                    bw.write_u32(8, 4); // cplcomant
+                }
+                // phsflginu == 0 → no phsflg.
+                // Rematrixing (2/0): blk0 rematstr implicit 1.
+                // nrematbd = 2 (cplinu && cplbegf == 0).
+                bw.write_u32(0, 1); // rematflg[0]
+                bw.write_u32(0, 1); // rematflg[1]
+                                    // chbwcod: both channels in coupling+SPX → none.
+                                    // Coupling exponents (cplexpstr = D15): 12 bins → 4 grps.
+                bw.write_u32(4, 4); // cplabsexp (<<1 → 8)
+                for _ in 0..4 {
+                    bw.write_u32(62, 7); // flat D15 deltas
+                }
+                // fbw exponents (D15, end_mant = cpl_begf_mant = 37):
+                // 12 groups + absexp + gainrng per channel.
+                for _ch in 0..2 {
+                    bw.write_u32(ABS_EXP, 4);
+                    for _ in 0..12 {
+                        bw.write_u32(62, 7);
+                    }
+                    bw.write_u32(0, 2); // gainrng
+                }
+            } else {
+                bw.write_u32(0, 1); // spxstre = 0 (strategy carries)
+                                    // SPX coordinates: spxcoe[ch] explicit → reuse.
+                bw.write_u32(0, 1);
+                bw.write_u32(0, 1);
+                // cplstre = 0 → no strategy; coordinates: cplcoe = 0.
+                bw.write_u32(0, 1);
+                bw.write_u32(0, 1);
+                bw.write_u32(0, 1); // rematstr = 0
+                                    // chexpstr REUSE → no chbwcod / exponents.
+            }
+            // bamode == 0, snroffststr == 0, frmfgaincode == 0 → nothing.
+            bw.write_u32(0, 1); // convsnroffste (strmtyp == 0)
+                                // cplleake: implicit 1 on block 0, explicit 0 after.
+            if blk == 0 {
+                bw.write_u32(0, 3); // cplfleak
+                bw.write_u32(0, 3); // cplsleak
+            } else {
+                bw.write_u32(0, 1); // cplleake = 0
+            }
+            // dbaflde == 0, skipflde == 0 → nothing.
+            // Mantissas: ch0 (0..37), then coupling (37..49, after the
+            // first coupled channel), then ch1 (0..37). Grouped-bap
+            // buffers are shared across the whole block.
+            let mut gs = GroupState::default();
+            let blk_seed = seed.wrapping_add(blk * 977);
+            for bin in 0..37 {
+                write_mantissa(&mut bw, &mut gs, ch_bap[bin], blk_seed, bin);
+            }
+            for bin in 37..49 {
+                write_mantissa(&mut bw, &mut gs, cpl_bap[bin - 37], blk_seed ^ 0xA5, bin);
+            }
+            for bin in 0..37 {
+                write_mantissa(&mut bw, &mut gs, ch_bap[bin], blk_seed ^ 0x5A, bin);
+            }
+        }
+
+        // ---- auxdata padding + errorcheck (§E.2.2.5/6) ----
+        let target_bits = WORDS_PER_FRAME as u64 * 16;
+        let used = bw.bit_position();
+        assert!(
+            used + 17 <= target_bits,
+            "crafted frame overflows its frmsiz budget ({used} + 17 > {target_bits})"
+        );
+        let mut pad = target_bits - used - 17;
+        while pad >= 32 {
+            bw.write_u32(0, 32);
+            pad -= 32;
+        }
+        if pad > 0 {
+            bw.write_u32(0, pad as u32);
+        }
+        bw.write_u32(0, 1); // encinfo
+        bw.write_u32(0, 16); // crc2 placeholder
+        let mut frame = bw.into_bytes();
+        let n = frame.len();
+        assert_eq!(n, WORDS_PER_FRAME as usize * 2);
+        let body_residue = ac3_crc_update(0, &frame[2..n - 2]);
+        let crc2 = ac3_crc_update(body_residue, &[0u8, 0u8]);
+        frame[n - 2] = (crc2 >> 8) as u8;
+        frame[n - 1] = (crc2 & 0xFF) as u8;
+        frame
+    }
+
+    fn ffmpeg_present() -> bool {
+        Command::new("ffmpeg")
+            .args(["-version"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Reference-decode `es` via ffmpeg → interleaved s16.
+    fn ffmpeg_decode_s16(tag: &str, es: &[u8]) -> Option<Vec<i16>> {
+        let dir = std::env::temp_dir();
+        let inp = dir.join(format!("oxideav_i13_{tag}_{}.eac3", std::process::id()));
+        let out = dir.join(format!("oxideav_i13_{tag}_{}.pcm", std::process::id()));
+        std::fs::write(&inp, es).ok()?;
+        let st = Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&inp)
+            .args([
+                "-f",
+                "s16le",
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+            ])
+            .arg(&out)
+            .output()
+            .ok()?;
+        let _ = std::fs::remove_file(&inp);
+        if !st.status.success() {
+            eprintln!(
+                "ffmpeg rejected the crafted stream ({tag}): {}",
+                String::from_utf8_lossy(&st.stderr)
+            );
+            return None;
+        }
+        let bytes = std::fs::read(&out).ok()?;
+        let _ = std::fs::remove_file(&out);
+        Some(
+            bytes
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+        )
+    }
+
+    /// Decode with our decoder, assert no zero-fill, and (when ffmpeg
+    /// is present) require ≥ `floor_db` per-channel agreement with the
+    /// reference decode of the same bytes.
+    fn run_crafted_gate(tag: &str, es: &[u8]) {
+        let mut state = Eac3DecoderState::default();
+        let mut ours: Vec<i16> = Vec::new();
+        let frame_len = WORDS_PER_FRAME as usize * 2;
+        for (i, chunk) in es.chunks(frame_len).enumerate() {
+            let f = decode_eac3_packet(&mut state, chunk)
+                .unwrap_or_else(|e| panic!("{tag}: frame {i} failed to decode: {e}"));
+            assert_eq!(f.channels, 2, "{tag}: channels");
+            ours.extend(
+                f.pcm_s16le
+                    .chunks_exact(2)
+                    .map(|c| i16::from_le_bytes([c[0], c[1]])),
+            );
+        }
+        assert_eq!(
+            state.frames_zero_filled, 0,
+            "{tag}: decoder zero-filled frames (issue-#13 dropout symptom): {:?}",
+            state.last_error
+        );
+        let rms = (ours.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>()
+            / ours.len().max(1) as f64)
+            .sqrt();
+        assert!(
+            rms > 10.0,
+            "{tag}: crafted stream decoded to near-silence (rms {rms:.2})"
+        );
+        if !ffmpeg_present() {
+            eprintln!("{tag}: ffmpeg unavailable — cross-check skipped");
+            return;
+        }
+        let Some(reference) = ffmpeg_decode_s16(tag, es) else {
+            panic!("{tag}: reference decoder rejected the crafted stream");
+        };
+        // Same bytes through both decoders — no lag, no priming skip
+        // beyond the first block window.
+        let n = (ours.len() / 2).min(reference.len() / 2);
+        assert!(n > 4096, "{tag}: not enough reference overlap ({n})");
+        for ch in 0..2usize {
+            let mut sse = 0.0f64;
+            for i in 256..n {
+                let d = ours[i * 2 + ch] as f64 - reference[i * 2 + ch] as f64;
+                sse += d * d;
+            }
+            let mse = sse / (n - 256) as f64;
+            let psnr = if mse <= f64::EPSILON {
+                120.0
+            } else {
+                10.0 * (32767.0f64 * 32767.0 / mse).log10()
+            };
+            eprintln!("{tag}: ch{ch} PSNR vs reference {psnr:.2} dB");
+            assert!(
+                psnr >= 50.0,
+                "{tag}: ch{ch} diverges from the reference decode ({psnr:.2} dB < 50 dB)"
+            );
+        }
+    }
+
+    /// The issue-#13 class repro: SPX + standard coupling co-active
+    /// with spxbegf = 0 → derived cplendf = −2 (ncplsubnd = 1).
+    #[test]
+    fn crafted_negative_cplendf_cpl_spx_frame_decodes() {
+        let mut es = Vec::new();
+        for f in 0..6u32 {
+            es.extend(build_cpl_spx_frame(0x1234 + f, false));
+        }
+        run_crafted_gate("negative-cplendf", &es);
+    }
+
+    /// Same geometry with §2.3.2.27 block-start information present
+    /// (formerly mis-sized: frame bits instead of 16-bit words through
+    /// a floor-log2+1 in place of ceiling-log2).
+    #[test]
+    fn crafted_blkstrtinfo_frame_decodes() {
+        let mut es = Vec::new();
+        for f in 0..6u32 {
+            es.extend(build_cpl_spx_frame(0x9e37 + f, true));
+        }
+        run_crafted_gate("blkstrtinfo", &es);
     }
 }

@@ -530,12 +530,17 @@ fn parse_tail(br: &mut BitReader<'_>, a: &mut AudFrm, bsi: &Bsi) -> Result<()> {
     if num_blocks != 1 {
         let blkstrtinfoe = br.read_u32(1)? != 0;
         if blkstrtinfoe {
-            // nblkstrtbits = (numblks - 1) * (4 + ceil(log2(frmsiz_bits)))
-            // For numblks=6 and frmsiz_bits ≤ 16, log2 ≤ 4 → 8 bits per
-            // entry → 5*8 = 40 bits. Spec-correct formula per §2.3.2.27.
-            let frame_bits = bsi.frame_bytes * 8;
-            let log2 = 32 - frame_bits.leading_zeros();
-            let bits_per = 4 + log2;
+            // §2.3.2.27: nblkstrtbits =
+            //   (numblks − 1) × (4 + ceiling(log2(words_per_frame)))
+            // with words_per_frame = frmsiz + 1 — 16-bit WORDS, not
+            // bits. An earlier revision fed the frame size in BITS
+            // through a floor-log2+1 in place of ceiling-log2, over-
+            // reading 4-6 bits per entry (20-30 bits on a 6-block
+            // frame) and desyncing every field after the audfrm on any
+            // stream that carries block-start info (issue #13 class).
+            let words_per_frame = (bsi.frame_bytes / 2).max(1);
+            let ceil_log2 = words_per_frame.next_power_of_two().trailing_zeros();
+            let bits_per = 4 + ceil_log2;
             let total = (num_blocks as u32 - 1) * bits_per;
             br.skip(total)?;
         }

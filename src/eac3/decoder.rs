@@ -100,6 +100,14 @@ pub struct Eac3DecoderState {
     skip_fields: Vec<Vec<u8>>,
     /// Per-frame error string (last seen). Diagnostic only.
     pub last_error: Option<String>,
+    /// Cumulative count of substream frames this decoder state emitted
+    /// as silence (the zero-fill fallback) because the frame failed to
+    /// parse or DSP-decode. A conformant stream decodes with this
+    /// counter staying at 0 — callers observing audible dropouts (the
+    /// issue-#13 symptom) can poll it to distinguish decoder-side
+    /// zero-fill from genuinely silent program audio. Counts each
+    /// affected substream frame (indep or dep) once.
+    pub frames_zero_filled: u64,
     /// Physical channel locations of dep-substream channels that were
     /// spliced into [`Self::indep_pcm_f32`] during the most recent
     /// packet, in the order they were appended. Always one entry per
@@ -330,6 +338,7 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
             Ok(a) => a,
             Err(e) => {
                 state.last_error = Some(format!("{e}"));
+                state.frames_zero_filled += 1;
                 let pcm = build_silent_indep(&bsi)?;
                 if matches!(
                     bsi.strmtyp,
@@ -444,6 +453,7 @@ fn decode_indep_substream(
         // so the next frame's reuse-strategy blocks don't pick up
         // garbage from a half-decoded prior frame.
         state.last_error = Some(format!("{e}"));
+        state.frames_zero_filled += 1;
         state.indep_state = Ac3State::new();
         state.skip_fields.clear();
         for v in floats.iter_mut() {
@@ -550,6 +560,7 @@ fn decode_dep_substream(
         // Silent fallback for the dep substream — leave indep PCM
         // untouched so the indep program is still audible.
         state.last_error = Some(format!("{e}"));
+        state.frames_zero_filled += 1;
         state.dep_state = Ac3State::new();
         state.skip_fields.clear();
         return Err(e);
