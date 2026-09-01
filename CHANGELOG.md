@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.10...v0.0.11) - 2026-09-01
+
+### Added
+
+- *(eac3)* add JOC stereo object renderer
+
+### Other
+
+- issue-#13 decode-conformance notes (README + CHANGELOG)
+- decode-side ffmpeg conformance harness + env-gated local-vector gate (issue #13)
+- fix three audblk/audfrm bit-accounting defects behind the issue-#13 broadcast decode class
+- joc_oamd_parse target for the #15 JOC/OAMD contribution
+- r454 status rewrite — fractional frames, TPNP, fuzzing, measured encoder position
+- transient pre-noise processing emission (§3.7 / §2.3.2.21-23)
+- coverage-guided harness standup (4 targets + daily workflow)
+- close three encoder bit-budget overflow classes (fuzz findings)
+- fractional syncframes (numblkscod 0/1/2) + convsync BSI-tail conformance fix
+- block-count-generic tuner/overhead signatures
+- hide internal public surface from cargo-semver-checks
+- eac3 r409: anchor AHT spec-deviation notes to codified errata entries E1/E2
+- metadata hardening — corruption sweep + black-box syntax/gain gates + README
+- eac3 r409: encoder-side E-AC-3 metadata surface (mixing + informational blocks, dialnorm/compr/dynrng)
+- ac3 r409: black-box DRC/dialnorm gain-word semantics gates
+- ac3 r409: encoder-side bitstream-metadata surface (§5.4.2 BSI words + per-block dynrng)
+- eac3 r409: reconcile §E.3.5.5.1 factor-2 overlap-add with codified errata entry E3 + two-direction regression pins
+- eac3 r406: §E.2.3.3.19 leading-bndstrc mask (third ecpl decode-conformance fix) + narrow-geometry & 44.1 kHz round-trips
+- eac3 r406: coherence-driven chaos coordinates — per-band de-correlation signalling + amp pre-compensation + stereo-width gate
+- eac3 r406: SPX + enhanced coupling co-active (§3.6.1) — SPX-bounded coupling region + three-region round-trip
+- eac3 r406: ecpl hardening + instrumentation — corruption sweep, 7.1 pair walk, rate-curve column, README
+- eac3 r406: encoder-side enhanced coupling — carrier coding + quantised-carrier coordinate measurement + round-trips
+- eac3 r406: two enhanced-coupling decode-conformance fixes (chincpl field order + §2.3.3.21-22 coordinate reuse)
+- eac3 r406: encoder-side ecpl primitives (ecplenc) + §E.3.5.5.1 carrier headroom-factor erratum fix
+- eac3 r390: document the encoder-side AHT subsystem + mixed chinspx (README / CHANGELOG / module docs)
+- eac3 r390: rate/quality instrumentation — rate-curve example + AHT monotonicity gate
+- eac3 r390: mixed per-channel chinspx + per-channel end_mant through the SNR tuner (§E.2.3.3.3)
+- eac3 r390: LFE AHT — lfeahtinu signalling + front-loaded LFE-AHT block (§3.4.2)
+- eac3 r390: AHT black-box cross-validation + §3.4.5 leading-constant correction (2 → √2)
+- eac3 r390: AHT encoder — §3.4 6-block DCT-II + hebap + VQ/GAQ emission through the decoder round-trip
+- eac3 r390: encoder-side AHT primitives — forward DCT-II, VQ search, GAQ quantiser/planner (§3.4.4/§3.4.5)
+- eac3 r390: spec-exact GAQ dequantisation per Tables E3.5/E3.6
+- add CI / crates.io / docs.rs / MIT-license badges
+
 - eac3 issue-#13: **three decode-side bit-accounting fixes for the real-broadcast E-AC-3 class** (uncorrelated output + second-long zero-fill dropouts): (1) Table E1.4's derived `cplendf` "may be negative" when SPX and standard coupling are co-active (`spxbegf < 2` → `cplendf ∈ {−1, −2}`) — the parser clamped it at 0, widening the coupling region by up to two sub-bands so band structure, exponent groups, coordinates and mantissas all over-read (the reporter's ~700-bit block-0 over-read, surfacing later as 'SPX sub-band range invalid' / out-of-bits); now kept signed through `ncplsubnd` / the mantissa region. (2) §2.3.2.27 `nblkstrtbits` uses `ceil(log2(frmsiz + 1))` — 16-bit WORDS — per entry; the parser fed the frame size in bits through floor-log2+1, over-reading 20-30 bits per 6-block frame whenever `blkstrtinfoe == 1`. (3) Table E1.4's `fgaincode` else-arm resets `fgaincod`/`cplfgaincod`/`lfefgaincod` to 0x4 on every block whose bit is 0 (previously a block's override leaked forward). Repro + pin: hand-written spec-conformant syncframes (`eac3::dsp` unit tests) with SPX + coupling co-active at `spxbegf = 0` and a `blkstrtinfoe = 1` variant — a geometry neither our encoder (ecpl-only) nor ffmpeg's (no SPX) can emit; ffmpeg accepts both crafted streams and matches our decode at ~92 dB/channel, and reintroducing either defect zero-fills them.
 
 - eac3 issue-#13: **decode-side ffmpeg conformance harness** (`tests/eac3_decode_ffmpeg.rs`, ffmpeg-gated) — the E-AC-3 interop tests previously only validated the encoder direction. New: (a) ffmpeg-GENERATED streams (stereo 128/192 kbps, explicit channel coupling at 96/64 kbps, mono, 5.1 with coupling, 44.1 kHz, dense pink noise with ffmpeg's full BSI metadata surface) must decode to ≥ 50 dB per channel vs ffmpeg's own decode of the same bytes with zero zero-filled frames (the noise config gates at 40 dB — masked bap-0 bins carry decoder-discretionary dither); (b) our-encoder streams exercising broadcast BSI shapes ffmpeg's encoder never emits (blk-0 implicit SPX incl. `spxbegf` 0/1, `compre = 1`, per-block `dynrng`, mixing + informational metadata blocks, AHT) are refereed by ffmpeg's decoder; (c) `OXIDEAV_AC3_LOCAL_EAC3=/path` runs the same lag-aligned per-channel PSNR gate on a local, uncommittable capture (e.g. the issue-#13 DVB recording). Also: `Eac3DecoderState::frames_zero_filled` — a typed cumulative counter of silent-fallback substream frames, so callers can distinguish decoder-side dropouts from genuinely silent audio; the `decode_frames` fuzz corpus gains the crafted co-active-coupling/SPX frames.
