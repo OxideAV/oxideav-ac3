@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- encoder r457: **equal-rate rate-distortion harness** (`tests/common/rd.rs`, `tests/equal_rate.rs`, `examples/equal_rate_report`) — a deterministic synthetic corpus (speech, music, transients, two-tone, pink noise, 5.1 with LFE; 16 kHz band-limited) is encoded by our AC-3 / E-AC-3 encoder and by the black-box reference encoder at equal nominal rate, every stream is decoded by both our decoder and the reference decoder, and each decode is scored by worst-channel SNR and a mean noise-to-mask ratio (§7.2.2 parametric mask on the source MDCT). The test pins per-cell floors, the decoder agreement on our streams (< 1.5 dB) and the distance to the reference encoder; README carries the ladder. The harness immediately exposed that the r454 "~24 dB flat" two-tone table was an aliased lag-search artefact: the standard path measured ≈ 12 dB at every rate.
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.10...v0.0.11) - 2026-09-01
 
 ### Added
