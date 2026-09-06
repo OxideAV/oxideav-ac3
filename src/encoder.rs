@@ -148,6 +148,14 @@ pub fn make_encoder_with_metadata(
     })?;
     let frame_bytes = frame_length_bytes(fscod, frmsizecod)
         .ok_or_else(|| Error::invalid("ac3 encoder: internal frame-length lookup failed"))?;
+    validate_min_rate(
+        acmod,
+        lfeon,
+        nfchans,
+        frame_bytes as usize,
+        target_kbps,
+        &meta,
+    )?;
 
     let out_params = {
         let mut p = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
@@ -184,6 +192,61 @@ pub fn make_encoder_with_metadata(
         cadence_csnr: CADENCE_CSNR_INIT,
         last_blksw: vec![false; nfchans],
     }))
+}
+
+/// Construction-time minimum-rate floor (the E-AC-3 encoder's twin):
+/// the fixed syncframe syntax plus one block-0 D45 exponent set per
+/// fbw channel (the cheapest legal frame the budget guard collapses
+/// to) plus the metadata words must fit the Table 5.18 frame with
+/// slack, otherwise every payload would overflow the packer (r457
+/// fuzz finding: 3/2 at 32 kbps needs ≈ 1400 bits of a 1024-bit
+/// frame).
+fn validate_min_rate(
+    acmod: u8,
+    lfeon: bool,
+    nfchans: usize,
+    frame_bytes: usize,
+    kbps: u32,
+    meta: &MetadataParams,
+) -> Result<()> {
+    let d45_anchor = {
+        let mut a = [0u8; BLOCKS_PER_FRAME];
+        a[0] = 3;
+        a
+    };
+    let plan = vec![d45_anchor; nfchans];
+    // The encoder couples every layout with ≥ 2 fbw channels; the
+    // coupling exponents + coordinates are the largest fixed cost of
+    // a starved frame, so the floor is taken on the same geometry
+    // (2/2 at 32 kbps / 44.1 kHz needs ≈ 1160 bits of a 1104-bit
+    // frame with coupling, ≈ 700 without — r457 fuzz finding).
+    let cpl = if nfchans >= 2 {
+        CouplingPlan::narrow_default(nfchans)
+    } else {
+        CouplingPlan::default()
+    };
+    let end = if cpl.in_use { cpl.begf_mant() } else { 253 };
+    let floor = overhead_bits_for_ends(
+        &[1u8, 0, 0, 0, 0, 0],
+        Some(&plan),
+        end,
+        None,
+        nfchans,
+        &cpl,
+        &DbaPlan::default(),
+        acmod,
+        lfeon,
+    ) + meta.frame_extra_bits()
+        + 64;
+    if floor as usize >= frame_bytes * 8 {
+        return Err(Error::Unsupported(format!(
+            "ac3 encoder: {kbps} kbps is too low for an acmod={acmod} frame — the fixed \
+             syntax + minimum exponent payload + metadata ({floor} bits) exceeds the \
+             {}-bit syncframe; raise the bit rate",
+            frame_bytes * 8,
+        )));
+    }
+    Ok(())
 }
 
 /// Match a target kbps to a row of Table 5.18. Returns the lower
@@ -786,47 +849,7 @@ impl Ac3Encoder {
         // and dropping it from the coupling group would cost ~15 kbps in
         // per-centre HF mantissas.
         if self.channels >= 2 && !cpl_disabled {
-            cpl.in_use = true;
-            cpl.begf = 8;
-            cpl.endf = 15;
-            for ch in 0..self.channels {
-                cpl.chincpl[ch] = true;
-            }
-            // No phase flags by default (mid-side over-suppression on
-            // anti-correlated transients can sound like ping-ponging
-            // smear; the decoder side handles phsflg=0 trivially).
-            // §5.4.3.10 forbids phsflginu outside acmod==2 (2/0 stereo)
-            // anyway, so multichan paths leave it false.
-            cpl.phsflginu = false;
-            // Merge each pair of subbands into one coupling band:
-            // cplbndstrc[0]=false (always), [1]=true, [2]=false,
-            // [3]=true, ... → bands of size 2. With 10 subbands
-            // (cplbegf=8, cplendf=15) this gives 5 coupling bands.
-            //
-            // Coarser bands ⇒ fewer cplco emissions per block ⇒ more
-            // bit savings, at a small per-band envelope-resolution
-            // cost. 5 bands × 5 ms blocks → ~140 Hz envelope tracking
-            // resolution which is fine well above the masker.
-            cpl.nsubbnd = 3 + cpl.endf as usize - cpl.begf as usize;
-            cpl.bndstrc[0] = false;
-            for sbnd in 1..cpl.nsubbnd {
-                cpl.bndstrc[sbnd] = sbnd % 2 == 1;
-            }
-            let mut nbnd = cpl.nsubbnd;
-            for sbnd in 1..cpl.nsubbnd {
-                if cpl.bndstrc[sbnd] {
-                    nbnd -= 1;
-                }
-            }
-            cpl.nbnd = nbnd;
-            // Coupling coordinates are signalled on block 0 only;
-            // every later block reuses (cplcoe[blk][ch]=false). Only
-            // coupled channels emit coords.
-            for ch in 0..self.channels {
-                if cpl.chincpl[ch] {
-                    cpl.cplcoe[0][ch] = true;
-                }
-            }
+            cpl = CouplingPlan::narrow_default(self.channels);
         }
 
         // Storage for the coupling-channel coefficients. Index by
@@ -1361,6 +1384,31 @@ impl Ac3Encoder {
             DbaPlan::default()
         } else {
             build_dba_plan(&exps, self.channels, ch_end_mant, &cpl)
+        };
+        // Delta bit allocation is optional side-info: drop it when the
+        // fixed syntax plus its segment lists would not leave the
+        // mantissa payload any room (the cadence guard above probes
+        // without dba; a starved 5.1 frame at 32 kbps / 32 kHz with
+        // metadata overflowed by one bit through the dba payload —
+        // r457 fuzz finding).
+        let dba_plan = {
+            let probe = overhead_bits_for_ends(
+                &exp_strategies,
+                Some(&chexpstr_plan),
+                ch_end_mant,
+                None,
+                self.channels,
+                &cpl,
+                &dba_plan,
+                self.acmod,
+                self.lfeon,
+            ) + 64
+                + self.meta.frame_extra_bits();
+            if probe >= (self.frame_bytes * 8) as u32 {
+                DbaPlan::default()
+            } else {
+                dba_plan
+            }
         };
 
         // Iteratively tune csnroffst+fsnroffst so the encoded mantissa
@@ -3771,6 +3819,9 @@ pub(crate) fn tune_snroffst_with_plan_ends(
         lfeon,
     ) + 32 /* safety */;
     let total_bits = (frame_bytes * 8) as u32;
+    if std::env::var("AC3_DEBUG_PERCH_SNR").is_ok() {
+        eprintln!("tune_snroffst: overhead={overhead} total={total_bits}");
+    }
     if overhead >= total_bits {
         // The fixed syntax alone exceeds the frame — fall back to the
         // floor allocation (near-universal bap 0) rather than the
@@ -4931,6 +4982,38 @@ impl Default for CouplingPlan {
 }
 
 impl CouplingPlan {
+    /// The encoder's default coupling geometry for `nfchans` fbw
+    /// channels: every channel coupled from `cplbegf = 8` (bin 133,
+    /// ≈ 6 kHz at 48 kHz) to `cplendf = 15` (bin 253), sub-bands
+    /// merged in pairs into 5 coupling bands, coordinates signalled on
+    /// block 0 and reused thereafter, no phase flags (§5.4.3.10
+    /// forbids `phsflginu` outside 2/0 anyway; mid-side
+    /// over-suppression on anti-correlated transients can sound like
+    /// ping-ponging smear). Coarser bands ⇒ fewer cplco emissions per
+    /// block ⇒ more bit savings, at a small per-band envelope-resolution
+    /// cost (5 bands × 5 ms blocks ≈ 140 Hz envelope tracking, fine
+    /// well above the masker).
+    pub(crate) fn narrow_default(nfchans: usize) -> Self {
+        let mut cpl = CouplingPlan {
+            in_use: true,
+            begf: 8,
+            endf: 15,
+            phsflginu: false,
+            ..CouplingPlan::default()
+        };
+        for ch in 0..nfchans.min(MAX_FBW) {
+            cpl.chincpl[ch] = true;
+            cpl.cplcoe[0][ch] = true;
+        }
+        cpl.nsubbnd = 3 + cpl.endf as usize - cpl.begf as usize;
+        cpl.bndstrc[0] = false;
+        for sbnd in 1..cpl.nsubbnd {
+            cpl.bndstrc[sbnd] = sbnd % 2 == 1;
+        }
+        cpl.nbnd = cpl.nsubbnd - cpl.bndstrc[1..cpl.nsubbnd].iter().filter(|&&m| m).count();
+        cpl
+    }
+
     /// Build a coupling plan describing the **enhanced-coupling**
     /// carrier region for the shared tuner / bit-accounting machinery
     /// (`tune_snroffst_with_plan_ends`, `mantissa_bits_total_ends`,
@@ -5362,6 +5445,111 @@ mod tests {
     /// (encoder side, post-quantise) and the decoder (post-grpsize
     /// expansion) see the same per-bin exponents — without this, bap[]
     /// disagreement causes mantissa-stream byte drift.
+    /// r457 fuzz finding (`ac3_encode_decode_roundtrip` input
+    /// `0a 30 16 41`): 3/2 at 32 kbps overflowed the packer on a
+    /// sawtooth payload — the constructor now refuses frames whose
+    /// fixed syntax + one D45 set per channel cannot fit, and every
+    /// accepted rate must encode arbitrary PCM.
+    /// r457 fuzz finding (`ac3_encode_decode_roundtrip` input
+    /// `2f 00 96 d7`): 5.1 at 32 kbps / 32 kHz with dialnorm + compr +
+    /// dynrng overflowed a 1536-bit frame by one bit.
+    #[test]
+    fn five_one_32k_32khz_with_metadata_never_overflows() {
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(32_000);
+        params.channels = Some(6);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(32_000);
+        params.options = oxideav_core::CodecOptions::new()
+            .set("dynrng", "150")
+            .set("dialnorm", "22")
+            .set("compr", "150");
+        let mut enc = make_encoder(&params).expect("5.1 at 32 kbps / 32 kHz");
+        let n = 1536 * 2 * 6;
+        let mut s16 = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            s16.push(0u8);
+            s16.push((i & 0x3f) as u8);
+        }
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: (n / 6) as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .expect("send_frame");
+        enc.flush().expect("flush");
+    }
+
+    /// r457 fuzz finding (`ac3_encode_decode_roundtrip` input
+    /// `db 18 f7 c8`): 2/2 at 32 kbps / 44.1 kHz (a 1104-bit frame)
+    /// overflowed by 11 bits — the coupling side-info the encoder
+    /// always emits for ≥ 2 fbw channels was missing from the
+    /// minimum-rate floor. It is refused now; 48 kbps must encode.
+    #[test]
+    fn two_two_32k_44khz_is_refused_and_48k_encodes() {
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(44_100);
+        params.channels = Some(4);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(32_000);
+        assert!(
+            make_encoder(&params).is_err(),
+            "2/2 at 32 kbps must be refused"
+        );
+        params.bit_rate = Some(48_000);
+        let mut enc = make_encoder(&params).expect("2/2 at 48 kbps / 44.1 kHz");
+        let n = 1536 * 2 * 4;
+        let mut s16 = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            s16.push(0u8);
+            s16.push((i & 0x3f) as u8);
+        }
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: (n / 4) as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .expect("send_frame");
+        enc.flush().expect("flush");
+    }
+
+    #[test]
+    fn min_rate_floor_rejects_starved_layouts_and_accepts_the_next_rate() {
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(5);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(32_000);
+        assert!(
+            make_encoder(&params).is_err(),
+            "3/2 at 32 kbps must be refused"
+        );
+        params.bit_rate = Some(96_000);
+        let mut enc = make_encoder(&params).expect("3/2 at 96 kbps");
+        let n = 1536 * 2 * 5;
+        let mut s16 = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            s16.push(0u8);
+            s16.push((i & 0x3f) as u8);
+        }
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: (n / 5) as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .expect("send_frame");
+        enc.flush().expect("flush");
+        let mut frames = 0;
+        loop {
+            match enc.receive_packet() {
+                Ok(_) => frames += 1,
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        assert_eq!(frames, 2);
+    }
+
     /// A flat exponent envelope carries no grouping penalty, so the
     /// election must pick the cheapest exponent payload (D45) and a
     /// single block-0 anchor.

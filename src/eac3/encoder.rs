@@ -1997,8 +1997,9 @@ impl Eac3Encoder {
             // budget scales by nblks/6); 6-block frames hit it at rate
             // floors, especially with tool/metadata overhead riding
             // along. When the chosen plan's overhead cannot fit,
-            // demote every anchor to D45 (the cheapest legal
-            // strategy) before committing exponent quantisation.
+            // collapse every channel to a single block-0 D45 anchor
+            // (the cheapest legal frame) before committing exponent
+            // quantisation.
             let plan = {
                 let mut plan = plan;
                 let budget = (sub.frame_bytes * 8) as u32;
@@ -2023,12 +2024,13 @@ impl Eac3Encoder {
                         .meta
                         .reserve_bits(sub.acmod, sub.lfeon, sub.strmtyp == 0);
                 if probe >= budget {
+                    // One block-0 D45 anchor per channel — the
+                    // cheapest legal frame (an elected second anchor
+                    // demoted to D45 still overflowed a 1360-bit 5.1
+                    // 3-block frame: r457 fuzz finding).
                     for p in plan.iter_mut() {
-                        for blk in 0..nblks {
-                            if p[blk] != 0 {
-                                p[blk] = 3; // D45
-                            }
-                        }
+                        *p = [0u8; BLOCKS_PER_FRAME];
+                        p[0] = 3; // D45
                     }
                 }
                 plan
@@ -2253,6 +2255,30 @@ impl Eac3Encoder {
                 end_mant_ch.iter().copied().min().unwrap_or(ch_end_mant),
                 &cpl,
             )
+        };
+        // Optional side-info: drop the dba segment lists when the fixed
+        // syntax plus dba would leave the mantissas no room (see the
+        // AC-3 encoder's note — the cadence guard probes without dba).
+        let dba_plan = {
+            let probe = overhead_bits_for_ends(
+                &exp_strategies[..nblks],
+                Some(&chexpstr_plan),
+                ch_end_mant,
+                Some(&end_mant_ch),
+                nfchans,
+                &cpl,
+                &dba_plan,
+                sub.acmod,
+                sub.lfeon,
+            ) + 64
+                + self
+                    .meta
+                    .reserve_bits(sub.acmod, sub.lfeon, sub.strmtyp == 0);
+            if probe >= (sub.frame_bytes * 8) as u32 {
+                crate::encoder::DbaPlan::default()
+            } else {
+                dba_plan
+            }
         };
         // When `snroffststr != 0`, the audblk carries per-block SNR
         // offsets instead of the single frame-level pair in audfrm. Those
@@ -3799,6 +3825,54 @@ mod tests {
     #[test]
     fn fractional_frames_roundtrip_51_2blocks() {
         assert_fractional_roundtrip(6, 448_000, 2, 16.0);
+    }
+
+    /// r457 fuzz finding (`encode_decode_roundtrip` input `7b 01 4f 00`):
+    /// a 7.1 pair at 128 kbps with 3-block syncframes — the smallest
+    /// 5.1 independent-substream budget the constructor accepts
+    /// (1360 bits) — overflowed the packer on a sawtooth payload once
+    /// the exponent cadence was elected per channel. Every
+    /// construction-accepted configuration must encode arbitrary PCM.
+    #[test]
+    fn seven_one_pair_three_block_128k_never_overflows() {
+        use crate::eac3::decoder::{decode_eac3_packet, Eac3DecoderState};
+        use oxideav_core::{AudioFrame, Error, Frame};
+        let channels = 8u16;
+        let blocks = 3usize;
+        let mut params = CodecParameters::audio(CodecId::new("eac3"));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(channels);
+        params.sample_format = Some(SampleFormat::S16);
+        params.bit_rate = Some(128_000);
+        params.options = oxideav_core::CodecOptions::new().set("blocks", blocks.to_string());
+        let mut enc = make_encoder(&params).expect("contract-valid 7.1 pair config");
+        let spf = 256 * blocks;
+        let n = spf * 2 * channels as usize;
+        let mut s16 = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            s16.push(0u8);
+            s16.push((i & 0x3f) as u8);
+        }
+        enc.send_frame(&Frame::Audio(AudioFrame {
+            samples: (n / channels as usize) as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .expect("send_frame on a contract-valid config");
+        enc.flush().expect("flush");
+        let mut st = Eac3DecoderState::default();
+        let mut samples = 0usize;
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => {
+                    let f = decode_eac3_packet(&mut st, &p.data).expect("own decode");
+                    samples += f.pcm_s16le.len() / 2 / channels as usize;
+                }
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("receive_packet: {e:?}"),
+            }
+        }
+        assert_eq!(samples, 2 * spf);
     }
 
     #[test]

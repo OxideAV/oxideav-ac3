@@ -443,7 +443,7 @@ TPNP-bearing encoder outputs join the same three corruption families.
 
 ## Fuzzing
 
-`fuzz/` carries five coverage-guided libfuzzer harnesses (daily CI
+`fuzz/` carries six coverage-guided libfuzzer harnesses (daily CI
 runs via the `Fuzz` workflow; corpora seed from the fixture set):
 
 - **`parse_headers`** — syncinfo + base-AC-3 BSI + Annex E BSI on raw
@@ -465,6 +465,10 @@ runs via the `Fuzz` workflow; corpora seed from the fixture set):
   × blocks × SPX/AHT/ecpl/TPNP × metadata) encodes arbitrary PCM and
   every emitted packet must decode through our own decoder with the
   exact sample count.
+- **`ac3_encode_decode_roundtrip`** (r457) — the base-AC-3 twin:
+  layout × Table 5.18 rate × sample rate × §5.4.2 metadata words
+  through the registry path, encode → our AC-3 decoder with exact
+  1536-sample frame counts.
 
 The round-trip target found (and r454 fixed) three encoder
 bit-budget-overflow classes on construction-accepted configs: a
@@ -476,7 +480,13 @@ target, rss-limited): `parse_headers` 218.3M execs (182k/s, +167
 corpus units), `decode_frames` 3.59M execs (+7,420 units),
 `eac3_substream_walk` 2.85M execs (+2,041 units),
 `encode_decode_roundtrip` 7.5K full encode→decode configs (+371
-units) — zero outstanding findings.
+units) — zero outstanding findings. r457 (three bounded ≤ 300 s runs
+over the new encoder paths): the new AC-3 target found two
+minimum-rate-floor gaps (no floor at all; coupling side-info missing
+from it) and a starved frame the optional dba segment lists pushed
+one bit over, and the E-AC-3 target found the budget guard demoting
+an elected second anchor instead of collapsing the frame — all fixed
+and pinned, both targets then ran 300 s clean.
 
 ## Equal-rate position
 

@@ -84,6 +84,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "ac3_encode_decode_roundtrip"
+path = "fuzz_targets/ac3_encode_decode_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "joc_oamd_parse"
 path = "fuzz_targets/joc_oamd_parse.rs"
 test = false
