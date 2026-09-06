@@ -1655,32 +1655,60 @@ impl Eac3Encoder {
         let mut coeffs: Vec<Vec<[f32; N_COEFFS]>> = vec![vec![[0.0; N_COEFFS]; nblks]; total_chans];
         // blksw exists only for fbw channels (LFE never short-blocks).
         let mut blksw: Vec<[bool; BLOCKS_PER_FRAME]> = vec![[false; BLOCKS_PER_FRAME]; nfchans];
+        // Pass 1 — §8.2.2 transient detection per fbw channel per
+        // block. AHT / enhanced-coupling / TPNP frames force long
+        // transforms: the 6-block DCT-II (§3.4.1) targets stationary
+        // content and a short block would break the cross-block bin
+        // alignment.
+        let blksw_allowed =
+            !self.aht && !ecpl_on && !self.tpnp && std::env::var("EAC3_DISABLE_BLKSW").is_err();
+        for ch in 0..nfchans {
+            let src_idx = sub.src_indices[ch];
+            let drain = &frame_pcm[src_idx];
+            for blk in 0..nblks {
+                let fresh = &drain[blk * SAMPLES_PER_BLOCK..(blk + 1) * SAMPLES_PER_BLOCK];
+                let fired = self.transient_state[src_idx].process(fresh);
+                blksw[ch][blk] = blksw_allowed && fired;
+            }
+        }
+        // Joint block-switch policy (see the AC-3 encoder): all fbw
+        // channels of the substream switch together whenever any
+        // channel's detector fires. `AC3_BLKSW_PER_CHANNEL=1` keeps
+        // the per-channel flags for A/B measurement.
+        if std::env::var("AC3_BLKSW_PER_CHANNEL").is_err() {
+            for blk in 0..nblks {
+                let any = (0..nfchans).any(|c| blksw[c][blk]);
+                for c in 0..nfchans {
+                    blksw[c][blk] = any;
+                }
+            }
+        }
+        // §8.2.9 dither defeat on a switched block and the one after it.
+        let mut dithflag: Vec<[bool; BLOCKS_PER_FRAME]> = vec![[true; BLOCKS_PER_FRAME]; nfchans];
+        for ch in 0..nfchans {
+            let src_idx = sub.src_indices[ch];
+            for blk in 0..nblks {
+                let prev = if blk == 0 {
+                    self.last_blksw[src_idx]
+                } else {
+                    blksw[ch][blk - 1]
+                };
+                dithflag[ch][blk] = !(blksw[ch][blk] || prev);
+            }
+            self.last_blksw[src_idx] = blksw[ch][nblks - 1];
+        }
+        // Pass 2 — window + forward MDCT per channel per block.
         for ch in 0..total_chans {
             let src_idx = sub.src_indices[ch];
             let drain = &frame_pcm[src_idx];
+            let is_lfe_chan = sub.lfeon && ch == nfchans;
             for blk in 0..nblks {
                 let mut in_buf = [0.0f32; 512];
                 in_buf[..256].copy_from_slice(&self.delay_line[src_idx]);
                 in_buf[256..].copy_from_slice(
                     &drain[blk * SAMPLES_PER_BLOCK..(blk + 1) * SAMPLES_PER_BLOCK],
                 );
-                let is_lfe_chan = sub.lfeon && ch == nfchans;
-                // AHT frames force long transforms: the 6-block DCT-II
-                // (§3.4.1) targets stationary content and a short block
-                // would break the cross-block bin alignment.
-                let is_short = if is_lfe_chan
-                    || self.aht
-                    || ecpl_on
-                    || self.tpnp
-                    || std::env::var("EAC3_DISABLE_BLKSW").is_ok()
-                {
-                    false
-                } else {
-                    self.transient_state[src_idx].process(&in_buf[256..])
-                };
-                if !is_lfe_chan {
-                    blksw[ch][blk] = is_short;
-                }
+                let is_short = !is_lfe_chan && blksw[ch][blk];
                 let mut win_buf = [0.0f32; 512];
                 for n in 0..256 {
                     win_buf[n] = in_buf[n] * WINDOW[n];
@@ -2760,12 +2788,13 @@ impl Eac3Encoder {
             for ch in 0..nfchans {
                 bw.write_u32(blksw[ch][blk] as u32, 1);
             }
-            for _ in 0..nfchans {
+            for ch in 0..nfchans {
                 // AHT channels reconstruct every bin from the front-
                 // loaded coefficient cache — hebap==0 bins are true
                 // zeros, so signal dithflag=0 to keep spec-strict
-                // decoders from substituting dither there.
-                bw.write_u32(u32::from(!self.aht), 1); // dithflag
+                // decoders from substituting dither there. Otherwise
+                // dither is on except around block switches (§8.2.9).
+                bw.write_u32(u32::from(!self.aht && dithflag[ch][blk]), 1); // dithflag
             }
             // §5.4.3.3-4 dynrnge + dynrng: when metadata configures a
             // dynamic-range word it is transmitted in EVERY block.

@@ -634,18 +634,77 @@ impl Ac3Encoder {
                                      // *separate* `+1`-sized exps array allocated below.
         let mut coeffs: Vec<Vec<[f32; N_COEFFS]>> =
             vec![vec![[0.0; N_COEFFS]; BLOCKS_PER_FRAME]; total_chans];
-        // §5.4.3.1 blksw[ch][blk] — per-block per-channel block-switch
-        // flag. Decided per block from the time-domain transient
-        // detector (see `detect_transient`). When `true`, the encoder
-        // runs the 256-sample MDCT pair (§7.6 / §8.2.3.2 short
-        // transform) instead of the long 512-sample MDCT, and the
-        // decoder swaps to the matching IMDCT path on the same flag.
-        // LFE has no blksw bit per spec — the LFE channel always uses
-        // the long-block MDCT (§5.4.3.1 lists blksw[ch] only for fbw).
-        let mut blksw: Vec<[bool; BLOCKS_PER_FRAME]> =
+        // Pass 1 — drain this frame's PCM and run the §8.2.2 transient
+        // detector per fbw channel per block (the detector inspects the
+        // fresh 256 samples that form the second half of the block's
+        // 512-sample MDCT window; the LFE never short-blocks — §5.4.3.1
+        // lists blksw[ch] for fbw channels only).
+        //
+        // `AC3_DISABLE_BLKSW=1` forces long blocks regardless of the
+        // detector output — useful when bisecting whether a quality
+        // regression is short-block-related.
+        let disable_blksw = std::env::var("AC3_DISABLE_BLKSW").is_ok();
+        let mut drains: Vec<Vec<f32>> = Vec::with_capacity(total_chans);
+        let mut blksw_raw: Vec<[bool; BLOCKS_PER_FRAME]> =
             vec![[false; BLOCKS_PER_FRAME]; self.channels];
         for ch in 0..total_chans {
             let drain: Vec<f32> = self.pending_samples[ch].drain(0..n_per).collect();
+            let is_lfe_chan = self.lfeon && ch == lfe_idx;
+            if !is_lfe_chan && !disable_blksw {
+                for blk in 0..BLOCKS_PER_FRAME {
+                    blksw_raw[ch][blk] = self.transient_state[ch]
+                        .process(&drain[blk * SAMPLES_PER_BLOCK..(blk + 1) * SAMPLES_PER_BLOCK]);
+                }
+            }
+            drains.push(drain);
+        }
+        // Block-switch policy: every fbw channel switches together
+        // whenever any channel's detector fires. Measured through the
+        // black-box reference decoder, a block in which the channels'
+        // `blksw` flags differ decodes with the unswitched channel
+        // corrupted over the overlap region (≈ 5 dB on the surround
+        // channels of a 5.1 mix, up to 40 dB on a pure tone next to a
+        // switched channel) while the in-tree decoder reconstructs
+        // both channels to the spec text; switching jointly avoids
+        // the divergent case at the price of a short block on channels
+        // whose own transient is weaker. `AC3_BLKSW_PER_CHANNEL=1`
+        // keeps the per-channel flags for A/B measurement.
+        let mut blksw = blksw_raw.clone();
+        if std::env::var("AC3_BLKSW_PER_CHANNEL").is_err() {
+            for blk in 0..BLOCKS_PER_FRAME {
+                let any = (0..self.channels).any(|c| blksw_raw[c][blk]);
+                for c in 0..self.channels {
+                    blksw[c][blk] = any;
+                }
+            }
+        }
+        // §8.2.9 dither strategy: defeat dither on a block-switched
+        // block and on the block that follows it (the short transform's
+        // bap-0 bins sit where pre-echo is most audible; the following
+        // block inherits the transient's exponent set).
+        let mut dithflag: Vec<[bool; BLOCKS_PER_FRAME]> =
+            vec![[true; BLOCKS_PER_FRAME]; self.channels];
+        for ch in 0..self.channels {
+            for blk in 0..BLOCKS_PER_FRAME {
+                let prev = if blk == 0 {
+                    self.last_blksw[ch]
+                } else {
+                    blksw[ch][blk - 1]
+                };
+                dithflag[ch][blk] = !(blksw[ch][blk] || prev);
+            }
+            self.last_blksw[ch] = blksw[ch][BLOCKS_PER_FRAME - 1];
+        }
+        // Pass 2 — window + forward MDCT per channel per block: the
+        // long 512-sample MDCT, or the 256-sample pair (§7.6 /
+        // §8.2.3.2 short transform) when the block is switched; the
+        // decoder swaps to the matching IMDCT path on the same flag.
+        // The window is the same regardless of long/short — the
+        // decoder applies the same 256-coeff KBD window after its
+        // IMDCT in both cases.
+        for ch in 0..total_chans {
+            let drain = &drains[ch];
+            let is_lfe_chan = self.lfeon && ch == lfe_idx;
             for blk in 0..BLOCKS_PER_FRAME {
                 // Build 512-sample input: left context + next 256.
                 let mut in_buf = [0.0f32; 512];
@@ -653,45 +712,7 @@ impl Ac3Encoder {
                 in_buf[256..].copy_from_slice(
                     &drain[blk * SAMPLES_PER_BLOCK..(blk + 1) * SAMPLES_PER_BLOCK],
                 );
-                // Per-block transient decision. Implements §8.2.2 of
-                // ATSC A/52: a 4th-order Butterworth HPF at 8 kHz
-                // followed by a hierarchical peak-ratio test on three
-                // levels (256 / 128×2 / 64×4). The "second half" of
-                // the 512-sample MDCT window — i.e. the freshly drained
-                // 256 samples in `in_buf[256..]` — is what we test;
-                // a transient there is what the short-block pair
-                // localises so it doesn't smear across the prior 256
-                // samples of left-context.
-                //
-                // Spec uses very strict ratios (T[1]=0.1, T[2]=0.075,
-                // T[3]=0.05) → ~10×–20× peak rises required; pure tones
-                // (even at low frequency) sit nowhere near these
-                // thresholds because the 8 kHz HPF removes the carrier
-                // entirely.
-                //
-                // The `AC3_DISABLE_BLKSW=1` environment variable
-                // forces long blocks regardless of detector output —
-                // useful when bisecting whether a quality regression
-                // is short-block-related.
-                // LFE never short-blocks (no blksw bit per §5.4.3.1).
-                let is_lfe_chan = self.lfeon && ch == lfe_idx;
-                let is_short = if is_lfe_chan || std::env::var("AC3_DISABLE_BLKSW").is_ok() {
-                    false
-                } else {
-                    self.transient_state[ch].process(&in_buf[256..])
-                };
-                if !is_lfe_chan {
-                    blksw[ch][blk] = is_short;
-                }
-                // Windowing (symmetric 512-sample AC-3 window). The
-                // window is the same regardless of long/short — the
-                // decoder applies the same 256-coeff KBD window after
-                // its IMDCT in both cases (`audblk.rs` around the
-                // `time[n] *= WINDOW[n]` line). The spec's §7.9.5
-                // distinguishes long-only / long-to-short / etc.
-                // window shapes, but the decoder's choice makes the
-                // 4-way distinction collapse to the long window for
-                // every block, which we honour here.
+                let is_short = !is_lfe_chan && blksw[ch][blk];
                 let mut win_buf = [0.0f32; 512];
                 for n in 0..256 {
                     win_buf[n] = in_buf[n] * WINDOW[n];
@@ -701,8 +722,6 @@ impl Ac3Encoder {
                 self.delay_line[ch].copy_from_slice(
                     &drain[blk * SAMPLES_PER_BLOCK..(blk + 1) * SAMPLES_PER_BLOCK],
                 );
-                // Forward MDCT — long (one 512-pt) or short pair
-                // (two interleaved 256-pt halves per §7.9.4.2).
                 if is_short {
                     mdct_256_pair(&win_buf, &mut coeffs[ch][blk]);
                 } else {
@@ -1538,17 +1557,14 @@ impl Ac3Encoder {
             for ch in 0..self.channels {
                 bw.write_u32(blksw[ch][blk] as u32, 1);
             }
-            // dithflag per channel: 1 (enable dither on zero-bap bins).
-            // Spec-recommended default; decoder drives an LFSR-backed
-            // pseudo-random mantissa replacement on bap=0 bins which
-            // removes coloration of the IMDCT's stop band on masked
-            // bins. After the backward-pass legaliser lowers some
-            // silent-bin exponents, dither there multiplies `0.707` by
-            // `2^-exp` which can be perceptible; however disabling
-            // dither globally is worse than enabling it (we measured
-            // ~2 dB PSNR regression on speech fixtures with dith off).
-            for _ in 0..self.channels {
-                bw.write_u32(1, 1);
+            // §5.4.3.2 dithflag[ch]: dither on (the decoder fills bap-0
+            // bins with LFSR noise, removing the stop-band coloration
+            // of masked bins) except on block-switched blocks and the
+            // block after them (§8.2.9). `AC3_NO_DITHER=1` defeats it
+            // everywhere for A/B measurement.
+            let no_dither = std::env::var("AC3_NO_DITHER").is_ok();
+            for ch in 0..self.channels {
+                bw.write_u32(u32::from(dithflag[ch][blk] && !no_dither), 1);
             }
             // §5.4.3.3-4 dynrnge + dynrng. When metadata configures a
             // dynamic-range word it is transmitted in EVERY block

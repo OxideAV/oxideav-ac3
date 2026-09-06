@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - encoder r457: **seven-bin LFE** — the encoder zeroed LFE bins ≥ 2 (≈ 140 Hz) before exponent extraction; the §7.1.3 syntax carries `lfeendmant = 7` and the allocator drops what is masked, so all seven bins are coded now (5.1/448 LFE channel 20.1 → 29.9 dB; reference 34.6).
 
+- encoder r457: **joint block switching + §8.2.9 dither defeat** — all fbw channels of a frame switch together whenever any channel's §8.2.2 detector fires (`AC3_BLKSW_PER_CHANNEL=1` restores per-channel flags), and `dithflag` is cleared on a switched block and the block after it. Measured through the reference decoder, a block whose channels carry different `blksw` flags decodes with the unswitched channel corrupted over its overlap region (≈ 5 dB on 5.1 surrounds, up to 40 dB on a tone beside a switched channel) while our decoder reconstructs both channels per the spec text; the joint policy keeps our streams out of that case (5.1/448 through the reference decoder 21.0 → 21.2 dB, decoder disagreement 1.9 → 1.1 dB mean).
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.10...v0.0.11) - 2026-09-01
 
 ### Added

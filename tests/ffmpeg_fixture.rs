@@ -20,11 +20,12 @@ use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, TimeBase};
 const FIXTURE: &[u8] = include_bytes!("fixtures/sine440_stereo.ac3");
 
 /// Three Gaussian tone bursts (440/1200/2400 Hz @ 0.5/1.0/1.5 s) encoded
-/// as 48 kHz stereo AC-3 @ 192 kbps. The envelope's sharp attacks force
-/// the encoder to switch to 256-point transforms (`blksw=1`) for 62 of
-/// the 378 audio blocks — enough coverage to gate short-block IMDCT
-/// correctness directly, unlike the pure-sine fixture which only
-/// exercises the long transform.
+/// as 48 kHz stereo AC-3 @ 192 kbps by the black-box validator's
+/// encoder. Its block-switch decision never fired on this signal
+/// (`examples/count_blksw` reports 0 short blocks in the 378), so the
+/// fixture gates long-block decode on burst content; short-block
+/// coverage comes from the in-process fixture further down (see the
+/// round-12 history note there).
 const TRANSIENT_FIXTURE: &[u8] = include_bytes!("fixtures/transient_bursts_stereo.ac3");
 
 #[test]
