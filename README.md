@@ -74,12 +74,17 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
 ### AC-3 encoder
 
 - Multichannel encode — 1/0, 2/0, 2/0+LFE (2.1), 3/0, 2/2, 3/2, 3/2.1
-  (5.1) and other acmod layouts, with per-channel D15/D25/D45 exponent
-  strategy selection (§7.1.3), 5-fbw channel coupling within the
-  §5.4.3.12 narrow-coupling validity envelope, a §8.2.2 transient
-  detector (4th-order Butterworth 8 kHz split for short-block
-  switching), per-channel `fsnroffst[ch]` tuning (§5.4.3.40), per-block
-  SNR-offset bit-pool redistribution, and §7.10.1 dual-CRC emission.
+  (5.1) and other acmod layouts, with a per-channel exponent refresh
+  cadence + D15/D25/D45 strategy elected by measured bit cost
+  (§7.1.3 — every anchor set bounds the blocks that reuse it), 5-fbw
+  channel coupling within the §5.4.3.12 narrow-coupling validity
+  envelope, a §8.2.2 transient detector (4th-order Butterworth 8 kHz
+  split; all fbw channels switch together, dither defeated on the
+  switched block and the next per §8.2.9), all seven LFE bins coded
+  (§7.1.3 `lfeendmant = 7`), per-channel `fsnroffst[ch]` tuning
+  (§5.4.3.40), per-block SNR-offset bit-pool redistribution, the
+  §7.2.2.1.1 all-zero-offset special case mirrored in the allocator,
+  and §7.10.1 dual-CRC emission.
 - **Bitstream-metadata surface** (`encoder::MetadataParams` /
   `make_encoder_with_metadata`, or the registry options `dialnorm`,
   `compr`, `dynrng`, `bsmod`, `cmixlev`, `surmixlev`, `dsurmod`,
@@ -263,11 +268,13 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   channels by their exact front-loaded payload and binary-searches
   the monotone `csnroffst·16 + fsnroffst` axis. Measured on a
   stationary stereo two-tone (in-tree decode): 42.0 dB @ 96 kbps
-  rising to 75.6 dB @ 448 kbps versus a flat ~23.9 dB for the
-  standard path (+18 to +52 dB); on a multitone+noise bed fixture
-  +7 to +22 dB. Black-box: mono / stereo / 5.1 AHT streams decode
-  through an external decoder binary at 28.1 / 28.1 / 33.4 dB
-  (vs 22.3 dB non-AHT baseline through the same harness).
+  rising to 75.6 dB @ 448 kbps. (Those r390 numbers were read against
+  a standard path that clipped every reuse block's mantissas and sat
+  at ~24 dB; with the r457 exponent-sharing bound the standard path
+  codes the same fixture 2-23 dB *above* AHT — AHT rate-distortion
+  tuning is a recorded follow-up, see "Equal-rate position".)
+  Black-box: mono / stereo / 5.1 AHT streams decode through an
+  external decoder binary at 28.1 / 28.1 / 33.4 dB.
   `examples/eac3_rate_curves.rs` prints the full
   standard/AHT/SPX/enhanced-coupling rate ladder;
   `aht_quality_scales_with_rate` gates the curve shape in CI.
@@ -374,13 +381,13 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   full-scale-noise dry-run through the real emission pipeline at
   construction. Round-trips walk every frame's BSI syntax (numblkscod
   / frmsiz / convsync cadence) and gate decode alignment against the
-  6-block encode of the same PCM (~24-28 dB for 3-block, ~24 dB
-  2-block, ~13 dB for the 1-block extreme — the honest
-  overhead-amortisation cost of re-anchoring exponents every 256·nblks
-  samples); the external decoder binary accepts all three shapes
-  (stereo 3/2-block @ 192 kbps at 23.4 / 26.0 dB vs the same
-  harness's 22.3 dB 6-block baseline, 1-block @ 384 kbps at
-  62.0 dB). Implementing the round-trip flushed out a decoder
+  6-block encode of the same PCM (r454 figures, taken before the r457
+  exponent-sharing bound: ~24-28 dB for 3-block, ~24 dB 2-block,
+  ~13 dB for the 1-block extreme — the honest overhead-amortisation
+  cost of re-anchoring exponents every 256·nblks samples); the
+  external decoder binary accepts all three shapes (r454: stereo
+  3/2-block @ 192 kbps at 23.4 / 26.0 dB vs the same harness's
+  22.3 dB 6-block baseline, 1-block @ 384 kbps at 62.0 dB). Implementing the round-trip flushed out a decoder
   conformance bug: the Annex E BSI parser read `convsync` / `blkid` /
   `frmsizecod` inside the informational-metadata block, but Table
   E1.2 places them OUTSIDE `if (infomdate)` — a fractional-frame
@@ -471,30 +478,64 @@ corpus units), `decode_frames` 3.59M execs (+7,420 units),
 `encode_decode_roundtrip` 7.5K full encode→decode configs (+371
 units) — zero outstanding findings.
 
-## Black-box encoder position
+## Equal-rate position
 
-Honest equal-rate PSNR on a shared 1 s two-tone fixture
-(0.3·sin 440 Hz + 0.18·sin 3517 Hz, lag-searched worst-channel PSNR
-through the external decoder binary): our position is measured, not
-implied:
+`tests/equal_rate.rs` (+ `cargo run --release --example
+equal_rate_report`) encodes a deterministic synthetic corpus — speech,
+music, transients, a two-tone, pink noise and a 5.1 mix with LFE, all
+band-limited to 16 kHz — with our encoder and with the black-box
+reference encoder at the same nominal rate, decodes every stream with
+**both** our decoder and the reference decoder, and scores worst-channel
+SNR plus a mean noise-to-mask ratio (the §7.2.2 parametric mask
+evaluated on the source's MDCT). The test pins our position and the
+distance to the reference; the table is the r457 ladder (3 s clips,
+worst-channel SNR in dB through the reference decoder; "r454" is the
+same binary with the exponent-sharing bound disabled — the position
+the previous round's two-tone table hid behind an aliased lag search).
 
-| fixture @ rate | external encoder | ours (standard) | ours (AHT) |
-| --- | --- | --- | --- |
-| mono @ 96 kbps | 74.3 dB | 24.1 dB | 58.6 dB |
-| mono @ 192 kbps | 87.8 dB | 24.1 dB | 74.6 dB |
-| stereo @ 96 kbps | 69.0 dB | 23.9 dB | 46.7 dB |
-| stereo @ 192 kbps | 86.9 dB | 24.1 dB | 58.7 dB |
-| stereo @ 384 kbps | 87.3 dB | 24.1 dB | 74.9 dB |
+| clip / kbps | AC-3 r454 | AC-3 r457 | AC-3 reference | E-AC-3 r457 | E-AC-3 reference |
+| --- | --- | --- | --- | --- | --- |
+| speech 64 / 96 / 192 | 9.3 / 10.4 / 11.1 | 11.1 / 16.8 / 29.5 | 13.9 / 19.3 / 32.8 | 11.2 / 16.8 / 29.4 | 13.9 / 18.1 / 30.3 |
+| music 96 / 192 / 384 | 10.5 / 11.8 / 11.9 | 17.8 / 33.4 / 51.1 | 29.4 / 34.0 / 50.9 | 17.3 / 31.3 / 48.3 | 27.5 / 33.7 / 50.7 |
+| transients 96 / 192 / 384 | 7.8 / 8.6 / 8.7 | 12.6 / 20.5 / 25.4 | 14.9 / 22.7 / 37.5 | 11.7 / 19.4 / 33.5 | 14.8 / 21.9 / 35.3 |
+| two-tone 96 / 192 / 384 | 11.5 / 12.0 / 12.0 | 40.3 / 61.2 / 74.3 | 11.8 / 62.5 / 76.8 | 35.0 / 59.5 / 77.8 | 11.8 / 62.7 / 76.5 |
+| pink 96 / 192 / 384 | 3.9 / 8.5 / 10.0 | 4.7 / 14.0 / 20.1 | 7.5 / 14.6 / 24.4 | 4.0 / 12.1 / 22.0 | 7.5 / 14.8 / 22.7 |
+| 5.1 mix 256 / 448 / 640 | 9.2 / 10.2 / 10.4 | 12.9 / 21.9 / 24.4 | 15.5 / 23.3 / 29.5 | 12.6 / 20.7 / 27.1 | 14.5 / 22.2 / 28.0 |
 
-The mature reference encoder is near-transparent on stationary tonal
-content; our AHT path scales correctly with rate (+28 dB across the
-ladder) while the standard path sits flat at ~24 dB regardless of
-rate — its SNR-offset tuner hits the csnroffst/bap ceiling on so
-sparse a spectrum and returns the surplus budget as padding (a
-recorded rate-distortion follow-up, not a conformance gap).
-The gap is rate-distortion maturity, not conformance: the external
-decoder accepts every stream shape this encoder emits (all tools,
-all frame shapes, metadata) at these rates.
+Per-tool deltas measured while landing (ours → ours, 2 s clips):
+
+- **Exponent-sharing bound** (the r454 defect): a REUSE block whose
+  coefficient outgrew its anchor's exponent had its mantissa clamped
+  at ±1 — every rate sat at ≈ 12 dB. Mono 440 Hz sine 11.2 → 76.4 dB;
+  speech/192 11.1 → 29.5; music/192 11.8 → 33.0; two-tone/192 12.0 → 51.7.
+- **Cadence + strategy election** (vs the fixed D15-on-blocks-0/3
+  pattern): two-tone/96 20.9 → 40.4, two-tone/192 58.3 → 65.5,
+  music/96 11.2 → 18.2, speech/192 28.4 → 29.4, transients/192 21.1 →
+  21.7, 5.1/448 20.0 → 22.6; the tight cells (64-96 kbps, 5.1 at
+  256 kbps) sit within 1 dB of a single-anchor frame.
+- **Seven-bin LFE**: 5.1/448 LFE channel 20.1 → 29.9 dB (reference 34.6).
+- **Joint block switching + §8.2.9 dither**: 5.1/448 through the
+  reference decoder 21.0 → 21.2 dB and the two decoders' reading of
+  our stream narrows from 1.9 to 1.1 dB mean.
+- **§7.2.2.1.1** (all SNR offsets zero → `bap[] = 0`): a decode-side
+  conformance fix in both decoders and the allocator — a frame the
+  tuner floors no longer packs mantissas the reference decoder does
+  not read.
+
+What still separates us from the reference (recorded follow-ups, in
+order of size): the low-rate coupling strategy (music at 96 kbps
+−11.6 dB; the coupling begin/band structure/coordinate cadence are
+fixed at `cplbegf = 8` / paired sub-bands / block-0 refresh), transient
+coding at high rates (AC-3 transients/384 −12 dB — the short-block
+path and per-block offset redistribution stop scaling above 192 kbps),
+noise-like content (pink −1..−4 dB) and the 5.1 surround/centre balance
+(−1.4..−5 dB). AHT now codes stationary content 2-23 dB *below* the
+standard path (its tuner never received the exponent bound) and is a
+follow-up of its own. The reference decoder accepts every stream shape
+this encoder emits at these rates; the sole residual decoder
+disagreement is a block in which the channels' `blksw` flags differ
+(the reference corrupts the unswitched channel's overlap region — the
+joint policy keeps our streams out of that case).
 
 ## Installation
 
