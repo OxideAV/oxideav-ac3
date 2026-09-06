@@ -181,6 +181,8 @@ pub fn make_encoder_with_metadata(
         transient_state: (0..nfchans).map(|_| TransientDetector::default()).collect(),
         packet_queue: Vec::new(),
         pts: 0,
+        cadence_csnr: CADENCE_CSNR_INIT,
+        last_blksw: vec![false; nfchans],
     }))
 }
 
@@ -493,6 +495,12 @@ struct Ac3Encoder {
     packet_queue: Vec<Packet>,
     /// Running sample PTS. Each produced syncframe carries SAMPLES_PER_FRAME.
     pts: i64,
+    /// Previous frame's tuned `csnroffst` — the operating point the
+    /// exponent-cadence election costs its candidates at.
+    cadence_csnr: u8,
+    /// Per fbw channel: was the previous frame's last block switched?
+    /// (§8.2.9 dither defeat spans the block after a short block.)
+    last_blksw: Vec<bool>,
 }
 
 impl Encoder for Ac3Encoder {
@@ -1140,67 +1148,133 @@ impl Ac3Encoder {
             }
         }
 
-        // Exponent strategy per block per channel.
+        // Exponent strategy per block per channel (§7.1.3 / §5.4.3.22).
         //
-        // A basic encoder can legally transmit D15 on block 0 and REUSE
-        // on blocks 1..5 — which is what this encoder shipped with. But
-        // that badly hurts quality on any non-stationary input: blocks
-        // 1..5 are quantised using block-0's spectral envelope, so their
-        // mantissas saturate (|coeff| * 2^e clamps to ±1) whenever the
-        // actual bin energy disagrees. Here we refresh exponents twice
-        // per frame — D15 on blocks 0 and 3, REUSE for 1/2/4/5 — which
-        // fits inside the 192 kbps budget for 2/0 stereo and recovers a
-        // large SNR margin on non-steady-state signals.
-        let exp_strategies: [u8; BLOCKS_PER_FRAME] = [1, 0, 0, 1, 0, 0];
-        // Pre-process the D15 exponents: clamp absexp to 4-bit range and
-        // clamp each forward delta to ±2. The output is a legal D15
-        // sequence the decoder will replay verbatim.
-        for ch in 0..self.channels {
-            for blk in 0..BLOCKS_PER_FRAME {
-                if exp_strategies[blk] == 1 {
-                    preprocess_d15(&mut exps[ch][blk][..ch_end_mant]);
+        // Each fbw channel elects its own refresh cadence by measured
+        // bit cost (`elect_exponent_cadence`): a stationary spectrum
+        // anchors once per frame and reuses five times, a moving one
+        // re-anchors where the envelope changes. The coupling
+        // pseudo-channel (or, without coupling, the LFE) elects the
+        // frame-wide `exp_strategies` cadence that also drives the
+        // cpl / LFE exponent emission. `AC3_DISABLE_EXPSTR_SEL=1`
+        // pins the legacy D15-on-blocks-0/3 pattern for A/B testing.
+        let legacy: [u8; BLOCKS_PER_FRAME] = [1, 0, 0, 1, 0, 0];
+        let fixed_plan = std::env::var("AC3_DISABLE_EXPSTR_SEL").is_ok();
+        let ref_ba = cadence_reference_ba(
+            &BitAllocParams {
+                sdcycod: 2,
+                fdcycod: 1,
+                sgaincod: 1,
+                dbpbcod: 2,
+                floorcod: 4,
+                csnroffst: 0,
+                fsnroffst: 0,
+                fsnroffst_ch: [0u8; MAX_FBW],
+                cplfsnroffst: 0,
+                lfefsnroffst: 0,
+                fgaincod: 4,
+                cplfgaincod: 4,
+                lfefgaincod: 4,
+            },
+            self.cadence_csnr,
+        );
+        let fscod = self.fscod;
+        let fbw_bap = |e: &[u8; N_COEFFS]| -> [u8; N_COEFFS] {
+            let mut bap = [0u8; N_COEFFS];
+            compute_bap(e, ch_end_mant, fscod, &ref_ba, &mut bap, None);
+            bap
+        };
+        let bpcb = (self.frame_bytes * 8 / (self.channels * BLOCKS_PER_FRAME)) as u32;
+        let chexpstr_plan: Vec<[u8; BLOCKS_PER_FRAME]> = (0..self.channels)
+            .map(|ch| {
+                if fixed_plan {
+                    legacy
+                } else {
+                    let chbw_bits = if cpl.in_use && cpl.chincpl[ch] { 0 } else { 6 };
+                    elect_exponent_cadence(
+                        &exps[ch],
+                        0,
+                        ch_end_mant,
+                        chbw_bits,
+                        false,
+                        bpcb,
+                        &fbw_bap,
+                    )
                 }
-            }
-        }
-        // Per-channel exponent-strategy selection (§7.1.3 / §5.4.3.22).
-        // After D15 preprocessing each anchor block (block 0 / 3) is
-        // smooth enough to consider D25 (grpsize=2) or D45 (grpsize=4)
-        // when adjacent bins share similar exponents. We pick per
-        // channel per block so a HF-rich channel can still emit D15
-        // while a smooth bass channel saves bits via D45. The frame
-        // anchor pattern (new on 0/3, REUSE on 1/2/4/5) is preserved.
-        // `AC3_DISABLE_EXPSTR_SEL=1` pins every "new" anchor to D15
-        // for A/B testing.
-        let chexpstr_plan: Vec<[u8; BLOCKS_PER_FRAME]> =
-            if std::env::var("AC3_DISABLE_EXPSTR_SEL").is_ok() {
-                let mut out = vec![[0u8; BLOCKS_PER_FRAME]; self.channels];
-                for ch in 0..self.channels {
-                    out[ch] = exp_strategies;
-                }
-                out
-            } else {
-                select_exp_strategies(&exps, self.channels, ch_end_mant)
+            })
+            .collect();
+        let exp_strategies: [u8; BLOCKS_PER_FRAME] = if fixed_plan {
+            legacy
+        } else if cpl.in_use {
+            let (b, e) = (cpl.begf_mant(), cpl.endf_mant());
+            let cpl_bap = |x: &[u8; N_COEFFS]| -> [u8; N_COEFFS] {
+                let mut bap = [0u8; N_COEFFS];
+                compute_bap_cpl(x, b, e, fscod, &ref_ba, &mut bap, None);
+                bap
             };
-        // Apply grpsize quantisation for any channel that picked D25/D45
-        // on an anchor block. The decoder will reconstruct the same
-        // exponents (one per grpsize span replicated across the span)
-        // so feeding the bit allocator and mantissa quantiser the same
-        // values keeps everything in lockstep.
-        for ch in 0..self.channels {
-            for blk in 0..BLOCKS_PER_FRAME {
-                let strat = chexpstr_plan[ch][blk];
-                if strat >= 2 {
-                    let grpsize = if strat == 2 { 2 } else { 4 };
-                    quantise_exponents_to_grpsize(&mut exps[ch][blk][..ch_end_mant], grpsize);
-                }
+            elect_exponent_cadence(&exps[cpl_idx_in_exps], b, e, 0, true, bpcb, &cpl_bap)
+        } else if self.lfeon {
+            let lfe_bap = |x: &[u8; N_COEFFS]| -> [u8; N_COEFFS] {
+                let mut bap = [0u8; N_COEFFS];
+                compute_bap(x, LFE_END_MANT, fscod, &ref_ba, &mut bap, None);
+                bap
+            };
+            elect_exponent_cadence(
+                &exps[lfe_idx_in_exps],
+                0,
+                LFE_END_MANT,
+                0,
+                true,
+                bpcb,
+                &lfe_bap,
+            )
+        } else {
+            [1, 0, 0, 0, 0, 0]
+        };
+        // Budget-floor guard: the elected plan's fixed syntax must
+        // leave room for mantissas; otherwise every anchor collapses to
+        // a single block-0 D45 set (the cheapest legal frame).
+        let (chexpstr_plan, exp_strategies) = {
+            let probe = overhead_bits_for_ends(
+                &exp_strategies,
+                Some(&chexpstr_plan),
+                ch_end_mant,
+                None,
+                self.channels,
+                &cpl,
+                &DbaPlan::default(),
+                self.acmod,
+                self.lfeon,
+            ) + 64
+                + self.meta.frame_extra_bits();
+            if probe >= (self.frame_bytes * 8) as u32 {
+                (
+                    vec![[3u8, 0, 0, 0, 0, 0]; self.channels],
+                    [1u8, 0, 0, 0, 0, 0],
+                )
+            } else {
+                (chexpstr_plan, exp_strategies)
             }
-            // For REUSE blocks (chexpstr==0), copy the most recent
-            // transmitted exponent set forward so compute_bap +
-            // mantissa quantisation use the exponents the decoder will
-            // see on this block.
+        };
+        // Fold every reuse block into its anchor (per-bin minimum
+        // exponent = loudest block of the run) BEFORE legalisation, so
+        // no reuse block's mantissa exceeds unity — see
+        // `bound_shared_exponents`. Then legalise each anchor (absexp
+        // to 4 bits, ±2 deltas), quantise D25/D45 anchors to their
+        // group size, and copy every anchor forward over its reuse run
+        // so the bit allocator and mantissa quantiser see exactly the
+        // exponents the decoder will reconstruct.
+        for ch in 0..self.channels {
+            bound_shared_exponents(&mut exps[ch], &chexpstr_plan[ch], 0, ch_end_mant);
             let mut last = 0usize;
             for blk in 0..BLOCKS_PER_FRAME {
-                if chexpstr_plan[ch][blk] != 0 {
+                let strat = chexpstr_plan[ch][blk];
+                if strat != 0 {
+                    preprocess_d15(&mut exps[ch][blk][..ch_end_mant]);
+                    if strat >= 2 {
+                        let grpsize = if strat == 2 { 2 } else { 4 };
+                        quantise_exponents_to_grpsize(&mut exps[ch][blk][..ch_end_mant], grpsize);
+                    }
                     last = blk;
                 } else {
                     let src: [u8; N_COEFFS] = exps[ch][last];
@@ -1208,22 +1282,17 @@ impl Ac3Encoder {
                 }
             }
         }
-        // Coupling-channel exponent strategy + D15 preprocessing.
-        // Same per-block strategy as the fbw channels (D15 on blocks
-        // 0 and 3, REUSE elsewhere) so the cpl side info adds no
-        // new strategy decisions to track.
+        // Coupling-channel exponents: D15 on the elected anchors,
+        // REUSE elsewhere (the cpl emitter is D15-only).
         if cpl.in_use {
             let cpl_idx = cpl_idx_in_exps;
             let begf_mant = cpl.begf_mant();
             let endf_mant = cpl.endf_mant();
-            for blk in 0..BLOCKS_PER_FRAME {
-                if exp_strategies[blk] == 1 {
-                    preprocess_d15(&mut exps[cpl_idx][blk][begf_mant..endf_mant]);
-                }
-            }
+            bound_shared_exponents(&mut exps[cpl_idx], &exp_strategies, begf_mant, endf_mant);
             let mut last = 0usize;
             for blk in 0..BLOCKS_PER_FRAME {
                 if exp_strategies[blk] == 1 {
+                    preprocess_d15(&mut exps[cpl_idx][blk][begf_mant..endf_mant]);
                     last = blk;
                 } else {
                     let src: [u8; N_COEFFS] = exps[cpl_idx][last];
@@ -1232,20 +1301,14 @@ impl Ac3Encoder {
                 }
             }
         }
-        // LFE exponent preprocessing + REUSE block fill. Same per-block
-        // strategy choice as fbw, but lfeexpstr is a *1-bit* flag in the
-        // bitstream (§5.4.3.23) rather than 2 bits — value 0 means
-        // REUSE, 1 means new D15. We map exp_strategies==1 → lfeexpstr=1
-        // and exp_strategies==0 → lfeexpstr=0, matching the fbw cadence.
+        // LFE exponents follow the frame cadence: `lfeexpstr` is a
+        // 1-bit flag (§5.4.3.23) — 1 = new D15 set, 0 = REUSE.
         if self.lfeon {
-            for blk in 0..BLOCKS_PER_FRAME {
-                if exp_strategies[blk] == 1 {
-                    preprocess_d15(&mut exps[lfe_idx_in_exps][blk][..LFE_END_MANT]);
-                }
-            }
+            bound_shared_exponents(&mut exps[lfe_idx_in_exps], &exp_strategies, 0, LFE_END_MANT);
             let mut last = 0usize;
             for blk in 0..BLOCKS_PER_FRAME {
                 if exp_strategies[blk] == 1 {
+                    preprocess_d15(&mut exps[lfe_idx_in_exps][blk][..LFE_END_MANT]);
                     last = blk;
                 } else {
                     let src: [u8; N_COEFFS] = exps[lfe_idx_in_exps][last];
@@ -1313,6 +1376,7 @@ impl Ac3Encoder {
             self.acmod,
             self.lfeon,
         );
+        self.cadence_csnr = tuned_ba.csnroffst;
         // Round-24 / task #170: per-block snroffst redistribution.
         // After the global tuner picks a frame-wide (csnr, fsnr_ch)
         // baseline, this pass moves bits between blocks based on
@@ -1847,6 +1911,15 @@ impl Ac3Encoder {
                 }
             }
             write_mantissa_stream(&mut bw, &codes);
+            if std::env::var("AC3_TRACE_BITPOS_ENC").is_ok() {
+                eprintln!(
+                    "TRACE-BITPOS-ENC blk={} end_pos={} plan={:?} strat={}",
+                    blk,
+                    bw.bit_position() - 40,
+                    chexpstr_plan.iter().map(|p| p[blk]).collect::<Vec<_>>(),
+                    exp_strategy
+                );
+            }
         }
 
         // auxdata: auxdatae=0 plus any necessary skip-padding so the
@@ -2154,6 +2227,51 @@ pub(crate) fn extract_exponent(x: f32) -> u8 {
     // which for ax ∈ [2^-25, 1) lies in 0..=24.
     let e = (-ax.log2().floor() as i32) - 1;
     e.clamp(0, 24) as u8
+}
+
+/// Bound every exponent-anchor block by the blocks that reuse it.
+///
+/// §7.1.3 lets an audio block signal REUSE (`chexpstr == 0`) so the
+/// decoder keeps the most recently transmitted exponent set. The
+/// shared exponents then scale the mantissas of *every* block in the
+/// run, so an anchor must carry, per bin, the **smallest** exponent
+/// (largest magnitude) seen anywhere in its run — otherwise a reuse
+/// block whose coefficient outgrows the anchor's gets a mantissa
+/// clamped at ±1 (a ~50 % amplitude error, ≈ 12 dB SNR on a
+/// stationary tone whose MDCT magnitude merely rotates between blocks).
+/// `anchors[blk] != 0` marks a block that transmits new exponents;
+/// bins `lo..hi` are folded. Runs the raw per-block extraction, so it
+/// must be called before the anchors are D15-legalised.
+pub(crate) fn bound_shared_exponents(
+    exps: &mut [[u8; N_COEFFS]],
+    anchors: &[u8],
+    lo: usize,
+    hi: usize,
+) {
+    // `AC3_DISABLE_EXPBOUND=1` reproduces the pre-r457 behaviour
+    // (anchor = its own block only) for A/B measurement.
+    if std::env::var("AC3_DISABLE_EXPBOUND").is_ok() {
+        return;
+    }
+    let nblks = exps.len().min(anchors.len());
+    let mut anchor = 0usize;
+    for blk in 0..nblks {
+        if anchors[blk] != 0 {
+            anchor = blk;
+            continue;
+        }
+        if anchor == blk {
+            continue;
+        }
+        let (head, tail) = exps.split_at_mut(blk);
+        let a = &mut head[anchor];
+        let b = &tail[0];
+        for k in lo..hi {
+            if b[k] < a[k] {
+                a[k] = b[k];
+            }
+        }
+    }
 }
 
 /// Pre-process the D15 exponent run so that successive differences
@@ -2539,50 +2657,226 @@ pub(crate) fn pick_strategy_for_block(exp: &[u8], end: usize) -> u8 {
     pick
 }
 
-/// Pick a per-channel-per-block exponent strategy plan. The plan
-/// honours the encoder's anchor-block convention (D15/D25/D45 on
-/// blocks 0 and 3, REUSE elsewhere — cadence chosen by the existing
-/// snr-offset and dba state machinery) but lets each anchor block
-/// pick the cheapest strategy that still represents its spectrum.
+/// Elect a per-channel exponent refresh cadence by measured bit cost
+/// (§7.1.3 — any block may transmit new exponents or REUSE).
 ///
-/// `exps[ch][blk]` = pre-D15-preprocessed raw exponents.
-/// `nchan`       = number of fbw channels (0..nchan-1 indexed).
-/// `end`         = ch_end_mant.
+/// Every anchor pattern over `nblks` blocks (block 0 always anchors;
+/// `2^(nblks-1)` candidates) is costed as the bits the frame would
+/// spend to reach one noise level at the reference SNR offset:
 ///
-/// Returned shape `[ch][blk]` matches `chexpstr[ch]` semantics:
-///   0 = REUSE, 1 = D15, 2 = D25, 3 = D45.
-pub(crate) fn select_exp_strategies(
-    exps: &[Vec<[u8; N_COEFFS]>],
-    nchan: usize,
-    end: usize,
-) -> Vec<[u8; BLOCKS_PER_FRAME]> {
-    select_exp_strategies_per_end(exps, nchan, &vec![end; nchan])
+/// * **exponent bits** — for each anchor, the payload of the cheapest
+///   legal strategy after the run's reuse blocks are folded in
+///   (`bound_shared_exponents`) and the set is D15-legalised:
+///   `4 + 7·ngrps + 2` (gainrng) plus `chbw_bits` (the `chbwcod` word
+///   a non-coupled fbw channel pays per anchor; 0 for the coupling /
+///   LFE pseudo-channels);
+/// * **mantissa bits** — `bap_for(exps)` (the §7.2.2 allocator at the
+///   reference offset) evaluated on every block's effective shared
+///   exponent set, charged at each bap's width;
+/// * **sharing bits** — a reuse block quantised against a louder
+///   anchor envelope carries its mantissas at the anchor's scale, so
+///   its noise sits `6.02 dB × (own − shared)` above what a fresh
+///   anchor would give at the same bap: every allocated bin is charged
+///   one bit per exponent step of envelope mismatch between the
+///   block's own legalised exponent and the shared one, capped at the
+///   bin's mantissa width (the bits a fresh anchor would have saved at
+///   equal noise — at most the whole mantissa).
+///
+/// Within a run the D15 / D25 / D45 choice is the one minimising all
+/// three terms. Across patterns the comparison uses the exponent +
+/// mantissa terms only, plus `extra_anchor_bias` per anchor after
+/// block 0: the envelope-mismatch term is what makes a coarse group
+/// size lose (it charges the neighbours a group drags down), but as a
+/// re-anchoring incentive it over-refreshes — measured on the corpus
+/// it cost 2-4 dB on speech and transients at 192 kbps — while
+/// without any bias the bit model under-values exponent side-info in
+/// tight frames (64-96 kbps, 5.1 at 256 kbps), where one anchor per
+/// frame measures best.
+///
+/// The minimum-cost pattern wins (ties → fewer anchors). Returns the
+/// `chexpstr`-coded plan: 0 = REUSE, 1 = D15, 2 = D25, 3 = D45 on the
+/// anchors (`d15_only` pins anchors to D15 — the LFE / coupling
+/// pseudo-channels' emitters are D15-only). `bits_per_channel_block`
+/// is the frame's mantissa+side-info budget per fbw channel per block
+/// (the scarcity the bias scales with). `exps` is read-only here: the
+/// caller applies the bound / legalisation with the elected plan.
+pub(crate) fn elect_exponent_cadence(
+    exps: &[[u8; N_COEFFS]],
+    lo: usize,
+    hi: usize,
+    chbw_bits: u32,
+    d15_only: bool,
+    bits_per_channel_block: u32,
+    bap_for: &dyn Fn(&[u8; N_COEFFS]) -> [u8; N_COEFFS],
+) -> [u8; BLOCKS_PER_FRAME] {
+    let nblks = exps.len().min(BLOCKS_PER_FRAME);
+    let mut plan = [0u8; BLOCKS_PER_FRAME];
+    if nblks == 0 || hi <= lo {
+        plan[0] = 1;
+        return plan;
+    }
+    if std::env::var("AC3_DISABLE_CADENCE").is_ok() {
+        // Legacy fixed cadence for A/B measurement.
+        for (blk, p) in plan.iter_mut().enumerate().take(nblks) {
+            *p = if blk % 3 == 0 { 1 } else { 0 };
+        }
+        return plan;
+    }
+    if let Some(m) = std::env::var("AC3_FORCE_CADENCE")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        for (blk, p) in plan.iter_mut().enumerate().take(nblks) {
+            *p = if blk == 0 || (m >> (blk - 1)) & 1 == 1 {
+                1
+            } else {
+                0
+            };
+        }
+        return plan;
+    }
+    let width = hi - lo;
+    let anchor_bias = extra_anchor_bias(bits_per_channel_block);
+    // Each block's own legalised exponents — the envelope a fresh D15
+    // anchor would give it.
+    let own: Vec<[u8; N_COEFFS]> = exps[..nblks]
+        .iter()
+        .map(|e| {
+            let mut w = *e;
+            preprocess_d15(&mut w[lo..hi]);
+            w
+        })
+        .collect();
+    // Cost of coding blocks `run` (anchor first) from one shared,
+    // legalised exponent set `set`: mantissa bits + envelope mismatch.
+    let run_cost = |set: &[u8; N_COEFFS], run: &[usize]| -> (u32, u32) {
+        let bap = bap_for(set);
+        let mant = approx_mantissa_bits(&bap, lo, hi);
+        let mut mismatch = 0u32;
+        for &blk in run {
+            let mine = &own[blk];
+            for k in lo..hi {
+                if bap[k] != 0 && mine[k] > set[k] {
+                    // A fresh anchor cannot save more than the bin's
+                    // whole mantissa (a silent bin under a loud
+                    // envelope drops to bap 0, no further).
+                    let w = (QUANTIZATION_BITS[bap[k] as usize] as u32).min(8);
+                    mismatch += ((mine[k] - set[k]) as u32).min(w);
+                }
+            }
+        }
+        (mant * run.len() as u32, mismatch)
+    };
+    let strategies: &[u8] = if d15_only { &[1] } else { &[1, 2, 3] };
+    let mut best_cost = u32::MAX;
+    let mut best_pattern = 0u32;
+    let mut best_strats = [0u8; BLOCKS_PER_FRAME];
+    let mut work: Vec<[u8; N_COEFFS]> = exps[..nblks].to_vec();
+    for pattern in 0..(1u32 << (nblks - 1)) {
+        let mut anchors = [0u8; BLOCKS_PER_FRAME];
+        anchors[0] = 1;
+        for blk in 1..nblks {
+            anchors[blk] = ((pattern >> (blk - 1)) & 1) as u8;
+        }
+        for (w, e) in work.iter_mut().zip(exps.iter()) {
+            w[lo..hi].copy_from_slice(&e[lo..hi]);
+        }
+        bound_shared_exponents(&mut work, &anchors, lo, hi);
+        let mut cost = 0u32;
+        let mut strats = [0u8; BLOCKS_PER_FRAME];
+        let mut blk = 0usize;
+        while blk < nblks && cost < best_cost {
+            let mut run_end = blk + 1;
+            while run_end < nblks && anchors[run_end] == 0 {
+                run_end += 1;
+            }
+            let run: Vec<usize> = (blk..run_end).collect();
+            // The cheapest legal strategy for this run's shared set.
+            let mut run_best = u32::MAX;
+            let mut run_best_pattern = 0u32;
+            let mut run_strat = 1u8;
+            for &strat in strategies {
+                let mut set = work[blk];
+                preprocess_d15(&mut set[lo..hi]);
+                let grpsize = match strat {
+                    2 => 2,
+                    3 => 4,
+                    _ => 1,
+                };
+                if grpsize > 1 {
+                    quantise_exponents_to_grpsize(&mut set[lo..hi], grpsize);
+                }
+                let ebits = 4 + 7 * ngrps_for_strategy(width, grpsize) as u32 + 2 + chbw_bits;
+                let (mant, mismatch) = run_cost(&set, &run);
+                let c = ebits + mant + mismatch;
+                if c < run_best {
+                    run_best = c;
+                    run_best_pattern = ebits + mant;
+                    run_strat = strat;
+                }
+            }
+            strats[blk] = run_strat;
+            cost += run_best_pattern;
+            if blk > 0 {
+                cost += anchor_bias;
+            }
+            blk = run_end;
+        }
+        if cost < best_cost
+            || (cost == best_cost && pattern.count_ones() < best_pattern.count_ones())
+        {
+            best_cost = cost;
+            best_pattern = pattern;
+            best_strats = strats;
+        }
+    }
+    plan[..nblks].copy_from_slice(&best_strats[..nblks]);
+    plan
 }
 
-/// [`select_exp_strategies`] with a per-channel coded bandwidth —
-/// needed when a subset of channels is in spectral extension (their
-/// exponent sets stop at the SPX begin frequency while full-bandwidth
-/// siblings run to the chbwcod-derived end).
-pub(crate) fn select_exp_strategies_per_end(
-    exps: &[Vec<[u8; N_COEFFS]>],
-    nchan: usize,
-    ends: &[usize],
-) -> Vec<[u8; BLOCKS_PER_FRAME]> {
-    let mut out = vec![[0u8; BLOCKS_PER_FRAME]; nchan];
-    for (ch, plan) in out.iter_mut().enumerate().take(nchan) {
-        // Anchor pattern: blocks 0 and 3 are "new". Pick the
-        // cheapest legal strategy for each anchor based on its
-        // smoothness; the in-between blocks REUSE.
-        let s0 = pick_strategy_for_block(&exps[ch][0], ends[ch]);
-        let s3 = pick_strategy_for_block(&exps[ch][3], ends[ch]);
-        plan[0] = s0;
-        plan[1] = 0;
-        plan[2] = 0;
-        plan[3] = s3;
-        plan[4] = 0;
-        plan[5] = 0;
+/// Bit penalty charged per extra exponent anchor (anchors after
+/// block 0) in the cadence election: 250 bits at generous budgets,
+/// rising by 4 bits per bit of per-channel-block budget below 400
+/// (a 96 kbps stereo frame — 256 bits/channel/block — pays ≈ 830,
+/// i.e. a second anchor must save more than one D15 set to be worth
+/// it). Both constants come from the equal-rate ladder sweep
+/// (`tests/equal_rate.rs`).
+pub(crate) fn extra_anchor_bias(bits_per_channel_block: u32) -> u32 {
+    250 + 400u32.saturating_sub(bits_per_channel_block) * 4
+}
+
+/// Approximate mantissa bits of one block's `bap[]` over `lo..hi`
+/// (grouped quantisers charged at their per-mantissa average).
+pub(crate) fn approx_mantissa_bits(bap: &[u8; N_COEFFS], lo: usize, hi: usize) -> u32 {
+    // ×6 fixed point: bap 1 = 5/3, bap 2 = 7/3, bap 4 = 7/2 bits.
+    const SIX: [u32; 16] = [
+        0, 10, 14, 18, 21, 24, 30, 36, 42, 48, 54, 60, 66, 72, 84, 96,
+    ];
+    let mut acc = 0u32;
+    for &b in &bap[lo..hi] {
+        acc += SIX[b as usize];
     }
-    out
+    acc / 6
+}
+
+/// Initial reference SNR offset for the cadence election before any
+/// frame has been tuned (≈ +27 dB over the mask, a mid-ladder point).
+pub(crate) const CADENCE_CSNR_INIT: u8 = 24;
+
+/// The bit-allocation parameter set the cadence election costs
+/// patterns at: the caller's psy parameters with the coarse SNR
+/// offset pinned to `csnr` — the previous frame's tuned `csnroffst`,
+/// i.e. the actual operating point of the rate ladder (a pattern that
+/// saves bits at +12 dB may waste them at +40 dB).
+pub(crate) fn cadence_reference_ba(ba: &BitAllocParams, csnr: u8) -> BitAllocParams {
+    BitAllocParams {
+        csnroffst: csnr.min(63),
+        fsnroffst: 0,
+        fsnroffst_ch: [0u8; MAX_FBW],
+        cplfsnroffst: 0,
+        lfefsnroffst: 0,
+        ..*ba
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5025,6 +5319,96 @@ mod tests {
     /// (encoder side, post-quantise) and the decoder (post-grpsize
     /// expansion) see the same per-bin exponents — without this, bap[]
     /// disagreement causes mantissa-stream byte drift.
+    /// A flat exponent envelope carries no grouping penalty, so the
+    /// election must pick the cheapest exponent payload (D45) and a
+    /// single block-0 anchor.
+    #[test]
+    fn elect_cadence_groups_a_flat_envelope() {
+        let exps: Vec<[u8; N_COEFFS]> = vec![[9u8; N_COEFFS]; BLOCKS_PER_FRAME];
+        let ba = cadence_reference_ba(
+            &BitAllocParams {
+                sdcycod: 2,
+                fdcycod: 1,
+                sgaincod: 1,
+                dbpbcod: 2,
+                floorcod: 4,
+                csnroffst: 0,
+                fsnroffst: 0,
+                fsnroffst_ch: [0u8; MAX_FBW],
+                cplfsnroffst: 0,
+                lfefsnroffst: 0,
+                fgaincod: 4,
+                cplfgaincod: 4,
+                lfefgaincod: 4,
+            },
+            CADENCE_CSNR_INIT,
+        );
+        let bap_for = |e: &[u8; N_COEFFS]| -> [u8; N_COEFFS] {
+            let mut bap = [0u8; N_COEFFS];
+            compute_bap(e, 253, 0, &ba, &mut bap, None);
+            bap
+        };
+        let plan = elect_exponent_cadence(&exps, 0, 253, 6, false, 512, &bap_for);
+        assert_eq!(plan, [3, 0, 0, 0, 0, 0], "flat envelope → one D45 anchor");
+    }
+
+    /// A sparse two-peak spectrum (tones) loses precision on every
+    /// neighbour a group drags down, so D15 wins; a loud second half
+    /// of the frame (an onset) is worth a second anchor once the
+    /// budget is generous.
+    #[test]
+    fn elect_cadence_keeps_d15_on_peaks_and_reanchors_on_an_onset() {
+        let mut quiet = [24u8; N_COEFFS];
+        quiet[20] = 2;
+        quiet[21] = 4;
+        quiet[60] = 3;
+        quiet[61] = 5;
+        let ba = cadence_reference_ba(
+            &BitAllocParams {
+                sdcycod: 2,
+                fdcycod: 1,
+                sgaincod: 1,
+                dbpbcod: 2,
+                floorcod: 4,
+                csnroffst: 0,
+                fsnroffst: 0,
+                fsnroffst_ch: [0u8; MAX_FBW],
+                cplfsnroffst: 0,
+                lfefsnroffst: 0,
+                fgaincod: 4,
+                cplfgaincod: 4,
+                lfefgaincod: 4,
+            },
+            40,
+        );
+        let bap_for = |e: &[u8; N_COEFFS]| -> [u8; N_COEFFS] {
+            let mut bap = [0u8; N_COEFFS];
+            compute_bap(e, 253, 0, &ba, &mut bap, None);
+            bap
+        };
+        let stationary: Vec<[u8; N_COEFFS]> = vec![quiet; BLOCKS_PER_FRAME];
+        let plan = elect_exponent_cadence(&stationary, 0, 253, 6, false, 512, &bap_for);
+        assert_eq!(plan[0], 1, "sparse peaks → D15 anchor, got {plan:?}");
+        assert!(
+            plan[1..].iter().all(|&v| v == 0),
+            "stationary → no re-anchor: {plan:?}"
+        );
+        // Blocks 3..5 carry a broadband onset 24 dB above the quiet
+        // half: sharing block 0's set would spend the loud envelope's
+        // mantissas on three quiet blocks.
+        let mut loud = [8u8; N_COEFFS];
+        loud[20] = 0;
+        loud[60] = 1;
+        let onset: Vec<[u8; N_COEFFS]> = vec![quiet, quiet, quiet, loud, loud, loud];
+        let plan = elect_exponent_cadence(&onset, 0, 253, 6, false, 1024, &bap_for);
+        assert_eq!(plan[0], 1, "{plan:?}");
+        assert_ne!(plan[3], 0, "onset at block 3 → second anchor, got {plan:?}");
+        assert!(
+            plan[1] == 0 && plan[2] == 0 && plan[4] == 0 && plan[5] == 0,
+            "{plan:?}"
+        );
+    }
+
     #[test]
     fn quantise_grpsize_roundtrip_parity_d25_d45() {
         for (label, mut exp_init) in [
@@ -5555,31 +5939,22 @@ mod tests {
         assert!(drms > 200.0, "ffmpeg-decoded RMS too low: {drms}");
     }
 
-    /// Per-channel-per-block exponent strategy selection (§7.1.3 /
-    /// §5.4.3.22) — verify the encoder picks D25 (`chexpstr=2`) on a
-    /// smooth-envelope source where it's spec-legal, and that the
-    /// validator binary cross-decodes the resulting bit-stream cleanly.
+    /// Smooth bass + mid harmonic mix (energy below ~2 kHz) encoded at
+    /// 192 kbps and cross-checked through the validator binary. The
+    /// exponent strategy is elected per anchor by measured bit cost
+    /// (`elect_exponent_cadence`) — on this fixture D15 wins, the
+    /// grouped strategies are covered by `elect_cadence_*` below.
     ///
-    /// Setup: a stereo bass tone (220 Hz) plus a few mid-band
-    /// harmonics. The energy is concentrated below ~2 kHz where each
-    /// 1/6-octave band's exponent envelope is smooth; D25's
-    /// pair-shared exponent representation costs ~½ the bits of D15
-    /// and the bit allocator can spend the savings on mantissa
-    /// resolution.
-    ///
-    /// Gates: (a) `parse_frame_side_info` reads `chexpstr[ch] == 2`
-    /// (D25) on at least one anchor block (block 0 or 3) of each
-    /// frame, (b) the validator binary decodes the elementary stream
-    /// without error, (c) the decoded RMS is non-trivial (not silence).
+    /// Gates: (a) the validator binary decodes the elementary stream
+    /// without error, (b) the decoded RMS is non-trivial (not silence).
     #[test]
-    fn d25_exp_strategy_selection_and_ffmpeg_crosscheck() {
+    fn smooth_bass_mix_ffmpeg_crosscheck() {
         use std::process::Command;
         let sr = 48_000u32;
         let dur = 1.0f32;
         let nsamp = (sr as f32 * dur) as usize;
         // Bass + mid harmonic mix — smooth spectral envelope below
-        // 2 kHz, near-silent above. The encoder's strategy selector
-        // should pick D25 on the anchor blocks.
+        // 2 kHz, near-silent above.
         let mut pcm = vec![0i16; nsamp * 2];
         for n in 0..nsamp {
             let t = n as f32 / sr as f32;
@@ -5622,37 +5997,7 @@ mod tests {
         }
         assert!(pkts.len() >= 30, "got only {} packets", pkts.len());
 
-        // Gate (a): at least one anchor block of each frame uses D25.
-        let mut frames_with_d25 = 0usize;
-        for p in &pkts {
-            let si = crate::syncinfo::parse(&p.data).expect("syncinfo");
-            let b = crate::bsi::parse(&p.data[5..]).expect("bsi");
-            let side = crate::audblk::parse_frame_side_info(&si, &b, &p.data).expect("side-info");
-            let mut frame_has_d25 = false;
-            for s in &side {
-                for v in s.chexpstr.iter().take(2) {
-                    if *v == 2 {
-                        frame_has_d25 = true;
-                    }
-                }
-            }
-            if frame_has_d25 {
-                frames_with_d25 += 1;
-            }
-        }
-        eprintln!(
-            "D25 selection: {}/{} frames carry chexpstr=2 on at least one fbw channel/block",
-            frames_with_d25,
-            pkts.len()
-        );
-        assert!(
-            frames_with_d25 * 2 >= pkts.len(),
-            "D25 strategy never picked ({} of {} frames) — selector thresholds may be off",
-            frames_with_d25,
-            pkts.len()
-        );
-
-        // Gate (b)/(c): ffmpeg cross-decode.
+        // Gates (a)/(b): ffmpeg cross-decode.
         let in_path = std::env::temp_dir().join("oxideav_ac3_d25_enc.ac3");
         let out_path = std::env::temp_dir().join("oxideav_ac3_d25_dec.pcm");
         std::fs::write(&in_path, &ac3_bytes).expect("write ac3");
@@ -5715,18 +6060,16 @@ mod tests {
     /// bit; with the cap this test passes against the validator binary
     /// and against our decoder's PSNR floor.
     ///
-    /// Picks a smooth low-band signal so the strategy selector emits
-    /// chexpstr=3 on at least one anchor block per frame.
+    /// Pure low tone at 192 kbps: self-decode PSNR + validator-binary
+    /// cross-check (the strategy is elected per anchor by measured
+    /// cost; D15 wins on this sparse spectrum).
     #[test]
-    fn d45_exp_strategy_selection_and_ffmpeg_crosscheck() {
+    fn pure_low_tone_ffmpeg_crosscheck() {
         use std::process::Command;
         let sr = 48_000u32;
         let dur = 1.0f32;
         let nsamp = (sr as f32 * dur) as usize;
-        // Pure 110 Hz tone: HF bins are zero so the decimated exponent
-        // ladder is monotonically increasing and very smooth — the
-        // smoothness test in `pick_strategy_for_block` should pick D45
-        // on at least one anchor block per frame.
+        // Pure 110 Hz tone: HF bins are zero.
         let mut pcm = vec![0i16; nsamp * 2];
         for n in 0..nsamp {
             let t = n as f32 / sr as f32;
@@ -5765,37 +6108,6 @@ mod tests {
             }
         }
         assert!(pkts.len() >= 30, "got only {} packets", pkts.len());
-
-        // Gate (a): at least half the frames should carry chexpstr=3
-        // (D45) on at least one fbw channel anchor block.
-        let mut frames_with_d45 = 0usize;
-        for p in &pkts {
-            let si = crate::syncinfo::parse(&p.data).expect("syncinfo");
-            let b = crate::bsi::parse(&p.data[5..]).expect("bsi");
-            let side = crate::audblk::parse_frame_side_info(&si, &b, &p.data).expect("side-info");
-            let mut frame_has_d45 = false;
-            for s in &side {
-                for v in s.chexpstr.iter().take(2) {
-                    if *v == 3 {
-                        frame_has_d45 = true;
-                    }
-                }
-            }
-            if frame_has_d45 {
-                frames_with_d45 += 1;
-            }
-        }
-        eprintln!(
-            "D45 selection: {}/{} frames carry chexpstr=3 on at least one fbw channel/block",
-            frames_with_d45,
-            pkts.len()
-        );
-        assert!(
-            frames_with_d45 * 2 >= pkts.len(),
-            "D45 strategy never picked ({} of {} frames) — selector thresholds may be off",
-            frames_with_d45,
-            pkts.len()
-        );
 
         // Gate (b): self-decode round-trip — PSNR > 20 dB after lag align.
         let dparams = CodecParameters::audio(CodecId::new("ac3"));
