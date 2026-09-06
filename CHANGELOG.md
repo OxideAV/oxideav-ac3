@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - decoder+encoder r457: **§7.2.2.1.1 all-zero SNR-offset special case** — when `csnroffst`, every `fsnroffst[ch]`, `cplfsnroffst` and `lfefsnroffst` are zero the decoder must set every `bap` to 0 without running the allocator. Neither decoder (AC-3 `audblk`, E-AC-3 `dsp`) nor the encoder's allocator did so: a frame the SNR tuner floored packed real mantissas that the reference decoder does not read, and the reference rejected the stream ("exponent out-of-range" from the desync). Both decoders and `compute_bap*` now honour the rule; `PerBlockSnr` substitutes the whole per-block offset set so the encoder evaluates exactly what it transmits.
 
+- encoder r457: **seven-bin LFE** — the encoder zeroed LFE bins ≥ 2 (≈ 140 Hz) before exponent extraction; the §7.1.3 syntax carries `lfeendmant = 7` and the allocator drops what is masked, so all seven bins are coded now (5.1/448 LFE channel 20.1 → 29.9 dB; reference 34.6).
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.10...v0.0.11) - 2026-09-01
 
 ### Added

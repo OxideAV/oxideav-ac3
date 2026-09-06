@@ -1124,24 +1124,15 @@ impl Ac3Encoder {
         // covering bins 1..7). Encoder mirrors that: extract on each
         // block, with the same D15-on-blocks-0/3 strategy.
         //
-        // §7.1.3 / A/52 §5.5.5 — LFE is spectrally constrained to
-        // 0–120 Hz. At 48 kHz with a 512-point MDCT, bin k has centre
-        // frequency (2k+1)×48000/1024 Hz: bin 0 ≈ 47 Hz, bin 1 ≈ 141 Hz.
-        // We zero coefficients from bin 2 onward so only sub-120 Hz
-        // content is coded in the LFE channel. LFE_END_MANT stays at 7
-        // (decoder expects it), but bins 2..7 carry exp=24 → bap=0 →
-        // no mantissa bits allocated.
+        // §7.1.3 — the LFE carries `lfeendmant = 7` coefficients
+        // (bins 0..6, ≈ 0-330 Hz at 48 kHz). All seven are coded: the
+        // LFE input is the producer's band-limited feed and anything it
+        // carries between 120 Hz and the bin-7 edge is signal the
+        // decoder reproduces (the §7.2 allocator drops what is masked).
+        // Zeroing bins ≥ 2 at encode time (pre-r457) held the LFE at
+        // ~20 dB SNR on an LFE feed rolled off above 90 Hz.
         if self.lfeon {
-            let lfe_cutoff = match self.sample_rate {
-                48_000 => 2usize,
-                44_100 => 2usize,
-                32_000 => 2usize, // 32k: bin 1 ≈ 125 Hz — still close enough
-                _ => 2usize,
-            };
             for blk in 0..BLOCKS_PER_FRAME {
-                for k in lfe_cutoff..LFE_END_MANT {
-                    coeffs[lfe_idx][blk][k] = 0.0;
-                }
                 for k in 0..LFE_END_MANT {
                     exps[lfe_idx_in_exps][blk][k] = extract_exponent(coeffs[lfe_idx][blk][k]);
                 }
