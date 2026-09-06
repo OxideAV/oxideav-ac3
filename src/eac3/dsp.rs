@@ -1399,45 +1399,13 @@ pub fn decode_indep_audblks(
         }
 
         // ---- bit allocation ----
-        for ch in 0..nfchans {
-            let end = state.channels[ch].end_mant;
-            audblk::run_bit_allocation(
-                state,
-                ch,
-                0,
-                end,
-                si.fscod,
-                state.fsnroffst[ch],
-                state.fgaincod[ch],
-                false,
-            );
-        }
-        if cplinu {
-            let start = state.cpl_begf_mant;
-            let end = state.cpl_endf_mant;
-            audblk::run_bit_allocation(
-                state,
-                MAX_FBW,
-                start,
-                end,
-                si.fscod,
-                state.cpl_fsnroffst,
-                state.cpl_fgaincod,
-                true,
-            );
-        }
-        if lfeon {
-            let lfe_ch = MAX_FBW + 1;
-            audblk::run_bit_allocation(
-                state,
-                lfe_ch,
-                0,
-                7,
-                si.fscod,
-                state.lfefsnroffst,
-                state.lfefgaincod,
-                false,
-            );
+        if audblk::all_snr_offsets_zero(state, nfchans, cplinu, lfeon) {
+            // §7.2.2.1.1 special case: every SNR offset is zero → no
+            // mantissas this block.
+            audblk::zero_all_baps(state, nfchans, cplinu, lfeon);
+        } else {
+            state.cpl_in_use = cplinu;
+            audblk::run_block_bit_allocation(state, nfchans, si.fscod, lfeon);
         }
 
         // ---- mantissas ----

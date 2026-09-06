@@ -1016,45 +1016,12 @@ pub(crate) fn parse_audblk_into(
     }
 
     // --- run bit allocation per channel ---
-    for ch in 0..nfchans {
-        let end = state.channels[ch].end_mant;
-        run_bit_allocation(
-            state,
-            ch,
-            0,
-            end,
-            si.fscod,
-            state.fsnroffst[ch],
-            state.fgaincod[ch],
-            false,
-        );
-    }
-    if state.cpl_in_use {
-        let start = state.cpl_begf_mant;
-        let end = state.cpl_endf_mant;
-        run_bit_allocation(
-            state,
-            MAX_FBW,
-            start,
-            end,
-            si.fscod,
-            state.cpl_fsnroffst,
-            state.cpl_fgaincod,
-            true,
-        );
-    }
-    if bsi.lfeon {
-        let lfe_ch = MAX_FBW + 1;
-        run_bit_allocation(
-            state,
-            lfe_ch,
-            0,
-            7,
-            si.fscod,
-            state.lfefsnroffst,
-            state.lfefgaincod,
-            false,
-        );
+    if all_snr_offsets_zero(state, nfchans, state.cpl_in_use, bsi.lfeon) {
+        // §7.2.2.1.1 special case: every SNR offset in the bit stream
+        // is zero → bap[] = 0 for every channel, no allocation run.
+        zero_all_baps(state, nfchans, state.cpl_in_use, bsi.lfeon);
+    } else {
+        run_block_bit_allocation(state, nfchans, si.fscod, bsi.lfeon);
     }
 
     // --- unpack mantissas ---
@@ -1257,6 +1224,84 @@ pub(crate) fn decode_exponents(
         *v = (*v).clamp(0, 24);
     }
     Ok(())
+}
+
+/// §7.2.2.1.1 special-case test: `csnroffst`, every `fsnroffst[ch]`,
+/// `cplfsnroffst` (when coupling is in use) and `lfefsnroffst` (when
+/// the LFE is on) are all zero.
+pub(crate) fn all_snr_offsets_zero(
+    state: &Ac3State,
+    nfchans: usize,
+    cpl_in_use: bool,
+    lfeon: bool,
+) -> bool {
+    state.snroffst_coarse == 0
+        && state.fsnroffst[..nfchans].iter().all(|&v| v == 0)
+        && (!cpl_in_use || state.cpl_fsnroffst == 0)
+        && (!lfeon || state.lfefsnroffst == 0)
+}
+
+/// §7.2.2.1.1: clear every channel's `bap[]` (no mantissas this block).
+pub(crate) fn zero_all_baps(state: &mut Ac3State, nfchans: usize, cpl_in_use: bool, lfeon: bool) {
+    for ch in 0..nfchans {
+        state.channels[ch].bap.fill(0);
+    }
+    if cpl_in_use {
+        state.channels[MAX_FBW].bap.fill(0);
+    }
+    if lfeon {
+        state.channels[MAX_FBW + 1].bap.fill(0);
+    }
+}
+
+/// Run the §7.2.2 allocator for every channel of the block (fbw
+/// channels, the coupling pseudo-channel when in use, the LFE when on).
+pub(crate) fn run_block_bit_allocation(
+    state: &mut Ac3State,
+    nfchans: usize,
+    fscod: u8,
+    lfeon: bool,
+) {
+    for ch in 0..nfchans {
+        let end = state.channels[ch].end_mant;
+        run_bit_allocation(
+            state,
+            ch,
+            0,
+            end,
+            fscod,
+            state.fsnroffst[ch],
+            state.fgaincod[ch],
+            false,
+        );
+    }
+    if state.cpl_in_use {
+        let start = state.cpl_begf_mant;
+        let end = state.cpl_endf_mant;
+        run_bit_allocation(
+            state,
+            MAX_FBW,
+            start,
+            end,
+            fscod,
+            state.cpl_fsnroffst,
+            state.cpl_fgaincod,
+            true,
+        );
+    }
+    if lfeon {
+        let lfe_ch = MAX_FBW + 1;
+        run_bit_allocation(
+            state,
+            lfe_ch,
+            0,
+            7,
+            fscod,
+            state.lfefsnroffst,
+            state.lfefgaincod,
+            false,
+        );
+    }
 }
 
 /// Parametric bit allocation (§7.2.2) for a single channel range.

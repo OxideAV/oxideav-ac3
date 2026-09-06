@@ -2911,6 +2911,22 @@ pub(crate) struct BitAllocParams {
     pub(crate) lfefgaincod: u8,
 }
 
+impl BitAllocParams {
+    /// §7.2.2.1.1 special case: every SNR offset the block transmits —
+    /// `csnroffst`, each `fsnroffst[ch]`, `cplfsnroffst`, `lfefsnroffst`
+    /// — is zero, so the decoder sets every `bap` to 0 without running
+    /// the allocator. The per-channel substitution helpers keep the
+    /// vector fields in step with the values actually transmitted, so
+    /// this reads the same set the decoder will see.
+    pub(crate) fn all_snr_offsets_zero(&self) -> bool {
+        self.csnroffst == 0
+            && self.fsnroffst == 0
+            && self.fsnroffst_ch.iter().all(|&v| v == 0)
+            && self.cplfsnroffst == 0
+            && self.lfefsnroffst == 0
+    }
+}
+
 /// Run the parametric bit allocator for one channel (start=0..end)
 /// and fill `bap_out` with the resulting pointers.
 ///
@@ -2948,6 +2964,12 @@ pub(crate) fn compute_bap_table(
     ptr_tab: &[u8; 64],
 ) {
     if end == 0 {
+        return;
+    }
+    if ba.all_snr_offsets_zero() {
+        // §7.2.2.1.1 special case — the decoder skips allocation
+        // entirely and every bap is 0.
+        bap_out[..end].fill(0);
         return;
     }
     // PSD
@@ -3101,6 +3123,11 @@ pub(crate) fn compute_bap_cpl(
     dba: Option<(&DbaPlan, usize)>,
 ) {
     if end <= start {
+        return;
+    }
+    if ba.all_snr_offsets_zero() {
+        // §7.2.2.1.1 special case (see `compute_bap_table`).
+        bap_out[start..end].fill(0);
         return;
     }
     let mut psd = [0i32; N_COEFFS];
@@ -4119,25 +4146,34 @@ impl PerBlockSnr {
         blk: usize,
         ch: usize,
     ) -> BitAllocParams {
-        let mut out = *base;
-        out.csnroffst = self.csnroffst[blk];
+        let mut out = self.block_params(base, blk);
         out.fsnroffst = self.fsnroffst_ch[blk][ch];
         out
     }
 
     pub(crate) fn ba_for_cpl(&self, base: &BitAllocParams, blk: usize) -> BitAllocParams {
-        let mut out = *base;
-        out.csnroffst = self.csnroffst[blk];
+        let mut out = self.block_params(base, blk);
         out.fsnroffst = self.cplfsnroffst[blk];
         out.fgaincod = base.cplfgaincod;
         out
     }
 
     pub(crate) fn ba_for_lfe(&self, base: &BitAllocParams, blk: usize) -> BitAllocParams {
-        let mut out = *base;
-        out.csnroffst = self.csnroffst[blk];
+        let mut out = self.block_params(base, blk);
         out.fsnroffst = self.lfefsnroffst[blk];
         out.fgaincod = base.lfefgaincod;
+        out
+    }
+
+    /// `base` with every SNR-offset field replaced by the values this
+    /// block transmits (so `BitAllocParams::all_snr_offsets_zero`
+    /// evaluates the block's own set).
+    fn block_params(&self, base: &BitAllocParams, blk: usize) -> BitAllocParams {
+        let mut out = *base;
+        out.csnroffst = self.csnroffst[blk];
+        out.fsnroffst_ch = self.fsnroffst_ch[blk];
+        out.cplfsnroffst = self.cplfsnroffst[blk];
+        out.lfefsnroffst = self.lfefsnroffst[blk];
         out
     }
 }
