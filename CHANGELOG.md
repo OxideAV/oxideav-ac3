@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.11...v0.0.12) - 2026-10-04
+
+### Other
+
+- README install snippet drops the retired oxideav-codec/oxideav-container crates
+- budget guards from the r457 fuzz round + AC-3 encoder round-trip fuzz target
+- equal-rate position ladder + r457 encoder status
+- joint block switching + §8.2.9 dither defeat
+- code all seven LFE bins (§7.1.3 lfeendmant = 7)
+- §7.2.2.1.1 all-zero SNR-offset special case
+- exponent-sharing bound + per-channel cadence/strategy election by measured cost (§7.1.3)
+- equal-rate rate-distortion harness (corpus + both encoders + both decoders + SNR/NMR scoring)
+
 - encoder r457: **equal-rate rate-distortion harness** (`tests/common/rd.rs`, `tests/equal_rate.rs`, `examples/equal_rate_report`) — a deterministic synthetic corpus (speech, music, transients, two-tone, pink noise, 5.1 with LFE; 16 kHz band-limited) is encoded by our AC-3 / E-AC-3 encoder and by the black-box reference encoder at equal nominal rate, every stream is decoded by both our decoder and the reference decoder, and each decode is scored by worst-channel SNR and a mean noise-to-mask ratio (§7.2.2 parametric mask on the source MDCT). The test pins per-cell floors, the decoder agreement on our streams (< 1.5 dB) and the distance to the reference encoder; README carries the ladder. The harness immediately exposed that the r454 "~24 dB flat" two-tone table was an aliased lag-search artefact: the standard path measured ≈ 12 dB at every rate.
 
 - encoder r457: **exponent-sharing bound** (`bound_shared_exponents`, both encoders) — a REUSE block's coefficients were quantised against its anchor's exponent set without the anchor ever bounding them, so any bin that outgrew the anchor clamped its mantissa at ±1 (≈ 12 dB SNR on a stationary tone whose MDCT magnitude merely rotates between blocks). Every anchor now carries the per-bin minimum exponent of its run before legalisation. Mono 440 Hz sine 11.2 → 76.4 dB, speech/192 11.1 → 29.5, music/192 11.8 → 33.0, two-tone/192 12.0 → 51.7 (ours→ours). The AHT round-trip gates, which only "won" because the standard path was broken, now pin AHT within 25 dB of the (better) standard path — AHT rate-distortion is a recorded follow-up.
