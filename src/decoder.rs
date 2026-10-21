@@ -38,6 +38,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         state: Ac3State::new(),
         eac3_state: eac3::Eac3DecoderState::default(),
         requested_channels: params.channels,
+        f32_output: params.sample_format == Some(SampleFormat::F32),
         prefer_ltrt: false,
         drc: DrcSettings::default(),
         render_joc_stereo: false,
@@ -58,6 +59,7 @@ pub fn make_eac3_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         state: Ac3State::new(),
         eac3_state: eac3::Eac3DecoderState::default(),
         requested_channels: params.channels,
+        f32_output: params.sample_format == Some(SampleFormat::F32),
         prefer_ltrt: false,
         drc: DrcSettings::default(),
         render_joc_stereo: false,
@@ -82,6 +84,7 @@ pub fn make_eac3_decoder_with_joc(params: &CodecParameters) -> Result<Box<dyn De
         state: Ac3State::new(),
         eac3_state: eac3::Eac3DecoderState::default(),
         requested_channels: params.channels,
+        f32_output: params.sample_format == Some(SampleFormat::F32),
         prefer_ltrt: false,
         drc: DrcSettings::default(),
         render_joc_stereo: true,
@@ -108,6 +111,7 @@ pub fn make_decoder_ltrt(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         state: Ac3State::new(),
         eac3_state: eac3::Eac3DecoderState::default(),
         requested_channels: params.channels,
+        f32_output: params.sample_format == Some(SampleFormat::F32),
         prefer_ltrt: true,
         drc: DrcSettings::default(),
         render_joc_stereo: false,
@@ -136,6 +140,7 @@ pub fn make_decoder_with_drc(
         state: Ac3State::new(),
         eac3_state: eac3::Eac3DecoderState::default(),
         requested_channels: params.channels,
+        f32_output: params.sample_format == Some(SampleFormat::F32),
         prefer_ltrt: false,
         drc: DrcSettings::default(),
         render_joc_stereo: false,
@@ -160,6 +165,10 @@ struct Ac3Decoder {
     /// stereo, `None` = passthrough of whatever the bitstream carries.
     /// Drives the §7.8 matrix in [`Ac3Decoder::process_frame`].
     requested_channels: Option<u16>,
+    /// `true` when the caller asked for [`SampleFormat::F32`] output
+    /// (`CodecParameters::sample_format`): frames then carry interleaved
+    /// little-endian f32 PCM, unquantised, instead of S16LE.
+    f32_output: bool,
     /// When `true` and a 2-channel downmix is requested, use the
     /// §7.8.2 **LtRt** (Dolby Surround matrix-encoded) equations
     /// instead of LoRo. Toggled by [`make_decoder_ltrt`]; the regular
@@ -334,7 +343,12 @@ impl Ac3Decoder {
                                 *sample *= dn_gain;
                             }
                         }
-                        Some((pack_f32_to_s16le(&samples), 2_u16))
+                        let pcm = if self.f32_output {
+                            pack_f32le(&samples)
+                        } else {
+                            pack_f32_to_s16le(&samples)
+                        };
+                        Some((pcm, 2_u16))
                     }
                     Err(_) => {
                         self.joc_renderer.reset();
@@ -352,6 +366,23 @@ impl Ac3Decoder {
 
         let (pcm, out_channels) = if let Some(rendered) = joc_stereo {
             rendered
+        } else if matches!(dmx_mode, DownmixMode::Passthrough) && self.f32_output {
+            let mut samples = self.eac3_state.indep_pcm_f32().to_vec();
+            if samples.len() != decoded.samples as usize * channels as usize {
+                return Err(Error::invalid(
+                    "eac3: f32 output covers the independent substream only",
+                ));
+            }
+            for sample in &mut samples {
+                *sample *= dn_gain;
+            }
+            wave_order::reorder_f32_in_place(
+                &mut samples,
+                decoded.acmod,
+                decoded.lfeon,
+                channels as usize,
+            );
+            (pack_f32le(&samples), channels)
         } else if matches!(dmx_mode, DownmixMode::Passthrough) {
             let mut pcm = decoded.pcm_s16le;
             if dn_gain != 1.0 {
@@ -430,15 +461,19 @@ impl Ac3Decoder {
                     &mut out_f32[out_base..out_base + SAMPLES_PER_BLOCK * out_ch],
                 );
             }
-            // Pack f32 → S16LE.
-            let mut out_bytes = vec![0u8; out_f32.len() * 2];
-            for (i, s) in out_f32.iter().enumerate() {
-                let clamped = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                let le = clamped.to_le_bytes();
-                out_bytes[i * 2] = le[0];
-                out_bytes[i * 2 + 1] = le[1];
+            if self.f32_output {
+                (pack_f32le(&out_f32), out_ch as u16)
+            } else {
+                // Pack f32 → S16LE.
+                let mut out_bytes = vec![0u8; out_f32.len() * 2];
+                for (i, s) in out_f32.iter().enumerate() {
+                    let clamped = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                    let le = clamped.to_le_bytes();
+                    out_bytes[i * 2] = le[0];
+                    out_bytes[i * 2 + 1] = le[1];
+                }
+                (out_bytes, out_ch as u16)
             }
-            (out_bytes, out_ch as u16)
         };
 
         self.time_base = TimeBase::new(1, decoded.sample_rate as i64);
@@ -541,6 +576,25 @@ impl Ac3Decoder {
             (out_ch as u16, out)
         };
 
+        // 3) F32 output: reorder to WAV-mask order and emit the samples
+        //    as they are.
+        if self.f32_output {
+            let mut out = out_samples;
+            if matches!(dmx_mode, DownmixMode::Passthrough) {
+                wave_order::reorder_f32_in_place(
+                    &mut out,
+                    bsi.acmod,
+                    bsi.lfeon,
+                    out_channels as usize,
+                );
+            }
+            return Ok(Frame::Audio(AudioFrame {
+                samples: SAMPLES_PER_FRAME,
+                pts: pkt.pts,
+                data: vec![pack_f32le(&out)],
+            }));
+        }
+
         // 3) Pack f32 → S16 interleaved.
         let bytes_per_sample = SampleFormat::S16.bytes_per_sample();
         let total_bytes = SAMPLES_PER_FRAME as usize * out_channels as usize * bytes_per_sample;
@@ -577,6 +631,11 @@ impl Ac3Decoder {
             data: vec![out_bytes],
         }))
     }
+}
+
+/// Interleaved f32 PCM as little-endian bytes (the F32 output format).
+fn pack_f32le(samples: &[f32]) -> Vec<u8> {
+    samples.iter().flat_map(|s| s.to_le_bytes()).collect()
 }
 
 /// Pack interleaved normalized f32 PCM into the decoder's S16LE output
@@ -1014,6 +1073,49 @@ mod tests {
     /// Decode the in-tree `sine440_stereo.ac3` validator fixture and
     /// return the RMS of the interleaved S16 output PCM under the supplied
     /// DRC settings.
+    /// Decode the stereo fixture with the given output sample format and
+    /// return each frame's payload.
+    fn decode_fixture_frames(format: SampleFormat) -> Vec<Vec<u8>> {
+        use oxideav_core::Packet;
+        use oxideav_core::TimeBase as TB;
+        const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/sine440_stereo.ac3");
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(48_000);
+        params.sample_format = Some(format);
+        let mut dec = make_decoder(&params).expect("make_decoder");
+        let mut frames = Vec::new();
+        for chunk in FIXTURE.chunks_exact(768) {
+            dec.send_packet(&Packet::new(0, TB::new(1, 48_000), chunk.to_vec()))
+                .unwrap();
+            while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+                frames.push(af.data[0].clone());
+            }
+        }
+        frames
+    }
+
+    #[test]
+    fn f32_output_is_the_unquantised_s16_output() {
+        let s16 = decode_fixture_frames(SampleFormat::S16);
+        let f32 = decode_fixture_frames(SampleFormat::F32);
+        assert_eq!(s16.len(), f32.len());
+        assert!(!f32.is_empty());
+        let mut fractional = 0usize;
+        for (a, b) in s16.iter().zip(&f32) {
+            assert_eq!(b.len(), a.len() * 2, "4 bytes per F32 sample");
+            for (q, f) in a.chunks_exact(2).zip(b.chunks_exact(4)) {
+                let v = f32::from_le_bytes([f[0], f[1], f[2], f[3]]);
+                // the S16 output is the F32 output quantised as the S16 path does
+                let expect = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                assert_eq!(i16::from_le_bytes([q[0], q[1]]), expect);
+                if (v * 32767.0).fract() != 0.0 {
+                    fractional += 1;
+                }
+            }
+        }
+        assert!(fractional > 0, "F32 keeps the precision S16 drops");
+    }
+
     fn decode_fixture_rms(drc: DrcSettings) -> f64 {
         use oxideav_core::Packet;
         use oxideav_core::TimeBase as TB;
