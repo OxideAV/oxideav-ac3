@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- decoder: **§7.7.1 `dynrng` now scales the LFE channel** (AC-3 and
+  E-AC-3). §5.4.3.4 applies the word to "the reproduced audio" and §6.1.9
+  to the block's coefficients with no channel exemption (only 1+1 mode
+  splits it into `dynrng` / `dynrng2` per channel); both decoders scaled
+  the fbw channels only, so a 5.1 stream carrying `dynrng` played its LFE
+  up to 24 dB off the rest of the program. Found by the r480
+  broadcast-shape matrix against the black-box decoder (every channel
+  ≥ 89 dB, LFE 17–37 dB; now 92–93 dB). `tests/dynrng_lfe.rs` pins the
+  LFE gain against Table 7.29 for both encoders' streams.
+
 - tables: **Table 7.15 hearing threshold, 44.1 kHz row** (#18, ropoctl)
   — `HTH[1]` bands 25, 28 and 34 were one step off the staged spec
   (`0x0340`/`0x0310`/`0x0300` for `0x0350`/`0x0320`/`0x02f0`). Where a
@@ -31,6 +41,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   black-box-encoded fixture.
 
 ### Changed
+
+- tests (issue #13 follow-through): **broadcast-shape decode matrix**
+  (`tests/eac3_decode_ffmpeg.rs::crafted_broadcast_matrix_*`) — our
+  E-AC-3 encoder emits every coding tool it can switch on (plain, SPX,
+  AHT, TPNP, SPX + TPNP + the full metadata set, AHT + mixing metadata)
+  at 48 / 44.1 / 32 kHz on stereo 192 kb/s and 5.1 448 kb/s six-block
+  frames plus the 1/2/3-block fractional-frame shapes, and the black-box
+  decoder must agree with ours at ≥ 50 dB per channel with zero
+  zero-filled frames (40 cells per rate; observed 57–93 dB). Cells are
+  chosen where the oracle is meaningful: SPX runs with `spxblnd = 31`
+  because the §E.3.6.4.2 noise component comes from a decoder-private
+  generator (measured: blend 0 → 20–30 dB, blend 31 → 68–77 dB between
+  decoders, identical spectra), the per-channel budget keeps the §7.3.4
+  dither floor out of the gate, and enhanced coupling / dependent
+  substreams stay out because the oracle does not render them (ecpl:
+  −512-sample lag at 12 dB; 7.1 pair: it drops the indep Ls/Rs and
+  leaves one output channel silent).
 
 - edition 2024, MSRV 1.95.
 

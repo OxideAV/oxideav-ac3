@@ -67,7 +67,10 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   normalisation (an opt-in playback scalar `10^((target − dialnorm)/20)`
   toward a chosen headroom target). Build a configured decoder with
   `decoder::make_decoder_with_drc(params, DrcSettings)`. Applies to both
-  the AC-3 and E-AC-3 paths.
+  the AC-3 and E-AC-3 paths. The resolved block gain scales every
+  reproduced channel including the LFE (§5.4.3.4 / §6.1.9; only 1+1
+  mode splits the program into `dynrng` / `dynrng2`), pinned by
+  `tests/dynrng_lfe.rs` against Table 7.29.
 - Downmix (§7.8) — LoRo and LtRt 2-channel.
 - Bitstream → WAV channel reorder for multichannel layouts.
 - Output format: interleaved S16LE by default; a decoder built with
@@ -178,7 +181,23 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   (`OXIDEAV_AC3_LOCAL_EAC3=/path` runs the same PSNR gate on captures
   that cannot be committed). Zero-fill fallbacks are now countable via
   `Eac3DecoderState::frames_zero_filled`, so callers can tell decoder
-  dropouts from silent program audio.
+  dropouts from silent program audio. The harness also carries a
+  **broadcast-shape matrix** (`crafted_broadcast_matrix_*`): every
+  coding tool our encoder can switch on (plain / SPX / AHT / TPNP /
+  SPX + TPNP + full metadata / AHT + mixing metadata) at 48 / 44.1 /
+  32 kHz on stereo 192 kb/s and 5.1 448 kb/s six-block frames plus the
+  1/2/3-block fractional shapes — 40 cells per rate, ffmpeg within
+  57–93 dB of our decode, zero zero-filled frames. The matrix is drawn
+  where the oracle is meaningful: SPX runs with `spxblnd = 31` because
+  the §E.3.6.4.2 noise component is a decoder-private generator (blend 0
+  → 20–30 dB between decoders with identical band spectra, blend 31 →
+  68–77 dB), the per-channel budget keeps the §7.3.4 dither floor
+  (bap = 0 bins, likewise decoder-private noise) out of the gate, and
+  enhanced coupling / dependent substreams are excluded because the
+  oracle does not render them (ecpl: −512-sample lag at 12 dB; the 7.1
+  indep + dep pair: it drops the indep Ls/Rs and leaves one output
+  channel silent). The matrix's first catch was the §7.7.1 `dynrng`
+  LFE omission below.
 - **Opt-in JOC object presentation**
   (`decoder::make_eac3_decoder_with_joc`) parses EC-3 Extension Type A
   and EMDF metadata from declared E-AC-3 skip fields, reconstructs up to

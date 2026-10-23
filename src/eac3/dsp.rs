@@ -540,14 +540,10 @@ pub fn decode_indep_audblks(
         if dynrnge {
             let dynrng = br.read_u32(8)? as u8;
             let g = state.drc.resolve_block_gain(dynrng, compr_ch1);
-            for ch in 0..nfchans {
-                state.channels[ch].dynrng = g;
-            }
+            audblk::set_program_dynrng(state, nfchans, lfeon, g);
         } else if blk == 0 {
             let g = state.drc.resolve_block_gain(0x00, compr_ch1);
-            for ch in 0..nfchans {
-                state.channels[ch].dynrng = g;
-            }
+            audblk::set_program_dynrng(state, nfchans, lfeon, g);
         }
         if bsi.acmod == 0 {
             let dynrng2e = br.read_u32(1)? != 0;

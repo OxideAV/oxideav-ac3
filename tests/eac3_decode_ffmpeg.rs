@@ -451,9 +451,20 @@ fn generated_stereo_44100_decodes_like_ffmpeg() {
 // ---------------------------------------------------------------------------
 
 fn encode_ours(channels: usize, bit_rate: u64, opts: &[(&str, &str)]) -> Vec<u8> {
+    encode_ours_at(channels, 48000, 3.0, bit_rate, opts)
+}
+
+/// [`encode_ours`] at a chosen sample rate and duration.
+fn encode_ours_at(
+    channels: usize,
+    rate: u32,
+    seconds: f32,
+    bit_rate: u64,
+    opts: &[(&str, &str)],
+) -> Vec<u8> {
     use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat};
     let mut params = CodecParameters::audio(CodecId::new(oxideav_ac3::CODEC_ID_STR_EAC3));
-    params.sample_rate = Some(48000);
+    params.sample_rate = Some(rate);
     params.channels = Some(channels as u16);
     params.sample_format = Some(SampleFormat::S16);
     params.bit_rate = Some(bit_rate);
@@ -462,11 +473,11 @@ fn encode_ours(channels: usize, bit_rate: u64, opts: &[(&str, &str)]) -> Vec<u8>
     }
     let mut enc = oxideav_ac3::eac3::make_encoder(&params).expect("make_encoder");
 
-    // 3 s multitone with per-channel detune so coupling/SPX have work.
-    let n = 48000 * 3;
+    // Multitone with per-channel detune so coupling/SPX have work.
+    let n = (rate as f32 * seconds) as usize;
     let mut s16 = Vec::with_capacity(n * channels * 2);
     for i in 0..n {
-        let t = i as f32 / 48000.0;
+        let t = i as f32 / rate as f32;
         for ch in 0..channels {
             let f0 = 440.0 * (1.0 + 0.05 * ch as f32);
             let v = 0.3 * (2.0 * std::f32::consts::PI * f0 * t).sin()
@@ -575,6 +586,114 @@ fn crafted_aht_compre_stereo_decodes_like_ffmpeg() {
     }
     let es = encode_ours(2, 192_000, &[("aht", "1"), ("compr", "0x0b")]);
     assert_decode_matches_ffmpeg("crafted AHT+compre stereo", &es, 2, 48000);
+}
+
+// ---------------------------------------------------------------------------
+// 2b. Broadcast-shape matrix — every coding tool our encoder can switch
+//     on, at every sample rate, on stereo and 5.1, through ffmpeg's
+//     decoder as the oracle. Cells are chosen where the oracle is
+//     meaningful: the per-channel budget keeps the §7.3.4 dither floor
+//     (bap = 0 bins are filled with decoder-private pseudo-random noise,
+//     uncorrelated between implementations) well under the 50 dB gate,
+//     SPX runs with `spxblnd = 31` so the §E.3.6.4.2 noise component
+//     (likewise a decoder-private generator) is off, and enhanced
+//     coupling / dependent substreams are left out because the oracle
+//     does not render them (recorded in README + the fixture notes).
+// ---------------------------------------------------------------------------
+
+/// The coding-tool axis of the matrix: (tag, encoder options).
+const MATRIX_TOOLS: &[(&str, &[(&str, &str)])] = &[
+    ("plain", &[]),
+    ("spx", &[("spx", "1"), ("spx_blnd", "31")]),
+    ("aht", &[("aht", "1")]),
+    ("tpnp", &[("tpnp", "1")]),
+    (
+        "spx+tpnp+meta",
+        &[
+            ("spx", "1"),
+            ("spx_blnd", "31"),
+            ("tpnp", "1"),
+            ("compr", "0x0b"),
+            ("dialnorm", "24"),
+            ("dynrng", "0xc8"),
+            ("dmixmod", "1"),
+            ("lfemixlevcod", "10"),
+            ("pgmscl", "51"),
+            ("mixlevel", "25"),
+            ("roomtyp", "1"),
+            ("copyright", "1"),
+            ("origbs", "1"),
+        ],
+    ),
+    (
+        "aht+meta",
+        &[
+            ("aht", "1"),
+            ("compr", "0x10"),
+            ("dialnorm", "27"),
+            ("dmixmod", "2"),
+            ("ltrtcmixlev", "4"),
+            ("lorocmixlev", "4"),
+            ("ltrtsurmixlev", "5"),
+            ("lorosurmixlev", "5"),
+            ("lfemixlevcod", "10"),
+        ],
+    ),
+];
+
+/// Run the matrix at one sample rate: stereo 192 kb/s and 5.1 448 kb/s
+/// six-block frames across every tool, plus the fractional-frame shapes
+/// (`numblkscod` 0..2) the tools cannot combine with.
+fn broadcast_matrix_at(rate: u32) {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg unavailable — skipping");
+        return;
+    }
+    for (tag, opts) in MATRIX_TOOLS {
+        for (channels, kbps) in [(2usize, 192u64), (6, 448)] {
+            let es = encode_ours_at(channels, rate, 0.5, kbps * 1000, opts);
+            assert_decode_matches_ffmpeg(
+                &format!("matrix {rate} Hz {channels}ch {kbps}k {tag}"),
+                &es,
+                channels,
+                rate,
+            );
+        }
+    }
+    for (channels, blocks, kbps, tool) in [
+        (2usize, "3", 192u64, "plain"),
+        (2, "2", 448, "plain"),
+        (2, "1", 448, "tpnp"),
+        (6, "3", 448, "plain"),
+    ] {
+        let opts: &[(&str, &str)] = if tool == "tpnp" {
+            &[("blocks", blocks), ("tpnp", "1")]
+        } else {
+            &[("blocks", blocks)]
+        };
+        let es = encode_ours_at(channels, rate, 0.5, kbps * 1000, opts);
+        assert_decode_matches_ffmpeg(
+            &format!("matrix {rate} Hz {channels}ch {blocks}blk {kbps}k {tool}"),
+            &es,
+            channels,
+            rate,
+        );
+    }
+}
+
+#[test]
+fn crafted_broadcast_matrix_48k_decodes_like_ffmpeg() {
+    broadcast_matrix_at(48_000);
+}
+
+#[test]
+fn crafted_broadcast_matrix_44k_decodes_like_ffmpeg() {
+    broadcast_matrix_at(44_100);
+}
+
+#[test]
+fn crafted_broadcast_matrix_32k_decodes_like_ffmpeg() {
+    broadcast_matrix_at(32_000);
 }
 
 // ---------------------------------------------------------------------------

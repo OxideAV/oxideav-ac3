@@ -573,17 +573,13 @@ pub(crate) fn parse_audblk_into(
         let dynrng = br.read_u32(8)? as u8;
         side.dynrng = dynrng;
         let g = state.drc.resolve_block_gain(dynrng, compr_ch1);
-        for ch in 0..nfchans {
-            state.channels[ch].dynrng = g;
-        }
+        set_program_dynrng(state, nfchans, bsi.lfeon, g);
     } else if blk == 0 {
         // §7.7.1.2 — block 0 with no dynrng word uses '0000 0000' (0 dB).
         // In RF mode that 0 dB dynrng still yields to the frame's compr
         // word, so route the block-0 default through the same resolver.
         let g = state.drc.resolve_block_gain(0x00, compr_ch1);
-        for ch in 0..nfchans {
-            state.channels[ch].dynrng = g;
-        }
+        set_program_dynrng(state, nfchans, bsi.lfeon, g);
     }
     // §5.4.3.5 dynrng2e — dual-mono ch2 dynamic-range present (1 bit),
     // §5.4.3.6 dynrng2 — dual-mono ch2 dynamic-range word (8 bits).
@@ -1225,6 +1221,17 @@ pub(crate) fn decode_exponents(
 /// §7.2.2.1.1 special-case test: `csnroffst`, every `fsnroffst[ch]`,
 /// `cplfsnroffst` (when coupling is in use) and `lfefsnroffst` (when
 /// the LFE is on) are all zero.
+/// Store the resolved §7.7.1 dynamic-range gain for the program's
+/// channels: every fbw channel and, when `lfeon`, the LFE slot
+/// (`MAX_FBW + 1`). §5.4.3.4 / §6.1.9 scale "the reproduced audio" of
+/// the block as a whole; only 1+1 mode (acmod 0) overrides Ch2 with
+/// `dynrng2` afterwards.
+pub(crate) fn set_program_dynrng(state: &mut Ac3State, nfchans: usize, lfeon: bool, gain: f32) {
+    for ch in (0..nfchans).chain(lfeon.then_some(MAX_FBW + 1)) {
+        state.channels[ch].dynrng = gain;
+    }
+}
+
 pub(crate) fn all_snr_offsets_zero(
     state: &Ac3State,
     nfchans: usize,
@@ -2266,8 +2273,12 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
     // `in_spx`, so this is a no-op there.
     apply_spectral_extension(state, nfchans);
 
-    // --- Dynrng scaling ---
-    for ch in 0..nfchans {
+    // --- Dynrng scaling (§6.1.9 / §7.7.1) ---
+    // The word scales the block's reproduced audio: every fbw channel
+    // and, when present, the LFE channel (§5.4.3.4 names no exception;
+    // only 1+1 mode splits the program into dynrng / dynrng2 per
+    // channel, and the LFE then follows the Ch1 word).
+    for ch in (0..nfchans).chain(bsi.lfeon.then_some(MAX_FBW + 1)) {
         let g = state.channels[ch].dynrng;
         if (g - 1.0).abs() > 1e-6 {
             let end = state.channels[ch].end_mant;
