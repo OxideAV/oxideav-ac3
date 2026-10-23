@@ -31,8 +31,8 @@ use oxideav_core::{Error, Result};
 use crate::bsi::Bsi;
 use crate::syncinfo::SyncInfo;
 use crate::tables::{
-    BAPTAB, BNDSZ, BNDTAB, DBPBTAB, FASTDEC, FASTGAIN, FLOORTAB, HTH, LATAB, MANT_LEVEL_11,
-    MANT_LEVEL_15, MANT_LEVEL_3, MANT_LEVEL_5, MANT_LEVEL_7, MASKTAB, QUANTIZATION_BITS, SLOWDEC,
+    BAPTAB, BNDSZ, BNDTAB, DBPBTAB, FASTDEC, FASTGAIN, FLOORTAB, HTH, LATAB, MANT_LEVEL_3,
+    MANT_LEVEL_5, MANT_LEVEL_7, MANT_LEVEL_11, MANT_LEVEL_15, MASKTAB, QUANTIZATION_BITS, SLOWDEC,
     SLOWGAIN, WINDOW,
 };
 
@@ -1180,11 +1180,7 @@ pub(crate) fn remat_band_count_spx(
             remat_band_count(true, cplbegf)
         }
     } else if spx_in_use {
-        if spx_begin_subbnd < 4 {
-            3
-        } else {
-            4
-        }
+        if spx_begin_subbnd < 4 { 3 } else { 4 }
     } else {
         4
     }
@@ -1526,67 +1522,68 @@ pub(crate) fn run_bit_allocation(
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
-    if let Some(tf) = trace_frame {
-        if tf == state.frame_counter && state.blkidx == trace_blk {
-            let label = if is_coupling {
-                "cpl".to_string()
-            } else if ch == MAX_FBW + 1 {
-                "lfe".to_string()
-            } else {
-                format!("ch{ch}")
-            };
-            eprintln!(
-                "TRACE frame={} blk={} {} bndstrt={} bndend={} start={} end={} fgain={:#x} sgain={:#x} fdecay={:#x} sdecay={:#x} dbknee={:#x} floor={:#x} snroffset={:#x}",
-                state.frame_counter,
-                state.blkidx,
-                label,
-                bndstrt,
-                bndend,
-                start,
-                end,
-                fgain,
-                sgain,
-                fdecay,
-                sdecay,
-                dbknee,
-                floor,
-                snroffset
-            );
-            eprintln!(
-                "TRACE  exp[0..bndend]: {:?}",
-                &state.channels[ch].exp[start..start + bndend.min(20)]
-            );
-            eprintln!(
-                "TRACE  psd[0..bndend]: {:?}",
-                &state.channels[ch].psd[start..start + bndend.min(20)]
-            );
-            eprintln!(
-                "TRACE  bndpsd[bndstrt..bndend]: {:?}",
-                &state.channels[ch].bndpsd[bndstrt..bndend]
-            );
-            eprintln!(
-                "TRACE  excite[bndstrt..bndend]: {:?}",
-                &excite[bndstrt..bndend]
-            );
-            eprintln!("TRACE  mask[bndstrt..bndend]: {:?}", &mask[bndstrt..bndend]);
-            eprintln!(
-                "TRACE  bap[start..end]: {:?}",
-                &state.channels[ch].bap[start..end.min(start + 30)]
-            );
-            // Re-derive the lowcomp progression for the first 7 bins so we
-            // can audit calc_lowcomp by hand against the spec table.
-            if bndstrt == 0 && !is_coupling {
-                let mut lc = 0i32;
-                let bp = |i: usize| state.channels[ch].bndpsd[i.min(49)] as i32;
-                eprint!("TRACE  lowcomp progression: ");
-                for bin in 0..7.min(bndend) {
-                    if bin + 1 < 50 {
-                        lc = calc_lowcomp(lc, bp(bin), bp(bin + 1), bin);
-                    }
-                    eprint!("[bin={} lc={}] ", bin, lc);
+    if let Some(tf) = trace_frame
+        && tf == state.frame_counter
+        && state.blkidx == trace_blk
+    {
+        let label = if is_coupling {
+            "cpl".to_string()
+        } else if ch == MAX_FBW + 1 {
+            "lfe".to_string()
+        } else {
+            format!("ch{ch}")
+        };
+        eprintln!(
+            "TRACE frame={} blk={} {} bndstrt={} bndend={} start={} end={} fgain={:#x} sgain={:#x} fdecay={:#x} sdecay={:#x} dbknee={:#x} floor={:#x} snroffset={:#x}",
+            state.frame_counter,
+            state.blkidx,
+            label,
+            bndstrt,
+            bndend,
+            start,
+            end,
+            fgain,
+            sgain,
+            fdecay,
+            sdecay,
+            dbknee,
+            floor,
+            snroffset
+        );
+        eprintln!(
+            "TRACE  exp[0..bndend]: {:?}",
+            &state.channels[ch].exp[start..start + bndend.min(20)]
+        );
+        eprintln!(
+            "TRACE  psd[0..bndend]: {:?}",
+            &state.channels[ch].psd[start..start + bndend.min(20)]
+        );
+        eprintln!(
+            "TRACE  bndpsd[bndstrt..bndend]: {:?}",
+            &state.channels[ch].bndpsd[bndstrt..bndend]
+        );
+        eprintln!(
+            "TRACE  excite[bndstrt..bndend]: {:?}",
+            &excite[bndstrt..bndend]
+        );
+        eprintln!("TRACE  mask[bndstrt..bndend]: {:?}", &mask[bndstrt..bndend]);
+        eprintln!(
+            "TRACE  bap[start..end]: {:?}",
+            &state.channels[ch].bap[start..end.min(start + 30)]
+        );
+        // Re-derive the lowcomp progression for the first 7 bins so we
+        // can audit calc_lowcomp by hand against the spec table.
+        if bndstrt == 0 && !is_coupling {
+            let mut lc = 0i32;
+            let bp = |i: usize| state.channels[ch].bndpsd[i.min(49)] as i32;
+            eprint!("TRACE  lowcomp progression: ");
+            for bin in 0..7.min(bndend) {
+                if bin + 1 < 50 {
+                    lc = calc_lowcomp(lc, bp(bin), bp(bin + 1), bin);
                 }
-                eprintln!();
+                eprint!("[bin={} lc={}] ", bin, lc);
             }
+            eprintln!();
         }
     }
 }
@@ -2295,25 +2292,26 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
     for ch in 0..nfchans {
         let mut coeffs = [0.0f32; 256];
         coeffs.copy_from_slice(&state.channels[ch].coeffs);
-        if let Some(tf) = trace_frame_dsp {
-            if tf == state.frame_counter && state.blkidx == trace_blk_dsp {
-                let max_abs = coeffs.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-                let nonzero = coeffs.iter().filter(|&&v| v != 0.0).count();
-                eprintln!(
-                    "TRACE-DSP ch{} pre-IMDCT max|coeff|={:.6e} nonzero_bins={} blksw={} dynrng={}",
-                    ch, max_abs, nonzero, state.channels[ch].blksw, state.channels[ch].dynrng
-                );
-                eprint!("TRACE-DSP ch{} coeff[0..16]: ", ch);
-                for v in &coeffs[..16] {
-                    eprint!("{:.4e} ", v);
-                }
-                eprintln!();
-                eprint!("TRACE-DSP ch{} coeff[16..32]: ", ch);
-                for v in &coeffs[16..32] {
-                    eprint!("{:.4e} ", v);
-                }
-                eprintln!();
+        if let Some(tf) = trace_frame_dsp
+            && tf == state.frame_counter
+            && state.blkidx == trace_blk_dsp
+        {
+            let max_abs = coeffs.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+            let nonzero = coeffs.iter().filter(|&&v| v != 0.0).count();
+            eprintln!(
+                "TRACE-DSP ch{} pre-IMDCT max|coeff|={:.6e} nonzero_bins={} blksw={} dynrng={}",
+                ch, max_abs, nonzero, state.channels[ch].blksw, state.channels[ch].dynrng
+            );
+            eprint!("TRACE-DSP ch{} coeff[0..16]: ", ch);
+            for v in &coeffs[..16] {
+                eprint!("{:.4e} ", v);
             }
+            eprintln!();
+            eprint!("TRACE-DSP ch{} coeff[16..32]: ", ch);
+            for v in &coeffs[16..32] {
+                eprint!("{:.4e} ", v);
+            }
+            eprintln!();
         }
         let mut time = [0.0f32; 512];
         if state.channels[ch].blksw {
@@ -2802,7 +2800,7 @@ mod spx_tests {
         assert!((coeffs[12] - 0.125).abs() < 1e-6);
         assert!((coeffs[13] - 0.25).abs() < 1e-6); // mirror
         assert!((coeffs[14] - 0.5).abs() < 1e-6); // mirror
-                                                  // Outside the 5-tap window, coefficients are untouched.
+        // Outside the 5-tap window, coefficients are untouched.
         assert_eq!(coeffs[9], 1.0);
         assert_eq!(coeffs[15], 1.0);
     }

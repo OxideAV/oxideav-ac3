@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dec.send_packet(pk)?;
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
             let plane = &a.data[0];
-            for c in plane.chunks_exact(4) {
+            for c in plane.as_chunks::<4>().0 {
                 let off = ch * 2;
                 let li = i16::from_le_bytes([c[off], c[off + 1]]);
                 let f = li as f32 / 32768.0;

@@ -8,7 +8,7 @@
 //! Bounded to 32 frames.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_ac3::eac3::{decode_eac3_packet, Eac3DecoderState};
+use oxideav_ac3::eac3::{Eac3DecoderState, decode_eac3_packet};
 use oxideav_ac3::syncinfo;
 
 fuzz_target!(|data: &[u8]| {

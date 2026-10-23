@@ -184,13 +184,14 @@ pub mod tables;
 // `tests/eac3_ffmpeg.rs` and the workspace registration in
 // `crate::lib::register`) don't need to change.
 pub use bsi::{
-    Bsi as Eac3Bsi, DrcSource, PanInfo, PremixCompression, PremixCompressionWord,
-    ProgramScaleFactor, BSID_BASE_AC3_MAX, EAC3_BSID,
+    BSID_BASE_AC3_MAX, Bsi as Eac3Bsi, DrcSource, EAC3_BSID, PanInfo, PremixCompression,
+    PremixCompressionWord, ProgramScaleFactor,
 };
-pub use decoder::{decode_eac3_packet, Eac3DecoderState};
+pub use decoder::{Eac3DecoderState, decode_eac3_packet};
 pub use ecplenc::EcplParams;
 pub use encoder::{
-    make_encoder, make_encoder_with_aht, make_encoder_with_blocks, make_encoder_with_ecpl,
-    make_encoder_with_spx, make_encoder_with_spx_ecpl, make_encoder_with_tpnp, CODEC_ID_STR,
+    CODEC_ID_STR, make_encoder, make_encoder_with_aht, make_encoder_with_blocks,
+    make_encoder_with_ecpl, make_encoder_with_spx, make_encoder_with_spx_ecpl,
+    make_encoder_with_tpnp,
 };
 pub use spxenc::SpxParams;

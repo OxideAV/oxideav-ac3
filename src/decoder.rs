@@ -203,7 +203,7 @@ impl Decoder for Ac3Decoder {
                     Err(Error::Eof)
                 } else {
                     Err(Error::NeedMore)
-                }
+                };
             }
         };
         self.process_frame(&pkt)
@@ -356,7 +356,7 @@ impl Ac3Decoder {
             let mut pcm = decoded.pcm_s16le;
             if dn_gain != 1.0 {
                 // Scale the already-quantised S16 samples in place.
-                for chunk in pcm.chunks_exact_mut(2) {
+                for chunk in pcm.as_chunks_mut::<2>().0 {
                     let v = i16::from_le_bytes([chunk[0], chunk[1]]);
                     let scaled = (v as f32 * dn_gain).clamp(-32768.0, 32767.0) as i16;
                     let le = scaled.to_le_bytes();
@@ -1036,7 +1036,7 @@ mod tests {
                 continue;
             }
             while let Ok(Frame::Audio(af)) = dec.receive_frame() {
-                for chunk in af.data[0].chunks_exact(2) {
+                for chunk in af.data[0].as_chunks::<2>().0 {
                     let v = i16::from_le_bytes([chunk[0], chunk[1]]) as f64;
                     sum_sq += v * v;
                     n += 1;

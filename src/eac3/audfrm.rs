@@ -27,8 +27,8 @@
 //! parser can use them as defaults when the per-block flag says
 //! "frame-level value reused".
 
-use oxideav_core::bits::BitReader;
 use oxideav_core::Result;
+use oxideav_core::bits::BitReader;
 
 use super::bsi::{Bsi, StreamType};
 
@@ -696,7 +696,7 @@ mod tests {
         bits.push((1, 1)); // dbaflde
         bits.push((1, 1)); // skipflde
         bits.push((1, 0)); // spxattene
-                           // acmod>1 → block 0 cplinu, then 5*(cplstre[, cplinu]) pairs.
+        // acmod>1 → block 0 cplinu, then 5*(cplstre[, cplinu]) pairs.
         bits.push((1, 0)); // cplinu[0] = 0
         for _ in 1..6 {
             bits.push((1, 0)); // cplstre[blk] = 0
@@ -780,7 +780,7 @@ mod tests {
         bits.push((1, 1)); // dbaflde
         bits.push((1, 1)); // skipflde
         bits.push((1, 0)); // spxattene
-                           // acmod>1 → cplinu[0]=1, then cplstre[1..5]=0 (sticky reuse keeps cplinu=1)
+        // acmod>1 → cplinu[0]=1, then cplstre[1..5]=0 (sticky reuse keeps cplinu=1)
         bits.push((1, 1));
         for _ in 1..6 {
             bits.push((1, 0));

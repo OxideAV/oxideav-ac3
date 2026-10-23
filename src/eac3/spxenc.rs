@@ -29,7 +29,7 @@
 //!   exponent / mantissa / master-coordinate quantiser, with
 //!   [`decode_coord`] as the exact decoder-side inverse for tests.
 
-use crate::audblk::{spx_translation_plan, N_COEFFS, SPX_ATTEN_TABLE};
+use crate::audblk::{N_COEFFS, SPX_ATTEN_TABLE, spx_translation_plan};
 use oxideav_core::{Error, Result};
 
 /// Encoder-facing SPX configuration.

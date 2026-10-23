@@ -150,19 +150,18 @@ fn main() {
                             rd::path_lag(&enc, Dec::Ours),
                             rd::path_lag(&enc, Dec::Reference)
                         );
-                        if std::env::var("OXIDEAV_RD_LAGSCAN").is_ok() {
-                            if let Some(es) = rd::encode(sig, &enc, kbps) {
-                                let pcm =
-                                    rd::decode(&es, &enc, Dec::Reference, sig.channels).unwrap();
-                                let mut best = (0usize, f64::NEG_INFINITY);
-                                for lag in 0..=1024usize {
-                                    let v = rd::snr_min_at(&sig.pcm, &pcm, sig.channels, lag);
-                                    if v > best.1 {
-                                        best = (lag, v);
-                                    }
+                        if std::env::var("OXIDEAV_RD_LAGSCAN").is_ok()
+                            && let Some(es) = rd::encode(sig, &enc, kbps)
+                        {
+                            let pcm = rd::decode(&es, &enc, Dec::Reference, sig.channels).unwrap();
+                            let mut best = (0usize, f64::NEG_INFINITY);
+                            for lag in 0..=1024usize {
+                                let v = rd::snr_min_at(&sig.pcm, &pcm, sig.channels, lag);
+                                if v > best.1 {
+                                    best = (lag, v);
                                 }
-                                println!("    lagscan best={:?}", best);
                             }
+                            println!("    lagscan best={:?}", best);
                         }
                     }
                 }

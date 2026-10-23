@@ -37,38 +37,38 @@
 //! bit allocation, mantissa quantisation) is identical to AC-3 and we
 //! reuse the helpers from `super::encoder` directly.
 
-use oxideav_core::bits::BitWriter;
 use oxideav_core::Encoder;
+use oxideav_core::bits::BitWriter;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
 
-use crate::audblk::{remat_band_count_spx, BLOCKS_PER_FRAME, N_COEFFS, SAMPLES_PER_BLOCK};
+use crate::audblk::{BLOCKS_PER_FRAME, N_COEFFS, SAMPLES_PER_BLOCK, remat_band_count_spx};
 // The 6-block frame constant (1536) only survives in the test suites'
 // fixture builders; the library paths are block-count-generic now.
 #[cfg(test)]
 use crate::decoder::SAMPLES_PER_FRAME;
 use crate::encoder::{
+    BitAllocParams, CADENCE_CSNR_INIT, CouplingPlan, DbaPlan, LFE_END_MANT, TransientDetector,
     ac3_crc_update, bound_shared_exponents, build_dba_plan, cadence_reference_ba, compute_bap,
     compute_bap_cpl, decode_input_samples, elect_exponent_cadence, extract_exponent,
     mantissa_bits_total, overhead_bits_for, overhead_bits_for_ends, pick_strategy_for_block,
     preprocess_d15, quantise_exponents_to_grpsize, quantise_mantissa, tune_snroffst_with_plan_ends,
-    write_exponents_cpl, write_exponents_grouped, write_mantissa_stream, BitAllocParams,
-    CouplingPlan, DbaPlan, TransientDetector, CADENCE_CSNR_INIT, LFE_END_MANT,
+    write_exponents_cpl, write_exponents_grouped, write_mantissa_stream,
 };
 use crate::mdct::{mdct_256_pair, mdct_512};
 use crate::tables::WINDOW;
 
 use super::ahtenc::{compute_hebap, dct_ii_6, plan_aht_channel, write_aht_channel};
 use super::dsp::DEFAULT_SPX_BNDSTRC;
-use super::ecpl::{reconstruct_carrier, DEFAULT_ECPL_BNDSTRC};
+use super::ecpl::{DEFAULT_ECPL_BNDSTRC, reconstruct_carrier};
 use super::ecplenc::{
-    band_cross_stats, band_mdct_energies, build_carrier_block, carrier_band_gains,
-    chaos_amp_factor, chaos_code_for, quantise_amp, quantise_angle, region_restrict, BandStats,
-    EcplGeometry, EcplParams,
+    BandStats, EcplGeometry, EcplParams, band_cross_stats, band_mdct_energies, build_carrier_block,
+    carrier_band_gains, chaos_amp_factor, chaos_code_for, quantise_amp, quantise_angle,
+    region_restrict,
 };
 use super::spxenc::{
-    band_coord_targets_span_atten, choose_mstrspxco, quantise_coord, SpxGeometry, SpxParams,
+    SpxGeometry, SpxParams, band_coord_targets_span_atten, choose_mstrspxco, quantise_coord,
 };
 
 /// Codec id string used by the E-AC-3 encoder (registered separately from
@@ -132,7 +132,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         Some(v) => {
             return Err(Error::invalid(format!(
                 "eac3 encoder: option aht={v} (expected 1/true/0/false)"
-            )))
+            )));
         }
     }
     match params.options.get("tpnp") {
@@ -141,7 +141,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         Some(v) => {
             return Err(Error::invalid(format!(
                 "eac3 encoder: option tpnp={v} (expected 1/true/0/false)"
-            )))
+            )));
         }
     }
     if let Some(ecpl) = ecpl_params_from_options(params)? {
@@ -490,7 +490,7 @@ fn ecpl_params_from_options(params: &CodecParameters) -> Result<Option<EcplParam
         Some(v) => {
             return Err(Error::invalid(format!(
                 "eac3 encoder: option ecpl={v} (expected 1/true/0/false)"
-            )))
+            )));
         }
     };
     let parse_u8 = |key: &str| -> Result<Option<u8>> {
@@ -513,7 +513,7 @@ fn ecpl_params_from_options(params: &CodecParameters) -> Result<Option<EcplParam
         Some(v) => {
             return Err(Error::invalid(format!(
                 "eac3 encoder: option ecpl_chaos={v} (expected 1/true/0/false)"
-            )))
+            )));
         }
     };
     let on = match enabled {
@@ -716,20 +716,20 @@ impl Eac3Metadata {
                     )));
                 }
             }
-            if let Some(l) = m.lfemixlevcod {
-                if l > 31 {
-                    return Err(Error::invalid(format!(
-                        "eac3 encoder: lfemixlevcod {l} out of range (0..=31)"
-                    )));
-                }
+            if let Some(l) = m.lfemixlevcod
+                && l > 31
+            {
+                return Err(Error::invalid(format!(
+                    "eac3 encoder: lfemixlevcod {l} out of range (0..=31)"
+                )));
             }
             for (name, v) in [("pgmscl", m.pgmscl), ("extpgmscl", m.extpgmscl)] {
-                if let Some(v) = v {
-                    if v > 63 {
-                        return Err(Error::invalid(format!(
-                            "eac3 encoder: {name} {v} out of range (0..=63)"
-                        )));
-                    }
+                if let Some(v) = v
+                    && v > 63
+                {
+                    return Err(Error::invalid(format!(
+                        "eac3 encoder: {name} {v} out of range (0..=63)"
+                    )));
                 }
             }
         }
@@ -1092,7 +1092,7 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
         _ => {
             return Err(Error::Unsupported(format!(
                 "eac3 encoder: unsupported sample rate {sample_rate} (48000/44100/32000 only)"
-            )))
+            )));
         }
     };
     let target_kbps: Option<u32> = params.bit_rate.map(|b| (b / 1000) as u32);
@@ -1186,7 +1186,7 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
         n => {
             return Err(Error::Unsupported(format!(
                 "eac3 encoder: unsupported channel count {n} (must be 1, 2, 6, or 8)"
-            )))
+            )));
         }
     };
 
@@ -1536,7 +1536,7 @@ impl Encoder for Eac3Encoder {
             _ => {
                 return Err(Error::invalid(
                     "eac3 encoder: send_frame requires an audio frame",
-                ))
+                ));
             }
         };
         let per_chan = decode_input_samples(audio, self.total_pcm_chans, self.input_sample_format)?;
@@ -1561,7 +1561,7 @@ impl Encoder for Eac3Encoder {
         let missing = self.frame_samples() - self.pending_samples[0].len();
         if missing > 0 {
             for ch in 0..self.total_pcm_chans {
-                self.pending_samples[ch].extend(std::iter::repeat(0.0).take(missing));
+                self.pending_samples[ch].extend(std::iter::repeat_n(0.0, missing));
             }
         }
         self.emit_syncframe()?;
@@ -1821,7 +1821,7 @@ impl Eac3Encoder {
                                 .spx
                                 .as_ref()
                                 .and_then(|p| p.channel_mask)
-                                .map_or(true, |m| m & (1 << ch) != 0)
+                                .is_none_or(|m| m & (1 << ch) != 0)
                     )
             })
             .collect();
@@ -2666,7 +2666,7 @@ impl Eac3Encoder {
         // (blkid / frmsizecod) is never emitted by this encoder.
         if sub.strmtyp == 0 && nblks != BLOCKS_PER_FRAME {
             let group = (BLOCKS_PER_FRAME / nblks) as u64;
-            let convsync = u32::from(self.frames_emitted % group == 0);
+            let convsync = u32::from(self.frames_emitted.is_multiple_of(group));
             bw.write_u32(convsync, 1);
         }
         bw.write_u32(0, 1); // addbsie = 0
@@ -2840,9 +2840,9 @@ impl Eac3Encoder {
                 (Some(g), 0) => {
                     let p = self.spx.as_ref().expect("spx params when geom is set");
                     bw.write_u32(1, 1); // spxinu = 1
-                                        // §E.2.3.3.3 chinspx[ch] — implicit for mono
-                                        // (acmod == 0x1); explicit per fbw channel
-                                        // otherwise (mixed membership allowed).
+                    // §E.2.3.3.3 chinspx[ch] — implicit for mono
+                    // (acmod == 0x1); explicit per fbw channel
+                    // otherwise (mixed membership allowed).
                     if sub.acmod != 0x1 {
                         for &member in in_spx.iter().take(nfchans) {
                             bw.write_u32(u32::from(member), 1);
@@ -3013,10 +3013,10 @@ impl Eac3Encoder {
             // + D15 groups over [ecplstartmant, ecplendmant), emitted on
             // the blocks whose audfrm `cplexpstr[blk]` is non-REUSE
             // (anchors 0 and 3). No gainrng for the coupling channel.
-            if let Some(g) = &ecpl_geom {
-                if exp_strategies[blk] == 1 {
-                    write_exponents_cpl(&mut bw, &exps[nfchans][blk], g.start_bin, g.end_bin);
-                }
+            if let Some(g) = &ecpl_geom
+                && exp_strategies[blk] == 1
+            {
+                write_exponents_cpl(&mut bw, &exps[nfchans][blk], g.start_bin, g.end_bin);
             }
             // §E.1.2.4 fbw exponents. After each channel's grouped
             // exponents, the spec emits `gainrng[ch]` (2 bits) — same as
@@ -3835,7 +3835,7 @@ mod tests {
     /// construction-accepted configuration must encode arbitrary PCM.
     #[test]
     fn seven_one_pair_three_block_128k_never_overflows() {
-        use crate::eac3::decoder::{decode_eac3_packet, Eac3DecoderState};
+        use crate::eac3::decoder::{Eac3DecoderState, decode_eac3_packet};
         use oxideav_core::{AudioFrame, Error, Frame};
         let channels = 8u16;
         let blocks = 3usize;
@@ -4295,14 +4295,14 @@ mod tests {
     }
 
     pub(crate) fn decode_all(bytes: &[u8], frame_bytes: usize) -> Vec<i16> {
-        use crate::eac3::decoder::{decode_eac3_packet, Eac3DecoderState};
+        use crate::eac3::decoder::{Eac3DecoderState, decode_eac3_packet};
         let mut st = Eac3DecoderState::default();
         let mut out = Vec::new();
         let mut off = 0usize;
         while off + frame_bytes <= bytes.len() {
             let frame = decode_eac3_packet(&mut st, &bytes[off..off + frame_bytes])
                 .expect("decode eac3 packet");
-            for chunk in frame.pcm_s16le.chunks_exact(2) {
+            for chunk in frame.pcm_s16le.as_chunks::<2>().0 {
                 out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
             }
             off += frame_bytes;
@@ -4964,24 +4964,28 @@ mod tests {
         let mut p = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
         p.sample_rate = Some(48_000);
         p.channels = Some(2);
-        assert!(make_encoder_with_spx(
-            &p,
-            SpxParams {
-                channel_mask: Some(0),
-                ..SpxParams::default()
-            }
-        )
-        .is_err());
+        assert!(
+            make_encoder_with_spx(
+                &p,
+                SpxParams {
+                    channel_mask: Some(0),
+                    ..SpxParams::default()
+                }
+            )
+            .is_err()
+        );
         // Mono cannot exclude its only channel (chinspx[0] implicit).
         p.channels = Some(1);
-        assert!(make_encoder_with_spx(
-            &p,
-            SpxParams {
-                channel_mask: Some(0b10),
-                ..SpxParams::default()
-            }
-        )
-        .is_err());
+        assert!(
+            make_encoder_with_spx(
+                &p,
+                SpxParams {
+                    channel_mask: Some(0b10),
+                    ..SpxParams::default()
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5574,9 +5578,9 @@ mod ecpl_tests {
             for (bnd, d) in deltas.iter().enumerate() {
                 if band_energies[bnd] < peak * 1e-3 {
                     continue; // > 30 dB below the loudest band: the
-                              // pure-tone fixtures leave only MDCT
-                              // leakage there — reconstruction noise
-                              // vs leakage is not a meaningful ratio.
+                    // pure-tone fixtures leave only MDCT
+                    // leakage there — reconstruction noise
+                    // vs leakage is not a meaningful ratio.
                 }
                 assert!(
                     d.abs() <= band_tol_db,
@@ -5756,7 +5760,7 @@ mod ecpl_tests {
         let pair_bytes = 1536 + 768;
         assert_eq!(stream.len() % pair_bytes, 0, "not a whole pair stream");
 
-        use crate::eac3::decoder::{decode_eac3_packet, Eac3DecoderState};
+        use crate::eac3::decoder::{Eac3DecoderState, decode_eac3_packet};
         let mut st = Eac3DecoderState::default();
         let mut out: Vec<i16> = Vec::new();
         let mut channels = 0usize;
@@ -5766,7 +5770,7 @@ mod ecpl_tests {
                 .expect("decode ecpl 7.1 indep+dep packet");
             assert_eq!(frame.channels, 8, "expected 8 output channels");
             channels = frame.channels as usize;
-            for c in frame.pcm_s16le.chunks_exact(2) {
+            for c in frame.pcm_s16le.as_chunks::<2>().0 {
                 out.push(i16::from_le_bytes([c[0], c[1]]));
             }
             off += pair_bytes;
@@ -6653,7 +6657,9 @@ mod meta_tests {
         let _ = std::fs::remove_file(&out_path);
         Some(
             bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect(),
         )

@@ -775,7 +775,7 @@ pub fn interpolate_bin_angles(band_angles: &[f32], nbins_per_bnd: &[usize]) -> V
         // Lower half of the first band (walks downward from the centre).
         if bnd == 1 && nbins_prev > 1 {
             let (mut y, mut down_bin): (f32, usize);
-            if nbins_prev % 2 == 0 {
+            if nbins_prev.is_multiple_of(2) {
                 y = angle_prev - slope / 2.0;
                 down_bin = nbins_prev / 2 - 1;
             } else {
@@ -798,7 +798,7 @@ pub fn interpolate_bin_angles(band_angles: &[f32], nbins_per_bnd: &[usize]) -> V
             bin = count;
         }
 
-        let (mut y, count): (f32, usize) = if nbins_prev % 2 == 0 {
+        let (mut y, count): (f32, usize) = if nbins_prev.is_multiple_of(2) {
             (angle_prev + slope / 2.0, nbins_curr / 2 + nbins_prev / 2)
         } else {
             (angle_prev, nbins_curr / 2 + nbins_prev.div_ceil(2))
@@ -822,7 +822,7 @@ pub fn interpolate_bin_angles(band_angles: &[f32], nbins_per_bnd: &[usize]) -> V
         // reference carries `y`/`slope` out of the loop and runs one
         // closing pass; we mirror that by detecting the last band here.
         if bnd == nbands - 1 {
-            let last_count = if nbins_curr % 2 == 0 {
+            let last_count = if nbins_curr.is_multiple_of(2) {
                 nbins_curr / 2
             } else {
                 nbins_curr / 2 + 1
@@ -1412,7 +1412,7 @@ mod tests {
         assert_eq!(ECPL_SUBBND_TAB[4], 37);
         assert_eq!(ECPL_SUBBND_TAB[21], 241);
         assert_eq!(ECPL_SUBBND_TAB[22], 253); // sentinel
-                                              // Sub-bands 0..=3 are 6 bins wide.
+        // Sub-bands 0..=3 are 6 bins wide.
         for s in 0..4 {
             assert_eq!(ECPL_SUBBND_TAB[s + 1] - ECPL_SUBBND_TAB[s], 6);
         }
@@ -1643,7 +1643,7 @@ mod tests {
         let necplbnd = 2usize;
         let mut w = BitWriter::new();
         w.write_u32(1, 1); // ecplangleintrp = 1
-                           // ch0: implicit param1e=1 → 2 amps (5 bits each).
+        // ch0: implicit param1e=1 → 2 amps (5 bits each).
         w.write_u32(3, 5);
         w.write_u32(7, 5);
         // ch1: implicit param1e=1 → 2 amps; implicit param2e=1 → 2×(angle
@@ -1693,10 +1693,10 @@ mod tests {
         let necplbnd = 1usize;
         let mut w = BitWriter::new();
         w.write_u32(0, 1); // ecplangleintrp = 0
-                           // ch0: param1e = 1 → 1 amp.
+        // ch0: param1e = 1 → 1 amp.
         w.write_u32(1, 1); // param1e
         w.write_u32(9, 5); // amp
-                           // ch1: param1e = 0 (reuse), param2e = 1 → angle+chaos; trans = 0.
+        // ch1: param1e = 0 (reuse), param2e = 1 → angle+chaos; trans = 0.
         w.write_u32(0, 1); // param1e
         w.write_u32(1, 1); // param2e
         w.write_u32(42, 6); // angle
@@ -1729,7 +1729,7 @@ mod tests {
         let necplbnd = 1usize;
         let mut w = BitWriter::new();
         w.write_u32(0, 1); // ecplangleintrp
-                           // ch0 (first coupled, first block): implicit param1e → 1 amp.
+        // ch0 (first coupled, first block): implicit param1e → 1 amp.
         w.write_u32(8, 5);
         // ch1 skipped (not in coupling).
         // ch2 (second coupled, first block): implicit param1e + param2e +

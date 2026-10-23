@@ -85,7 +85,7 @@ fn decode_ac3(data: &[u8]) -> Vec<i16> {
         );
         dec.send_packet(&pkt).unwrap();
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-            for s in a.data[0].chunks_exact(2) {
+            for s in a.data[0].as_chunks::<2>().0 {
                 pcm.push(i16::from_le_bytes([s[0], s[1]]));
             }
         }

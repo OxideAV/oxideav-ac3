@@ -14,7 +14,7 @@
 //! rejects is an encoder (or decoder) bug.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_ac3::eac3::{decode_eac3_packet, Eac3DecoderState};
+use oxideav_ac3::eac3::{Eac3DecoderState, decode_eac3_packet};
 use oxideav_core::{
     AudioFrame, CodecId, CodecOptions, CodecParameters, Error, Frame, SampleFormat,
 };

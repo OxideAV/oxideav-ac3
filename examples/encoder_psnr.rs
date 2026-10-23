@@ -140,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dec.send_packet(p)?;
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
             let plane = &a.data[0];
-            for c in plane.chunks_exact(4) {
+            for c in plane.as_chunks::<4>().0 {
                 let li = i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0;
                 let ri = i16::from_le_bytes([c[2], c[3]]) as f32 / 32768.0;
                 dec_l.push(li);
@@ -156,7 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let skip = 2048usize.min(dec_l.len().saturating_sub(1));
     let best_lag: i32 = 256;
     let _ = (dec_r.len(),); // silence unused-var for early exits
-                            // Full-length PSNR using best_lag.
+    // Full-length PSNR using best_lag.
     let usable = l
         .len()
         .saturating_sub(skip)

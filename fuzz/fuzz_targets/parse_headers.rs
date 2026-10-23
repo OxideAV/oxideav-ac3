@@ -25,7 +25,9 @@ fuzz_target!(|data: &[u8]| {
     // Annex E BSI starts right after the 2-byte syncword.
     if data.len() > 2 {
         if let Ok(b) = eac3::bsi::parse(&data[2..]) {
-            assert!(b.num_blocks == 1 || b.num_blocks == 2 || b.num_blocks == 3 || b.num_blocks == 6);
+            assert!(
+                b.num_blocks == 1 || b.num_blocks == 2 || b.num_blocks == 3 || b.num_blocks == 6
+            );
             assert!(b.nfchans <= 5);
             // convsync only exists on fractional independent frames.
             if b.convsync.is_some() {

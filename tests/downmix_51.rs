@@ -65,7 +65,7 @@ fn decode_ac3_fully(data: &[u8], target_channels: Option<u16>) -> (u16, Vec<i16>
                 let derived = buf.len() / (a.samples as usize) / 2;
                 out_channels = derived as u16;
             }
-            for s in buf.chunks_exact(2) {
+            for s in buf.as_chunks::<2>().0 {
                 pcm.push(i16::from_le_bytes([s[0], s[1]]));
             }
         }
@@ -133,7 +133,9 @@ fn downmix_to_stereo_uses_two_channels() {
     // Skip the 512-sample primer per the existing RMS fixture test.
     let skip = 2 * 512;
     let left_energy: f64 = pcm
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .skip(skip / 2)
         .map(|s| (s[0] as f64) * (s[0] as f64))
         .sum();
@@ -161,7 +163,7 @@ fn downmix_stereo_envelope_tracks_ffmpeg() {
     let ref_path = std::env::temp_dir().join("oxideav_ac3_dmx_ref.wav");
 
     // 1. 5.1 AC-3 source.
-    let gen = Command::new("ffmpeg")
+    let r#gen = Command::new("ffmpeg")
         .args([
             "-y",
             "-hide_banner",
@@ -182,7 +184,7 @@ fn downmix_stereo_envelope_tracks_ffmpeg() {
         ])
         .arg(&src_path)
         .status();
-    if gen.map(|s| !s.success()).unwrap_or(true) {
+    if r#gen.map(|s| !s.success()).unwrap_or(true) {
         eprintln!("ffmpeg 5.1 AC-3 generation failed — skipping");
         return;
     }
@@ -213,7 +215,9 @@ fn downmix_stereo_envelope_tracks_ffmpeg() {
 
     assert_eq!(ch, 2);
     let ref_pcm: Vec<i16> = reference
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|b| i16::from_le_bytes([b[0], b[1]]))
         .collect();
     assert!(!ours.is_empty());
@@ -235,7 +239,12 @@ fn downmix_stereo_envelope_tracks_ffmpeg() {
     // level — the remaining gap is IMDCT / matrix-quantisation drift.
     let (mut ours_l, mut ref_l, mut ours_r, mut ref_r) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let mut count = 0u64;
-    for (o, r) in ours.chunks_exact(2).zip(rref.chunks_exact(2)) {
+    for (o, r) in ours
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(rref.as_chunks::<2>().0.iter())
+    {
         ours_l += (o[0] as f64).powi(2);
         ours_r += (o[1] as f64).powi(2);
         ref_l += (r[0] as f64).powi(2);

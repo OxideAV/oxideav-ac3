@@ -12,8 +12,8 @@ use std::{f32::consts::FRAC_PI_2, fmt};
 use super::{
     joc::JocMetadata,
     joc_qmf::{
-        Complex32, QmfAnalysis, QmfSynthesis, QMF_RECONSTRUCTION_DELAY, QMF_SUBBANDS,
-        QMF_TIMESLOTS_PER_EAC3_FRAME,
+        Complex32, QMF_RECONSTRUCTION_DELAY, QMF_SUBBANDS, QMF_TIMESLOTS_PER_EAC3_FRAME,
+        QmfAnalysis, QmfSynthesis,
     },
     joc_reconstruct::{JocMatrixDecoder, JocReconstructionError},
     oamd::{OamdDecoder, OamdFrame, OamdObjectKind, OamdObjectState, OamdParseError},
@@ -139,9 +139,9 @@ impl JocRenderer {
         }
 
         let shape = (num_channels, num_objects);
-        let expected_sequence =
-            self.last_sequence
-                .map(|sequence| if sequence == 1023 { 1 } else { sequence + 1 });
+        let expected_sequence = self
+            .last_sequence
+            .map(|sequence| if sequence == 1023 { 1 } else { sequence + 1 });
         if metadata.sequence_count != 0
             && (expected_sequence != Some(metadata.sequence_count) || self.shape != Some(shape))
         {

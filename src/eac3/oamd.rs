@@ -313,9 +313,9 @@ fn parse_program_assignment(
                     if assignment & (1 << index) != 0 {
                         if index == 0 || index == 7 {
                             kinds.push(OamdObjectKind::Lfe);
-                            kinds.extend(std::iter::repeat(OamdObjectKind::Bed).take(width - 1));
+                            kinds.extend(std::iter::repeat_n(OamdObjectKind::Bed, width - 1));
                         } else {
-                            kinds.extend(std::iter::repeat(OamdObjectKind::Bed).take(width));
+                            kinds.extend(std::iter::repeat_n(OamdObjectKind::Bed, width));
                         }
                     }
                 }
@@ -340,7 +340,7 @@ fn parse_program_assignment(
             .ok_or(OamdParseError::Invalid(
                 "OAMD intermediate-spatial-format index",
             ))?;
-        kinds.extend(std::iter::repeat(OamdObjectKind::Isf).take(count));
+        kinds.extend(std::iter::repeat_n(OamdObjectKind::Isf, count));
     }
     if content & 0b0010 != 0 {
         let mut dynamic_count = bits.read(5, "OAMD dynamic-object count")?;
@@ -353,7 +353,7 @@ fn parse_program_assignment(
             .ok()
             .and_then(|count| count.checked_add(1))
             .ok_or(OamdParseError::Limit("OAMD dynamic-object count"))?;
-        kinds.extend(std::iter::repeat(OamdObjectKind::Dynamic).take(count));
+        kinds.extend(std::iter::repeat_n(OamdObjectKind::Dynamic, count));
     }
     if content & 1 != 0 {
         let reserved_bytes = bits.read(4, "OAMD reserved-data size")? as usize + 1;
@@ -805,11 +805,13 @@ mod tests {
         }
 
         fn into_bytes(mut self) -> Vec<u8> {
-            while self.bits.len() % 8 != 0 {
+            while !self.bits.len().is_multiple_of(8) {
                 self.bits.push(false);
             }
             self.bits
-                .chunks_exact(8)
+                .as_chunks::<8>()
+                .0
+                .iter()
                 .map(|byte| {
                     byte.iter()
                         .fold(0_u8, |value, bit| (value << 1) | u8::from(*bit))

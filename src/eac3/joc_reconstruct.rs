@@ -102,9 +102,9 @@ impl JocMatrixDecoder {
             return Err(JocReconstructionError::Invalid("JOC object-update count"));
         }
 
-        let expected_sequence =
-            self.last_sequence
-                .map(|sequence| if sequence == 1023 { 1 } else { sequence + 1 });
+        let expected_sequence = self
+            .last_sequence
+            .map(|sequence| if sequence == 1023 { 1 } else { sequence + 1 });
         let shape = (num_objects, num_channels);
         if metadata.sequence_count == 0
             || expected_sequence.is_some_and(|expected| expected != metadata.sequence_count)

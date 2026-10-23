@@ -178,7 +178,7 @@ fn decoder_sine_fixture_has_nonzero_rms() {
         dec.send_packet(&pkt).unwrap();
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
             let buf = &a.data[0];
-            for s in buf.chunks_exact(4) {
+            for s in buf.as_chunks::<4>().0 {
                 let l = i16::from_le_bytes([s[0], s[1]]);
                 let r = i16::from_le_bytes([s[2], s[3]]);
                 samples_left.push(l);
@@ -429,7 +429,7 @@ fn transient_fixture_has_short_blocks() {
         .with_pts(frame_idx * SAMPLES_PER_FRAME as i64);
         dec.send_packet(&pkt).unwrap();
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-            for s in a.data[0].chunks_exact(2) {
+            for s in a.data[0].as_chunks::<2>().0 {
                 decoded.push(i16::from_le_bytes([s[0], s[1]]));
             }
         }

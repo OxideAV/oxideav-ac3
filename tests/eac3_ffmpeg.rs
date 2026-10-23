@@ -121,7 +121,7 @@ fn ffmpeg_decode(eac3_bytes: &[u8], channels: usize) -> Option<Vec<f32>> {
     let _ = fs::remove_file(&in_path);
     let _ = fs::remove_file(&out_path);
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for c in bytes.chunks_exact(2) {
+    for c in bytes.as_chunks::<2>().0 {
         let v = i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0;
         out.push(v);
     }
@@ -593,7 +593,7 @@ fn eac3_71_pair_decodes_through_ffmpeg() {
 #[test]
 fn eac3_71_decoder_surfaces_chanmap_lrs_rrs() {
     use oxideav_ac3::eac3::chanmap::ChannelLocation;
-    use oxideav_ac3::eac3::decoder::{decode_eac3_packet, Eac3DecoderState};
+    use oxideav_ac3::eac3::decoder::{Eac3DecoderState, decode_eac3_packet};
 
     let pcm = build_sine_pcm_71();
     let bytes = encode_eac3(&pcm, 8, 576_000);

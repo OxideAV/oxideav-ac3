@@ -20,7 +20,7 @@
 use std::env;
 
 use oxideav_ac3::eac3;
-use oxideav_ac3::eac3::decoder::{decode_eac3_packet, Eac3DecoderState};
+use oxideav_ac3::eac3::decoder::{Eac3DecoderState, decode_eac3_packet};
 use oxideav_ac3::eac3::ecplenc::EcplParams;
 use oxideav_ac3::eac3::spxenc::SpxParams;
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Encoder, Error, Frame, SampleFormat};
@@ -114,7 +114,7 @@ fn decode(stream: &[u8], frame_bytes: usize) -> Vec<i16> {
     let mut off = 0usize;
     while off + frame_bytes <= stream.len() {
         let f = decode_eac3_packet(&mut st, &stream[off..off + frame_bytes]).expect("decode");
-        for c in f.pcm_s16le.chunks_exact(2) {
+        for c in f.pcm_s16le.as_chunks::<2>().0 {
             out.push(i16::from_le_bytes([c[0], c[1]]));
         }
         off += frame_bytes;

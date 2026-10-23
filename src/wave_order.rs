@@ -369,7 +369,7 @@ mod tests {
         }
         reorder_s16le_in_place(&mut buf, 7, true, 6);
         let mut got = [0i16; 6];
-        for (i, ch) in buf.chunks_exact(2).enumerate() {
+        for (i, ch) in buf.as_chunks::<2>().0.iter().enumerate() {
             got[i] = i16::from_le_bytes([ch[0], ch[1]]);
         }
         // wave order (L, R, C, LFE, Ls, Rs) = (10, 30, 20, 60, 40, 50)

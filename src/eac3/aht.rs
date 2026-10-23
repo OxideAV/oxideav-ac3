@@ -80,8 +80,8 @@
 
 use std::f32::consts::PI;
 
-use oxideav_core::bits::BitReader;
 use oxideav_core::Result;
+use oxideav_core::bits::BitReader;
 
 use super::tables::aht_codebooks::{
     VQ_HEBAP1, VQ_HEBAP2, VQ_HEBAP3, VQ_HEBAP4, VQ_HEBAP5, VQ_HEBAP6, VQ_HEBAP7,
@@ -127,11 +127,7 @@ pub fn hebap_from_address(psd: i16, mask_after_floor: i32) -> u8 {
 /// pseudo-code paragraph that builds `chgaqbin[ch][bin]`.
 #[inline]
 pub fn endbap_for_gaqmod(gaqmod: u8) -> u8 {
-    if gaqmod < 2 {
-        12
-    } else {
-        17
-    }
+    if gaqmod < 2 { 12 } else { 17 }
 }
 
 /// Compute `chgaqbin[ch][bin]` per the §3.4.2 pseudo-code:

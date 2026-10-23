@@ -297,7 +297,7 @@ pub fn synth_transients(dur_s: f32, seed: u64) -> Vec<f32> {
         let mut l = 0.0f32;
         let mut r = 0.0f32;
         // Kick on beats 0 and 8 of 16.
-        if s % 16 == 0 || s % 16 == 8 || s % 16 == 11 {
+        if s.is_multiple_of(16) || s % 16 == 8 || s % 16 == 11 {
             let fk = 40.0 + 90.0 * (-tp * 40.0).exp();
             let env = (-tp * 9.0).exp();
             let ph =
@@ -316,7 +316,7 @@ pub fn synth_transients(dur_s: f32, seed: u64) -> Vec<f32> {
             r += body + rng.gauss() * env * 0.35;
         }
         // Hi-hat on every even 16th.
-        if s % 2 == 0 {
+        if s.is_multiple_of(2) {
             let env = (-tp * 90.0).exp();
             let w = rng.gauss();
             let hp = w - hp_prev;
@@ -601,7 +601,9 @@ fn to_wav_s16(sig: &Signal) -> Vec<u8> {
 
 fn s16_to_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
         .collect()
 }

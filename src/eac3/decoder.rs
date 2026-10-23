@@ -48,7 +48,7 @@ use super::audfrm::{self, AudFrm};
 use super::bsi::{self, Bsi as Eac3Bsi, StreamType};
 use super::chanmap::{self, ChannelLocation};
 use super::dsp;
-use super::joc::{parse_ec3_extension_type_a, parse_joc_emdf, JocMetadata};
+use super::joc::{JocMetadata, parse_ec3_extension_type_a, parse_joc_emdf};
 
 /// E-AC-3 syncword — same value as base AC-3 (§E.2.2.1).
 // internal — exposed for tests/fuzz; not part of the stable API
@@ -373,10 +373,10 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
                 // Round 3: decode + splice into indep_pcm_f32. On
                 // failure (Unsupported / parse error) we keep the
                 // indep PCM as-is so output is still meaningful.
-                if decode_dep_substream(state, &bsi, &audfrm, &mut br).is_ok() {
-                    if let Some(metadata) = decode_substream_joc(&bsi, &state.skip_fields) {
-                        joc_metadata = Some(metadata);
-                    }
+                if decode_dep_substream(state, &bsi, &audfrm, &mut br).is_ok()
+                    && let Some(metadata) = decode_substream_joc(&bsi, &state.skip_fields)
+                {
+                    joc_metadata = Some(metadata);
                 }
             }
             StreamType::Reserved => {
@@ -697,14 +697,14 @@ fn splice_dep_into_indep(
     state.indep_locations.extend(extend_locs.iter().copied());
 
     // Diagnostic: log the chanmap for any future bug hunts.
-    if let Some(map) = chanmap {
-        if std::env::var("EAC3_TRACE_CHANMAP").is_ok() {
-            eprintln!(
-                "TRACE-CHANMAP dep substream: chanmap=0x{map:04X} dep_nchans={dep_nchans} \
+    if let Some(map) = chanmap
+        && std::env::var("EAC3_TRACE_CHANMAP").is_ok()
+    {
+        eprintln!(
+            "TRACE-CHANMAP dep substream: chanmap=0x{map:04X} dep_nchans={dep_nchans} \
                  replaced={} extended={num_extend} → indep grown to {new_nchans} channels",
-                dep_nchans - num_extend,
-            );
-        }
+            dep_nchans - num_extend,
+        );
     }
 
     extend_locs

@@ -72,7 +72,8 @@ fuzz_target!(|data: &[u8]| {
     loop {
         match enc.receive_packet() {
             Ok(p) => {
-                dec.send_packet(&p).expect("own decode of an encoder-emitted syncframe");
+                dec.send_packet(&p)
+                    .expect("own decode of an encoder-emitted syncframe");
                 match dec.receive_frame() {
                     Ok(Frame::Audio(a)) => samples += a.samples as usize,
                     Ok(_) => {}

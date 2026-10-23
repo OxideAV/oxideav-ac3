@@ -255,7 +255,7 @@ pub fn verify_ac3_syncframe(syncframe: &[u8], frame_bytes: usize) -> CrcStatus {
             return CrcStatus {
                 crc1_ok: Some(false),
                 crc2_ok: Some(false),
-            }
+            };
         }
     };
     let crc1_residue = ac3_crc_update(0, &syncframe[2..crc1_end]);

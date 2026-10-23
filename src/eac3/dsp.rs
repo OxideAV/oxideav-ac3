@@ -1392,10 +1392,10 @@ pub fn decode_indep_audblks(
         }
 
         // ---- §E.1.3.5.6 skip ----
-        if audfrm.skipflde {
-            if let Some(skip_field) = read_skip_field(br)? {
-                skip_fields.push(skip_field);
-            }
+        if audfrm.skipflde
+            && let Some(skip_field) = read_skip_field(br)?
+        {
+            skip_fields.push(skip_field);
         }
 
         // ---- bit allocation ----
@@ -1699,43 +1699,41 @@ fn run_deferred_ecpl_dsp(
 
         let skip = deferred_skip_decouple[i];
         state.skip_decouple = skip;
-        if skip {
-            if let Some(curr) = &ecpl_blocks[abs_blk] {
-                let prev = if abs_blk > 0 {
-                    ecpl_blocks[abs_blk - 1].as_ref().unwrap_or(&zero_block)
-                } else {
-                    // Frame block 0 — its "previous block" is the prior
-                    // frame's last enhanced-coupling block (§E.3.5.5.1).
-                    &prev_frame_block
-                };
-                let next = if abs_blk + 1 < ecpl_blocks.len() {
-                    ecpl_blocks[abs_blk + 1].as_ref().unwrap_or(&zero_block)
-                } else {
-                    &zero_block
-                };
-                // Per-channel transform-coefficient buffers; pre-seed with
-                // the already-decoded independent (low-frequency) region so
-                // synthesis only overwrites the enhanced-coupling bins.
-                let mut chcoef: Vec<[f32; 256]> = (0..super::ecpl::ECPL_MAX_FBW)
-                    .map(|ch| {
-                        let mut b = [0.0f32; 256];
-                        if ch < nfchans {
-                            b.copy_from_slice(&state.channels[ch].coeffs);
-                        }
-                        b
-                    })
-                    .collect();
-                super::ecpl::synthesize_block(
-                    &mut state.ecpl_state,
-                    prev,
-                    curr,
-                    next,
-                    &mut chcoef,
-                    512,
-                );
-                for ch in 0..nfchans {
-                    state.channels[ch].coeffs.copy_from_slice(&chcoef[ch]);
-                }
+        if skip && let Some(curr) = &ecpl_blocks[abs_blk] {
+            let prev = if abs_blk > 0 {
+                ecpl_blocks[abs_blk - 1].as_ref().unwrap_or(&zero_block)
+            } else {
+                // Frame block 0 — its "previous block" is the prior
+                // frame's last enhanced-coupling block (§E.3.5.5.1).
+                &prev_frame_block
+            };
+            let next = if abs_blk + 1 < ecpl_blocks.len() {
+                ecpl_blocks[abs_blk + 1].as_ref().unwrap_or(&zero_block)
+            } else {
+                &zero_block
+            };
+            // Per-channel transform-coefficient buffers; pre-seed with
+            // the already-decoded independent (low-frequency) region so
+            // synthesis only overwrites the enhanced-coupling bins.
+            let mut chcoef: Vec<[f32; 256]> = (0..super::ecpl::ECPL_MAX_FBW)
+                .map(|ch| {
+                    let mut b = [0.0f32; 256];
+                    if ch < nfchans {
+                        b.copy_from_slice(&state.channels[ch].coeffs);
+                    }
+                    b
+                })
+                .collect();
+            super::ecpl::synthesize_block(
+                &mut state.ecpl_state,
+                prev,
+                curr,
+                next,
+                &mut chcoef,
+                512,
+            );
+            for ch in 0..nfchans {
+                state.channels[ch].coeffs.copy_from_slice(&chcoef[ch]);
             }
         }
 
@@ -3186,7 +3184,7 @@ mod issue13_craft_tests {
 
     use oxideav_core::bits::BitWriter;
 
-    use super::super::decoder::{decode_eac3_packet, Eac3DecoderState};
+    use super::super::decoder::{Eac3DecoderState, decode_eac3_packet};
     use crate::audblk::{self, Ac3State, MAX_FBW};
     use crate::crc::ac3_crc_update;
     use crate::tables::QUANTIZATION_BITS;
@@ -3302,7 +3300,7 @@ mod issue13_craft_tests {
         bw.write_u32(0x0B, 8); // compr
         bw.write_u32(0, 1); // mixmdate
         bw.write_u32(0, 1); // infomdate
-                            // strmtyp == 0 && numblkscod == 3 → no convsync
+        // strmtyp == 0 && numblkscod == 3 → no convsync
         bw.write_u32(0, 1); // addbsie
 
         // ---- audfrm (Table E1.3) ----
@@ -3317,7 +3315,7 @@ mod issue13_craft_tests {
         bw.write_u32(0, 1); // dbaflde
         bw.write_u32(0, 1); // skipflde
         bw.write_u32(0, 1); // spxattene
-                            // coupling data (acmod > 1): cplinu[0] = 1; blocks 1-5 reuse.
+        // coupling data (acmod > 1): cplinu[0] = 1; blocks 1-5 reuse.
         bw.write_u32(1, 1); // cplinu[0]
         for _ in 1..6 {
             bw.write_u32(0, 1); // cplstre[blk] = 0 → cplinu carries
@@ -3333,13 +3331,13 @@ mod issue13_craft_tests {
         // numblkscod == 3 → convexpstre implicit 1).
         bw.write_u32(0, 5); // convexpstr[0]
         bw.write_u32(0, 5); // convexpstr[1]
-                            // snroffststr == 0 → frame-level SNR offsets.
+        // snroffststr == 0 → frame-level SNR offsets.
         bw.write_u32(CSNROFFST as u32, 6); // frmcsnroffst
         bw.write_u32(FSNROFFST as u32, 4); // frmfsnroffst
-                                           // block start information (numblkscod != 0).
+        // block start information (numblkscod != 0).
         if blkstrtinfo {
             bw.write_u32(1, 1); // blkstrtinfoe
-                                // §2.3.2.27: (numblks−1) × (4 + ceil(log2(words_per_frame)))
+            // §2.3.2.27: (numblks−1) × (4 + ceil(log2(words_per_frame)))
             let bits_per = 4 + WORDS_PER_FRAME.next_power_of_two().trailing_zeros();
             for _ in 0..5 {
                 bw.write_u32(0, bits_per); // informational; decoders skip
@@ -3354,7 +3352,7 @@ mod issue13_craft_tests {
             bw.write_u32(0, 1);
             bw.write_u32(0, 1);
             bw.write_u32(0, 1); // dynrnge
-                                // SPX strategy: blk0 implicit spxstre=1; later blocks 0.
+            // SPX strategy: blk0 implicit spxstre=1; later blocks 0.
             if blk == 0 {
                 bw.write_u32(1, 1); // spxinu = 1
                 bw.write_u32(1, 1); // chinspx[0]
@@ -3363,8 +3361,8 @@ mod issue13_craft_tests {
                 bw.write_u32(0, 3); // spxbegf = 0 → spx_begin_subbnd 2
                 bw.write_u32(2, 3); // spxendf = 2 → spx_end_subbnd 7
                 bw.write_u32(0, 1); // spxbndstrce = 0 → default banding
-                                    // (5 bands: sub-bands 3..7 all split)
-                                    // SPX coordinates — firstspxcos → spxcoe implicit 1.
+                // (5 bands: sub-bands 3..7 all split)
+                // SPX coordinates — firstspxcos → spxcoe implicit 1.
                 for _ch in 0..2 {
                     bw.write_u32(31, 5); // spxblnd = 31 → zero noise blend
                     bw.write_u32(0, 2); // mstrspxco
@@ -3375,15 +3373,15 @@ mod issue13_craft_tests {
                 }
                 // Coupling strategy (cplstre[0] = 1 from audfrm).
                 bw.write_u32(0, 1); // ecplinu = 0 (standard coupling)
-                                    // acmod == 2 → chincpl implicit for both channels.
+                // acmod == 2 → chincpl implicit for both channels.
                 bw.write_u32(0, 1); // phsflginu
                 bw.write_u32(0, 4); // cplbegf = 0
-                                    // SPX in use → NO cplendf bits (derived = spxbegf−2 = −2).
+                // SPX in use → NO cplendf bits (derived = spxbegf−2 = −2).
                 bw.write_u32(0, 1); // cplbndstrce = 0 (1 sub-band anyway)
-                                    // Coupling coordinates — firstcplcos → cplcoe implicit 1.
+                // Coupling coordinates — firstcplcos → cplcoe implicit 1.
                 for _ch in 0..2 {
                     bw.write_u32(0, 2); // mstrcplco
-                                        // ncplbnd = 1 band.
+                    // ncplbnd = 1 band.
                     bw.write_u32(1, 4); // cplcoexp
                     bw.write_u32(8, 4); // cplcomant
                 }
@@ -3392,8 +3390,8 @@ mod issue13_craft_tests {
                 // nrematbd = 2 (cplinu && cplbegf == 0).
                 bw.write_u32(0, 1); // rematflg[0]
                 bw.write_u32(0, 1); // rematflg[1]
-                                    // chbwcod: both channels in coupling+SPX → none.
-                                    // Coupling exponents (cplexpstr = D15): 12 bins → 4 grps.
+                // chbwcod: both channels in coupling+SPX → none.
+                // Coupling exponents (cplexpstr = D15): 12 bins → 4 grps.
                 bw.write_u32(4, 4); // cplabsexp (<<1 → 8)
                 for _ in 0..4 {
                     bw.write_u32(62, 7); // flat D15 deltas
@@ -3409,18 +3407,18 @@ mod issue13_craft_tests {
                 }
             } else {
                 bw.write_u32(0, 1); // spxstre = 0 (strategy carries)
-                                    // SPX coordinates: spxcoe[ch] explicit → reuse.
+                // SPX coordinates: spxcoe[ch] explicit → reuse.
                 bw.write_u32(0, 1);
                 bw.write_u32(0, 1);
                 // cplstre = 0 → no strategy; coordinates: cplcoe = 0.
                 bw.write_u32(0, 1);
                 bw.write_u32(0, 1);
                 bw.write_u32(0, 1); // rematstr = 0
-                                    // chexpstr REUSE → no chbwcod / exponents.
+                // chexpstr REUSE → no chbwcod / exponents.
             }
             // bamode == 0, snroffststr == 0, frmfgaincode == 0 → nothing.
             bw.write_u32(0, 1); // convsnroffste (strmtyp == 0)
-                                // cplleake: implicit 1 on block 0, explicit 0 after.
+            // cplleake: implicit 1 on block 0, explicit 0 after.
             if blk == 0 {
                 bw.write_u32(0, 3); // cplfleak
                 bw.write_u32(0, 3); // cplsleak
@@ -3513,7 +3511,9 @@ mod issue13_craft_tests {
         let _ = std::fs::remove_file(&out);
         Some(
             bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect(),
         )
@@ -3532,7 +3532,9 @@ mod issue13_craft_tests {
             assert_eq!(f.channels, 2, "{tag}: channels");
             ours.extend(
                 f.pcm_s16le
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| i16::from_le_bytes([c[0], c[1]])),
             );
         }

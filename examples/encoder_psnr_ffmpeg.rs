@@ -136,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nd = dec.len() / 4;
     let mut dec_l = Vec::with_capacity(nd);
     let mut dec_r = Vec::with_capacity(nd);
-    for c in dec.chunks_exact(4) {
+    for c in dec.as_chunks::<4>().0 {
         let li = i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0;
         let ri = i16::from_le_bytes([c[2], c[3]]) as f32 / 32768.0;
         dec_l.push(li);

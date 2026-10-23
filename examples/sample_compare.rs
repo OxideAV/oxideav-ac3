@@ -61,7 +61,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame_idx += 1;
     }
     let extract = |buf: &[u8], ch: usize| -> Vec<i16> {
-        buf.chunks_exact(4)
+        buf.as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[ch * 2], c[ch * 2 + 1]]))
             .collect()
     };

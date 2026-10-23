@@ -23,14 +23,14 @@
 //! implementation produces a syntactically-valid syncframe for the
 //! 48 kHz stereo 192 kbps mode.
 
-use oxideav_core::bits::BitWriter;
 use oxideav_core::Encoder;
+use oxideav_core::bits::BitWriter;
 use oxideav_core::{
     AudioFrame, ChannelLayout, CodecId, CodecParameters, Error, Frame, Packet, Result,
     SampleFormat, TimeBase,
 };
 
-use crate::audblk::{remat_band_count, BLOCKS_PER_FRAME, MAX_FBW, N_COEFFS, SAMPLES_PER_BLOCK};
+use crate::audblk::{BLOCKS_PER_FRAME, MAX_FBW, N_COEFFS, SAMPLES_PER_BLOCK, remat_band_count};
 
 /// LFE channel mantissa-bin upper bound. Per §7.1.3 / §5.4.3.23 the LFE
 /// is fixed at 7 mantissa bins (one D15 absexp + 2 groups of 3 deltas →
@@ -40,9 +40,9 @@ pub(crate) const LFE_END_MANT: usize = 7;
 use crate::decoder::SAMPLES_PER_FRAME;
 use crate::mdct::{mdct_256_pair, mdct_512};
 use crate::tables::{
-    frame_length_bytes, nominal_bitrate_kbps, BAPTAB, BNDSZ, BNDTAB, DBPBTAB, FASTDEC, FASTGAIN,
-    FLOORTAB, HTH, LATAB, MANT_LEVEL_11, MANT_LEVEL_15, MANT_LEVEL_3, MANT_LEVEL_5, MANT_LEVEL_7,
-    MASKTAB, QUANTIZATION_BITS, SLOWDEC, SLOWGAIN, WINDOW,
+    BAPTAB, BNDSZ, BNDTAB, DBPBTAB, FASTDEC, FASTGAIN, FLOORTAB, HTH, LATAB, MANT_LEVEL_3,
+    MANT_LEVEL_5, MANT_LEVEL_7, MANT_LEVEL_11, MANT_LEVEL_15, MASKTAB, QUANTIZATION_BITS, SLOWDEC,
+    SLOWGAIN, WINDOW, frame_length_bytes, nominal_bitrate_kbps,
 };
 
 /// Build an encoder instance. Required parameters (via
@@ -110,7 +110,7 @@ pub fn make_encoder_with_metadata(
         _ => {
             return Err(Error::Unsupported(format!(
                 "ac3 encoder: unsupported channel count {channels} (must be 1..=6)"
-            )))
+            )));
         }
     };
     let fscod: u8 = match sample_rate {
@@ -120,7 +120,7 @@ pub fn make_encoder_with_metadata(
         _ => {
             return Err(Error::Unsupported(format!(
                 "ac3 encoder: unsupported sample rate {sample_rate} (48000/44100/32000 only)"
-            )))
+            )));
         }
     };
 
@@ -581,7 +581,7 @@ impl Encoder for Ac3Encoder {
             _ => {
                 return Err(Error::invalid(
                     "ac3 encoder: send_frame requires an audio frame",
-                ))
+                ));
             }
         };
         // Per-frame channel-count and sample-rate are no longer carried on
@@ -618,7 +618,7 @@ impl Encoder for Ac3Encoder {
         if missing > 0 {
             let total_chans = self.channels + usize::from(self.lfeon);
             for ch in 0..total_chans {
-                self.pending_samples[ch].extend(std::iter::repeat(0.0).take(missing));
+                self.pending_samples[ch].extend(std::iter::repeat_n(0.0, missing));
             }
         }
         self.emit_syncframe()?;
@@ -677,7 +677,7 @@ pub(crate) fn decode_input_samples(
         other => {
             return Err(Error::Unsupported(format!(
                 "ac3 encoder: sample format {other:?} not yet supported"
-            )))
+            )));
         }
     }
     Ok(out)
@@ -688,13 +688,13 @@ impl Ac3Encoder {
         let n_per = SAMPLES_PER_FRAME as usize;
         let total_chans = self.channels + usize::from(self.lfeon);
         let lfe_idx = self.channels; // index into pending_samples / delay_line for LFE
-                                     // Run the 6-block MDCT pipeline per channel and stash coefficient
-                                     // blocks per channel: blocks × N_COEFFS.
-                                     // We allocate `channels + 1` slots so LFE coefficients can live
-                                     // at index `self.channels` when present, mirroring the source-
-                                     // interleaved layout (LFE last). Index isn't a coupling
-                                     // pseudo-channel here — that lives at index `self.channels` in a
-                                     // *separate* `+1`-sized exps array allocated below.
+        // Run the 6-block MDCT pipeline per channel and stash coefficient
+        // blocks per channel: blocks × N_COEFFS.
+        // We allocate `channels + 1` slots so LFE coefficients can live
+        // at index `self.channels` when present, mirroring the source-
+        // interleaved layout (LFE last). Index isn't a coupling
+        // pseudo-channel here — that lives at index `self.channels` in a
+        // *separate* `+1`-sized exps array allocated below.
         let mut coeffs: Vec<Vec<[f32; N_COEFFS]>> =
             vec![vec![[0.0; N_COEFFS]; BLOCKS_PER_FRAME]; total_chans];
         // Pass 1 — drain this frame's PCM and run the §8.2.2 transient
@@ -2702,12 +2702,11 @@ pub(crate) fn pick_strategy_for_block(exp: &[u8], end: usize) -> u8 {
     } else {
         1
     };
-    if let Ok(force) = std::env::var("AC3_FORCE_EXPSTR") {
-        if let Ok(v) = force.parse::<u8>() {
-            if (1..=3).contains(&v) {
-                return v;
-            }
-        }
+    if let Ok(force) = std::env::var("AC3_FORCE_EXPSTR")
+        && let Ok(v) = force.parse::<u8>()
+        && (1..=3).contains(&v)
+    {
+        return v;
     }
     pick
 }
@@ -5358,7 +5357,7 @@ fn pick_mstrcplco(max_cplco: f32) -> u8 {
     }
     let lg = max_cplco.log2();
     let need_shift = (-(lg.floor()) as i32) - 1; // total shift for the loudest band
-                                                 // We want need_shift - 3*mstr ∈ 0..15; minimise mstr.
+    // We want need_shift - 3*mstr ∈ 0..15; minimise mstr.
     let need_shift = need_shift.max(0);
     let mstr = (need_shift - 14).max(0); // ensure cplcoexp ≤ 14
     let mstr = mstr.div_euclid(3) + i32::from(mstr.rem_euclid(3) > 0);
@@ -5755,7 +5754,7 @@ mod tests {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
                     let plane = &a.data[0];
-                    for s in plane.chunks_exact(4) {
+                    for s in plane.as_chunks::<4>().0 {
                         let l = i16::from_le_bytes([s[0], s[1]]);
                         decoded_samples_left.push(l);
                     }
@@ -5965,7 +5964,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in a.data[0].chunks_exact(4) {
+                for s in a.data[0].as_chunks::<4>().0 {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -6155,7 +6154,9 @@ mod tests {
             decoded_bytes.len()
         );
         let dsq: f64 = decoded_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 let l = i16::from_le_bytes([c[0], c[1]]) as f64;
                 l * l
@@ -6266,7 +6267,9 @@ mod tests {
             decoded_bytes.len()
         );
         let dsq: f64 = decoded_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 let l = i16::from_le_bytes([c[0], c[1]]) as f64;
                 l * l
@@ -6347,7 +6350,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in a.data[0].chunks_exact(4) {
+                for s in a.data[0].as_chunks::<4>().0 {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -6427,7 +6430,9 @@ mod tests {
             decoded_bytes.len()
         );
         let dsq: f64 = decoded_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 let l = i16::from_le_bytes([c[0], c[1]]) as f64;
                 l * l
@@ -6535,7 +6540,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in a.data[0].chunks_exact(4) {
+                for s in a.data[0].as_chunks::<4>().0 {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -6627,7 +6632,9 @@ mod tests {
             decoded_bytes.len()
         );
         let dsq: f64 = decoded_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 let l = i16::from_le_bytes([c[0], c[1]]) as f64;
                 l * l
@@ -6730,7 +6737,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in a.data[0].chunks_exact(4) {
+                for s in a.data[0].as_chunks::<4>().0 {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -6792,7 +6799,9 @@ mod tests {
             decoded_bytes.len()
         );
         let dsq: f64 = decoded_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 let l = i16::from_le_bytes([c[0], c[1]]) as f64;
                 l * l
@@ -6893,7 +6902,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in a.data[0].chunks_exact(2) {
+                for s in a.data[0].as_chunks::<2>().0 {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -7116,7 +7125,7 @@ mod tests {
         let (nsamp, bytes) = build_multichan_pcm(channels, sr, dur, 220.0);
         // Reconstruct the source PCM as f32 / i16 for the PSNR baseline.
         let mut src_i16: Vec<i16> = Vec::with_capacity(nsamp * channels as usize);
-        for c in bytes.chunks_exact(2) {
+        for c in bytes.as_chunks::<2>().0 {
             src_i16.push(i16::from_le_bytes([c[0], c[1]]));
         }
 
@@ -7152,7 +7161,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in a.data[0].chunks_exact(2) {
+                for s in a.data[0].as_chunks::<2>().0 {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -7305,7 +7314,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in a.data[0].chunks_exact(2) {
+                for s in a.data[0].as_chunks::<2>().0 {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -7431,7 +7440,9 @@ mod tests {
         let skip = 768usize.min(frames);
         let usable = frames.saturating_sub(skip);
         let samples: Vec<i16> = decoded_bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         let mut per_ch_rms = vec![0.0f64; nch];
@@ -7537,7 +7548,9 @@ mod tests {
         let skip = 768usize.min(frames);
         let usable = frames.saturating_sub(skip);
         let samples: Vec<i16> = decoded_bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         let mut per_ch_rms = vec![0.0f64; nch];
@@ -7571,7 +7584,9 @@ mod tests {
         let src_to_ffmpeg = [0usize, 2, 1, 4, 5, 3];
         let (_nsamp_src, src_bytes) = build_multichan_pcm(channels, sr, 0.5, 220.0);
         let src_samples: Vec<i16> = src_bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         for src_ch in 0..nch {
@@ -7744,9 +7759,11 @@ mod tests {
             // The encoder reads `AC3_DISABLE_CPL` per frame so setting
             // it before the encode loop is sufficient.
             if disable_cpl {
-                std::env::set_var("AC3_DISABLE_CPL", "1");
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                unsafe { std::env::set_var("AC3_DISABLE_CPL", "1") };
             } else {
-                std::env::remove_var("AC3_DISABLE_CPL");
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                unsafe { std::env::remove_var("AC3_DISABLE_CPL") };
             }
             let mut params = CodecParameters::audio(CodecId::new("ac3"));
             params.sample_rate = Some(sr);
@@ -7816,7 +7833,7 @@ mod tests {
                 );
                 dec.send_packet(&pkt).unwrap();
                 if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                    for s in a.data[0].chunks_exact(2) {
+                    for s in a.data[0].as_chunks::<2>().0 {
                         decoded.push(i16::from_le_bytes([s[0], s[1]]));
                     }
                 }
@@ -7830,7 +7847,9 @@ mod tests {
             let skip = 768usize.min(frames_decoded);
             let usable = frames_decoded.saturating_sub(skip);
             let src_samples: Vec<i16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
             let mut total_psnr = 0.0f64;
@@ -7867,7 +7886,8 @@ mod tests {
         let (psnr_with, bytes_with, cpl_blocks_with, total_blocks) = encode_and_psnr(false);
         let (psnr_without, bytes_without, cpl_blocks_without, _) = encode_and_psnr(true);
         // Restore env state.
-        std::env::remove_var("AC3_DISABLE_CPL");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("AC3_DISABLE_CPL") };
 
         eprintln!(
             "5.1 @ {} kbps coupling-on  : avg-fbw PSNR {:.2} dB ({} bytes, {}/{} cpl blocks)",
@@ -8047,9 +8067,11 @@ mod tests {
 
         let encode_and_psnr = |disable: bool| -> (f64, usize) {
             if disable {
-                std::env::set_var("AC3_DISABLE_PERBLOCK_SNR", "1");
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                unsafe { std::env::set_var("AC3_DISABLE_PERBLOCK_SNR", "1") };
             } else {
-                std::env::remove_var("AC3_DISABLE_PERBLOCK_SNR");
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                unsafe { std::env::remove_var("AC3_DISABLE_PERBLOCK_SNR") };
             }
             let mut params = CodecParameters::audio(CodecId::new("ac3"));
             params.sample_rate = Some(sr);
@@ -8082,13 +8104,15 @@ mod tests {
             for p in &pkts {
                 dec.send_packet(p).unwrap();
                 while let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                    for s in a.data[0].chunks_exact(4) {
+                    for s in a.data[0].as_chunks::<4>().0 {
                         decoded.push(i16::from_le_bytes([s[0], s[1]]));
                     }
                 }
             }
             let orig: Vec<i16> = bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
             let n = decoded.len().min(orig.len());
@@ -8146,7 +8170,8 @@ mod tests {
 
         let (psnr_with, bytes_with) = encode_and_psnr(false);
         let (psnr_without, bytes_without) = encode_and_psnr(true);
-        std::env::remove_var("AC3_DISABLE_PERBLOCK_SNR");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("AC3_DISABLE_PERBLOCK_SNR") };
 
         eprintln!(
             "block-3 transient @ {} kbps: per-block-tuned  = {:.2} dB ({} bytes)",
@@ -8315,7 +8340,7 @@ mod tests {
         for p in pkts {
             dec.send_packet(p).unwrap();
             while let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in a.data[0].chunks_exact(2) {
+                for s in a.data[0].as_chunks::<2>().0 {
                     out.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -8559,7 +8584,9 @@ mod tests {
         let bytes = std::fs::read(&out_path).expect("ffmpeg output");
         let _ = std::fs::remove_file(&out_path);
         let samples: Vec<i16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         // Skip the first frame's worth of samples (priming edge).

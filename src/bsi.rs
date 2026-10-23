@@ -557,11 +557,7 @@ impl DialNorm {
     /// callers re-emitting the BSI byte-for-byte should use this
     /// rather than [`Self::codepoint`].
     pub fn wire_value(self) -> u8 {
-        if self.was_reserved {
-            0
-        } else {
-            self.raw
-        }
+        if self.was_reserved { 0 } else { self.raw }
     }
 
     /// `true` when the on-the-wire codepoint was the reserved
@@ -709,8 +705,8 @@ impl CompressionGain {
     pub fn linear(self) -> f32 {
         let x_shift = (self.x() as i32) + 1; // -7..=+8
         let y_frac = (16.0 + self.y() as f32) / 32.0; // 0.5..=31/32
-                                                      // 2^x_shift via direct floating multiply: x_shift fits in i32 well
-                                                      // within f32 exponent range (-7..=+8).
+        // 2^x_shift via direct floating multiply: x_shift fits in i32 well
+        // within f32 exponent range (-7..=+8).
         let two_pow = 2.0f32.powi(x_shift);
         two_pow * y_frac
     }

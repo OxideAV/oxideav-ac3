@@ -16,7 +16,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::tables::{frame_length_bytes, nominal_bitrate_kbps, sample_rate_hz, FRAME_SIZE_TABLE};
+use crate::tables::{FRAME_SIZE_TABLE, frame_length_bytes, nominal_bitrate_kbps, sample_rate_hz};
 
 /// The 16-bit AC-3 syncword (§5.4.1.1).
 pub const SYNCWORD: u16 = 0x0B77;

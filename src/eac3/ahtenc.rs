@@ -29,12 +29,12 @@
 
 use oxideav_core::bits::BitWriter;
 
-use super::aht::{endbap_for_gaqmod, gaq_remap, HEBAP_MANT_BITS, VQ_BITS};
+use super::aht::{HEBAP_MANT_BITS, VQ_BITS, endbap_for_gaqmod, gaq_remap};
 use super::tables::aht_codebooks::{
     VQ_HEBAP1, VQ_HEBAP2, VQ_HEBAP3, VQ_HEBAP4, VQ_HEBAP5, VQ_HEBAP6, VQ_HEBAP7,
 };
 use crate::audblk::N_COEFFS;
-use crate::encoder::{compute_bap_table, BitAllocParams, DbaPlan};
+use crate::encoder::{BitAllocParams, DbaPlan, compute_bap_table};
 
 /// Forward DCT-II of length 6 — the inverse of the §3.4.5 transform
 /// as deployed (see [`super::aht::idct_ii_6`]: leading constant `√2`,
@@ -474,8 +474,8 @@ pub(crate) fn compute_hebap(
 mod tests {
     use super::*;
     use crate::eac3::aht::{
-        self, fill_gaqbin, gaq_sections, idct_ii_6, read_gaq_gains, read_scalar_aht_mantissas,
-        AHT_BLOCKS,
+        self, AHT_BLOCKS, fill_gaqbin, gaq_sections, idct_ii_6, read_gaq_gains,
+        read_scalar_aht_mantissas,
     };
     use oxideav_core::bits::BitReader;
 

@@ -33,7 +33,7 @@
 //! Construction is cheap (just a 5×2 matrix of `f32`) so callers can
 //! cache a `Downmix` across syncframes or build one per block.
 
-use crate::bsi::{annex_d_center_mix_gain, annex_d_surround_mix_gain, AnnexDMixLevels, Bsi};
+use crate::bsi::{AnnexDMixLevels, Bsi, annex_d_center_mix_gain, annex_d_surround_mix_gain};
 use crate::eac3::Eac3Bsi;
 use crate::tables::{CENTER_MIX_LEVEL, SURROUND_MIX_LEVEL};
 
@@ -819,7 +819,7 @@ mod tests {
         assert!((d.out_coeffs[0][1] - 0.2265).abs() < 1e-3);
         assert!((d.out_coeffs[0][3] + 0.2265).abs() < 1e-3); // -K
         assert!((d.out_coeffs[0][4] + 0.2265).abs() < 1e-3); // -K
-                                                             // Rt mirrors with +K for both surrounds.
+        // Rt mirrors with +K for both surrounds.
         assert!((d.out_coeffs[1][2] - 0.3204).abs() < 1e-3);
         assert!((d.out_coeffs[1][1] - 0.2265).abs() < 1e-3);
         assert!((d.out_coeffs[1][3] - 0.2265).abs() < 1e-3); // +K

@@ -71,7 +71,7 @@ fn decode_with(
             if a.samples > 0 {
                 out_channels = (buf.len() / (a.samples as usize) / 2) as u16;
             }
-            for s in buf.chunks_exact(2) {
+            for s in buf.as_chunks::<2>().0 {
                 pcm.push(i16::from_le_bytes([s[0], s[1]]));
             }
         }
@@ -95,14 +95,14 @@ fn channel_correlation(pcm: &[i16]) -> f64 {
         return 0.0;
     }
     let (mut sum_l, mut sum_r) = (0.0f64, 0.0f64);
-    for c in tail.chunks_exact(2) {
+    for c in tail.as_chunks::<2>().0 {
         sum_l += c[0] as f64;
         sum_r += c[1] as f64;
     }
     let mean_l = sum_l / n as f64;
     let mean_r = sum_r / n as f64;
     let (mut num, mut sq_l, mut sq_r) = (0.0f64, 0.0f64, 0.0f64);
-    for c in tail.chunks_exact(2) {
+    for c in tail.as_chunks::<2>().0 {
         let dl = c[0] as f64 - mean_l;
         let dr = c[1] as f64 - mean_r;
         num += dl * dr;
@@ -110,11 +110,7 @@ fn channel_correlation(pcm: &[i16]) -> f64 {
         sq_r += dr * dr;
     }
     let denom = (sq_l * sq_r).sqrt();
-    if denom < 1.0 {
-        0.0
-    } else {
-        num / denom
-    }
+    if denom < 1.0 { 0.0 } else { num / denom }
 }
 
 /// Channel energies (RMS²) for left and right tails. Used to confirm
@@ -129,7 +125,7 @@ fn channel_energies(pcm: &[i16]) -> (f64, f64) {
     let mut l = 0.0f64;
     let mut r = 0.0f64;
     let mut n = 0u64;
-    for c in tail.chunks_exact(2) {
+    for c in tail.as_chunks::<2>().0 {
         l += (c[0] as f64).powi(2);
         r += (c[1] as f64).powi(2);
         n += 1;
@@ -275,8 +271,10 @@ fn ltrt_matches_loro_when_no_surround_content() {
     let (mut loro_l, mut ltrt_l) = (0.0f64, 0.0f64);
     let mut count = 0u64;
     for (lo, lt) in loro_pcm[skip..n]
-        .chunks_exact(2)
-        .zip(ltrt_pcm[skip..n].chunks_exact(2))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(ltrt_pcm[skip..n].as_chunks::<2>().0.iter())
     {
         loro_l += (lo[0] as f64).powi(2);
         ltrt_l += (lt[0] as f64).powi(2);

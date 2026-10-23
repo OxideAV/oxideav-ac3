@@ -189,8 +189,7 @@ mod tests {
         let mut analysis = QmfAnalysis::default();
         let mut synthesis = QmfSynthesis::default();
         let mut output = Vec::with_capacity(input.len());
-        for block in input.chunks_exact(QMF_SUBBANDS) {
-            let pcm: &[f32; QMF_SUBBANDS] = block.try_into().expect("fixed-size block");
+        for pcm in input.as_chunks::<QMF_SUBBANDS>().0 {
             output.extend(synthesis.process(&analysis.process(pcm)));
         }
 

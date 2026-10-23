@@ -2,7 +2,7 @@
 //! dump per-frame shape. Set `EAC3_DUMP_BLK=1` for per-block detail.
 //! Usage: `cargo run --example eac3_dump -- <file.eac3>`
 
-use oxideav_ac3::eac3::{decode_eac3_packet, Eac3DecoderState};
+use oxideav_ac3::eac3::{Eac3DecoderState, decode_eac3_packet};
 
 fn find_frames(data: &[u8]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();

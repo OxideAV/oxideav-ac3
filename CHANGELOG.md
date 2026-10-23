@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95.
+
 - encoder r457: **equal-rate rate-distortion harness** (`tests/common/rd.rs`, `tests/equal_rate.rs`, `examples/equal_rate_report`) — a deterministic synthetic corpus (speech, music, transients, two-tone, pink noise, 5.1 with LFE; 16 kHz band-limited) is encoded by our AC-3 / E-AC-3 encoder and by the black-box reference encoder at equal nominal rate, every stream is decoded by both our decoder and the reference decoder, and each decode is scored by worst-channel SNR and a mean noise-to-mask ratio (§7.2.2 parametric mask on the source MDCT). The test pins per-cell floors, the decoder agreement on our streams (< 1.5 dB) and the distance to the reference encoder; README carries the ladder. The harness immediately exposed that the r454 "~24 dB flat" two-tone table was an aliased lag-search artefact: the standard path measured ≈ 12 dB at every rate.
 
 - encoder r457: **exponent-sharing bound** (`bound_shared_exponents`, both encoders) — a REUSE block's coefficients were quantised against its anchor's exponent set without the anchor ever bounding them, so any bin that outgrew the anchor clamped its mantissa at ±1 (≈ 12 dB SNR on a stationary tone whose MDCT magnitude merely rotates between blocks). Every anchor now carries the per-bin minimum exponent of its run before legalisation. Mono 440 Hz sine 11.2 → 76.4 dB, speech/192 11.1 → 29.5, music/192 11.8 → 33.0, two-tone/192 12.0 → 51.7 (ours→ours). The AHT round-trip gates, which only "won" because the standard path was broken, now pin AHT within 25 dB of the (better) standard path — AHT rate-distortion is a recorded follow-up.

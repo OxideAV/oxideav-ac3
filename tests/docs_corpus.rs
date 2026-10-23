@@ -159,7 +159,7 @@ fn parse_wav(bytes: &[u8]) -> Option<RefPcm> {
         return None;
     }
     let mut samples = Vec::with_capacity(data.len() / 2);
-    for chunk in data.chunks_exact(2) {
+    for chunk in data.as_chunks::<2>().0 {
         samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
     }
     Some(RefPcm {
@@ -409,7 +409,7 @@ fn decode_stream(input: &[u8]) -> DecodedPcm {
                     }
                 }
                 samples.reserve(n);
-                for chunk in plane.chunks_exact(2) {
+                for chunk in plane.as_chunks::<2>().0 {
                     samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
                 frames_ok += 1;
@@ -549,21 +549,21 @@ fn evaluate(case: &CorpusCase) {
         eprintln!("{}: first decoder error: {err}", case.name);
     }
 
-    if let Some(want_ch) = case.channels {
-        if refp.channels != want_ch {
-            eprintln!(
-                "{}: WARN expected.wav says {} channels, case requested {}",
-                case.name, refp.channels, want_ch
-            );
-        }
+    if let Some(want_ch) = case.channels
+        && refp.channels != want_ch
+    {
+        eprintln!(
+            "{}: WARN expected.wav says {} channels, case requested {}",
+            case.name, refp.channels, want_ch
+        );
     }
-    if let Some(want_sr) = case.sample_rate {
-        if refp.sample_rate != want_sr {
-            eprintln!(
-                "{}: WARN expected.wav sample rate {} != case-requested {}",
-                case.name, refp.sample_rate, want_sr
-            );
-        }
+    if let Some(want_sr) = case.sample_rate
+        && refp.sample_rate != want_sr
+    {
+        eprintln!(
+            "{}: WARN expected.wav sample rate {} != case-requested {}",
+            case.name, refp.sample_rate, want_sr
+        );
     }
 
     if ours.frames_ok == 0 {

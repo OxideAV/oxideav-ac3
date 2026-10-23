@@ -27,7 +27,7 @@
 
 use std::process::Command;
 
-use oxideav_ac3::eac3::decoder::{decode_eac3_packet, Eac3DecoderState};
+use oxideav_ac3::eac3::decoder::{Eac3DecoderState, decode_eac3_packet};
 
 const PSNR_FLOOR_DB: f64 = 50.0;
 
@@ -111,7 +111,9 @@ fn ffmpeg_decode(tag: &str, es: &[u8], channels: usize, rate: u32) -> Option<Vec
     let _ = std::fs::remove_file(&out);
     Some(
         bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect(),
     )
@@ -165,7 +167,9 @@ fn our_decode(data: &[u8]) -> Option<(Vec<i16>, usize, u32, u64)> {
                 rate = f.sample_rate;
                 let mut frame_pcm: Vec<i16> = f
                     .pcm_s16le
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| i16::from_le_bytes([c[0], c[1]]))
                     .collect();
                 // `decode_eac3_packet` emits the natural bitstream
@@ -176,7 +180,9 @@ fn our_decode(data: &[u8]) -> Option<(Vec<i16>, usize, u32, u64)> {
                 if channels == 6 {
                     const MAP: [usize; 6] = [0, 2, 1, 5, 3, 4];
                     frame_pcm = frame_pcm
-                        .chunks_exact(6)
+                        .as_chunks::<6>()
+                        .0
+                        .iter()
                         .flat_map(|fr| MAP.map(|i| fr[i]))
                         .collect();
                 }
