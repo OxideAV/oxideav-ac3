@@ -70,6 +70,11 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   the AC-3 and E-AC-3 paths.
 - Downmix (§7.8) — LoRo and LtRt 2-channel.
 - Bitstream → WAV channel reorder for multichannel layouts.
+- Output format: interleaved S16LE by default; a decoder built with
+  `CodecParameters::sample_format = Some(SampleFormat::F32)` emits the
+  same channels as interleaved little-endian f32, unquantised (the S16
+  output is exactly that f32 output truncated to 16 bits). Both the
+  AC-3 and E-AC-3 paths (passthrough, downmix, JOC stereo) honour it.
 
 ### AC-3 encoder
 

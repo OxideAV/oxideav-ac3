@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- decoder: **opt-in F32 output** (#17, ropoctl) — a decoder built with
+  `CodecParameters::sample_format = Some(SampleFormat::F32)` emits each
+  frame as interleaved little-endian f32 in the same WAVE channel order
+  as the S16 output, taken before the S16 quantisation. The AC-3 path,
+  the E-AC-3 passthrough (independent + spliced dependent substreams),
+  downmix and JOC stereo paths all honour it; with S16 or no
+  `sample_format` the output is byte-for-byte unchanged.
+
 ### Changed
 
 - edition 2024, MSRV 1.95.

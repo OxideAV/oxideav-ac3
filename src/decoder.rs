@@ -368,10 +368,16 @@ impl Ac3Decoder {
             rendered
         } else if matches!(dmx_mode, DownmixMode::Passthrough) && self.f32_output {
             let mut samples = self.eac3_state.indep_pcm_f32().to_vec();
+            // Defensive — the scratch carries the indep program plus
+            // every spliced dependent substream, so this only fires
+            // when the eac3 state is out of sync with `decoded`.
             if samples.len() != decoded.samples as usize * channels as usize {
-                return Err(Error::invalid(
-                    "eac3: f32 output covers the independent substream only",
-                ));
+                return Err(Error::invalid(format!(
+                    "eac3 f32 output: scratch len {} != frames*ch {}*{}",
+                    samples.len(),
+                    decoded.samples,
+                    channels,
+                )));
             }
             for sample in &mut samples {
                 *sample *= dn_gain;
@@ -1070,9 +1076,6 @@ mod tests {
 
     // -- DRC control surface (§6.1.9 / §7.6 / §7.7) end-to-end tests --
 
-    /// Decode the in-tree `sine440_stereo.ac3` validator fixture and
-    /// return the RMS of the interleaved S16 output PCM under the supplied
-    /// DRC settings.
     /// Decode the stereo fixture with the given output sample format and
     /// return each frame's payload.
     fn decode_fixture_frames(format: SampleFormat) -> Vec<Vec<u8>> {
@@ -1084,7 +1087,7 @@ mod tests {
         params.sample_format = Some(format);
         let mut dec = make_decoder(&params).expect("make_decoder");
         let mut frames = Vec::new();
-        for chunk in FIXTURE.chunks_exact(768) {
+        for chunk in FIXTURE.as_chunks::<768>().0 {
             dec.send_packet(&Packet::new(0, TB::new(1, 48_000), chunk.to_vec()))
                 .unwrap();
             while let Ok(Frame::Audio(af)) = dec.receive_frame() {
@@ -1103,11 +1106,11 @@ mod tests {
         let mut fractional = 0usize;
         for (a, b) in s16.iter().zip(&f32) {
             assert_eq!(b.len(), a.len() * 2, "4 bytes per F32 sample");
-            for (q, f) in a.chunks_exact(2).zip(b.chunks_exact(4)) {
-                let v = f32::from_le_bytes([f[0], f[1], f[2], f[3]]);
+            for (q, f) in a.as_chunks::<2>().0.iter().zip(b.as_chunks::<4>().0) {
+                let v = f32::from_le_bytes(*f);
                 // the S16 output is the F32 output quantised as the S16 path does
                 let expect = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                assert_eq!(i16::from_le_bytes([q[0], q[1]]), expect);
+                assert_eq!(i16::from_le_bytes(*q), expect);
                 if (v * 32767.0).fract() != 0.0 {
                     fractional += 1;
                 }
@@ -1116,6 +1119,9 @@ mod tests {
         assert!(fractional > 0, "F32 keeps the precision S16 drops");
     }
 
+    /// Decode the in-tree `sine440_stereo.ac3` validator fixture and
+    /// return the RMS of the interleaved S16 output PCM under the supplied
+    /// DRC settings.
     fn decode_fixture_rms(drc: DrcSettings) -> f64 {
         use oxideav_core::Packet;
         use oxideav_core::TimeBase as TB;
