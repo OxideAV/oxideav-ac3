@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- container: **raw `.ac3` / `.eac3` / `.ec3` elementary-stream demuxer +
+  probe** (`container`, registered through `register!` as container
+  `ac3`; umbrella playback corpus #4 cells 120–122). One packet per
+  presentation period — an AC-3 syncframe (Table 5.18 length, 1536
+  samples) or an E-AC-3 program-0 independent frame plus the dependent /
+  additional-program frames behind it (`frmsiz`, `numblkscod` blocks,
+  reduced `fscod2` rates) — timestamps in samples, constant-rate
+  duration estimate, packet-boundary seeking, resync over junk and
+  orphan dependent frames. The probe needs 0x0B77 + a valid header at
+  offset 0 and at the first frame's end. Packet counts match
+  `ffprobe -count_frames` on the corpus cells (`tests/elementary_stream.rs`).
+
+- decoder: **packets carrying several consecutive syncframes decode
+  completely**. `send_packet` splits the payload into presentation
+  periods (AC-3 frame / E-AC-3 program-0 independent frame with its
+  followers) and `receive_frame` drains them in order with per-period
+  timestamps; previously a multi-frame packet (an MPEG-TS PES payload)
+  decoded only its last independent frame.
+
 - decoder: **opt-in F32 output** (#17, ropoctl) — a decoder built with
   `CodecParameters::sample_format = Some(SampleFormat::F32)` emits each
   frame as interleaved little-endian f32 in the same WAVE channel order

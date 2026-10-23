@@ -33,7 +33,7 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Ac3Decoder {
         codec_id: params.codec_id.clone(),
         time_base: TimeBase::new(1, 48_000),
-        pending: None,
+        pending: std::collections::VecDeque::new(),
         eof: false,
         state: Ac3State::new(),
         eac3_state: eac3::Eac3DecoderState::default(),
@@ -54,7 +54,7 @@ pub fn make_eac3_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Ac3Decoder {
         codec_id: params.codec_id.clone(),
         time_base: TimeBase::new(1, 48_000),
-        pending: None,
+        pending: std::collections::VecDeque::new(),
         eof: false,
         state: Ac3State::new(),
         eac3_state: eac3::Eac3DecoderState::default(),
@@ -79,7 +79,7 @@ pub fn make_eac3_decoder_with_joc(params: &CodecParameters) -> Result<Box<dyn De
     Ok(Box::new(Ac3Decoder {
         codec_id: params.codec_id.clone(),
         time_base: TimeBase::new(1, 48_000),
-        pending: None,
+        pending: std::collections::VecDeque::new(),
         eof: false,
         state: Ac3State::new(),
         eac3_state: eac3::Eac3DecoderState::default(),
@@ -106,7 +106,7 @@ pub fn make_decoder_ltrt(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Ac3Decoder {
         codec_id: params.codec_id.clone(),
         time_base: TimeBase::new(1, 48_000),
-        pending: None,
+        pending: std::collections::VecDeque::new(),
         eof: false,
         state: Ac3State::new(),
         eac3_state: eac3::Eac3DecoderState::default(),
@@ -135,7 +135,7 @@ pub fn make_decoder_with_drc(
     let mut dec = Ac3Decoder {
         codec_id: params.codec_id.clone(),
         time_base: TimeBase::new(1, 48_000),
-        pending: None,
+        pending: std::collections::VecDeque::new(),
         eof: false,
         state: Ac3State::new(),
         eac3_state: eac3::Eac3DecoderState::default(),
@@ -153,7 +153,12 @@ pub fn make_decoder_with_drc(
 struct Ac3Decoder {
     codec_id: CodecId,
     time_base: TimeBase,
-    pending: Option<Packet>,
+    /// Presentation periods still to be decoded from the last packet
+    /// handed to [`Decoder::send_packet`]. A packet may carry several
+    /// consecutive syncframes (an MPEG-TS PES payload typically does);
+    /// [`split_packet`] cuts it into one entry per period and
+    /// [`Decoder::receive_frame`] drains them in order.
+    pending: std::collections::VecDeque<Packet>,
     eof: bool,
     state: Ac3State,
     /// Per-decoder E-AC-3 state — empty in round 1 (no overlap-add
@@ -195,17 +200,17 @@ impl Decoder for Ac3Decoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if self.pending.is_some() {
+        if !self.pending.is_empty() {
             return Err(Error::other(
                 "AC-3 decoder: receive_frame must be called before sending another packet",
             ));
         }
-        self.pending = Some(packet.clone());
+        self.pending = split_packet(packet);
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        let pkt = match self.pending.take() {
+        let pkt = match self.pending.pop_front() {
             Some(p) => p,
             None => {
                 return if self.eof {
@@ -224,7 +229,7 @@ impl Decoder for Ac3Decoder {
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.pending = None;
+        self.pending.clear();
         self.eof = false;
         self.state = Ac3State::new();
         self.eac3_state = eac3::Eac3DecoderState::default();
@@ -637,6 +642,65 @@ impl Ac3Decoder {
             data: vec![out_bytes],
         }))
     }
+}
+
+/// Cut a packet into one sub-packet per presentation period.
+///
+/// Containers that frame AC-3 themselves (MP4, Matroska, the `.ac3`
+/// demuxer) hand over exactly one period per packet and the split is
+/// the identity. Transport-stream PES payloads carry several
+/// consecutive syncframes; each AC-3 frame, and each E-AC-3 program-0
+/// independent frame together with the dependent / additional-program
+/// frames that follow it (Annex E §E.3.8 — the decoder renders program
+/// 0), becomes its own sub-packet. Timestamps advance by the period's
+/// sample count rescaled into the packet's time base; the duration is
+/// set per period. Bytes that do not parse as a syncframe header where
+/// a frame is expected stay attached to the preceding period (or form
+/// the single sub-packet of an unparsable packet) so the frame decoder
+/// reports them exactly as before.
+fn split_packet(packet: &Packet) -> std::collections::VecDeque<Packet> {
+    use crate::container::parse_sync_frame;
+    let data = &packet.data[..];
+    let mut out = std::collections::VecDeque::new();
+    // Period boundaries: offsets of every program-start syncframe.
+    let mut starts: Vec<(usize, u32, u32)> = Vec::new(); // (offset, samples, sample_rate)
+    let mut off = 0usize;
+    while off + 6 <= data.len() {
+        let Some(f) = parse_sync_frame(&data[off..]) else {
+            break;
+        };
+        if f.program_start {
+            starts.push((off, f.samples, f.sample_rate));
+        }
+        if off + f.len > data.len() {
+            break;
+        }
+        off += f.len;
+    }
+    if starts.len() <= 1 {
+        out.push_back(packet.clone());
+        return out;
+    }
+    let mut pts = packet.pts;
+    let mut dts = packet.dts;
+    for (i, &(start, samples, sample_rate)) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).map_or(data.len(), |n| n.0);
+        let ticks =
+            TimeBase::new(1, i64::from(sample_rate)).rescale(i64::from(samples), packet.time_base);
+        let mut sub = Packet::new(
+            packet.stream_index,
+            packet.time_base,
+            data[start..end].to_vec(),
+        );
+        sub.pts = pts;
+        sub.dts = dts;
+        sub.duration = Some(ticks);
+        sub.flags = packet.flags;
+        out.push_back(sub);
+        pts = pts.map(|p| p.saturating_add(ticks));
+        dts = dts.map(|d| d.saturating_add(ticks));
+    }
+    out
 }
 
 /// Interleaved f32 PCM as little-endian bytes (the F32 output format).

@@ -443,6 +443,28 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   a TPNP corruption sweep, and the external decoder binary accepts
   the syntax (27.4 dB on impulse-train content).
 
+### Elementary-stream container (`.ac3` / `.eac3` / `.ec3`)
+
+[`container`] registers the raw elementary stream with the runtime's
+`ContainerRegistry` (name `ac3`, extensions `ac3` / `eac3` / `ec3`):
+the probe wants the 0x0B77 syncword plus a valid header at offset 0
+**and** at the frame boundary the first header announces, and the
+demuxer emits one packet per presentation period — an AC-3 syncframe
+(`frmsizecod` / `fscod`, Table 5.18, 1536 samples), or an E-AC-3
+program-0 independent frame (`frmsiz`, `numblkscod` → 1/2/3/6 blocks
+of 256 samples, reduced `fscod2` rates) together with the dependent /
+additional-program frames that follow it, so a 7.1 indep + dep pair is
+one packet. Timestamps count samples; duration and seeking use the
+constant-rate estimate from the first packet's size. Packet counts for
+the playback-corpus cells (AC-3 stereo / 5.1, E-AC-3 5.1) match
+`ffprobe -count_frames` (`tests/elementary_stream.rs`).
+
+The decoder itself accepts a packet carrying **several consecutive
+syncframes** (an MPEG-TS PES payload typically does): it splits the
+packet into presentation periods, drains them through successive
+`receive_frame` calls and advances the timestamps by each period's
+sample count rescaled into the packet's time base.
+
 ### CRC
 
 §7.10.1 CRC-16 (poly 0x8005), shared between the encoder (forward

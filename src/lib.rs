@@ -56,6 +56,10 @@ pub mod audblk;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod bsi;
+/// Raw `.ac3` / `.eac3` elementary-stream container: probe + demuxer
+/// (one packet per presentation period, dependent substreams grouped
+/// with their independent frame).
+pub mod container;
 pub mod crc;
 pub mod decoder;
 // internal — exposed for tests/fuzz; not part of the stable API
@@ -193,6 +197,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
 /// Unified registration entry point — installs AC-3 + E-AC-3 into the
 /// codec sub-registry of the supplied [`oxideav_core::RuntimeContext`].
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    container::register_container(&mut ctx.containers);
     register_codecs(&mut ctx.codecs);
 }
 
