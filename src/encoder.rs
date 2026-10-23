@@ -191,7 +191,26 @@ pub fn make_encoder_with_metadata(
         pts: 0,
         cadence_csnr: CADENCE_CSNR_INIT,
         last_blksw: vec![false; nfchans],
+        disable_cpl: parse_disable_knob(params, "cpl", "AC3_DISABLE_CPL")?,
+        disable_perblock_snr: parse_disable_knob(
+            params,
+            "perblock_snr",
+            "AC3_DISABLE_PERBLOCK_SNR",
+        )?,
     }))
+}
+
+/// Construction-time A/B knob: the `CodecParameters::options` key
+/// (`"0"` / `"false"` disables the tool; absent or `"1"` keeps it) or,
+/// as the legacy switch, the named environment variable being set.
+/// Read once here so an encode never consults the process environment
+/// mid-frame.
+fn parse_disable_knob(params: &CodecParameters, key: &str, env: &str) -> Result<bool> {
+    let via_option = match params.options.get(key) {
+        Some(v) => !parse_bool_opt(key, v)?,
+        None => false,
+    };
+    Ok(via_option || std::env::var(env).is_ok())
 }
 
 /// Construction-time minimum-rate floor (the E-AC-3 encoder's twin):
@@ -564,6 +583,13 @@ struct Ac3Encoder {
     /// Per fbw channel: was the previous frame's last block switched?
     /// (§8.2.9 dither defeat spans the block after a short block.)
     last_blksw: Vec<bool>,
+    /// A/B knob: skip §7.4 channel coupling entirely (option `cpl = 0`
+    /// or the `AC3_DISABLE_CPL` environment variable at construction).
+    disable_cpl: bool,
+    /// A/B knob: pin every block to the frame's flat SNR-offset plan
+    /// instead of the per-block §5.4.3.37-43 redistribution (option
+    /// `perblock_snr = 0` or `AC3_DISABLE_PERBLOCK_SNR` at construction).
+    disable_perblock_snr: bool,
 }
 
 impl Encoder for Ac3Encoder {
@@ -832,7 +858,7 @@ impl Ac3Encoder {
         // re-derives L_recv = cplmant * cplco_L * 8, R_recv = cplmant *
         // cplco_R * 8 — preserving the per-band envelope of each
         // channel without spending bits on per-channel mantissas.
-        let cpl_disabled = std::env::var("AC3_DISABLE_CPL").is_ok();
+        let cpl_disabled = self.disable_cpl;
         let mut cpl = CouplingPlan::default();
         // ATSC A/52 §7.4: coupling is allowed for any acmod with ≥ 2 fbw
         // channels. The coupling group can include up to 5 fbw channels
@@ -1446,7 +1472,7 @@ impl Ac3Encoder {
         // snroffste so the decoder applies the new values immediately.
         // The AC3_DISABLE_PERBLOCK_SNR env var pins the plan to the
         // flat global one — useful for A/B-ing the contribution.
-        let snr_plan = if std::env::var("AC3_DISABLE_PERBLOCK_SNR").is_ok() {
+        let snr_plan = if self.disable_perblock_snr {
             PerBlockSnr::from_global(&tuned_ba)
         } else {
             tune_per_block_snroffst_with_plan(
@@ -7704,7 +7730,7 @@ mod tests {
     /// Round-25 (task #155): demonstrate the bit-savings of multichan
     /// coupling on HF-rich content. Encode a 5.1 fixture twice — once
     /// with all 5 fbw channels coupled (the default), and once with
-    /// `AC3_DISABLE_CPL` set so coupling is suppressed — at the same
+    /// the `cpl = 0` option so coupling is suppressed — at the same
     /// nominal bitrate, and verifies the coupling tool engages
     /// end-to-end without regressing the decode.
     ///
@@ -7730,19 +7756,16 @@ mod tests {
     ///
     ///  1. coupling-on must *engage* — at least one block emits
     ///     `cplinu = 1` in the bitstream side-info;
-    ///  2. coupling-off (`AC3_DISABLE_CPL`) must emit `cplinu = 0` in
+    ///  2. coupling-off (`cpl = 0`) must emit `cplinu = 0` in
     ///     every block;
     ///  3. both paths produce a *valid, non-degraded* self-decode at or
     ///     above the same per-channel floor the rest of the 5.1 suite
     ///     uses — i.e. coupling does not *regress* the decode;
     ///  4. at matched `frmsizecod` the two bitstreams are the same size.
     ///
-    /// Still `#[ignore]`d because it mutates the process-wide
-    /// `AC3_DISABLE_CPL` env var and would race a concurrently-running
-    /// encode; run alone with `cargo test -- --ignored
-    /// five_one_coupling_beats_no_coupling_at_low_bitrate`.
+    /// The no-coupling arm uses the construction-time `cpl = 0` option,
+    /// so the test shares the process with the rest of the suite.
     #[test]
-    #[ignore = "mutates AC3_DISABLE_CPL — must run alone (cargo test -- --ignored)"]
     fn five_one_coupling_beats_no_coupling_at_low_bitrate() {
         // 320 kbps for 5.1 — below the 448 kbps default, the budget at
         // which coupling is most relevant.
@@ -7755,21 +7778,14 @@ mod tests {
         // Returns (avg-fbw PSNR, bitstream byte count, count of blocks
         // whose side-info carried `cplinu == 1`, total blocks).
         let encode_and_psnr = |disable_cpl: bool| -> (f64, usize, usize, usize) {
-            // Switch the env knob inside this closure; restore on exit.
-            // The encoder reads `AC3_DISABLE_CPL` per frame so setting
-            // it before the encode loop is sufficient.
-            if disable_cpl {
-                // FIXME: Audit that the environment access only happens in single-threaded code.
-                unsafe { std::env::set_var("AC3_DISABLE_CPL", "1") };
-            } else {
-                // FIXME: Audit that the environment access only happens in single-threaded code.
-                unsafe { std::env::remove_var("AC3_DISABLE_CPL") };
-            }
             let mut params = CodecParameters::audio(CodecId::new("ac3"));
             params.sample_rate = Some(sr);
             params.channels = Some(channels);
             params.sample_format = Some(SampleFormat::S16);
             params.bit_rate = Some(kbps * 1000);
+            if disable_cpl {
+                params.options.insert("cpl".to_string(), "0".to_string());
+            }
             let mut enc = make_encoder(&params).expect("make_encoder");
             enc.send_frame(&Frame::Audio(AudioFrame {
                 samples: nsamp as u32,
@@ -7885,9 +7901,6 @@ mod tests {
 
         let (psnr_with, bytes_with, cpl_blocks_with, total_blocks) = encode_and_psnr(false);
         let (psnr_without, bytes_without, cpl_blocks_without, _) = encode_and_psnr(true);
-        // Restore env state.
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("AC3_DISABLE_CPL") };
 
         eprintln!(
             "5.1 @ {} kbps coupling-on  : avg-fbw PSNR {:.2} dB ({} bytes, {}/{} cpl blocks)",
@@ -7918,7 +7931,7 @@ mod tests {
         // (2) Coupling-off must suppress the tool in every block.
         assert_eq!(
             cpl_blocks_without, 0,
-            "AC3_DISABLE_CPL still emitted {}/{} coupled blocks",
+            "cpl = 0 still emitted {}/{} coupled blocks",
             cpl_blocks_without, total_blocks
         );
         // (3) Coupling must not *regress* the decode: the coupling-on
@@ -8048,12 +8061,9 @@ mod tests {
     /// per-block-tuned run must produce equal-or-better localised
     /// PSNR over block 3's sample range.
     ///
-    /// Marked `#[ignore]` so it doesn't race with other tests over the
-    /// `AC3_DISABLE_PERBLOCK_SNR` env var (set/remove here would flip
-    /// the encoder's decision in any concurrently-running encode).
-    /// Run with `cargo test -- --ignored perblock_snroffst_helps_transient`.
+    /// The flat arm uses the construction-time `perblock_snr = 0`
+    /// option, so the test shares the process with the rest of the suite.
     #[test]
-    #[ignore = "mutates AC3_DISABLE_PERBLOCK_SNR — must run alone (cargo test -- --ignored)"]
     fn perblock_snroffst_helps_transient() {
         let sr = 48_000u32;
         let (nsamp, bytes) = build_perblock_transient_pcm(sr);
@@ -8066,18 +8076,16 @@ mod tests {
         let kbps = 96u64;
 
         let encode_and_psnr = |disable: bool| -> (f64, usize) {
-            if disable {
-                // FIXME: Audit that the environment access only happens in single-threaded code.
-                unsafe { std::env::set_var("AC3_DISABLE_PERBLOCK_SNR", "1") };
-            } else {
-                // FIXME: Audit that the environment access only happens in single-threaded code.
-                unsafe { std::env::remove_var("AC3_DISABLE_PERBLOCK_SNR") };
-            }
             let mut params = CodecParameters::audio(CodecId::new("ac3"));
             params.sample_rate = Some(sr);
             params.channels = Some(2);
             params.sample_format = Some(SampleFormat::S16);
             params.bit_rate = Some(kbps * 1000);
+            if disable {
+                params
+                    .options
+                    .insert("perblock_snr".to_string(), "0".to_string());
+            }
             let mut enc = make_encoder(&params).expect("make_encoder");
             let audio = AudioFrame {
                 samples: nsamp as u32,

@@ -59,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   −512-sample lag at 12 dB; 7.1 pair: it drops the indep Ls/Rs and
   leaves one output channel silent).
 
+- encoder: the coupling and per-block-SNR A/B knobs are construction-time
+  options (`cpl = 0`, `perblock_snr = 0`) read once into the encoder; the
+  `AC3_DISABLE_CPL` / `AC3_DISABLE_PERBLOCK_SNR` environment variables
+  still work but are no longer consulted per frame. The two A/B tests that
+  used to mutate the process environment (and were `#[ignore]`d for it)
+  now run with the rest of the suite.
+
 - edition 2024, MSRV 1.95.
 
 - encoder r457: **equal-rate rate-distortion harness** (`tests/common/rd.rs`, `tests/equal_rate.rs`, `examples/equal_rate_report`) — a deterministic synthetic corpus (speech, music, transients, two-tone, pink noise, 5.1 with LFE; 16 kHz band-limited) is encoded by our AC-3 / E-AC-3 encoder and by the black-box reference encoder at equal nominal rate, every stream is decoded by both our decoder and the reference decoder, and each decode is scored by worst-channel SNR and a mean noise-to-mask ratio (§7.2.2 parametric mask on the source MDCT). The test pins per-cell floors, the decoder agreement on our streams (< 1.5 dB) and the distance to the reference encoder; README carries the ladder. The harness immediately exposed that the r454 "~24 dB flat" two-tone table was an aliased lag-search artefact: the standard path measured ≈ 12 dB at every rate.

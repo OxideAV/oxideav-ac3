@@ -93,6 +93,11 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   (§5.4.3.40), per-block SNR-offset bit-pool redistribution, the
   §7.2.2.1.1 all-zero-offset special case mirrored in the allocator,
   and §7.10.1 dual-CRC emission.
+- A/B knobs for the two encoder tools whose contribution the suite
+  measures: options `cpl = 0` (no §7.4 coupling) and `perblock_snr = 0`
+  (flat frame-level SNR offsets), read once at construction; the
+  `AC3_DISABLE_CPL` / `AC3_DISABLE_PERBLOCK_SNR` environment variables
+  remain as the legacy switch.
 - **Bitstream-metadata surface** (`encoder::MetadataParams` /
   `make_encoder_with_metadata`, or the registry options `dialnorm`,
   `compr`, `dynrng`, `bsmod`, `cmixlev`, `surmixlev`, `dsurmod`,
