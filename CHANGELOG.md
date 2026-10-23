@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   downmix and JOC stereo paths all honour it; with S16 or no
   `sample_format` the output is byte-for-byte unchanged.
 
+### Fixed
+
+- tables: **Table 7.15 hearing threshold, 44.1 kHz row** (#18, ropoctl)
+  — `HTH[1]` bands 25, 28 and 34 were one step off the staged spec
+  (`0x0340`/`0x0310`/`0x0300` for `0x0350`/`0x0320`/`0x02f0`). Where a
+  band's mask is the hearing threshold the decoder's `bap[]` then
+  differed from the encoder's, the mantissa unpack lost sync and the
+  rest of the frame decoded to noise (a 44.1 kHz stereo tone at 192 kb/s
+  decoded at −0.5 … 10 dB; now > 30 dB). All 150 cells of `HTH` are
+  verified against A/52:2018 Table 7.15; the encoder shares the table.
+  `tests/hearing_threshold_44k.rs` pins each band with a short
+  black-box-encoded fixture.
+
 ### Changed
 
 - edition 2024, MSRV 1.95.

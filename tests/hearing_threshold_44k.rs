@@ -48,8 +48,10 @@ fn decode(stream: &[u8]) -> Vec<f64> {
         );
         pcm.extend(
             frame.data[0]
-                .chunks_exact(2)
-                .map(|b| f64::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0),
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| f64::from(i16::from_le_bytes(*b)) / 32768.0),
         );
         at += len;
     }
@@ -61,7 +63,7 @@ fn assert_tone(stream: &[u8], tone: impl Fn(usize, usize) -> f64) {
     let pcm = decode(stream);
     for ch in 0..2 {
         let (mut signal, mut error) = (0.0, 0.0);
-        for (i, frame) in pcm.chunks_exact(2).enumerate() {
+        for (i, frame) in pcm.as_chunks::<2>().0.iter().enumerate() {
             let expected = if i < 256 { 0.0 } else { tone(ch, i - 256) };
             signal += expected * expected;
             error += (frame[ch] - expected).powi(2);
