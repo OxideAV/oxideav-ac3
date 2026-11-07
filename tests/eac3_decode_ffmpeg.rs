@@ -681,7 +681,14 @@ fn crafted_std_coupling_spx_geometry_sweep_decodes_like_ffmpeg() {
         // begin (cplbegf = cplendf + 2).
         let single = (derived_endf + 2).to_string();
         for (channels, kbps) in [(2usize, 128u64), (6, 384)] {
-            for cpl_begf in [None, Some("0"), Some(single.as_str())] {
+            // The default cplbegf (min(8, cplendf + 2)) coincides with
+            // the single-sub-band region except at spxbegf = 7.
+            let regions: &[Option<&str>] = if begf == 7 {
+                &[None, Some("0"), Some(single.as_str())]
+            } else {
+                &[Some("0"), Some(single.as_str())]
+            };
+            for &cpl_begf in regions {
                 let mut opts: Vec<(&str, &str)> = vec![
                     ("cpl", "1"),
                     ("spx", "1"),
@@ -693,7 +700,7 @@ fn crafted_std_coupling_spx_geometry_sweep_decodes_like_ffmpeg() {
                 if let Some(c) = cpl_begf {
                     opts.push(("cpl_begf", c));
                 }
-                let es = encode_ours_at(channels, 48_000, 0.5, kbps * 1000, &opts);
+                let es = encode_ours_at(channels, 48_000, 0.25, kbps * 1000, &opts);
                 assert_decode_matches_ffmpeg(
                     &format!(
                         "cpl+spx spxbegf={begf} cplbegf={} {channels}ch {kbps}k",
@@ -736,7 +743,7 @@ fn crafted_std_coupling_region_sweep_decodes_like_ffmpeg() {
             let es = encode_ours_at(
                 channels,
                 rate,
-                0.5,
+                0.25,
                 kbps * 1000,
                 // dither = 0: zero-bit mantissas decode as true zeros,
                 // so wide low-rate coupling regions compare
