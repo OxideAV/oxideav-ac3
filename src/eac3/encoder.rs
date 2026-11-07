@@ -542,6 +542,7 @@ fn ecpl_params_from_options(params: &CodecParameters) -> Result<Option<EcplParam
 /// per-block mixing configuration are emitted as absent
 /// (`mixdef = 0`, `paninfoe = 0`, `frmmixcfginfoe = 0`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Eac3MixMetadata {
     /// `dmixmod` (2 bits, §E.2.3.1.11) — preferred stereo downmix
     /// (0 = not indicated, 1 = LtRt, 2 = LoRo; 3 is reserved).
@@ -567,6 +568,64 @@ pub struct Eac3MixMetadata {
     pub extpgmscl: Option<u8>,
 }
 
+impl Eac3MixMetadata {
+    /// Builder: set [`dmixmod`](Self::dmixmod).
+    #[must_use]
+    pub fn with_dmixmod(mut self, v: u8) -> Self {
+        self.dmixmod = v;
+        self
+    }
+
+    /// Builder: set [`ltrtcmixlev`](Self::ltrtcmixlev).
+    #[must_use]
+    pub fn with_ltrtcmixlev(mut self, v: u8) -> Self {
+        self.ltrtcmixlev = v;
+        self
+    }
+
+    /// Builder: set [`lorocmixlev`](Self::lorocmixlev).
+    #[must_use]
+    pub fn with_lorocmixlev(mut self, v: u8) -> Self {
+        self.lorocmixlev = v;
+        self
+    }
+
+    /// Builder: set [`ltrtsurmixlev`](Self::ltrtsurmixlev).
+    #[must_use]
+    pub fn with_ltrtsurmixlev(mut self, v: u8) -> Self {
+        self.ltrtsurmixlev = v;
+        self
+    }
+
+    /// Builder: set [`lorosurmixlev`](Self::lorosurmixlev).
+    #[must_use]
+    pub fn with_lorosurmixlev(mut self, v: u8) -> Self {
+        self.lorosurmixlev = v;
+        self
+    }
+
+    /// Builder: set [`lfemixlevcod`](Self::lfemixlevcod).
+    #[must_use]
+    pub fn with_lfemixlevcod(mut self, v: Option<u8>) -> Self {
+        self.lfemixlevcod = v;
+        self
+    }
+
+    /// Builder: set [`pgmscl`](Self::pgmscl).
+    #[must_use]
+    pub fn with_pgmscl(mut self, v: Option<u8>) -> Self {
+        self.pgmscl = v;
+        self
+    }
+
+    /// Builder: set [`extpgmscl`](Self::extpgmscl).
+    #[must_use]
+    pub fn with_extpgmscl(mut self, v: Option<u8>) -> Self {
+        self.extpgmscl = v;
+        self
+    }
+}
+
 impl Default for Eac3MixMetadata {
     /// −3 dB centre / −3 dB surround downmix levels on both LtRt and
     /// LoRo targets, downmix preference not indicated, no LFE mix
@@ -590,6 +649,7 @@ impl Default for Eac3MixMetadata {
 /// (`dsurmod` / `dheadphonmod`) and ≥ 6-channel (`dsurexmod`) arms are
 /// emitted only when acmod carries them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Eac3InfoMetadata {
     /// `bsmod` (3 bits, Table 5.7) — bit-stream mode.
     pub bsmod: u8,
@@ -611,8 +671,67 @@ pub struct Eac3InfoMetadata {
     pub sourcefscod: bool,
 }
 
+impl Eac3InfoMetadata {
+    /// Builder: set [`bsmod`](Self::bsmod).
+    #[must_use]
+    pub fn with_bsmod(mut self, v: u8) -> Self {
+        self.bsmod = v;
+        self
+    }
+
+    /// Builder: set [`copyrightb`](Self::copyrightb).
+    #[must_use]
+    pub fn with_copyrightb(mut self, v: bool) -> Self {
+        self.copyrightb = v;
+        self
+    }
+
+    /// Builder: set [`origbs`](Self::origbs).
+    #[must_use]
+    pub fn with_origbs(mut self, v: bool) -> Self {
+        self.origbs = v;
+        self
+    }
+
+    /// Builder: set [`dsurmod`](Self::dsurmod).
+    #[must_use]
+    pub fn with_dsurmod(mut self, v: u8) -> Self {
+        self.dsurmod = v;
+        self
+    }
+
+    /// Builder: set [`dheadphonmod`](Self::dheadphonmod).
+    #[must_use]
+    pub fn with_dheadphonmod(mut self, v: u8) -> Self {
+        self.dheadphonmod = v;
+        self
+    }
+
+    /// Builder: set [`dsurexmod`](Self::dsurexmod).
+    #[must_use]
+    pub fn with_dsurexmod(mut self, v: u8) -> Self {
+        self.dsurexmod = v;
+        self
+    }
+
+    /// Builder: set [`audprod`](Self::audprod).
+    #[must_use]
+    pub fn with_audprod(mut self, v: Option<Eac3AudioProduction>) -> Self {
+        self.audprod = v;
+        self
+    }
+
+    /// Builder: set [`sourcefscod`](Self::sourcefscod).
+    #[must_use]
+    pub fn with_sourcefscod(mut self, v: bool) -> Self {
+        self.sourcefscod = v;
+        self
+    }
+}
+
 /// `audprodie` body for [`Eac3InfoMetadata`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Eac3AudioProduction {
     /// `mixlevel` (5 bits, 0..=31) — peak SPL is `80 + mixlevel`.
     pub mixlevel: u8,
@@ -620,6 +739,38 @@ pub struct Eac3AudioProduction {
     pub roomtyp: u8,
     /// `adconvtyp` (1 bit) — HDCD-type A/D conversion.
     pub adconvtyp: bool,
+}
+
+impl Eac3AudioProduction {
+    /// Build a [`Eac3AudioProduction`] from every field.
+    pub fn new(mixlevel: u8, roomtyp: u8, adconvtyp: bool) -> Self {
+        Self {
+            mixlevel,
+            roomtyp,
+            adconvtyp,
+        }
+    }
+
+    /// Builder: set [`mixlevel`](Self::mixlevel).
+    #[must_use]
+    pub fn with_mixlevel(mut self, v: u8) -> Self {
+        self.mixlevel = v;
+        self
+    }
+
+    /// Builder: set [`roomtyp`](Self::roomtyp).
+    #[must_use]
+    pub fn with_roomtyp(mut self, v: u8) -> Self {
+        self.roomtyp = v;
+        self
+    }
+
+    /// Builder: set [`adconvtyp`](Self::adconvtyp).
+    #[must_use]
+    pub fn with_adconvtyp(mut self, v: bool) -> Self {
+        self.adconvtyp = v;
+        self
+    }
 }
 
 impl Default for Eac3InfoMetadata {
@@ -652,6 +803,7 @@ impl Default for Eac3InfoMetadata {
 /// `dsurexmod`, `mixlevel` + `roomtyp` + `adconvtyp`, `sourcefscod`.
 /// Setting any key of a block emits that block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Eac3Metadata {
     /// `dialnorm` (5 bits, §5.4.2.8 semantics) — valid 1..=31.
     pub dialnorm: u8,
@@ -664,6 +816,43 @@ pub struct Eac3Metadata {
     pub mixmd: Option<Eac3MixMetadata>,
     /// §E.2.3.1.62+ informational-metadata block (`infomdate = 1`).
     pub infomd: Option<Eac3InfoMetadata>,
+}
+
+impl Eac3Metadata {
+    /// Builder: set [`dialnorm`](Self::dialnorm).
+    #[must_use]
+    pub fn with_dialnorm(mut self, v: u8) -> Self {
+        self.dialnorm = v;
+        self
+    }
+
+    /// Builder: set [`compr`](Self::compr).
+    #[must_use]
+    pub fn with_compr(mut self, v: Option<u8>) -> Self {
+        self.compr = v;
+        self
+    }
+
+    /// Builder: set [`dynrng`](Self::dynrng).
+    #[must_use]
+    pub fn with_dynrng(mut self, v: Option<u8>) -> Self {
+        self.dynrng = v;
+        self
+    }
+
+    /// Builder: set [`mixmd`](Self::mixmd).
+    #[must_use]
+    pub fn with_mixmd(mut self, v: Option<Eac3MixMetadata>) -> Self {
+        self.mixmd = v;
+        self
+    }
+
+    /// Builder: set [`infomd`](Self::infomd).
+    #[must_use]
+    pub fn with_infomd(mut self, v: Option<Eac3InfoMetadata>) -> Self {
+        self.infomd = v;
+        self
+    }
 }
 
 impl Default for Eac3Metadata {

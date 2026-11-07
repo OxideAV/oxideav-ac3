@@ -228,10 +228,22 @@ impl Eac3DecoderState {
 /// Snapshot of the most recent independent substream's output shape
 /// — channels, sample rate, samples per frame.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct IndepProgramShape {
     pub nchans: u16,
     pub sample_rate: u32,
     pub samples_per_frame: u32,
+}
+
+impl IndepProgramShape {
+    /// Build a [`IndepProgramShape`] from every field.
+    pub fn new(nchans: u16, sample_rate: u32, samples_per_frame: u32) -> Self {
+        Self {
+            nchans,
+            sample_rate,
+            samples_per_frame,
+        }
+    }
 }
 
 /// Result of decoding one E-AC-3 packet.

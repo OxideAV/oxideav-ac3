@@ -45,6 +45,7 @@ use crate::audblk::N_COEFFS;
 
 /// Encoder-facing enhanced-coupling parameters (§E.2.3.3.16-17 codes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EcplParams {
     /// `ecplbegf` (4 bits) — begin-frequency code, Table E3.8. The
     /// encoder restricts it to `2..=13` (begin sub-band ≥ 4, i.e. the
@@ -65,6 +66,29 @@ pub struct EcplParams {
     /// chaos 0 everywhere (fully correlated model — the decode is then
     /// a deterministic pure amplitude+angle reconstruction).
     pub chaos: bool,
+}
+
+impl EcplParams {
+    /// Builder: set [`ecplbegf`](Self::ecplbegf).
+    #[must_use]
+    pub fn with_ecplbegf(mut self, v: u8) -> Self {
+        self.ecplbegf = v;
+        self
+    }
+
+    /// Builder: set [`ecplendf`](Self::ecplendf).
+    #[must_use]
+    pub fn with_ecplendf(mut self, v: u8) -> Self {
+        self.ecplendf = v;
+        self
+    }
+
+    /// Builder: set [`chaos`](Self::chaos).
+    #[must_use]
+    pub fn with_chaos(mut self, v: bool) -> Self {
+        self.chaos = v;
+        self
+    }
 }
 
 impl Default for EcplParams {

@@ -845,10 +845,8 @@ fn eac3_spx_atten_band_energy_through_ffmpeg() {
     // placement (a mis-sized field would desynchronise everything
     // after it) and (b) that the notch-compensated coordinates still
     // deliver the §3.6.4.3 banded energy.
-    let spx = SpxParams {
-        atten_code: Some(14), // Table E3.14 taps [0.5, 0.25, 0.125]
-        ..SpxParams::default()
-    };
+    // Table E3.14 taps [0.5, 0.25, 0.125]
+    let spx = SpxParams::default().with_atten_code(Some(14));
     let geom = SpxGeometry::derive(&spx, &oxideav_ac3::eac3::dsp::DEFAULT_SPX_BNDSTRC)
         .expect("SPX geometry");
     let pcm = build_spx_multitone(2);
@@ -1022,10 +1020,7 @@ fn eac3_spx_mixed_membership_through_ffmpeg() {
     // the chinspx[ch] = 0 arm: the non-SPX channel must keep its
     // chbwcod, its longer exponent set, and its own mantissa run —
     // one mis-gated field desynchronises the whole frame.
-    let spx = SpxParams {
-        channel_mask: Some(0b01),
-        ..SpxParams::default()
-    };
+    let spx = SpxParams::default().with_channel_mask(Some(0b01));
     let geom = SpxGeometry::derive(&spx, &oxideav_ac3::eac3::dsp::DEFAULT_SPX_BNDSTRC)
         .expect("SPX geometry");
     let pcm = build_spx_multitone(2);

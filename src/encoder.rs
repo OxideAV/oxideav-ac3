@@ -307,11 +307,33 @@ fn pick_frmsizecod(kbps: u32) -> Option<u8> {
 /// `80 + mixlevel` dB SPL) and the 2-bit `roomtyp` code (Table 5.12:
 /// 0 = not indicated, 1 = large room / X-curve, 2 = small room / flat).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AudioProductionParams {
     /// `mixlevel` (5 bits, 0..=31) — §5.4.2.14.
     pub mixlevel: u8,
     /// `roomtyp` (2 bits, 0..=2; 3 is reserved) — §5.4.2.15.
     pub roomtyp: u8,
+}
+
+impl AudioProductionParams {
+    /// Build a [`AudioProductionParams`] from every field.
+    pub fn new(mixlevel: u8, roomtyp: u8) -> Self {
+        Self { mixlevel, roomtyp }
+    }
+
+    /// Builder: set [`mixlevel`](Self::mixlevel).
+    #[must_use]
+    pub fn with_mixlevel(mut self, v: u8) -> Self {
+        self.mixlevel = v;
+        self
+    }
+
+    /// Builder: set [`roomtyp`](Self::roomtyp).
+    #[must_use]
+    pub fn with_roomtyp(mut self, v: u8) -> Self {
+        self.roomtyp = v;
+        self
+    }
 }
 
 /// Encoder-side bitstream-metadata surface: the §5.4.2 BSI advisory
@@ -332,6 +354,7 @@ pub struct AudioProductionParams {
 /// `mixlevel` (0..=31) + `roomtyp` (0..=2) (setting either emits
 /// `audprodie = 1`), `copyright` and `origbs` (`1`/`true`/`0`/`false`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MetadataParams {
     /// `dialnorm` (5 bits, §5.4.2.8) — dB of dialogue headroom below
     /// digital 100%, valid `1..=31` (`0` is reserved on the wire).
@@ -368,6 +391,85 @@ pub struct MetadataParams {
     pub copyrightb: bool,
     /// `origbs` (§5.4.2.25).
     pub origbs: bool,
+}
+
+impl MetadataParams {
+    /// Builder: set [`dialnorm`](Self::dialnorm).
+    #[must_use]
+    pub fn with_dialnorm(mut self, v: u8) -> Self {
+        self.dialnorm = v;
+        self
+    }
+
+    /// Builder: set [`compr`](Self::compr).
+    #[must_use]
+    pub fn with_compr(mut self, v: Option<u8>) -> Self {
+        self.compr = v;
+        self
+    }
+
+    /// Builder: set [`dynrng`](Self::dynrng).
+    #[must_use]
+    pub fn with_dynrng(mut self, v: Option<u8>) -> Self {
+        self.dynrng = v;
+        self
+    }
+
+    /// Builder: set [`bsmod`](Self::bsmod).
+    #[must_use]
+    pub fn with_bsmod(mut self, v: u8) -> Self {
+        self.bsmod = v;
+        self
+    }
+
+    /// Builder: set [`cmixlev`](Self::cmixlev).
+    #[must_use]
+    pub fn with_cmixlev(mut self, v: u8) -> Self {
+        self.cmixlev = v;
+        self
+    }
+
+    /// Builder: set [`surmixlev`](Self::surmixlev).
+    #[must_use]
+    pub fn with_surmixlev(mut self, v: u8) -> Self {
+        self.surmixlev = v;
+        self
+    }
+
+    /// Builder: set [`dsurmod`](Self::dsurmod).
+    #[must_use]
+    pub fn with_dsurmod(mut self, v: u8) -> Self {
+        self.dsurmod = v;
+        self
+    }
+
+    /// Builder: set [`langcod`](Self::langcod).
+    #[must_use]
+    pub fn with_langcod(mut self, v: Option<u8>) -> Self {
+        self.langcod = v;
+        self
+    }
+
+    /// Builder: set [`audprod`](Self::audprod).
+    #[must_use]
+    pub fn with_audprod(mut self, v: Option<AudioProductionParams>) -> Self {
+        self.audprod = v;
+        self
+    }
+
+    /// Builder: set [`copyrightb`](Self::copyrightb).
+    #[must_use]
+    pub fn with_copyrightb(mut self, v: bool) -> Self {
+        self.copyrightb = v;
+        self
+    }
+
+    /// Builder: set [`origbs`](Self::origbs).
+    #[must_use]
+    pub fn with_origbs(mut self, v: bool) -> Self {
+        self.origbs = v;
+        self
+    }
 }
 
 impl Default for MetadataParams {

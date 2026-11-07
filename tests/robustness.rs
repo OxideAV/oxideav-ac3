@@ -221,11 +221,9 @@ fn eac3_spx_encoded_stream_survives_corruption() {
     params.channels = Some(2);
     params.sample_format = Some(SampleFormat::S16);
     params.bit_rate = Some(192_000);
-    let spx = oxideav_ac3::eac3::SpxParams {
-        atten_code: Some(14),
-        explicit_band_structure: true,
-        ..Default::default()
-    };
+    let spx = oxideav_ac3::eac3::SpxParams::default()
+        .with_atten_code(Some(14))
+        .with_explicit_band_structure(true);
     let mut enc: Box<dyn Encoder> =
         oxideav_ac3::eac3::make_encoder_with_spx(&params, spx).expect("spx encoder");
     enc.send_frame(&Frame::Audio(AudioFrame {

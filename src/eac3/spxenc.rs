@@ -37,6 +37,7 @@ use oxideav_core::{Error, Result};
 /// Field ranges mirror the §E.2.3.3.4-6 / §E.2.3.3.10 bitstream
 /// fields; [`SpxGeometry::derive`] validates the combination.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct SpxParams {
     /// `spxbegf` (§E.2.3.3.5, 3 bits, 0..=7) — SPX begin frequency
     /// code. `spx_begin_subbnd = spxbegf + 2` for `spxbegf < 6`, else
@@ -94,6 +95,64 @@ pub struct SpxParams {
     /// channel must be set, and mono (`acmod == 0x1`) cannot exclude
     /// its only channel (the spec makes `chinspx[0]` implicit there).
     pub channel_mask: Option<u8>,
+}
+
+impl SpxParams {
+    /// Builder: set [`spxbegf`](Self::spxbegf).
+    #[must_use]
+    pub fn with_spxbegf(mut self, v: u8) -> Self {
+        self.spxbegf = v;
+        self
+    }
+
+    /// Builder: set [`spxendf`](Self::spxendf).
+    #[must_use]
+    pub fn with_spxendf(mut self, v: u8) -> Self {
+        self.spxendf = v;
+        self
+    }
+
+    /// Builder: set [`spxstrtf`](Self::spxstrtf).
+    #[must_use]
+    pub fn with_spxstrtf(mut self, v: u8) -> Self {
+        self.spxstrtf = v;
+        self
+    }
+
+    /// Builder: set [`spxblnd`](Self::spxblnd).
+    #[must_use]
+    pub fn with_spxblnd(mut self, v: u8) -> Self {
+        self.spxblnd = v;
+        self
+    }
+
+    /// Builder: set [`adaptive_copy_start`](Self::adaptive_copy_start).
+    #[must_use]
+    pub fn with_adaptive_copy_start(mut self, v: bool) -> Self {
+        self.adaptive_copy_start = v;
+        self
+    }
+
+    /// Builder: set [`atten_code`](Self::atten_code).
+    #[must_use]
+    pub fn with_atten_code(mut self, v: Option<u8>) -> Self {
+        self.atten_code = v;
+        self
+    }
+
+    /// Builder: set [`explicit_band_structure`](Self::explicit_band_structure).
+    #[must_use]
+    pub fn with_explicit_band_structure(mut self, v: bool) -> Self {
+        self.explicit_band_structure = v;
+        self
+    }
+
+    /// Builder: set [`channel_mask`](Self::channel_mask).
+    #[must_use]
+    pub fn with_channel_mask(mut self, v: Option<u8>) -> Self {
+        self.channel_mask = v;
+        self
+    }
 }
 
 impl Default for SpxParams {

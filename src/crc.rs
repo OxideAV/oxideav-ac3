@@ -200,6 +200,7 @@ pub fn crc1_boundary_bytes(frame_bytes: usize) -> Option<usize> {
 /// it doesn't apply to this syncframe (E-AC-3 has no `crc1`, so a
 /// `verify_eac3_syncframe` always reports `crc1_ok = None`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CrcStatus {
     /// `Some(true)` if the LFSR residue over the first 5/8 of the
     /// syncframe (post-syncword) is zero, `Some(false)` if non-zero.
@@ -208,6 +209,13 @@ pub struct CrcStatus {
     /// `Some(true)` if the LFSR residue over the whole syncframe
     /// (post-syncword) is zero. `Some(false)` if non-zero.
     pub crc2_ok: Option<bool>,
+}
+
+impl CrcStatus {
+    /// Build a [`CrcStatus`] from every field.
+    pub fn new(crc1_ok: Option<bool>, crc2_ok: Option<bool>) -> Self {
+        Self { crc1_ok, crc2_ok }
+    }
 }
 
 impl CrcStatus {

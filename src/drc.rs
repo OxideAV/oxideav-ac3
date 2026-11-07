@@ -46,6 +46,7 @@
 /// the heavier `compr` word. The [`DrcMode::Custom`] arm exposes the
 /// §7.7.1.2 partial-compression cut/boost factors directly.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[non_exhaustive]
 pub enum DrcMode {
     /// §7.7.1 default — apply the full `dynrng` gain word (cut factor
     /// `1.0`, boost factor `1.0`). This is the mandatory decoder
@@ -72,6 +73,7 @@ pub enum DrcMode {
 /// spec-mandated baseline (full `dynrng`, no heavy compression, no
 /// dialnorm playback normalisation).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[non_exhaustive]
 pub struct DrcSettings {
     /// Which §7.7 regime to apply.
     pub mode: DrcMode,
@@ -83,6 +85,15 @@ pub struct DrcSettings {
     /// level (the spec default — see §7.6, "not directly used by the
     /// decoder").
     pub dialnorm_target: Option<u8>,
+}
+
+impl DrcSettings {
+    /// Builder: set [`mode`](Self::mode).
+    #[must_use]
+    pub fn with_mode(mut self, v: DrcMode) -> Self {
+        self.mode = v;
+        self
+    }
 }
 
 impl DrcSettings {

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `CrcStatus::new`, `AudioProductionParams::new`,
+  `Eac3AudioProduction::new`, `IndepProgramShape::new`, and `with_*`
+  setters on `DrcSettings`, `MetadataParams`, `AudioProductionParams`,
+  `EcplParams`, `SpxParams` and the four `Eac3*` metadata records.
+
+### Changed
+
+- API hygiene: `DrcMode` (enum) and the records `CrcStatus`,
+  `DrcSettings`, `encoder::AudioProductionParams`,
+  `encoder::MetadataParams`, `eac3::EcplParams`, `eac3::SpxParams`,
+  `eac3::encoder::{Eac3MixMetadata, Eac3InfoMetadata,
+  Eac3AudioProduction, Eac3Metadata}`, `eac3::decoder::IndepProgramShape`
+  and `eac3::Eac3Bsi` are now `#[non_exhaustive]`. Build them with
+  `Default` / `new(..)` plus the `with_*` setters; fields stay readable.
+  `StreamType`, `PremixCompressionWord` and `DrcSource` stay exhaustive
+  (they decode fixed 2-bit / 1-bit fields).
+
 ## [0.0.12](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.11...v0.0.12) - 2026-10-24
 
 ### Fixed

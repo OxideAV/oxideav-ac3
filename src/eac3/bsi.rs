@@ -465,6 +465,7 @@ impl PremixCompression {
 /// decoder + dispatcher. Fields not surfaced are still parsed (the
 /// bit cursor walk has to land at the start of `audfrm()`).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Bsi {
     pub strmtyp: StreamType,
     pub substreamid: u8,
