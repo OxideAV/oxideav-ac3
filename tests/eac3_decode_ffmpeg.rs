@@ -124,6 +124,12 @@ fn ffmpeg_decode(tag: &str, es: &[u8], channels: usize, rate: u32) -> Option<Vec
 /// that follow it into one packet for `decode_eac3_packet`.
 /// Returns (interleaved s16, channels, sample_rate, zero_filled).
 fn our_decode(data: &[u8]) -> Option<(Vec<i16>, usize, u32, u64)> {
+    our_decode_seeded(data, None)
+}
+
+/// [`our_decode`] with the decoder-private noise generators (§7.3.4
+/// dither, §E.3.6.4.2 SPX noise) re-seeded when `seed` is set.
+fn our_decode_seeded(data: &[u8], seed: Option<u32>) -> Option<(Vec<i16>, usize, u32, u64)> {
     let mut frames: Vec<(usize, usize)> = Vec::new();
     let mut off = 0usize;
     while off + 6 <= data.len() {
@@ -157,6 +163,9 @@ fn our_decode(data: &[u8]) -> Option<(Vec<i16>, usize, u32, u64)> {
         i = j;
     }
     let mut state = Eac3DecoderState::default();
+    if let Some(seed) = seed {
+        state.reseed_noise(seed);
+    }
     let mut pcm: Vec<i16> = Vec::new();
     let mut channels = 0usize;
     let mut rate = 0u32;
@@ -258,6 +267,43 @@ fn per_channel_psnr(ours: &[i16], theirs: &[i16], channels: usize) -> Option<(i3
     Some((best_lag, psnrs))
 }
 
+/// Per-channel PSNR between two of OUR decodes of one stream that
+/// differ only in the decoder-private noise seed (sample-aligned, same
+/// skip as [`per_channel_psnr`]). The spec leaves the §7.3.4 dither and
+/// §E.3.6.4.2 SPX noise sequences to the decoder, so this is the
+/// agreement ceiling ANY two conformant decoders can reach on the
+/// stream: their difference is two uncorrelated noise fields of the
+/// same power, exactly like ours-vs-ours here. 120 dB when the stream
+/// carries no decoder-private noise.
+fn self_noise_psnr(data: &[u8], ours: &[i16], channels: usize) -> Vec<f64> {
+    let (alt, ..) = our_decode_seeded(data, Some(0x9E37_79B9)).expect("reseeded decode");
+    let n = ours.len().min(alt.len()) / channels;
+    (0..channels)
+        .map(|ch| {
+            let mut sse = 0.0f64;
+            let mut count = 0u64;
+            for i in 1536.min(n)..n {
+                let d = ours[i * channels + ch] as f64 - alt[i * channels + ch] as f64;
+                sse += d * d;
+                count += 1;
+            }
+            let mse = sse / count.max(1) as f64;
+            if mse <= f64::EPSILON {
+                120.0
+            } else {
+                10.0 * (32767.0f64 * 32767.0 / mse).log10()
+            }
+        })
+        .collect()
+}
+
+/// Margin below the self-noise ceiling a cross-decoder comparison may
+/// sit: the two decoders' noise generators need not share our level
+/// exactly (§7.3.4 allows a 0.5–0.75 uniform scale) and the noise
+/// estimate itself fluctuates. A desynced or tool-mishandled decode
+/// lands tens of dB lower, far outside it.
+const NOISE_MARGIN_DB: f64 = 4.0;
+
 /// Run the decode-vs-ffmpeg gate on raw E-AC-3 elementary stream bytes.
 fn assert_decode_matches_ffmpeg(tag: &str, es: &[u8], want_channels: usize, want_rate: u32) {
     assert_decode_matches_ffmpeg_floor(tag, es, want_channels, want_rate, PSNR_FLOOR_DB);
@@ -286,12 +332,62 @@ fn assert_decode_matches_ffmpeg_floor(
     };
     let (lag, psnrs) = per_channel_psnr(&ours, &reference, channels)
         .unwrap_or_else(|| panic!("{tag}: not enough overlapping samples to compare"));
-    eprintln!("{tag}: lag={lag} per-channel PSNR vs ffmpeg: {psnrs:.2?}");
+    let ceiling = self_noise_psnr(es, &ours, channels);
+    eprintln!(
+        "{tag}: lag={lag} per-channel PSNR vs ffmpeg: {psnrs:.2?} (decoder-private noise ceiling {ceiling:.2?})"
+    );
     for (ch, p) in psnrs.iter().enumerate() {
+        // The fixed floor, lowered only as far as the stream's own
+        // decoder-private noise forces it.
+        let floor = floor_db.min(ceiling[ch] - NOISE_MARGIN_DB);
         assert!(
-            *p >= floor_db,
-            "{tag}: ch{ch} PSNR {p:.2} dB below the {floor_db} dB floor (lag {lag})"
+            *p >= floor,
+            "{tag}: ch{ch} PSNR {p:.2} dB below the {floor:.2} dB floor (lag {lag}, noise ceiling {:.2} dB)",
+            ceiling[ch]
         );
+    }
+    assert_no_segment_dropouts(tag, &ours, &reference, channels, lag);
+}
+
+/// Localised-dropout check (the issue-#13 "full-second silence gaps"
+/// symptom, which a whole-stream PSNR can average away): in every
+/// 1536-sample segment where the reference is above −50 dBFS RMS, our
+/// decode's power must be within 6 dB of it.
+fn assert_no_segment_dropouts(
+    tag: &str,
+    ours: &[i16],
+    reference: &[i16],
+    channels: usize,
+    lag: i32,
+) {
+    const SEG: usize = 1536;
+    let n_ours = ours.len() / channels;
+    let n_ref = reference.len() / channels;
+    let floor_pow = (32767.0f64 * 10f64.powf(-50.0 / 20.0)).powi(2);
+    for ch in 0..channels {
+        let mut start = SEG;
+        while start + SEG <= n_ours {
+            let (mut p_o, mut p_r, mut cnt) = (0.0f64, 0.0f64, 0u64);
+            for i in start..start + SEG {
+                let j = i as i64 + lag as i64;
+                if j < 0 || j as usize >= n_ref {
+                    continue;
+                }
+                let o = ours[i * channels + ch] as f64;
+                let r = reference[j as usize * channels + ch] as f64;
+                p_o += o * o;
+                p_r += r * r;
+                cnt += 1;
+            }
+            if cnt == SEG as u64 && p_r / cnt as f64 > floor_pow {
+                assert!(
+                    p_o >= p_r / 4.0,
+                    "{tag}: ch{ch} dropout at sample {start}: ours {:.1} dB below the reference",
+                    10.0 * (p_r / p_o.max(1e-9)).log10()
+                );
+            }
+            start += SEG;
+        }
     }
 }
 
@@ -985,8 +1081,13 @@ fn crafted_broadcast_matrix_32k_decodes_like_ffmpeg() {
 // ---------------------------------------------------------------------------
 
 /// Set `OXIDEAV_AC3_LOCAL_EAC3=/path/to/stream.eac3` to run the same
-/// decode-vs-ffmpeg PSNR gate on a local elementary stream that cannot
-/// be committed (broadcast captures). Skips silently when unset.
+/// decode-vs-ffmpeg gate on a local elementary stream that cannot be
+/// committed (broadcast captures): no zero-filled frames, no localised
+/// dropouts, and per-channel PSNR ≥ 50 dB — or, when the stream carries
+/// decoder-private noise (§7.3.4 dither, §E.3.6.4.2 SPX noise blending,
+/// both left to the decoder by the spec, and both routine in broadcast
+/// streams), within 4 dB of the ceiling two conformant decoders can
+/// reach on it. Skips silently when unset.
 #[test]
 fn local_eac3_vector_matches_ffmpeg() {
     let Ok(path) = std::env::var("OXIDEAV_AC3_LOCAL_EAC3") else {
@@ -998,22 +1099,7 @@ fn local_eac3_vector_matches_ffmpeg() {
         return;
     }
     let es = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    let (ours, channels, rate, zero_filled) =
+    let (_, channels, rate, _) =
         our_decode(&es).unwrap_or_else(|| panic!("local vector: our decoder failed"));
-    assert_eq!(
-        zero_filled, 0,
-        "local vector: decoder zero-filled {zero_filled} frames (dropouts)"
-    );
-    let Some(reference) = ffmpeg_decode("local", &es, channels, rate) else {
-        panic!("local vector: ffmpeg failed to decode");
-    };
-    let (lag, psnrs) = per_channel_psnr(&ours, &reference, channels)
-        .expect("local vector: not enough overlap to compare");
-    eprintln!("local vector: lag={lag} per-channel PSNR vs ffmpeg: {psnrs:.2?}");
-    for (ch, p) in psnrs.iter().enumerate() {
-        assert!(
-            *p >= PSNR_FLOOR_DB,
-            "local vector: ch{ch} PSNR {p:.2} dB below {PSNR_FLOOR_DB} dB (lag {lag})"
-        );
-    }
+    assert_decode_matches_ffmpeg_floor("local vector", &es, channels, rate, PSNR_FLOOR_DB);
 }

@@ -217,6 +217,22 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   as spectral holes, 27–39 dB below the reference decoder's band
   power on a near-threshold fixture; they now match it within 0.5 dB
   (`coupled_zero_bit_dither_level_matches_ffmpeg`, AC-3 and E-AC-3).
+  Every PSNR gate in the harness is now **noise-ceiling aware**: the
+  §7.3.4 dither and §E.3.6.4.2 SPX noise sequences are left to the
+  decoder, so the stream is decoded twice by us under different noise
+  seeds (`Eac3DecoderState::reseed_noise`) and the ours-vs-ours PSNR is
+  the agreement any two conformant decoders can reach on it; the fixed
+  floor is lowered only to 4 dB under that ceiling. Measured, the
+  ours-vs-ffmpeg PSNR tracks the ceiling cell for cell (dense-noise
+  192 kb/s: 44.28 vs 44.26 dB; SPX `spxbegf = 0`: 59.97 vs 60.05 dB),
+  i.e. the residual against the reference decoder is decoder-private
+  noise only; with `dither = 0` and no SPX blending every cell sits at
+  ~90.7 dB (s16 rounding). Each gate also checks every 1536-sample
+  segment for localised dropouts (power ≥ reference − 6 dB wherever the
+  reference is above −50 dBFS). The env-gated local-vector gate runs
+  the same checks, so a broadcast capture with SPX noise blending and
+  dither — the norm — is judged against its own noise ceiling instead
+  of an unreachable 50 dB.
 - **Opt-in JOC object presentation**
   (`decoder::make_eac3_decoder_with_joc`) parses EC-3 Extension Type A
   and EMDF metadata from declared E-AC-3 skip fields, reconstructs up to

@@ -121,6 +121,24 @@ pub struct Eac3DecoderState {
 }
 
 impl Eac3DecoderState {
+    /// Re-seed the decoder-private pseudo-random generators — the
+    /// §7.3.4 zero-bit dither and the §E.3.6.4.2 SPX noise — of both
+    /// substream states. The spec leaves these sequences to the decoder
+    /// ("any reasonably random sequence"), so two decodes of one stream
+    /// under different seeds differ exactly by that noise: conformance
+    /// harnesses use the pair to measure the decoder-private noise
+    /// ceiling of a stream before comparing against another decoder.
+    /// `seed == 0` is mapped to a fixed non-zero value (both generators
+    /// stall on an all-zero state).
+    #[doc(hidden)]
+    pub fn reseed_noise(&mut self, seed: u32) {
+        let s = if seed == 0 { 0x6D2B_79F5 } else { seed };
+        for st in [&mut self.indep_state, &mut self.dep_state] {
+            st.dither_lfsr_state = (s & 0xFFFF).max(1);
+            st.spx_noise_lfsr = s.rotate_left(16) | 1;
+        }
+    }
+
     /// Read-only view of the indep substream's per-frame interleaved
     /// f32 PCM (range -1..1). After [`decode_eac3_packet`] this is the
     /// indep substream's PCM in `(acmod, lfeon)` bitstream order; if

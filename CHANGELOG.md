@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   geometry — plus a `dither = 0` option for deterministic decodes. The
   decode-vs-ffmpeg harness sweeps every `spxbegf` with coupling and
   seven transmitted coupling regions (#13).
+- Decode-vs-ffmpeg gates are noise-ceiling aware: each stream is also
+  decoded under a second decoder-private noise seed (hidden
+  `Eac3DecoderState::reseed_noise`), and the floor drops only to 4 dB
+  under that ours-vs-ours ceiling; every 1536-sample segment is checked
+  for dropouts. The env-gated `OXIDEAV_AC3_LOCAL_EAC3` broadcast-capture
+  gate uses the same rules (#13).
 - `CrcStatus::new`, `AudioProductionParams::new`,
   `Eac3AudioProduction::new`, `IndepProgramShape::new`, and `with_*`
   setters on `DrcSettings`, `MetadataParams`, `AudioProductionParams`,
