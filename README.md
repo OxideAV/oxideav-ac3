@@ -177,9 +177,9 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   `blkstrtinfo` width (16-bit words through ceiling-log2, formerly
   frame bits through floor-log2+1), and the per-block `fgaincod`
   default reset. The class is pinned by hand-written spec-conformant
-  syncframes (SPX + coupling co-active — a geometry no available
-  encoder produces) that ffmpeg accepts and both decoders agree on at
-  ~92 dB, by a decode-side ffmpeg conformance harness
+  syncframes (SPX + coupling co-active) that ffmpeg accepts and both
+  decoders agree on at ~92 dB, by our encoder now emitting that
+  geometry (standard coupling, below), by a decode-side ffmpeg conformance harness
   (`tests/eac3_decode_ffmpeg.rs`: ffmpeg-generated streams across
   rates/modes/coupling/metadata + our-encoder broadcast BSI shapes,
   ≥ 50 dB per channel), and by an env-gated local-vector gate
@@ -202,7 +202,21 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   oracle does not render them (ecpl: −512-sample lag at 12 dB; the 7.1
   indep + dep pair: it drops the indep Ls/Rs and leaves one output
   channel silent). The matrix's first catch was the §7.7.1 `dynrng`
-  LFE omission below.
+  LFE omission below. With the encoder's standard coupling (`cpl`)
+  the matrix adds `cpl` and `cpl+spx` cells, and two sweeps walk the
+  broadcast geometry exhaustively: every `spxbegf` code 0..7 with
+  coupling co-active (derived `cplendf` −2..7, default / widest /
+  single-sub-band regions, stereo 128 kb/s and 5.1 384 kb/s with
+  `compr` + `dynrng`: 59–92 dB per channel vs ffmpeg) and seven
+  transmitted `cplbegf`/`cplendf` regions × four rate/mode/sample-rate
+  shapes. The second catch: zero-bit (bap = 0) coupling-channel
+  mantissas were decoded as true zeros in every coupled channel.
+  §7.3.4 applies dither *after* each channel is extracted from the
+  coupling channel, per channel, gated by that channel's `dithflag` —
+  so coupled high bands at low rates (the broadcast norm) came out
+  as spectral holes, 27–39 dB below the reference decoder's band
+  power on a near-threshold fixture; they now match it within 0.5 dB
+  (`coupled_zero_bit_dither_level_matches_ffmpeg`, AC-3 and E-AC-3).
 - **Opt-in JOC object presentation**
   (`decoder::make_eac3_decoder_with_joc`) parses EC-3 Extension Type A
   and EMDF metadata from declared E-AC-3 skip fields, reconstructs up to
@@ -307,6 +321,19 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   `examples/eac3_rate_curves.rs` prints the full
   standard/AHT/SPX/enhanced-coupling rate ladder;
   `aht_quality_scales_with_rate` gates the curve shape in CI.
+
+  **Standard coupling on the encoder side** (the `cpl`, `cpl_begf`,
+  `cpl_endf` options; Annex E `ecplinu = 0`, §E.2.3.3.14-15 / §7.4):
+  every fbw channel of the independent substream is coupled above
+  `cplbegf` (default 8, bin 133) through one shared coupling channel
+  (§7.4.1 channel average) and per-band `cplco` coordinates refreshed
+  on blocks 0 and 3 (block 3 thrifted to `cplcoe = 0` when its codes
+  repeat), Table E2.12 default banding (`cplbndstrce = 0`). It runs
+  co-active with SPX — `cplendf` is then derived from `spxbegf`
+  (Table E1.4, negative for `spxbegf < 2`) and not transmitted — and
+  is exclusive with AHT / enhanced coupling (6-block frames only).
+  The `dither = 0` option signals `dithflag = 0` on every block, for
+  deterministic decodes in conformance comparisons.
 
   **Enhanced coupling is now on the encoder side too**
   (`eac3::make_encoder_with_ecpl(params, EcplParams)` / the `ecpl`,

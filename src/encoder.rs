@@ -5175,14 +5175,50 @@ impl CouplingPlan {
         }
     }
 
+    /// Build a coupling plan describing an Annex E **standard
+    /// coupling** region (`ecplinu = 0`, §E.2.3.3.14-15) for the shared
+    /// tuner / bit-accounting machinery: sub-bands `cplbegf ..
+    /// cplbegf + nsubbnd` with the merge flags `bndstrc` (indexed by
+    /// the offset from `cplbegf`, entry 0 always `false`). `nsubbnd`
+    /// carries the region end directly because the SPX-derived
+    /// `cplendf` may be negative (Table E1.4 note). The coordinate
+    /// fields stay at their defaults — the E-AC-3 encoder plans and
+    /// emits its own per-span coordinates.
+    pub(crate) fn for_eac3_standard(
+        begf: u8,
+        nsubbnd: usize,
+        bndstrc: &[bool; 18],
+        nfchans: usize,
+    ) -> Self {
+        debug_assert!(nsubbnd >= 1 && begf as usize + nsubbnd <= 18);
+        let mut chincpl = [false; MAX_FBW];
+        for slot in chincpl.iter_mut().take(nfchans.min(MAX_FBW)) {
+            *slot = true;
+        }
+        let merged = bndstrc[1..nsubbnd].iter().filter(|&&m| m).count();
+        Self {
+            in_use: true,
+            begf,
+            endf: (begf as usize + nsubbnd).saturating_sub(3) as u8,
+            chincpl,
+            bndstrc: *bndstrc,
+            nsubbnd,
+            nbnd: nsubbnd - merged,
+            ..Self::default()
+        }
+    }
+
     /// Mantissa-domain inclusive lower bound of coupling region.
     fn begf_mant(&self) -> usize {
         37 + 12 * self.begf as usize
     }
     /// Mantissa-domain exclusive upper bound (matches the decoder's
-    /// `cpl_endf_mant = 37 + 12*(cplendf + 3)`).
+    /// `cpl_endf_mant = 37 + 12*(cplendf + 3)`). Computed from the
+    /// sub-band count (`ncplsubnd = 3 + cplendf - cplbegf`, §5.4.3.12)
+    /// so the Annex E SPX-derived `cplendf`, which may be negative
+    /// (Table E1.4 note), is representable.
     fn endf_mant(&self) -> usize {
-        37 + 12 * (self.endf as usize + 3)
+        37 + 12 * (self.begf as usize + self.nsubbnd)
     }
     /// Build the `subband -> band` lookup table. Same logic as the
     /// decoder so encoder + decoder agree on per-band coordinate
@@ -5429,7 +5465,7 @@ pub(crate) fn build_dba_plan(
 ///
 /// Returns `(cplcoexp, cplcomant)`. For `cplco ≤ 0` (silent band),
 /// returns the "all silent" code `(15, 0)` which decodes to 0.
-fn quantise_cplco(cplco: f32, mstrcplco: u8) -> (u8, u8) {
+pub(crate) fn quantise_cplco(cplco: f32, mstrcplco: u8) -> (u8, u8) {
     if cplco <= 0.0 || !cplco.is_finite() {
         return (15, 0);
     }
@@ -5476,7 +5512,7 @@ fn quantise_cplco(cplco: f32, mstrcplco: u8) -> (u8, u8) {
 ///
 /// Loud bands ⇒ small total shift ⇒ mstrcplco = 0.
 /// Quiet bands ⇒ large total shift ⇒ mstrcplco grows.
-fn pick_mstrcplco(max_cplco: f32) -> u8 {
+pub(crate) fn pick_mstrcplco(max_cplco: f32) -> u8 {
     if max_cplco >= 1.0 {
         return 0;
     }
@@ -5495,7 +5531,7 @@ fn pick_mstrcplco(max_cplco: f32) -> u8 {
 /// Reconstruct the linear coupling coordinate from its quantised
 /// (cplcoexp, cplcomant, mstrcplco) representation. Mirrors the
 /// decoder's `state.cpl_coord = mant * 2^(-shift)` formula.
-fn reconstruct_cplco(cplcoexp: u8, cplcomant: u8, mstrcplco: u8) -> f32 {
+pub(crate) fn reconstruct_cplco(cplcoexp: u8, cplcomant: u8, mstrcplco: u8) -> f32 {
     let mant = if cplcoexp == 15 {
         cplcomant as f32 / 16.0
     } else {

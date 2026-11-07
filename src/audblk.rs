@@ -304,6 +304,14 @@ pub struct Ac3State {
     /// (§7.3.4). Persisted across audio blocks and syncframes so the
     /// dither sequence has a smooth long-period character.
     pub dither_lfsr_state: u32,
+    /// Per bin of the coupling region: was this block's coupling-channel
+    /// mantissa a `bap = 0` (zero-bit) mantissa? §7.3.4 applies dither
+    /// to those bins AFTER each channel is extracted from the coupling
+    /// channel, per channel (so the dither is uncorrelated between
+    /// channels), gated by that channel's `dithflag`. Set by the
+    /// standard coupling-mantissa read; cleared by the coupling-AHT path
+    /// (AHT zero-bit coefficients are not dither-substituted).
+    pub cpl_bap0: [bool; N_COEFFS],
     /// Monotonically increasing syncframe counter used for trace gating
     /// (e.g. `AC3_TRACE_FRAME=14`). Incremented at the top of every
     /// `decode_frame` call. Not part of the spec — diagnostic only.
@@ -389,6 +397,7 @@ impl Ac3State {
             // Non-zero seed so the LFSR doesn't get stuck on all-zeros.
             // Arbitrary fixed value keeps decodes byte-reproducible.
             dither_lfsr_state: 0x1234,
+            cpl_bap0: [false; N_COEFFS],
             frame_counter: 0,
             skip_decouple: false,
             ecpl_state: crate::eac3::ecpl::EcplState::new(),
@@ -1746,9 +1755,11 @@ pub(crate) fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitRead
             let cplc = MAX_FBW;
             for bin in start..end_c {
                 let bap = state.channels[cplc].bap[bin];
-                // Coupling-channel mantissas are never dithered — the
-                // spec explicitly says dither is applied after a channel
-                // is extracted from the coupling channel (§7.3.4 para 1).
+                // The coupling-channel mantissa itself is not dithered:
+                // §7.3.4 applies dither after each channel is extracted
+                // from the coupling channel (see `dsp_block`), so only
+                // the zero-bit position is recorded here.
+                state.cpl_bap0[bin] = bap == 0;
                 let val = fetch_mantissa(
                     br,
                     bap,
@@ -2189,13 +2200,27 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
             if !state.channels[ch].in_coupling {
                 continue;
             }
+            // §7.3.4: "Dither is applied after the individual channels
+            // are extracted from the coupling channel. In this way, the
+            // dither applied to each channel's upper frequencies is
+            // uncorrelated." A zero-bit coupling mantissa becomes, in each
+            // extracted channel whose dithflag is set, a fresh dither
+            // value taking the mantissa's place — then the same
+            // `>> exponent` and coordinate scaling as a coded mantissa.
+            let dith = state.channels[ch].dithflag;
             for sbnd_off in 0..nsub {
                 let band = sbnd2bnd[sbnd_off];
                 let coord = state.cpl_coord[ch][band] * 8.0;
                 let base = start + sbnd_off * 12;
                 let limit = (base + 12).min(end);
                 for bin in base..limit {
-                    let mut v = state.channels[cpl_ch].coeffs[bin] * coord;
+                    let cpl_val = if dith && state.cpl_bap0[bin] {
+                        let e = state.channels[cpl_ch].exp[bin] as i32;
+                        dither_lfsr(&mut state.dither_lfsr_state) * 2f32.powi(-e)
+                    } else {
+                        state.channels[cpl_ch].coeffs[bin]
+                    };
+                    let mut v = cpl_val * coord;
                     // phase flag for right channel in 2/0.
                     if acmod == 0x2 && ch == 1 && state.cpl_phsflg[band] {
                         v = -v;

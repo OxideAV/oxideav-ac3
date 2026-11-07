@@ -9,10 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- E-AC-3 encoder: standard coupling (`cpl`, `cpl_begf`, `cpl_endf`
+  options; Annex E `ecplinu = 0`), co-active with SPX through the Table
+  E1.4 derived (possibly negative) `cplendf` — the issue-#13 broadcast
+  geometry — plus a `dither = 0` option for deterministic decodes. The
+  decode-vs-ffmpeg harness sweeps every `spxbegf` with coupling and
+  seven transmitted coupling regions (#13).
 - `CrcStatus::new`, `AudioProductionParams::new`,
   `Eac3AudioProduction::new`, `IndepProgramShape::new`, and `with_*`
   setters on `DrcSettings`, `MetadataParams`, `AudioProductionParams`,
   `EcplParams`, `SpxParams` and the four `Eac3*` metadata records.
+
+### Fixed
+
+- Decoder (AC-3 and E-AC-3): zero-bit coupling-channel mantissas are
+  now dithered per coupled channel after decoupling when that
+  channel's `dithflag` is set (§7.3.4); they were left at zero, leaving
+  spectral holes in coupled high bands at low rates (#13).
 
 ### Changed
 

@@ -462,6 +462,30 @@ fn encode_ours_at(
     bit_rate: u64,
     opts: &[(&str, &str)],
 ) -> Vec<u8> {
+    // Multitone with per-channel detune so coupling/SPX have work.
+    let n = (rate as f32 * seconds) as usize;
+    let mut pcm = Vec::with_capacity(n * channels);
+    for i in 0..n {
+        let t = i as f32 / rate as f32;
+        for ch in 0..channels {
+            let f0 = 440.0 * (1.0 + 0.05 * ch as f32);
+            let v = 0.3 * (2.0 * std::f32::consts::PI * f0 * t).sin()
+                + 0.15 * (2.0 * std::f32::consts::PI * (2500.0 + 200.0 * ch as f32) * t).sin()
+                + 0.08 * (2.0 * std::f32::consts::PI * (9000.0 + 500.0 * ch as f32) * t).sin();
+            pcm.push((v * 32767.0).clamp(-32768.0, 32767.0) as i16);
+        }
+    }
+    encode_ours_pcm(channels, rate, bit_rate, opts, &pcm)
+}
+
+/// Encode interleaved s16 PCM with our E-AC-3 encoder.
+fn encode_ours_pcm(
+    channels: usize,
+    rate: u32,
+    bit_rate: u64,
+    opts: &[(&str, &str)],
+    pcm: &[i16],
+) -> Vec<u8> {
     use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, SampleFormat};
     let mut params = CodecParameters::audio(CodecId::new(oxideav_ac3::CODEC_ID_STR_EAC3));
     params.sample_rate = Some(rate);
@@ -472,21 +496,8 @@ fn encode_ours_at(
         params.options.insert((*k).to_string(), (*v).to_string());
     }
     let mut enc = oxideav_ac3::eac3::make_encoder(&params).expect("make_encoder");
-
-    // Multitone with per-channel detune so coupling/SPX have work.
-    let n = (rate as f32 * seconds) as usize;
-    let mut s16 = Vec::with_capacity(n * channels * 2);
-    for i in 0..n {
-        let t = i as f32 / rate as f32;
-        for ch in 0..channels {
-            let f0 = 440.0 * (1.0 + 0.05 * ch as f32);
-            let v = 0.3 * (2.0 * std::f32::consts::PI * f0 * t).sin()
-                + 0.15 * (2.0 * std::f32::consts::PI * (2500.0 + 200.0 * ch as f32) * t).sin()
-                + 0.08 * (2.0 * std::f32::consts::PI * (9000.0 + 500.0 * ch as f32) * t).sin();
-            let q = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
-            s16.extend_from_slice(&q.to_le_bytes());
-        }
-    }
+    let n = pcm.len() / channels;
+    let s16: Vec<u8> = pcm.iter().flat_map(|v| v.to_le_bytes()).collect();
     enc.send_frame(&Frame::Audio(AudioFrame {
         samples: n as u32,
         pts: Some(0),
@@ -552,6 +563,277 @@ fn crafted_spx_low_begf_stereo_decodes_like_ffmpeg() {
 }
 
 #[test]
+fn crafted_std_coupling_spx_geometry_sweep_decodes_like_ffmpeg() {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg unavailable — skipping");
+        return;
+    }
+    // The issue-#13 geometry end to end: Annex E standard coupling
+    // (`ecplinu = 0`) co-active with SPX, so `cplendf` is DERIVED from
+    // spxbegf (Table E1.4) — negative for spxbegf 0/1 — and the
+    // coupling region sits between `cplbegf` and the SPX begin. Every
+    // spxbegf code, at a broadcast-like stereo rate and on 5.1, plus
+    // the lowest legal cplbegf for each (one-sub-band regions).
+    for begf in 0..=7u8 {
+        let b = begf.to_string();
+        let derived_endf: i32 = if begf < 6 {
+            begf as i32 - 2
+        } else {
+            begf as i32 * 2 - 7
+        };
+        // Narrowest legal region: a single sub-band ending at the SPX
+        // begin (cplbegf = cplendf + 2).
+        let single = (derived_endf + 2).to_string();
+        for (channels, kbps) in [(2usize, 128u64), (6, 384)] {
+            for cpl_begf in [None, Some("0"), Some(single.as_str())] {
+                let mut opts: Vec<(&str, &str)> = vec![
+                    ("cpl", "1"),
+                    ("spx", "1"),
+                    ("spx_begf", &b),
+                    ("spx_blnd", "31"),
+                    ("compr", "0x0b"),
+                    ("dynrng", "0xc8"),
+                ];
+                if let Some(c) = cpl_begf {
+                    opts.push(("cpl_begf", c));
+                }
+                let es = encode_ours_at(channels, 48_000, 0.5, kbps * 1000, &opts);
+                assert_decode_matches_ffmpeg(
+                    &format!(
+                        "cpl+spx spxbegf={begf} cplbegf={} {channels}ch {kbps}k",
+                        cpl_begf.unwrap_or("default")
+                    ),
+                    &es,
+                    channels,
+                    48_000,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn crafted_std_coupling_region_sweep_decodes_like_ffmpeg() {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg unavailable — skipping");
+        return;
+    }
+    // Standard coupling without SPX: transmitted cplendf, the Table
+    // E2.12 default banding over every begin/end shape (narrow,
+    // single-sub-band, full-width), stereo and 5.1, 48/44.1/32 kHz.
+    for (begf, endf) in [
+        (0u8, 15u8),
+        (2, 12),
+        (5, 15),
+        (8, 15),
+        (11, 10),
+        (12, 12),
+        (15, 15),
+    ] {
+        for (channels, kbps, rate) in [
+            (2usize, 128u64, 48_000u32),
+            (6, 384, 48_000),
+            (2, 96, 44_100),
+            (2, 96, 32_000),
+        ] {
+            let (b, e) = (begf.to_string(), endf.to_string());
+            let es = encode_ours_at(
+                channels,
+                rate,
+                0.5,
+                kbps * 1000,
+                // dither = 0: zero-bit mantissas decode as true zeros,
+                // so wide low-rate coupling regions compare
+                // deterministically (§7.3.4 dither is decoder-private).
+                &[
+                    ("cpl", "1"),
+                    ("cpl_begf", &b),
+                    ("cpl_endf", &e),
+                    ("dither", "0"),
+                ],
+            );
+            assert_decode_matches_ffmpeg(
+                &format!("cpl begf={begf} endf={endf} {channels}ch {kbps}k {rate} Hz"),
+                &es,
+                channels,
+                rate,
+            );
+        }
+    }
+}
+
+/// Mean windowed-DFT power per channel over the bins in
+/// `[f_lo, f_hi)` Hz (512-sample Hann frames, hop 512), at `lag`.
+fn band_power_db(
+    pcm: &[i16],
+    channels: usize,
+    rate: u32,
+    lag: i32,
+    f_lo: f64,
+    f_hi: f64,
+) -> Vec<f64> {
+    const N: usize = 512;
+    let n = pcm.len() / channels;
+    let k_lo = (f_lo * N as f64 / rate as f64).ceil() as usize;
+    let k_hi = (f_hi * N as f64 / rate as f64).floor() as usize;
+    let win: Vec<f64> = (0..N)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / N as f64).cos())
+        .collect();
+    let mut out = Vec::with_capacity(channels);
+    for ch in 0..channels {
+        let mut acc = 0.0f64;
+        let mut frames = 0u64;
+        let mut start = 2048usize;
+        while start + N + 2048 < n {
+            for k in k_lo..k_hi {
+                let (mut re, mut im) = (0.0f64, 0.0f64);
+                for (i, w) in win.iter().enumerate() {
+                    let idx = (start + i) as i32 + lag;
+                    let v = pcm[idx as usize * channels + ch] as f64 * w;
+                    let ph = 2.0 * std::f64::consts::PI * (k * i) as f64 / N as f64;
+                    re += v * ph.cos();
+                    im -= v * ph.sin();
+                }
+                acc += re * re + im * im;
+            }
+            frames += 1;
+            start += N;
+        }
+        out.push(10.0 * (acc / (frames.max(1) as f64 * (k_hi - k_lo) as f64)).log10());
+    }
+    out
+}
+
+/// Stereo program for the coupled-dither gates: a loud low tone per
+/// channel plus near-threshold high-band content (48 tones from 10
+/// kHz, 12 dB lower in R), one second at 48 kHz.
+fn near_threshold_hf_stereo() -> Vec<i16> {
+    let rate = 48_000u32;
+    let n = rate as usize;
+    let mut pcm = Vec::with_capacity(n * 2);
+    let mut seed = 0x2468_ace1u32;
+    let mut tones: Vec<(f32, f32)> = Vec::new();
+    for j in 0..48 {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        let phase = (seed >> 8) as f32 / (1u32 << 24) as f32 * std::f32::consts::TAU;
+        tones.push((10_000.0 + 180.0 * j as f32, phase));
+    }
+    for i in 0..n {
+        let t = i as f32 / rate as f32;
+        let hf: f32 = tones
+            .iter()
+            .map(|&(f, ph)| (std::f32::consts::TAU * f * t + ph).sin())
+            .sum::<f32>()
+            * 0.000_15;
+        for (f0, g) in [(440.0f32, 1.0f32), (523.0, 0.25)] {
+            let v = 0.3 * (std::f32::consts::TAU * f0 * t).sin() + g * hf;
+            pcm.push((v * 32767.0).round().clamp(-32768.0, 32767.0) as i16);
+        }
+    }
+    pcm
+}
+
+/// Assert per-channel 10.5–18 kHz band power of `ours` within 1.5 dB
+/// of the ffmpeg decode `reference` (lag-aligned).
+fn assert_coupled_band_power_matches(tag: &str, ours: &[i16], reference: &[i16]) {
+    let (lag, _) = per_channel_psnr(ours, reference, 2).expect("overlap");
+    let p_ours = band_power_db(ours, 2, 48_000, 0, 10_500.0, 18_000.0);
+    let p_ref = band_power_db(reference, 2, 48_000, lag, 10_500.0, 18_000.0);
+    eprintln!("{tag}: coupled-band power ours {p_ours:.2?} dB, ffmpeg {p_ref:.2?} dB (lag {lag})");
+    for ch in 0..2 {
+        assert!(
+            (p_ours[ch] - p_ref[ch]).abs() < 1.5,
+            "{tag} ch{ch}: coupled-band power {:.2} dB vs reference {:.2} dB",
+            p_ours[ch],
+            p_ref[ch]
+        );
+    }
+}
+
+#[test]
+fn coupled_zero_bit_dither_level_matches_ffmpeg() {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg unavailable — skipping");
+        return;
+    }
+    // §7.3.4: zero-bit (bap = 0) coupling-channel mantissas are
+    // replaced by dither AFTER each channel is extracted from the
+    // coupling channel, so every coupled channel with dithflag = 1
+    // carries its own noise there — at the level the coupling
+    // exponent and that channel's coordinate set. The program is
+    // coupled from 9.1 kHz at a low rate so most of the coupling
+    // channel is allocated zero bits. The dither is decoder-private
+    // noise, so the waveforms cannot match; the band POWER must, per
+    // channel (a decoder leaving those bins at zero sits 27–39 dB low).
+    let pcm = near_threshold_hf_stereo();
+    let es = encode_ours_pcm(2, 48_000, 64_000, &[("cpl", "1"), ("cpl_begf", "5")], &pcm);
+    let (ours, channels, _, zero_filled) = our_decode(&es).expect("our decode");
+    assert_eq!((channels, zero_filled), (2, 0));
+    let reference = ffmpeg_decode("cpl dither", &es, 2, 48_000).expect("ffmpeg decode");
+    assert_coupled_band_power_matches("E-AC-3 cpl 64k", &ours, &reference);
+}
+
+#[test]
+fn ac3_coupled_zero_bit_dither_level_matches_ffmpeg() {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg unavailable — skipping");
+        return;
+    }
+    // The same §7.3.4 gate on base AC-3 (shared decouple path): our
+    // AC-3 encoder couples 2/0 from cplbegf 8 by default; at 48 kb/s
+    // a decoder leaving the zero-bit coupled bins at zero sits ~5 dB
+    // low in the band.
+    use oxideav_core::{
+        AudioFrame, CodecId, CodecParameters, CodecRegistry, Error, Frame, Packet, SampleFormat,
+        TimeBase,
+    };
+    let pcm = near_threshold_hf_stereo();
+    let mut params = CodecParameters::audio(CodecId::new("ac3"));
+    params.sample_rate = Some(48_000);
+    params.channels = Some(2);
+    params.sample_format = Some(SampleFormat::S16);
+    params.bit_rate = Some(48_000);
+    let mut enc = oxideav_ac3::encoder::make_encoder(&params).expect("ac3 make_encoder");
+    enc.send_frame(&Frame::Audio(AudioFrame {
+        samples: (pcm.len() / 2) as u32,
+        pts: Some(0),
+        data: vec![pcm.iter().flat_map(|v| v.to_le_bytes()).collect()],
+    }))
+    .expect("send_frame");
+    enc.flush().expect("flush");
+    let mut packets = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(p) => packets.push(p.data),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("receive_packet: {e:?}"),
+        }
+    }
+    let mut reg = CodecRegistry::new();
+    oxideav_ac3::register_codecs(&mut reg);
+    let mut dec = reg.first_decoder(&params).expect("ac3 decoder");
+    let mut ours: Vec<i16> = Vec::new();
+    for (i, data) in packets.iter().enumerate() {
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), data.clone()).with_pts(i as i64 * 1536);
+        dec.send_packet(&pkt).expect("send_packet");
+        while let Ok(f) = dec.receive_frame() {
+            if let Frame::Audio(a) = f {
+                ours.extend(
+                    a.data[0]
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|c| i16::from_le_bytes(*c)),
+                );
+            }
+        }
+    }
+    let es: Vec<u8> = packets.concat();
+    let reference = ffmpeg_decode("ac3 cpl dither", &es, 2, 48_000).expect("ffmpeg decode");
+    assert_coupled_band_power_matches("AC-3 cpl 48k", &ours, &reference);
+}
+
+#[test]
 fn crafted_spx_mixmd_51_decodes_like_ffmpeg() {
     if !ffmpeg_present() {
         eprintln!("ffmpeg unavailable — skipping");
@@ -604,6 +886,8 @@ fn crafted_aht_compre_stereo_decodes_like_ffmpeg() {
 /// The coding-tool axis of the matrix: (tag, encoder options).
 const MATRIX_TOOLS: &[(&str, &[(&str, &str)])] = &[
     ("plain", &[]),
+    ("cpl", &[("cpl", "1")]),
+    ("cpl+spx", &[("cpl", "1"), ("spx", "1"), ("spx_blnd", "31")]),
     ("spx", &[("spx", "1"), ("spx_blnd", "31")]),
     ("aht", &[("aht", "1")]),
     ("tpnp", &[("tpnp", "1")]),

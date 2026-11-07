@@ -249,7 +249,7 @@ pub const DEFAULT_SPX_BNDSTRC: [bool; 18] = {
 /// `cplbndstrce == 0` in the first coupling block of a frame (Annex E
 /// standard coupling); base AC-3 always transmits the structure
 /// explicitly and never consults this table.
-const DEFCPLBNDSTRC: [bool; 18] = {
+pub(crate) const DEFCPLBNDSTRC: [bool; 18] = {
     let mut t = [false; 18];
     t[8] = true;
     t[10] = true;
@@ -2038,15 +2038,20 @@ fn unpack_mixed_mantissas(
                     br,
                     &mut aht_coeffs[cpl],
                 )?;
+                for flag in &mut state.cpl_bap0[start..end_c] {
+                    *flag = false;
+                }
                 aht_filled[cpl] = true;
                 aht_pending[cpl] = false;
             } else {
-                // Standard coupling-channel read. Coupling mantissas are
-                // never dithered (§7.3.4 para 1: dither is applied after a
-                // channel is extracted from the coupling channel), so the
-                // bap=0 LFSR substitution is skipped here.
+                // Standard coupling-channel read. The coupling mantissa
+                // itself is not dithered: §7.3.4 applies dither after each
+                // channel is extracted from the coupling channel (see
+                // `audblk::dsp_block`), so only the zero-bit positions
+                // are recorded here.
                 for bin in start..end_c {
                     let bap = state.channels[cpl].bap[bin];
+                    state.cpl_bap0[bin] = bap == 0;
                     let val = audblk::fetch_mantissa(
                         br,
                         bap,
