@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.11...v0.0.12) - 2026-10-24
+
+### Fixed
+
+- fixup for #18: CHANGELOG entry + as_chunks in the band tests
+- fixup for #17: F32 output on every decoder path, pinned
+
+### Other
+
+- raw .ac3/.eac3 elementary-stream demuxer + probe; decoder splits multi-syncframe packets
+- coupling / per-block-SNR A/B knobs are construction-time options; the two env-mutating tests run with the suite
+- §7.7.1 dynrng scales the LFE channel; broadcast-shape decode matrix vs ffmpeg (issue #13)
+- three entries of the 44.1 kHz hearing threshold row (bands 25, 28, 34)
+- opt-in F32 output (CodecParameters::sample_format = F32)
+- edition 2024, MSRV 1.95
+- README install snippet drops the retired oxideav-codec/oxideav-container crates
+- budget guards from the r457 fuzz round + AC-3 encoder round-trip fuzz target
+- equal-rate position ladder + r457 encoder status
+- joint block switching + §8.2.9 dither defeat
+- code all seven LFE bins (§7.1.3 lfeendmant = 7)
+- §7.2.2.1.1 all-zero SNR-offset special case
+- exponent-sharing bound + per-channel cadence/strategy election by measured cost (§7.1.3)
+- equal-rate rate-distortion harness (corpus + both encoders + both decoders + SNR/NMR scoring)
+
 ### Added
 
 - container: **raw `.ac3` / `.eac3` / `.ec3` elementary-stream demuxer +
