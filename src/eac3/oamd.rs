@@ -765,26 +765,34 @@ impl<'a> BitCursor<'a> {
     }
 }
 
-/// Synthetic OAMD payloads for unit tests of the parser and renderer.
-#[cfg(test)]
-pub(super) mod test_support {
+/// Synthetic OAMD payloads: the writer behind the unit tests of the
+/// parser and renderer, the renderer throughput example and the
+/// structure-aware fuzz harness (no JOC bitstream is available to the
+/// project, so object metadata has to be made here).
+// internal — exposed for tests/fuzz/benches; not part of the stable API
+#[doc(hidden)]
+pub mod synth {
     use super::OBJECT_ELEMENT_ID;
 
     /// Render information of one dynamic test object (one update block,
     /// zero-dB gain).
     #[derive(Clone, Copy, Debug)]
-    pub(in super::super) struct TestObject {
+    pub struct TestObject {
         /// Raw `pos3D_X/Y` (0..=62) and signed `pos3D_Z` (−15..=15).
-        pub(in super::super) position: [i16; 3],
-        pub(in super::super) zone_constraints: u32,
-        pub(in super::super) elevation: bool,
+        pub position: [i16; 3],
+        /// `zone_constraints_idx` (0..=5).
+        pub zone_constraints: u32,
+        /// `b_enable_elevation`.
+        pub elevation: bool,
         /// `object_size_bits` (0..=31) for all three axes.
-        pub(in super::super) size: u32,
-        pub(in super::super) snap: bool,
+        pub size: u32,
+        /// `b_object_snap` (channel lock).
+        pub snap: bool,
     }
 
     impl TestObject {
-        pub(in super::super) fn at(position: [i16; 3]) -> Self {
+        /// A point object at `position` without constraints.
+        pub fn at(position: [i16; 3]) -> Self {
             Self {
                 position,
                 zone_constraints: 0,
@@ -797,7 +805,7 @@ pub(super) mod test_support {
 
     /// The program assignment of a test payload.
     #[derive(Clone, Copy, Debug)]
-    pub(in super::super) enum TestProgram {
+    pub enum TestProgram {
         /// `b_dyn_object_only_program` with an optional leading LFE.
         Dynamic { lfe: bool },
         /// One standard bed (`bed_channel_assignment[]` mask) followed by
@@ -808,12 +816,18 @@ pub(super) mod test_support {
     /// A one-update-block payload: `fixed` objects without render
     /// information (LFE / bed) followed by `objects`, all ramping over
     /// `ramp_code` (0 = none, 1 = 512, 2 = 1536 samples).
-    pub(in super::super) fn payload(
+    pub fn payload(
         program: TestProgram,
         fixed: usize,
         objects: &[TestObject],
         ramp_code: u32,
     ) -> Vec<u8> {
+        // The unescaped 5-bit count fields carry at most 31 objects.
+        let fixed = fixed.min(31);
+        let objects = &objects[..objects.len().min(31 - fixed)];
+        if fixed + objects.len() == 0 {
+            return Vec::new();
+        }
         let mut object = TestBitWriter::default();
         object.write(0, 2); // sample offset zero
         object.write(0, 3); // one update block
@@ -848,7 +862,7 @@ pub(super) mod test_support {
         let mut payload = TestBitWriter::default();
         payload.write(0, 2); // version zero
         let count = fixed + objects.len();
-        payload.write(u32::try_from(count - 1).expect("object count"), 5);
+        payload.write(count as u32 - 1, 5);
         match program {
             TestProgram::Dynamic { lfe } => {
                 payload.write(1, 1); // dynamic-only program
@@ -866,7 +880,7 @@ pub(super) mod test_support {
                 payload.write(1, 1); // standard assignment
                 payload.write(assignment, 10);
                 if objects > 0 {
-                    payload.write(u32::try_from(objects - 1).expect("dynamic count"), 5);
+                    payload.write((objects.clamp(1, 31) - 1) as u32, 5);
                 }
             }
         }
@@ -875,7 +889,7 @@ pub(super) mod test_support {
         payload.write(u32::from(OBJECT_ELEMENT_ID), 4);
         // The element is one byte longer than the object data: the
         // discard flag, the data, seven bits of zero padding.
-        payload.write_variable(u32::try_from(object_data.len()).expect("test element size"));
+        payload.write_variable(object_data.len() as u32);
         payload.write(0, 1); // retain unknown element
         for byte in &object_data {
             payload.write(u32::from(*byte), 8);
@@ -908,8 +922,8 @@ pub(super) mod test_support {
                 self.write(value, 4);
                 self.write(0, 1);
             } else {
-                let rest = value - 16;
-                assert!(rest < 256);
+                // At most 32 objects of at most 35 bits: well under 272.
+                let rest = (value - 16).min(255);
                 self.write(rest >> 4, 4);
                 self.write(1, 1);
                 self.write(rest & 15, 4);
@@ -961,7 +975,7 @@ mod tests {
     /// and every bed object is anchored at its speaker.
     #[test]
     fn standard_bed_assignment_yields_speaker_labels_and_positions() {
-        use super::test_support::{TestObject, TestProgram, payload};
+        use super::synth::{TestObject, TestProgram, payload};
         // Elements 9 (L/R), 8 (C), 7 (LFE), 6 (Ls/Rs) and 4 (Tfl/Tfr).
         let assignment = 0b11_1101_0000;
         let payload = payload(

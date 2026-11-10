@@ -680,7 +680,7 @@ pub fn decode_indep_audblks(
                                 (spxcomant + 4.0) / 8.0
                             };
                             let shift = spxcoexp + 3 * mstrspxco;
-                            state.channels[ch].spx_coord[bnd] = temp * 2f32.powi(-shift);
+                            state.channels[ch].spx_coord[bnd] = temp * audblk::pow2_neg(shift);
                         }
                     }
                     // spxcoe == 0 → reuse the prior block's coordinates +
@@ -950,7 +950,7 @@ pub fn decode_indep_audblks(
                                 (cplcomant + 16) as f32 / 32.0
                             };
                             let shift = cplcoexp + 3 * mstrcplco;
-                            state.cpl_coord[ch][bnd] = mant * 2f32.powi(-shift);
+                            state.cpl_coord[ch][bnd] = mant * audblk::pow2_neg(shift);
                         }
                         state.cpl_coord_valid[ch] = true;
                     }
@@ -1453,7 +1453,7 @@ pub fn decode_indep_audblks(
             }
         }
         #[cfg(debug_assertions)]
-        if std::env::var("EAC3_DUMP_BLK").is_ok() {
+        if crate::audblk::debug_env("EAC3_DUMP_BLK").is_some() {
             let ch0end = state.channels[0].end_mant;
             let ch1end = state.channels[1].end_mant;
             let c0excpl = state.channels[0].in_coupling;
@@ -2005,7 +2005,7 @@ fn unpack_mixed_mantissas(
                     val
                 };
                 let e = state.channels[ch].exp[bin] as i32;
-                state.channels[ch].coeffs[bin] = final_val * 2f32.powi(-e);
+                state.channels[ch].coeffs[bin] = final_val * audblk::pow2_neg(e);
             }
         }
 
@@ -2064,7 +2064,7 @@ fn unpack_mixed_mantissas(
                         false,
                     )?;
                     let e = state.channels[cpl].exp[bin] as i32;
-                    state.channels[cpl].coeffs[bin] = val * 2f32.powi(-e);
+                    state.channels[cpl].coeffs[bin] = val * audblk::pow2_neg(e);
                 }
             }
         }
@@ -2120,7 +2120,7 @@ fn unpack_mixed_mantissas(
                     val
                 };
                 let e = state.channels[lfe].exp[bin] as i32;
-                state.channels[lfe].coeffs[bin] = final_val * 2f32.powi(-e);
+                state.channels[lfe].coeffs[bin] = final_val * audblk::pow2_neg(e);
             }
         }
     }
@@ -2237,7 +2237,7 @@ fn decode_aht_channel_mantissas(
         let c = aht::idct_ii_6(x);
         // `coeff = mantissa · 2^(-exp)` for each block.
         let exp = state.channels[ch].exp[bin] as i32;
-        let scale = 2f32.powi(-exp);
+        let scale = audblk::pow2_neg(exp);
         for blk in 0..AHT_BLOCKS {
             cache[blk][bin] = c[blk] * scale;
         }

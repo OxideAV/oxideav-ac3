@@ -451,6 +451,20 @@ struct PannedSpeaker {
     top: bool,
 }
 
+/// Most rows of equal depth in one layer (9.1.6: front, wide, side,
+/// back).
+const MAX_LAYER_ROWS: usize = 4;
+
+/// The allowed speakers of one layer of a layout, grouped by row.
+struct PanLayer {
+    rows: usize,
+    row_y: [f32; MAX_LAYER_ROWS],
+    /// Speakers of row `r` are `row_start[r]..row_start[r + 1]`.
+    row_start: [usize; MAX_LAYER_ROWS + 1],
+    x: [f32; MAX_LAYOUT_CHANNELS],
+    channel: [usize; MAX_LAYOUT_CHANNELS],
+}
+
 /// Precomputed geometry of one [`JocLayout`].
 #[derive(Clone, Debug)]
 pub(super) struct Panner {
@@ -594,15 +608,8 @@ impl Panner {
             sanitize(source.size[1], 0.0).clamp(0.0, 1.0),
             sanitize(source.size[2], 0.0).clamp(0.0, 1.0),
         ];
-        if size == [0.0; 3] {
-            self.point(position, allowed, 1.0, gains);
-            for gain in gains.iter_mut().take(self.channels) {
-                *gain = gain.sqrt();
-            }
-            return;
-        }
-
         // Extent: average the power of point sources across the object.
+        // A point object is the one-source case of the same sum.
         let offsets = |extent: f32| -> ([f32; 3], usize) {
             if extent > 0.0 {
                 ([-0.5 * extent, 0.0, 0.5 * extent], 3)
@@ -614,15 +621,68 @@ impl Panner {
         let (dy, ny) = offsets(size[1]);
         let (dz, nz) = offsets(size[2]);
         let weight = 1.0 / (nx * ny * nz) as f32;
-        for &oz in &dz[..nz] {
-            for &oy in &dy[..ny] {
-                for &ox in &dx[..nx] {
-                    let point = [
-                        (position[0] + ox).clamp(0.0, 1.0),
-                        (position[1] + oy).clamp(0.0, 1.0),
-                        (position[2] + oz).clamp(-1.0, 1.0),
-                    ];
-                    self.point(point, allowed, weight, gains);
+
+        // The three pan stages are separable, so each is evaluated once
+        // per distinct coordinate of the source grid instead of once per
+        // source: the layer split for every z, the row bracket of each
+        // layer for every y, the speaker bracket of each row for every x.
+        let layers = [self.layer(false, allowed), self.layer(true, allowed)];
+        let (has_plane, has_top) = (layers[0].rows > 0, layers[1].rows > 0);
+        let mut top_shares = [0.0_f32; 3];
+        for (share, &oz) in top_shares.iter_mut().zip(&dz[..nz]) {
+            let z = (position[2] + oz).clamp(-1.0, 1.0);
+            *share = if has_plane && has_top {
+                (z.clamp(0.0, 1.0) * FRAC_PI_2).sin().powi(2)
+            } else if has_top {
+                1.0
+            } else {
+                0.0
+            };
+        }
+        let mut row_brackets = [[(0_usize, 0_usize, 0.0_f32); 3]; 2];
+        let mut speaker_brackets = [[[(0_usize, 0_usize, 0.0_f32); 3]; MAX_LAYER_ROWS]; 2];
+        for (layer_index, layer) in layers.iter().enumerate() {
+            if layer.rows == 0 {
+                continue;
+            }
+            for (bracketed, &oy) in row_brackets[layer_index].iter_mut().zip(&dy[..ny]) {
+                let y = (position[1] + oy).clamp(0.0, 1.0);
+                *bracketed = bracket(&layer.row_y[..layer.rows], y);
+            }
+            for row in 0..layer.rows {
+                let speakers = layer.row_start[row]..layer.row_start[row + 1];
+                for (bracketed, &ox) in speaker_brackets[layer_index][row].iter_mut().zip(&dx[..nx])
+                {
+                    let x = (position[0] + ox).clamp(0.0, 1.0);
+                    let (left, right, share) = bracket(&layer.x[speakers.clone()], x);
+                    *bracketed = (
+                        layer.channel[speakers.start + left],
+                        layer.channel[speakers.start + right],
+                        share,
+                    );
+                }
+            }
+        }
+
+        for &top_share in &top_shares[..nz] {
+            for y_index in 0..ny {
+                for x_index in 0..nx {
+                    for (layer_index, layer_share) in [(0, 1.0 - top_share), (1, top_share)] {
+                        if layer_share <= 0.0 {
+                            continue;
+                        }
+                        let layer_weight = weight * layer_share;
+                        let (low, high, share) = row_brackets[layer_index][y_index];
+                        for (row, row_share) in [(low, 1.0 - share), (high, share)] {
+                            if row_share <= 0.0 {
+                                continue;
+                            }
+                            let (left, right, x_share) =
+                                speaker_brackets[layer_index][row][x_index];
+                            gains[left] += layer_weight * row_share * (1.0 - x_share);
+                            gains[right] += layer_weight * row_share * x_share;
+                        }
+                    }
                 }
             }
         }
@@ -631,76 +691,38 @@ impl Panner {
         }
     }
 
-    /// Accumulate `weight` × the squared point-source gains into `power`.
-    fn point(
-        &self,
-        position: [f32; 3],
-        allowed: &[bool],
-        weight: f32,
-        power: &mut [f32; MAX_LAYOUT_CHANNELS],
-    ) {
-        let has = |top: bool| {
-            self.speakers
-                .iter()
-                .zip(allowed)
-                .any(|(speaker, &ok)| ok && speaker.top == top)
+    /// The allowed speakers of one layer, grouped into rows of equal
+    /// depth (the speaker list is sorted by layer, y, x).
+    fn layer(&self, top: bool, allowed: &[bool]) -> PanLayer {
+        let mut layer = PanLayer {
+            rows: 0,
+            row_y: [0.0; MAX_LAYER_ROWS],
+            row_start: [0; MAX_LAYER_ROWS + 1],
+            x: [0.0; MAX_LAYOUT_CHANNELS],
+            channel: [0; MAX_LAYOUT_CHANNELS],
         };
-        let (has_plane, has_top) = (has(false), has(true));
-        let top_share = if has_plane && has_top {
-            (position[2].clamp(0.0, 1.0) * FRAC_PI_2).sin().powi(2)
-        } else if has_top {
-            1.0
-        } else {
-            0.0
-        };
-        for (top, share) in [(false, 1.0 - top_share), (true, top_share)] {
-            if share > 0.0 {
-                self.layer(top, position, allowed, weight * share, power);
-            }
-        }
-    }
-
-    fn layer(
-        &self,
-        top: bool,
-        position: [f32; 3],
-        allowed: &[bool],
-        weight: f32,
-        power: &mut [f32; MAX_LAYOUT_CHANNELS],
-    ) {
-        // Rows of the layer: the distinct `y` of its allowed speakers,
-        // ascending (the speaker list is sorted by layer, y, x).
-        let mut rows = [0.0_f32; MAX_LAYOUT_CHANNELS];
-        let mut row_count = 0;
+        let mut count = 0;
         for (speaker, &ok) in self.speakers.iter().zip(allowed) {
-            if ok && speaker.top == top {
-                let y = speaker.position[1];
-                if row_count == 0 || rows[row_count - 1] != y {
-                    rows[row_count] = y;
-                    row_count += 1;
-                }
-            }
-        }
-        let (low, high, share) = bracket(&rows[..row_count], position[1]);
-        for (row, row_share) in [(low, 1.0 - share), (high, share)] {
-            if row_share <= 0.0 {
+            if !ok || speaker.top != top {
                 continue;
             }
-            let y = rows[row];
-            let mut xs = [0.0_f32; MAX_LAYOUT_CHANNELS];
-            let mut channels = [0_usize; MAX_LAYOUT_CHANNELS];
-            let mut count = 0;
-            for (speaker, &ok) in self.speakers.iter().zip(allowed) {
-                if ok && speaker.top == top && speaker.position[1] == y {
-                    xs[count] = speaker.position[0];
-                    channels[count] = speaker.channel;
-                    count += 1;
+            let y = speaker.position[1];
+            if layer.rows == 0 || layer.row_y[layer.rows - 1] != y {
+                if layer.rows == MAX_LAYER_ROWS {
+                    // No layout has more rows; fold any excess into the
+                    // last one rather than index out of bounds.
+                    layer.rows -= 1;
                 }
+                layer.row_y[layer.rows] = y;
+                layer.row_start[layer.rows] = count;
+                layer.rows += 1;
             }
-            let (left, right, x_share) = bracket(&xs[..count], position[0]);
-            power[channels[left]] += weight * row_share * (1.0 - x_share);
-            power[channels[right]] += weight * row_share * x_share;
+            layer.x[count] = speaker.position[0];
+            layer.channel[count] = speaker.channel;
+            count += 1;
+            layer.row_start[layer.rows] = count;
         }
+        layer
     }
 
     fn snap(&self, position: [f32; 3], allowed: &[bool], gains: &mut [f32; MAX_LAYOUT_CHANNELS]) {

@@ -24,33 +24,36 @@ pub(super) struct Complex32 {
     pub(super) im: f32,
 }
 
-impl Complex32 {
-    fn add_real_scaled(&mut self, value: f32, cosine: f32, sine: f32) {
-        self.re = value.mul_add(cosine, self.re);
-        self.im = value.mul_add(sine, self.im);
-    }
-}
-
+/// Modulation matrices, stored one array per component and laid out so
+/// each transform walks its input once while updating a contiguous run
+/// of independent accumulators (which the compiler can vectorise).
 struct ModulationTables {
-    /// `[subband][modulation sample][cosine, sine]` for analysis.
-    analysis: Vec<[f32; 2]>,
-    /// `[modulation sample][subband][cosine / n, sine / n]` for synthesis.
-    synthesis: Vec<[f32; 2]>,
+    /// `[modulation sample][subband]` cosines for analysis.
+    analysis_cos: Vec<f32>,
+    /// `[modulation sample][subband]` sines for analysis.
+    analysis_sin: Vec<f32>,
+    /// `[subband][modulation sample]` cosine / n for synthesis.
+    synthesis_cos: Vec<f32>,
+    /// `[subband][modulation sample]` sine / n for synthesis.
+    synthesis_sin: Vec<f32>,
 }
 
 fn modulation_tables() -> &'static ModulationTables {
     static TABLES: OnceLock<ModulationTables> = OnceLock::new();
     TABLES.get_or_init(|| {
-        let mut analysis = Vec::with_capacity(QMF_SUBBANDS * QMF_MODULATION_SIZE);
+        let mut analysis_cos = vec![0.0; QMF_MODULATION_SIZE * QMF_SUBBANDS];
+        let mut analysis_sin = vec![0.0; QMF_MODULATION_SIZE * QMF_SUBBANDS];
         for subband in 0..QMF_SUBBANDS {
             for sample in 0..QMF_MODULATION_SIZE {
                 let phase =
                     PI * (subband as f64 + 0.5) * (sample as f64 - 0.5) / QMF_SUBBANDS as f64;
-                analysis.push([phase.cos() as f32, phase.sin() as f32]);
+                analysis_cos[sample * QMF_SUBBANDS + subband] = phase.cos() as f32;
+                analysis_sin[sample * QMF_SUBBANDS + subband] = phase.sin() as f32;
             }
         }
 
-        let mut synthesis = Vec::with_capacity(QMF_MODULATION_SIZE * QMF_SUBBANDS);
+        let mut synthesis_cos = vec![0.0; QMF_SUBBANDS * QMF_MODULATION_SIZE];
+        let mut synthesis_sin = vec![0.0; QMF_SUBBANDS * QMF_MODULATION_SIZE];
         for sample in 0..QMF_MODULATION_SIZE {
             for subband in 0..QMF_SUBBANDS {
                 // Use the normative matrix equation on TS 103 420 page 67:
@@ -60,16 +63,18 @@ fn modulation_tables() -> &'static ModulationTables {
                 let phase = PI / (4 * QMF_SUBBANDS) as f64
                     * (2 * subband + 1) as f64
                     * (2.0 * sample as f64 - 4.0 * QMF_SUBBANDS as f64 + 1.0);
-                synthesis.push([
-                    (phase.cos() / QMF_SUBBANDS as f64) as f32,
-                    (phase.sin() / QMF_SUBBANDS as f64) as f32,
-                ]);
+                synthesis_cos[subband * QMF_MODULATION_SIZE + sample] =
+                    (phase.cos() / QMF_SUBBANDS as f64) as f32;
+                synthesis_sin[subband * QMF_MODULATION_SIZE + sample] =
+                    (phase.sin() / QMF_SUBBANDS as f64) as f32;
             }
         }
 
         ModulationTables {
-            analysis,
-            synthesis,
+            analysis_cos,
+            analysis_sin,
+            synthesis_cos,
+            synthesis_sin,
         }
     })
 }
@@ -90,6 +95,11 @@ impl Default for QmfAnalysis {
 impl QmfAnalysis {
     /// Transform 64 consecutive time-domain samples into one complex QMF
     /// timeslot. Input order is chronological.
+    ///
+    /// Every accumulator below receives its terms in the same order as
+    /// the textbook form (taps in ascending group order, modulation
+    /// samples in ascending order); only the loop nesting differs, so
+    /// the inner loops run over independent accumulators.
     pub(super) fn process(&mut self, pcm: &[f32; QMF_SUBBANDS]) -> [Complex32; QMF_SUBBANDS] {
         self.state
             .copy_within(..QMF_FILTER_LENGTH - QMF_SUBBANDS, QMF_SUBBANDS);
@@ -98,21 +108,36 @@ impl QmfAnalysis {
         }
 
         let mut folded = [0.0_f32; QMF_MODULATION_SIZE];
-        for (sample, value) in folded.iter_mut().enumerate() {
-            for tap_group in 0..QMF_FILTER_LENGTH / QMF_MODULATION_SIZE {
-                let index = sample + tap_group * QMF_MODULATION_SIZE;
-                *value = (self.state[index] * QMF_WINDOW[index]).mul_add(1.0, *value);
+        for (state, window) in self
+            .state
+            .as_chunks::<QMF_MODULATION_SIZE>()
+            .0
+            .iter()
+            .zip(QMF_WINDOW.as_chunks::<QMF_MODULATION_SIZE>().0)
+        {
+            for ((value, &state), &window) in folded.iter_mut().zip(state).zip(window) {
+                *value = (state * window).mul_add(1.0, *value);
             }
         }
 
         let tables = modulation_tables();
-        let mut output = [Complex32::default(); QMF_SUBBANDS];
-        for (subband, value) in output.iter_mut().enumerate() {
-            let row = &tables.analysis
-                [subband * QMF_MODULATION_SIZE..(subband + 1) * QMF_MODULATION_SIZE];
-            for (sample, &[cosine, sine]) in folded.iter().zip(row) {
-                value.add_real_scaled(*sample, cosine, sine);
+        let mut real = [0.0_f32; QMF_SUBBANDS];
+        let mut imaginary = [0.0_f32; QMF_SUBBANDS];
+        for ((&sample, cosines), sines) in folded
+            .iter()
+            .zip(tables.analysis_cos.as_chunks::<QMF_SUBBANDS>().0)
+            .zip(tables.analysis_sin.as_chunks::<QMF_SUBBANDS>().0)
+        {
+            for (value, &cosine) in real.iter_mut().zip(cosines) {
+                *value = sample.mul_add(cosine, *value);
             }
+            for (value, &sine) in imaginary.iter_mut().zip(sines) {
+                *value = sample.mul_add(sine, *value);
+            }
+        }
+        let mut output = [Complex32::default(); QMF_SUBBANDS];
+        for ((value, re), im) in output.iter_mut().zip(real).zip(imaginary) {
+            *value = Complex32 { re, im };
         }
         output
     }
@@ -121,22 +146,29 @@ impl QmfAnalysis {
 #[derive(Clone)]
 pub(super) struct QmfSynthesis {
     state: [f32; QMF_SYNTHESIS_STATE_LENGTH],
+    /// No non-zero sample has entered the state since it was cleared.
+    silent: bool,
 }
 
 impl Default for QmfSynthesis {
     fn default() -> Self {
         Self {
             state: [0.0; QMF_SYNTHESIS_STATE_LENGTH],
+            silent: true,
         }
     }
 }
 
 impl QmfSynthesis {
     pub(super) fn is_silent(&self) -> bool {
-        self.state.iter().all(|sample| sample.abs() <= f32::EPSILON)
+        self.silent || self.state.iter().all(|sample| sample.abs() <= f32::EPSILON)
     }
 
     /// Transform one complex QMF timeslot into 64 chronological PCM samples.
+    ///
+    /// As in [`QmfAnalysis::process`], the accumulation order of every
+    /// output is the textbook one (subbands ascending, then tap groups
+    /// ascending with the first window half before the second).
     pub(super) fn process(&mut self, qmf: &[Complex32; QMF_SUBBANDS]) -> [f32; QMF_SUBBANDS] {
         self.state.copy_within(
             ..QMF_SYNTHESIS_STATE_LENGTH - QMF_MODULATION_SIZE,
@@ -144,27 +176,38 @@ impl QmfSynthesis {
         );
 
         let tables = modulation_tables();
-        for sample in 0..QMF_MODULATION_SIZE {
-            let row = &tables.synthesis[sample * QMF_SUBBANDS..(sample + 1) * QMF_SUBBANDS];
-            let mut value = 0.0_f32;
-            for (qmf_sample, &[cosine, sine]) in qmf.iter().zip(row) {
-                value = qmf_sample
-                    .re
-                    .mul_add(cosine, (-qmf_sample.im).mul_add(sine, value));
+        let mut modulated = [0.0_f32; QMF_MODULATION_SIZE];
+        for ((qmf_sample, cosines), sines) in qmf
+            .iter()
+            .zip(tables.synthesis_cos.as_chunks::<QMF_MODULATION_SIZE>().0)
+            .zip(tables.synthesis_sin.as_chunks::<QMF_MODULATION_SIZE>().0)
+        {
+            let re = qmf_sample.re;
+            let negated_im = -qmf_sample.im;
+            for ((value, &cosine), &sine) in modulated.iter_mut().zip(cosines).zip(sines) {
+                *value = re.mul_add(cosine, negated_im.mul_add(sine, *value));
             }
-            self.state[sample] = value;
         }
+        self.state[..QMF_MODULATION_SIZE].copy_from_slice(&modulated);
+        self.silent = false;
 
         let mut output = [0.0_f32; QMF_SUBBANDS];
-        for (sample, value) in output.iter_mut().enumerate() {
-            for tap_group in 0..QMF_FILTER_LENGTH / QMF_MODULATION_SIZE {
-                let first_window = tap_group * QMF_MODULATION_SIZE + sample;
-                let second_window = first_window + QMF_SUBBANDS;
-                let first_state = tap_group * QMF_SUBBANDS * 4 + sample;
-                let second_state = first_state + QMF_SUBBANDS * 3;
-                *value = (self.state[first_state] * QMF_WINDOW[first_window]).mul_add(1.0, *value);
-                *value =
-                    (self.state[second_state] * QMF_WINDOW[second_window]).mul_add(1.0, *value);
+        for tap_group in 0..QMF_FILTER_LENGTH / QMF_MODULATION_SIZE {
+            let first_window = &QMF_WINDOW[tap_group * QMF_MODULATION_SIZE..][..QMF_SUBBANDS];
+            let second_window =
+                &QMF_WINDOW[tap_group * QMF_MODULATION_SIZE + QMF_SUBBANDS..][..QMF_SUBBANDS];
+            let first_state = &self.state[tap_group * QMF_SUBBANDS * 4..][..QMF_SUBBANDS];
+            let second_state =
+                &self.state[tap_group * QMF_SUBBANDS * 4 + QMF_SUBBANDS * 3..][..QMF_SUBBANDS];
+            for ((((value, &state_a), &window_a), &state_b), &window_b) in output
+                .iter_mut()
+                .zip(first_state)
+                .zip(first_window)
+                .zip(second_state)
+                .zip(second_window)
+            {
+                *value = (state_a * window_a).mul_add(1.0, *value);
+                *value = (state_b * window_b).mul_add(1.0, *value);
             }
         }
         output

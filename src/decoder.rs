@@ -604,8 +604,11 @@ impl Ac3Decoder {
             for blk in 0..nblocks {
                 let mut per_ch: [[f32; SAMPLES_PER_BLOCK]; 5] = [[0.0; SAMPLES_PER_BLOCK]; 5];
                 let base = blk * SAMPLES_PER_BLOCK * nchans;
+                // A concealed frame can report fewer program channels
+                // than its `acmod` names (down to none); the channels
+                // it lacks stay silent in the matrix input.
                 for n in 0..SAMPLES_PER_BLOCK {
-                    for ch in 0..nfchans.min(5) {
+                    for ch in 0..nfchans.min(5).min(nchans) {
                         // §7.6 dialnorm scalar folded into the matrix input
                         // (unity unless a dialnorm target is configured).
                         per_ch[ch][n] = src_f32[base + n * nchans + ch] * dn_gain;
@@ -738,7 +741,7 @@ impl Ac3Decoder {
                 let mut per_ch: [[f32; SAMPLES_PER_BLOCK]; 5] = [[0.0; SAMPLES_PER_BLOCK]; 5];
                 let base = blk * SAMPLES_PER_BLOCK * nchans;
                 for n in 0..SAMPLES_PER_BLOCK {
-                    for ch in 0..nfchans.min(5) {
+                    for ch in 0..nfchans.min(5).min(nchans) {
                         per_ch[ch][n] = floats[base + n * nchans + ch];
                     }
                 }

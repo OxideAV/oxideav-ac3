@@ -728,7 +728,7 @@ fn splice_dep_into_indep(
 
     // Diagnostic: log the chanmap for any future bug hunts.
     if let Some(map) = chanmap
-        && std::env::var("EAC3_TRACE_CHANMAP").is_ok()
+        && crate::audblk::debug_env("EAC3_TRACE_CHANMAP").is_some()
     {
         eprintln!(
             "TRACE-CHANMAP dep substream: chanmap=0x{map:04X} dep_nchans={dep_nchans} \

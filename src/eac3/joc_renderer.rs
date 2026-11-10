@@ -243,8 +243,8 @@ impl JocRenderer {
         }
 
         let mut object_pcm = vec![0.0_f32; num_objects * SAMPLES_PER_JOC_FRAME];
+        let mut inputs = vec![[Complex32::default(); QMF_SUBBANDS]; num_channels];
         for timeslot in 0..QMF_TIMESLOTS_PER_EAC3_FRAME {
-            let mut inputs = vec![[Complex32::default(); QMF_SUBBANDS]; num_channels];
             for (channel, input) in inputs.iter_mut().enumerate() {
                 let source_channel = joc_to_bitstream_channel(channel);
                 let mut block = [0.0_f32; QMF_SUBBANDS];
@@ -256,18 +256,22 @@ impl JocRenderer {
             }
 
             for (object, synthesis) in self.syntheses.iter_mut().enumerate() {
+                // Each subband sums its channels in ascending order; the
+                // channel loop is outermost so the subband loop runs over
+                // independent accumulators.
                 let mut reconstructed = [Complex32::default(); QMF_SUBBANDS];
-                for (subband, value) in reconstructed.iter_mut().enumerate() {
-                    for (channel, input) in inputs.iter().enumerate() {
-                        let coefficient = matrices.coefficient(object, timeslot, channel, subband);
-                        value.re = input[subband].re.mul_add(coefficient, value.re);
-                        value.im = input[subband].im.mul_add(coefficient, value.im);
+                for (channel, input) in inputs.iter().enumerate() {
+                    let coefficients = matrices.subbands(object, timeslot, channel);
+                    for ((value, sample), &coefficient) in
+                        reconstructed.iter_mut().zip(input).zip(coefficients)
+                    {
+                        value.re = sample.re.mul_add(coefficient, value.re);
+                        value.im = sample.im.mul_add(coefficient, value.im);
                     }
                 }
-                if synthesis.is_silent()
-                    && reconstructed.iter().all(|sample| {
-                        sample.re.abs() <= f32::EPSILON && sample.im.abs() <= f32::EPSILON
-                    })
+                if reconstructed.iter().all(|sample| {
+                    sample.re.abs() <= f32::EPSILON && sample.im.abs() <= f32::EPSILON
+                }) && synthesis.is_silent()
                 {
                     continue;
                 }
@@ -292,13 +296,28 @@ impl JocRenderer {
             }
         }
 
+        type RampKey = (*const OamdObjectState, *const OamdObjectState, u32);
+        let mut stereo_memo: Vec<(Option<RampKey>, [f32; 2])> = vec![(None, [0.0; 2]); num_objects];
         let mut output = vec![0.0_f32; SAMPLES_PER_JOC_FRAME * channels];
         for (sample, mixed) in output.chunks_exact_mut(channels).enumerate() {
             let delay = self.delay_position;
             for (object, &oamd_index) in object_indices.iter().enumerate() {
                 let mut current_gain = [0.0_f32; MAX_LAYOUT_CHANNELS];
                 if stereo {
-                    current_gain[..2].copy_from_slice(&stereo_gains_at(&oamd, oamd_index, sample));
+                    // The gains are a pure function of the ramp the sample
+                    // falls in and its position there: outside a ramp
+                    // they repeat sample after sample.
+                    let (from, to, alpha) = ramp_at(&oamd, oamd_index, sample);
+                    let key = (
+                        std::ptr::from_ref(from),
+                        std::ptr::from_ref(to),
+                        alpha.to_bits(),
+                    );
+                    let memo = &mut stereo_memo[object];
+                    if memo.0 != Some(key) {
+                        *memo = (Some(key), stereo_gains(from, to, alpha));
+                    }
+                    current_gain[..2].copy_from_slice(&memo.1);
                 } else {
                     let knot = sample / GAIN_GRID;
                     let fraction = (sample % GAIN_GRID) as f32 / GAIN_GRID as f32;
@@ -569,11 +588,6 @@ fn ramp_at(
     (from, to, alpha)
 }
 
-fn stereo_gains_at(frame: &OamdFrame, object: usize, sample: usize) -> [f32; 2] {
-    let (from, to, alpha) = ramp_at(frame, object, sample);
-    stereo_gains(from, to, alpha)
-}
-
 /// Panning gains of OAMD object `object` at `sample` over the channels of
 /// a multichannel layout, object gain included.
 fn layout_gains_at(
@@ -730,39 +744,14 @@ mod tests {
 
     // --- Layout rendering ------------------------------------------------
 
-    use super::super::joc::JocObjectUpdate;
-    use super::super::oamd::test_support::{TestObject, TestProgram, payload};
+    use super::super::oamd::synth::{TestObject, TestProgram, payload};
 
     const FRAME: usize = SAMPLES_PER_JOC_FRAME;
 
     /// JOC metadata reconstructing object `n` from JOC channel
     /// `routing[n]` alone (order L, R, C, Ls, Rs) with unit gain.
     fn routed_metadata(sequence: u16, oamd_payload: &[u8], routing: &[usize]) -> JocMetadata {
-        JocMetadata {
-            complexity_index: 1,
-            group_id: 0,
-            oamd_payload: oamd_payload.to_vec(),
-            joc_payload: Vec::new(),
-            downmix_config: 0,
-            num_objects: routing.len() as u8,
-            extension_config: 0,
-            sequence_count: sequence,
-            num_channels: 5,
-            clip_gain: 1.0,
-            object_updates: routing
-                .iter()
-                .map(|&channel| {
-                    let mut coefficients = vec![0.0; 5];
-                    coefficients[channel] = 1.0;
-                    JocObjectUpdate::Parameters {
-                        num_bands: 1,
-                        slope: false,
-                        offsets: Vec::new(),
-                        coefficients,
-                    }
-                })
-                .collect(),
-        }
+        JocMetadata::synthetic(sequence, oamd_payload.to_vec(), routing)
     }
 
     /// Bitstream-order (L, C, R, Ls, Rs, LFE) test program: one tone per

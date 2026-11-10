@@ -492,7 +492,7 @@ pub fn decode_frame(
                 }
             }
         }
-        if std::env::var("AC3_TRACE_BITPOS").is_ok() {
+        if debug_env("AC3_TRACE_BITPOS").is_some() {
             // Round-12 diagnostic: verify per-block bit-cursor lands inside
             // the syncframe (frame_bits ≈ 6104 for a 192 kbps frame; CRC
             // and a few padding bits sit between the last block's end and
@@ -693,7 +693,7 @@ pub(crate) fn parse_audblk_into(
                             (cplcomant + 16) as f32 / 32.0
                         };
                         let shift = cplcoexp + 3 * mstrcplco;
-                        state.cpl_coord[ch][bnd] = mant * 2f32.powi(-shift);
+                        state.cpl_coord[ch][bnd] = mant * pow2_neg(shift);
                     }
                     state.cpl_coord_valid[ch] = true;
                 }
@@ -722,7 +722,7 @@ pub(crate) fn parse_audblk_into(
                 side.rematflg[rbnd] = v;
             }
         }
-        if std::env::var("AC3_TRACE_REMAT").is_ok() {
+        if debug_env("AC3_TRACE_REMAT").is_some() {
             eprintln!(
                 "TRACE-REMAT blk={} rematstr={} rematflg={:?}",
                 blk, rematstr, state.rematflg
@@ -794,7 +794,7 @@ pub(crate) fn parse_audblk_into(
                 }
             }
         }
-        if std::env::var("AC3_TRACE_CPL").is_ok() {
+        if debug_env("AC3_TRACE_CPL").is_some() {
             eprintln!(
                 "TRACE-CPL blk={} cplexpstr={} cplabsexp={} (<<1={}) ncplgrps={} grpsize={}",
                 blk,
@@ -1030,7 +1030,7 @@ pub(crate) fn parse_audblk_into(
     }
 
     // --- unpack mantissas ---
-    if std::env::var("AC3_DEBUG_FULL").is_ok() && blk == 0 {
+    if debug_env("AC3_DEBUG_FULL").is_some() && blk == 0 {
         let mut histo = [0u32; 16];
         for ch in 0..nfchans {
             let end = state.channels[ch].end_mant;
@@ -1531,11 +1531,8 @@ pub(crate) fn run_bit_allocation(
     // Dumps bndpsd / excite / mask / bap for the requested frame+block. Used
     // to compare against the validator binary's decode of the same fixture.
     // Cheap when the env vars aren't set.
-    let trace_frame = std::env::var("AC3_TRACE_FRAME")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok());
-    let trace_blk = std::env::var("AC3_TRACE_BLK")
-        .ok()
+    let trace_frame = debug_env("AC3_TRACE_FRAME").and_then(|s| s.parse::<u64>().ok());
+    let trace_blk = debug_env("AC3_TRACE_BLK")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
     if let Some(tf) = trace_frame
@@ -1659,6 +1656,55 @@ pub(crate) fn dither_lfsr(state: &mut u32) -> f32 {
     (word as i32 - 0x8000) as f32 / 32768.0 * 0.707
 }
 
+/// `2^-e` for `e` in `0..64`, by exact halving.
+const POW2_NEG: [f32; 64] = {
+    let mut table = [1.0f32; 64];
+    let mut i = 1;
+    while i < 64 {
+        table[i] = table[i - 1] * 0.5;
+        i += 1;
+    }
+    table
+};
+
+/// `2^-e` — the exponent scaling of a mantissa (§7.3), a coupling
+/// coordinate (§7.4.3) or a quantiser step. Tabulated for the range
+/// exponents take (every entry is an exact power of two, as `powi`
+/// returns); anything outside falls back to `powi`.
+#[inline]
+pub(crate) fn pow2_neg(e: i32) -> f32 {
+    if (0..64).contains(&e) {
+        POW2_NEG[e as usize]
+    } else {
+        2f32.powi(-e)
+    }
+}
+
+/// A debug / trace switch from the process environment.
+///
+/// The decoder consults these switches several times per audio block;
+/// the environment is read once per process (a lookup takes the
+/// environment lock and scans every variable) and answered from a
+/// table afterwards.
+pub(crate) fn debug_env(name: &'static str) -> Option<&'static str> {
+    const NAMES: [&str; 9] = [
+        "AC3_TRACE_BITPOS",
+        "AC3_TRACE_REMAT",
+        "AC3_TRACE_CPL",
+        "AC3_DEBUG_FULL",
+        "AC3_TRACE_FRAME",
+        "AC3_TRACE_BLK",
+        "AC3_TRACE_MANT",
+        "EAC3_DUMP_BLK",
+        "EAC3_TRACE_CHANMAP",
+    ];
+    static VALUES: std::sync::OnceLock<[Option<String>; 9]> = std::sync::OnceLock::new();
+    let values = VALUES.get_or_init(|| NAMES.map(|name| std::env::var(name).ok()));
+    let index = NAMES.iter().position(|&known| known == name);
+    debug_assert!(index.is_some(), "{name} is not a tabulated debug switch");
+    index.and_then(|index| values[index].as_deref())
+}
+
 /// Unpack + dequantize mantissas for all channels (§7.3).
 /// Populates ChannelState.coeffs with dequantized transform coefficients.
 pub(crate) fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitReader) -> Result<()> {
@@ -1691,14 +1737,11 @@ pub(crate) fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitRead
     // `AC3_TRACE_BLK=B` plus `AC3_TRACE_MANT=1`. Used by maintainers when
     // chasing bit-stream alignment issues; off by default to keep the
     // hot path clean.
-    let trace_mant_frame = std::env::var("AC3_TRACE_FRAME")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok());
-    let trace_mant_blk = std::env::var("AC3_TRACE_BLK")
-        .ok()
+    let trace_mant_frame = debug_env("AC3_TRACE_FRAME").and_then(|s| s.parse::<u64>().ok());
+    let trace_mant_blk = debug_env("AC3_TRACE_BLK")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
-    let trace_mant_on = std::env::var("AC3_TRACE_MANT").is_ok();
+    let trace_mant_on = debug_env("AC3_TRACE_MANT").is_some();
     for ch in 0..nfchans {
         let end = state.channels[ch].end_mant;
         let dith = state.channels[ch].dithflag;
@@ -1738,7 +1781,7 @@ pub(crate) fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitRead
                 val
             };
             let e = state.channels[ch].exp[bin] as i32;
-            state.channels[ch].coeffs[bin] = final_val * 2f32.powi(-e);
+            state.channels[ch].coeffs[bin] = final_val * pow2_neg(e);
             if trace_this && bin < 32 {
                 eprintln!(
                     "TRACE-MANT ch{} bin={:3} bap={:2} exp={:2} bit_pos_before={} mant={:.5} dither_used={} coeff={:.5e}",
@@ -1776,7 +1819,7 @@ pub(crate) fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitRead
                     false,
                 )?;
                 let e = state.channels[cplc].exp[bin] as i32;
-                state.channels[cplc].coeffs[bin] = val * 2f32.powi(-e);
+                state.channels[cplc].coeffs[bin] = val * pow2_neg(e);
             }
             got_cplchan = true;
         }
@@ -1803,7 +1846,7 @@ pub(crate) fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitRead
                 val
             };
             let e = state.channels[lfe_ch].exp[bin] as i32;
-            state.channels[lfe_ch].coeffs[bin] = final_val * 2f32.powi(-e);
+            state.channels[lfe_ch].coeffs[bin] = final_val * pow2_neg(e);
         }
     }
     Ok(())
@@ -1887,7 +1930,7 @@ pub(crate) fn fetch_mantissa(
             let shift = 32 - nbits;
             let signed = (raw << shift) >> shift;
             // Normalize to (-1, 1): divide by 2^(nbits-1).
-            let scale = 2f32.powi(-(nbits as i32 - 1));
+            let scale = pow2_neg(nbits as i32 - 1);
             Ok(signed as f32 * scale)
         }
         _ => Ok(0.0),
@@ -2220,7 +2263,7 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
                 for bin in base..limit {
                     let cpl_val = if dith && state.cpl_bap0[bin] {
                         let e = state.channels[cpl_ch].exp[bin] as i32;
-                        dither_lfsr(&mut state.dither_lfsr_state) * 2f32.powi(-e)
+                        dither_lfsr(&mut state.dither_lfsr_state) * pow2_neg(e)
                     } else {
                         state.channels[cpl_ch].coeffs[bin]
                     };
@@ -2322,11 +2365,8 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
     // complex IFFT (N/8 for short blocks) → post-twiddle → de-interleave.
     // Matches the direct-form reference within f32 precision on the long
     // path; the short path is validated by the validator-fixture RMS gate.
-    let trace_frame_dsp = std::env::var("AC3_TRACE_FRAME")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok());
-    let trace_blk_dsp = std::env::var("AC3_TRACE_BLK")
-        .ok()
+    let trace_frame_dsp = debug_env("AC3_TRACE_FRAME").and_then(|s| s.parse::<u64>().ok());
+    let trace_blk_dsp = debug_env("AC3_TRACE_BLK")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
     for ch in 0..nfchans {

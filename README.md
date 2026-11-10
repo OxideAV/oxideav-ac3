@@ -678,7 +678,10 @@ runs via the `Fuzz` workflow; corpora seed from the fixture set):
   Huffman matrix decode, the standalone OAMD object-element decoder,
   and the QMF object reconstruction + object renderer (stereo and a
   selector-picked multichannel layout) on every container that parses
-  (corpus seeded with synthetic valid EMDF).
+  (corpus seeded with synthetic valid EMDF), plus a structure-aware
+  leg that builds OAMD programs from the input (dynamic / bed
+  assignment, per-object position, size, zone, elevation, snap, ramp,
+  optional bit flips) and renders them.
 - **`encode_decode_roundtrip`** — structure-aware differential
   testing: a fuzz-picked contract-valid configuration (layout × rate
   × blocks × SPX/AHT/ecpl/TPNP × metadata) encodes arbitrary PCM and
@@ -705,7 +708,16 @@ minimum-rate-floor gaps (no floor at all; coupling side-info missing
 from it) and a starved frame the optional dba segment lists pushed
 one bit over, and the E-AC-3 target found the budget guard demoting
 an elected second anchor instead of collapsing the frame — all fixed
-and pinned, both targets then ran 300 s clean.
+and pinned, both targets then ran 300 s clean. r486 (bounded 90–150 s
+runs of all six targets over the new decoder option paths):
+`decode_frames`, now picking the `joc_layout` option and output format
+from the input, found a concealed frame returning an empty payload
+under a fixed layout and an out-of-bounds read in the stereo downmix
+of a channel-less concealed frame — both fixed and pinned
+(`tests/joc_layout.rs`, `tests/robustness.rs`), then 559k runs clean;
+`joc_oamd_parse` gained a structure-aware leg that synthesizes OAMD
+programs (dynamic and bed, every object property) and renders them
+through each layout — 3.4M + 30k runs clean.
 
 ## Equal-rate position
 
@@ -765,6 +777,77 @@ this encoder emits at these rates; the sole residual decoder
 disagreement is a block in which the channels' `blksw` flags differ
 (the reference corrupts the unswitched channel's overlap region — the
 joint policy keeps our streams out of that case).
+
+## Performance
+
+`cargo run --release --example throughput [seconds]` encodes, decodes
+and object-renders deterministic synthetic 5.1 programme material
+(harmonic stacks with level motion, a noise bed, sparse transients) and
+prints each stage as a multiple of real time together with an FNV-1a
+hash of its output. Figures below: 20 s of programme, decode stages
+repeated 20 times (`THROUGHPUT_REPEAT=20`), single thread, Apple M5 Max,
+rustc 1.98 — the r486 pass, before → after. **Every stage's output
+hash is unchanged**, and a 372-configuration encode / decode hash
+matrix (AC-3 and E-AC-3, mono … 7.1, 32 / 44.1 / 48 kHz, every encoder
+tool) is byte-identical before and after.
+
+| stage (× real time) | before | after |
+| --- | ---: | ---: |
+| encode AC-3 5.1 448 kb/s | 0.7 | 25.6 |
+| encode E-AC-3 5.1 384 kb/s | 0.6 | 19.7 |
+| encode E-AC-3 5.1 384 kb/s, SPX + coupling | 1.2 | 36.3 |
+| encode E-AC-3 5.1 384 kb/s, AHT | 2.1 | 42.6 |
+| decode AC-3 5.1 448 kb/s | 253 | 469 |
+| decode E-AC-3 5.1 384 kb/s | 228 | 402 |
+| decode E-AC-3 5.1, SPX + coupling | 276 | 493 |
+| decode E-AC-3 5.1, AHT | 284 | 519 |
+| decode E-AC-3 5.1 → stereo downmix | 221 | 365 |
+| decode E-AC-3 5.1 → 7.1.4 channel route | 202 | 308 |
+| JOC render, 15 moving objects + LFE → stereo | 9.6 | 40.3 |
+| JOC render → 5.1 | 9.1 | 43.8 |
+| JOC render → 7.1.4 | 8.1 | 37.5 |
+| JOC render → 9.1.6 | 7.9 | 39.3 |
+
+Where the time went, and what replaced it (all exact — same values,
+same summation order):
+
+- **Forward MDCT** (encoders): the direct-form §8.2.3.2 sum evaluated a
+  `cos` per term — 131 072 per block and channel. The kernels are
+  tabulated once (`[n][k]`, each entry by the same expression) and the
+  loops nested so every coefficient still accumulates over ascending
+  `n` while the inner loop runs over independent sums.
+- **SNR-offset search** (encoders): all 1024 `(csnroffst, fsnroffst)`
+  pairs were tried, each re-running the whole §7.2.2 PSD / excitation /
+  mask pipeline for every channel and block. The mask is now built once
+  per channel-block (`MaskedPsd`); a candidate only redoes the final
+  pointer lookup, counted as a histogram (`AllocEval`), and the largest
+  fitting offset is found by bisecting a monotone lower bound of the
+  bit count (grouped mantissas at their fractional cost) and walking
+  down to the first exact fit — provably the same answer as the
+  exhaustive scan. The per-channel and per-block refinements re-count
+  only the cells whose offset changed.
+- **Exponent cadence election** (encoders): the 32 anchor patterns of a
+  frame only ever contain 21 distinct runs; each run's cost is computed
+  once instead of once per pattern.
+- **IMDCT** (decoders): the pre/post-twiddle tables were rebuilt (256
+  `cos`/`sin`) on every call and the FFT derived its twiddles by a
+  running product inside the butterfly loop; both are tables now (the
+  FFT's holding the same running-product values).
+- **Per-coefficient `2^-exp`** (decoders): `powi` per mantissa became a
+  table of exact powers of two. Debug-trace switches, formerly ~12
+  environment lookups per audio block, are read once per process.
+- **JOC QMF bank and object mix**: analysis / synthesis modulation and
+  the channel-to-object matrix run with the long dimension innermost
+  over independent accumulators (same accumulation order per output);
+  the per-timeslot scratch allocation and a 1280-sample silence scan
+  per object and timeslot are gone; the stereo pan law is evaluated
+  once per ramp position instead of once per sample; the layout panner
+  evaluates each pan stage once per coordinate of the extent grid.
+
+Remaining headroom is structural and would change output bits: the
+forward MDCT and the JOC QMF bank are still direct-form `O(N²)`
+(an FFT-based form rounds differently), and the cadence election still
+runs the allocator on every candidate run.
 
 ## Installation
 

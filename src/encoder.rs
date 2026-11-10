@@ -2953,17 +2953,60 @@ pub(crate) fn elect_exponent_cadence(
     let mut best_cost = u32::MAX;
     let mut best_pattern = 0u32;
     let mut best_strats = [0u8; BLOCKS_PER_FRAME];
+    // A run (anchor block .. next anchor) is costed from its own blocks
+    // alone — the shared set is the anchor bounded by the blocks that
+    // reuse it — so the 2^(nblks-1) patterns only ever ask for the
+    // nblks·(nblks+1)/2 distinct runs. Each is evaluated once, on first
+    // use: `(exponent + mantissa bits, strategy)`.
+    let mut run_memo = [[None::<(u32, u8)>; BLOCKS_PER_FRAME + 1]; BLOCKS_PER_FRAME];
     let mut work: Vec<[u8; N_COEFFS]> = exps[..nblks].to_vec();
+    let mut evaluate_run = |blk: usize, run_end: usize| -> (u32, u8) {
+        if let Some(known) = run_memo[blk][run_end] {
+            return known;
+        }
+        // The run's shared set: its anchor, bounded by its reuse blocks.
+        let mut anchors = [1u8; BLOCKS_PER_FRAME];
+        for a in anchors.iter_mut().take(run_end).skip(blk + 1) {
+            *a = 0;
+        }
+        for (w, e) in work.iter_mut().zip(exps.iter()) {
+            w[lo..hi].copy_from_slice(&e[lo..hi]);
+        }
+        bound_shared_exponents(&mut work, &anchors, lo, hi);
+        let run: Vec<usize> = (blk..run_end).collect();
+        // The cheapest legal strategy for this run's shared set.
+        let mut run_best = u32::MAX;
+        let mut run_best_pattern = 0u32;
+        let mut run_strat = 1u8;
+        for &strat in strategies {
+            let mut set = work[blk];
+            preprocess_d15(&mut set[lo..hi]);
+            let grpsize = match strat {
+                2 => 2,
+                3 => 4,
+                _ => 1,
+            };
+            if grpsize > 1 {
+                quantise_exponents_to_grpsize(&mut set[lo..hi], grpsize);
+            }
+            let ebits = 4 + 7 * ngrps_for_strategy(width, grpsize) as u32 + 2 + chbw_bits;
+            let (mant, mismatch) = run_cost(&set, &run);
+            let c = ebits + mant + mismatch;
+            if c < run_best {
+                run_best = c;
+                run_best_pattern = ebits + mant;
+                run_strat = strat;
+            }
+        }
+        run_memo[blk][run_end] = Some((run_best_pattern, run_strat));
+        (run_best_pattern, run_strat)
+    };
     for pattern in 0..(1u32 << (nblks - 1)) {
         let mut anchors = [0u8; BLOCKS_PER_FRAME];
         anchors[0] = 1;
         for blk in 1..nblks {
             anchors[blk] = ((pattern >> (blk - 1)) & 1) as u8;
         }
-        for (w, e) in work.iter_mut().zip(exps.iter()) {
-            w[lo..hi].copy_from_slice(&e[lo..hi]);
-        }
-        bound_shared_exponents(&mut work, &anchors, lo, hi);
         let mut cost = 0u32;
         let mut strats = [0u8; BLOCKS_PER_FRAME];
         let mut blk = 0usize;
@@ -2972,31 +3015,7 @@ pub(crate) fn elect_exponent_cadence(
             while run_end < nblks && anchors[run_end] == 0 {
                 run_end += 1;
             }
-            let run: Vec<usize> = (blk..run_end).collect();
-            // The cheapest legal strategy for this run's shared set.
-            let mut run_best = u32::MAX;
-            let mut run_best_pattern = 0u32;
-            let mut run_strat = 1u8;
-            for &strat in strategies {
-                let mut set = work[blk];
-                preprocess_d15(&mut set[lo..hi]);
-                let grpsize = match strat {
-                    2 => 2,
-                    3 => 4,
-                    _ => 1,
-                };
-                if grpsize > 1 {
-                    quantise_exponents_to_grpsize(&mut set[lo..hi], grpsize);
-                }
-                let ebits = 4 + 7 * ngrps_for_strategy(width, grpsize) as u32 + 2 + chbw_bits;
-                let (mant, mismatch) = run_cost(&set, &run);
-                let c = ebits + mant + mismatch;
-                if c < run_best {
-                    run_best = c;
-                    run_best_pattern = ebits + mant;
-                    run_strat = strat;
-                }
-            }
+            let (run_best_pattern, run_strat) = evaluate_run(blk, run_end);
             strats[blk] = run_strat;
             cost += run_best_pattern;
             if blk > 0 {
@@ -3100,6 +3119,12 @@ impl BitAllocParams {
     /// the allocator. The per-channel substitution helpers keep the
     /// vector fields in step with the values actually transmitted, so
     /// this reads the same set the decoder will see.
+    /// The combined SNR offset `(((csnroffst − 15) << 4) + fsnroffst) << 2`
+    /// (§7.2.2.5) of the channel these parameters describe.
+    pub(crate) fn snroffset(&self) -> i32 {
+        (((self.csnroffst as i32 - 15) << 4) + self.fsnroffst as i32) << 2
+    }
+
     pub(crate) fn all_snr_offsets_zero(&self) -> bool {
         self.csnroffst == 0
             && self.fsnroffst == 0
@@ -3154,130 +3179,481 @@ pub(crate) fn compute_bap_table(
         bap_out[..end].fill(0);
         return;
     }
-    // PSD
-    let mut psd = [0i32; N_COEFFS];
-    for bin in 0..end {
-        psd[bin] = 3072 - ((exp[bin] as i32) << 7);
+    MaskedPsd::fbw(exp, end, fscod, ba, dba).for_each_bap(
+        false,
+        ba.snroffset(),
+        ptr_tab,
+        |i, bap| {
+            bap_out[i] = bap;
+        },
+    );
+}
+
+/// The SNR-offset-independent part of the §7.2.2 parametric allocation
+/// of one channel in one block: the PSD, and the masking curve with
+/// the delta-bit-allocation segments applied. Only the last step —
+/// subtracting the SNR offset and looking the pointer up — depends on
+/// `csnroffst` / `fsnroffst`, so the encoder's offset searches build
+/// this once per channel and block and re-run only that step.
+#[derive(Clone)]
+pub(crate) struct MaskedPsd {
+    psd: [i32; N_COEFFS],
+    mask: [i32; 50],
+    /// First and one-past-last coefficient of the channel.
+    start: usize,
+    end: usize,
+    floor: i32,
+}
+
+impl MaskedPsd {
+    /// A channel without coefficients.
+    fn empty() -> Self {
+        Self {
+            psd: [0; N_COEFFS],
+            mask: [0; 50],
+            start: 0,
+            end: 0,
+            floor: 0,
+        }
     }
-    // Band PSD
-    let mut bndpsd = [0i32; 50];
-    let bndstrt = MASKTAB[0] as usize;
-    let bndend = MASKTAB[end - 1] as usize + 1;
-    {
-        let mut j = 0usize;
-        let mut k = bndstrt;
-        loop {
-            let lastbin = (BNDTAB[k] as usize + BNDSZ[k] as usize).min(end);
-            bndpsd[k] = psd[j];
-            j += 1;
-            while j < lastbin {
-                bndpsd[k] = logadd(bndpsd[k], psd[j]);
+
+    /// Full-bandwidth (or LFE) channel, coefficients `0..end`.
+    pub(crate) fn fbw(
+        exp: &[u8; N_COEFFS],
+        end: usize,
+        fscod: u8,
+        ba: &BitAllocParams,
+        dba: Option<(&DbaPlan, usize)>,
+    ) -> Self {
+        if end == 0 {
+            return Self::empty();
+        }
+        // PSD
+        let mut psd = [0i32; N_COEFFS];
+        for bin in 0..end {
+            psd[bin] = 3072 - ((exp[bin] as i32) << 7);
+        }
+        // Band PSD
+        let mut bndpsd = [0i32; 50];
+        let bndstrt = MASKTAB[0] as usize;
+        let bndend = MASKTAB[end - 1] as usize + 1;
+        {
+            let mut j = 0usize;
+            let mut k = bndstrt;
+            loop {
+                let lastbin = (BNDTAB[k] as usize + BNDSZ[k] as usize).min(end);
+                bndpsd[k] = psd[j];
                 j += 1;
+                while j < lastbin {
+                    bndpsd[k] = logadd(bndpsd[k], psd[j]);
+                    j += 1;
+                }
+                k += 1;
+                if end <= lastbin {
+                    break;
+                }
             }
-            k += 1;
-            if end <= lastbin {
+        }
+        // Excitation — fbw, non-coupled path.
+        let sdecay = SLOWDEC[ba.sdcycod as usize];
+        let fdecay = FASTDEC[ba.fdcycod as usize];
+        let sgain = SLOWGAIN[ba.sgaincod as usize];
+        let dbknee = DBPBTAB[ba.dbpbcod as usize];
+        let floor = FLOORTAB[ba.floorcod as usize];
+        let fgain = FASTGAIN[ba.fgaincod as usize];
+
+        let mut excite = [0i32; 50];
+        let mut lowcomp = 0i32;
+        // §7.2.2.4 fbw path (start == 0). The `lfe_last` flag mirrors the
+        // decoder's same-named branch: when this channel is the LFE
+        // (end == 7), we skip the calc_lowcomp call at bin=6 so encoder
+        // and decoder derive the same excitation/mask/bap[] arrays.
+        let lfe_last = end == 7;
+        if bndend > 0 {
+            lowcomp = calc_lowcomp(lowcomp, bndpsd[0], bndpsd[1], 0);
+            excite[0] = bndpsd[0] - fgain - lowcomp;
+        }
+        if bndend > 1 {
+            lowcomp = calc_lowcomp(lowcomp, bndpsd[1], bndpsd[2], 1);
+            excite[1] = bndpsd[1] - fgain - lowcomp;
+        }
+        let mut begin = 7.min(bndend);
+        let mut fastleak = 0i32;
+        let mut slowleak = 0i32;
+        for bin in 2..7.min(bndend) {
+            if !(lfe_last && bin == 6) {
+                lowcomp = calc_lowcomp(lowcomp, bndpsd[bin], bndpsd[bin + 1], bin);
+            }
+            fastleak = bndpsd[bin] - fgain;
+            slowleak = bndpsd[bin] - sgain;
+            excite[bin] = fastleak - lowcomp;
+            if !(lfe_last && bin == 6) && bndpsd[bin] <= bndpsd[bin + 1] {
+                begin = bin + 1;
                 break;
             }
         }
+        for bin in begin..22.min(bndend) {
+            if !(lfe_last && bin == 6) {
+                lowcomp = calc_lowcomp(lowcomp, bndpsd[bin], bndpsd[bin + 1], bin);
+            }
+            fastleak -= fdecay;
+            fastleak = fastleak.max(bndpsd[bin] - fgain);
+            slowleak -= sdecay;
+            slowleak = slowleak.max(bndpsd[bin] - sgain);
+            excite[bin] = (fastleak - lowcomp).max(slowleak);
+        }
+        if bndend > 22 {
+            for bin in 22..bndend {
+                fastleak -= fdecay;
+                fastleak = fastleak.max(bndpsd[bin] - fgain);
+                slowleak -= sdecay;
+                slowleak = slowleak.max(bndpsd[bin] - sgain);
+                excite[bin] = fastleak.max(slowleak);
+            }
+        }
+        // Mask.
+        let hth_row = &HTH[fscod as usize];
+        let mut mask = [0i32; 50];
+        for bin in bndstrt..bndend {
+            let mut exc = excite[bin];
+            if bndpsd[bin] < dbknee {
+                exc += (dbknee - bndpsd[bin]) >> 2;
+            }
+            mask[bin] = exc.max(hth_row[bin] as i32);
+        }
+        // §7.2.2.6 delta bit allocation — apply BEFORE bap[] computation,
+        // exactly mirroring the decoder. The mask offsets in dba can be
+        // either negative (more bits assigned in that band) or positive
+        // (fewer bits — what our encoder picks by default to free budget
+        // for snroffst).
+        if let Some((plan, idx)) = dba {
+            apply_dba_segments(plan, idx, &mut mask);
+        }
+        Self {
+            psd,
+            mask,
+            start: 0,
+            end,
+            floor,
+        }
     }
-    // Excitation — fbw, non-coupled path.
-    let sdecay = SLOWDEC[ba.sdcycod as usize];
-    let fdecay = FASTDEC[ba.fdcycod as usize];
-    let sgain = SLOWGAIN[ba.sgaincod as usize];
-    let dbknee = DBPBTAB[ba.dbpbcod as usize];
-    let floor = FLOORTAB[ba.floorcod as usize];
-    let fgain = FASTGAIN[ba.fgaincod as usize];
-    let snroffset = (((ba.csnroffst as i32 - 15) << 4) + ba.fsnroffst as i32) << 2;
 
-    let mut excite = [0i32; 50];
-    let mut lowcomp = 0i32;
-    // §7.2.2.4 fbw path (start == 0). The `lfe_last` flag mirrors the
-    // decoder's same-named branch: when this channel is the LFE
-    // (end == 7), we skip the calc_lowcomp call at bin=6 so encoder
-    // and decoder derive the same excitation/mask/bap[] arrays.
-    let lfe_last = end == 7;
-    if bndend > 0 {
-        lowcomp = calc_lowcomp(lowcomp, bndpsd[0], bndpsd[1], 0);
-        excite[0] = bndpsd[0] - fgain - lowcomp;
-    }
-    if bndend > 1 {
-        lowcomp = calc_lowcomp(lowcomp, bndpsd[1], bndpsd[2], 1);
-        excite[1] = bndpsd[1] - fgain - lowcomp;
-    }
-    let mut begin = 7.min(bndend);
-    let mut fastleak = 0i32;
-    let mut slowleak = 0i32;
-    for bin in 2..7.min(bndend) {
-        if !(lfe_last && bin == 6) {
-            lowcomp = calc_lowcomp(lowcomp, bndpsd[bin], bndpsd[bin + 1], bin);
+    /// Coupling pseudo-channel, coefficients `start..end`
+    /// (`ba.fgaincod` is the coupling fast gain).
+    pub(crate) fn cpl(
+        exp: &[u8; N_COEFFS],
+        start: usize,
+        end: usize,
+        fscod: u8,
+        ba: &BitAllocParams,
+        dba: Option<(&DbaPlan, usize)>,
+    ) -> Self {
+        if end <= start {
+            return Self::empty();
         }
-        fastleak = bndpsd[bin] - fgain;
-        slowleak = bndpsd[bin] - sgain;
-        excite[bin] = fastleak - lowcomp;
-        if !(lfe_last && bin == 6) && bndpsd[bin] <= bndpsd[bin + 1] {
-            begin = bin + 1;
-            break;
+        let mut psd = [0i32; N_COEFFS];
+        for bin in start..end {
+            psd[bin] = 3072 - ((exp[bin] as i32) << 7);
         }
-    }
-    for bin in begin..22.min(bndend) {
-        if !(lfe_last && bin == 6) {
-            lowcomp = calc_lowcomp(lowcomp, bndpsd[bin], bndpsd[bin + 1], bin);
+        let bndstrt = MASKTAB[start] as usize;
+        let bndend = MASKTAB[end - 1] as usize + 1;
+        let mut bndpsd = [0i32; 50];
+        {
+            let mut j = start;
+            let mut k = bndstrt;
+            loop {
+                let lastbin = (BNDTAB[k] as usize + BNDSZ[k] as usize).min(end);
+                bndpsd[k] = psd[j];
+                j += 1;
+                while j < lastbin {
+                    bndpsd[k] = logadd(bndpsd[k], psd[j]);
+                    j += 1;
+                }
+                k += 1;
+                if end <= lastbin {
+                    break;
+                }
+            }
         }
-        fastleak -= fdecay;
-        fastleak = fastleak.max(bndpsd[bin] - fgain);
-        slowleak -= sdecay;
-        slowleak = slowleak.max(bndpsd[bin] - sgain);
-        excite[bin] = (fastleak - lowcomp).max(slowleak);
-    }
-    if bndend > 22 {
-        for bin in 22..bndend {
+        let sdecay = SLOWDEC[ba.sdcycod as usize];
+        let fdecay = FASTDEC[ba.fdcycod as usize];
+        let sgain = SLOWGAIN[ba.sgaincod as usize];
+        let dbknee = DBPBTAB[ba.dbpbcod as usize];
+        let floor = FLOORTAB[ba.floorcod as usize];
+        let fgain = FASTGAIN[ba.fgaincod as usize];
+        // §7.2.2.4 cpl path. cpl_fleak / cpl_sleak default to 0 (no
+        // cplleake transmitted), giving fastleak_init = slowleak_init = 0
+        // and the +768 offset applied in the decoder.
+        let mut fastleak = 768i32;
+        let mut slowleak = 768i32;
+        let mut excite = [0i32; 50];
+        for bin in bndstrt..bndend {
             fastleak -= fdecay;
             fastleak = fastleak.max(bndpsd[bin] - fgain);
             slowleak -= sdecay;
             slowleak = slowleak.max(bndpsd[bin] - sgain);
             excite[bin] = fastleak.max(slowleak);
         }
+        let hth_row = &HTH[fscod as usize];
+        let mut mask = [0i32; 50];
+        for bin in bndstrt..bndend {
+            let mut exc = excite[bin];
+            if bndpsd[bin] < dbknee {
+                exc += (dbknee - bndpsd[bin]) >> 2;
+            }
+            mask[bin] = exc.max(hth_row[bin] as i32);
+        }
+        // §7.2.2.6 dba — coupling-channel variant. The decoder applies the
+        // cpl-channel deltba segments to the same `mask[]` array before
+        // bap[] is computed, even though the cpl excitation path is the
+        // simpler `fastleak.max(slowleak)` branch.
+        if let Some((plan, idx)) = dba {
+            apply_dba_segments(plan, idx, &mut mask);
+        }
+        Self {
+            psd,
+            mask,
+            start,
+            end,
+            floor,
+        }
     }
-    // Mask.
-    let hth_row = &HTH[fscod as usize];
-    let mut mask = [0i32; 50];
-    for bin in bndstrt..bndend {
-        let mut exc = excite[bin];
-        if bndpsd[bin] < dbknee {
-            exc += (dbknee - bndpsd[bin]) >> 2;
+
+    /// The last allocation step: visit every coefficient's pointer for
+    /// the given SNR offset. `all_zero` is the §7.2.2.1.1 special case
+    /// (every transmitted SNR offset zero → every pointer 0).
+    #[inline]
+    fn for_each_bap(
+        &self,
+        all_zero: bool,
+        snroffset: i32,
+        ptr_tab: &[u8; 64],
+        mut visit: impl FnMut(usize, u8),
+    ) {
+        if self.end <= self.start {
+            return;
         }
-        mask[bin] = exc.max(hth_row[bin] as i32);
+        if all_zero {
+            for i in self.start..self.end {
+                visit(i, 0);
+            }
+            return;
+        }
+        let end = self.end;
+        let floor = self.floor;
+        let mut i = self.start;
+        let mut j = MASKTAB[self.start] as usize;
+        loop {
+            let lastbin = (BNDTAB[j] as usize + BNDSZ[j] as usize).min(end);
+            let mut m = self.mask[j];
+            m -= snroffset;
+            m -= floor;
+            if m < 0 {
+                m = 0;
+            }
+            m &= 0x1fe0;
+            m += floor;
+            while i < lastbin {
+                let addr = ((self.psd[i] - m) >> 5).clamp(0, 63) as usize;
+                visit(i, ptr_tab[addr]);
+                i += 1;
+            }
+            if i >= end {
+                break;
+            }
+            j += 1;
+        }
     }
-    // §7.2.2.6 delta bit allocation — apply BEFORE bap[] computation,
-    // exactly mirroring the decoder. The mask offsets in dba can be
-    // either negative (more bits assigned in that band) or positive
-    // (fewer bits — what our encoder picks by default to free budget
-    // for snroffst).
-    if let Some((plan, idx)) = dba {
-        apply_dba_segments(plan, idx, &mut mask);
+}
+
+/// Which pseudo-channel an [`AllocEval`] cell belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AllocSlot {
+    Fbw(usize),
+    Cpl,
+    Lfe,
+}
+
+/// One channel-block of an [`AllocEval`]: its masking state, and the
+/// pointer histogram of the SNR offset it was last asked for.
+struct AllocCell {
+    /// The mask-shaping parameters `masked` was built with.
+    mask_key: Option<[u8; 6]>,
+    masked: MaskedPsd,
+    /// `(all_zero, snroffset)` of `hist`.
+    hist_key: Option<(bool, i32)>,
+    hist: [u32; 16],
+}
+
+/// Mantissa-bit accounting for the encoder's SNR-offset searches.
+///
+/// The searches evaluate many `(csnroffst, fsnroffst)` candidates over
+/// the same exponents. This keeps, per channel and block, the masking
+/// curve (built once) and the histogram of allocation pointers for the
+/// offset currently selected (rebuilt only when that cell's offset
+/// changes), and counts the frame's mantissa bits from the histograms —
+/// the same total [`mantissa_bits_total_ends`] returns for the `bap[]`
+/// arrays [`compute_bap`] / [`compute_bap_cpl`] would have produced.
+pub(crate) struct AllocEval<'a> {
+    exps: &'a [Vec<[u8; N_COEFFS]>],
+    end: usize,
+    end_ch: Option<&'a [usize]>,
+    nchan: usize,
+    fscod: u8,
+    cpl: &'a CouplingPlan,
+    dba: &'a DbaPlan,
+    lfeon: bool,
+    blocks: usize,
+    /// `[slot][blk]`, slots `0..nchan` fbw, `nchan` coupling, `nchan + 1` LFE.
+    cells: Vec<AllocCell>,
+}
+
+impl<'a> AllocEval<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        exps: &'a [Vec<[u8; N_COEFFS]>],
+        end: usize,
+        end_ch: Option<&'a [usize]>,
+        nchan: usize,
+        fscod: u8,
+        cpl: &'a CouplingPlan,
+        dba: &'a DbaPlan,
+        lfeon: bool,
+    ) -> Self {
+        let blocks = exps.first().map_or(0, Vec::len);
+        let cells = (0..(nchan + 2) * blocks)
+            .map(|_| AllocCell {
+                mask_key: None,
+                masked: MaskedPsd::empty(),
+                hist_key: None,
+                hist: [0; 16],
+            })
+            .collect();
+        Self {
+            exps,
+            end,
+            end_ch,
+            nchan,
+            fscod,
+            cpl,
+            dba,
+            lfeon,
+            blocks,
+            cells,
+        }
     }
-    // bap.
-    let mut i = 0usize;
-    let mut j = MASKTAB[0] as usize;
-    loop {
-        let lastbin = (BNDTAB[j] as usize + BNDSZ[j] as usize).min(end);
-        let mut m = mask[j];
-        m -= snroffset;
-        m -= floor;
-        if m < 0 {
-            m = 0;
+
+    /// Select the SNR offset of one channel-block: `ba` is the parameter
+    /// set [`compute_bap`] (fbw / LFE) or [`compute_bap_cpl`] (coupling)
+    /// would have been called with for it.
+    pub(crate) fn select(&mut self, slot: AllocSlot, blk: usize, ba: &BitAllocParams) {
+        let (index, exps_slot) = match slot {
+            AllocSlot::Fbw(ch) => (ch, ch),
+            AllocSlot::Cpl => (self.nchan, self.nchan),
+            AllocSlot::Lfe => (self.nchan + 1, self.nchan + 1),
+        };
+        if blk >= self.blocks {
+            return;
         }
-        m &= 0x1fe0;
-        m += floor;
-        while i < lastbin {
-            let addr = ((psd[i] - m) >> 5).clamp(0, 63) as usize;
-            bap_out[i] = ptr_tab[addr];
-            i += 1;
+        let cell = &mut self.cells[index * self.blocks + blk];
+        let mask_key = [
+            ba.sdcycod,
+            ba.fdcycod,
+            ba.sgaincod,
+            ba.dbpbcod,
+            ba.floorcod,
+            ba.fgaincod,
+        ];
+        if cell.mask_key != Some(mask_key) {
+            let exp = &self.exps[exps_slot][blk];
+            cell.masked = match slot {
+                AllocSlot::Fbw(ch) => {
+                    let ch_end = self.end_ch.map_or(self.end, |e| e[ch]);
+                    MaskedPsd::fbw(exp, ch_end, self.fscod, ba, Some((self.dba, ch)))
+                }
+                AllocSlot::Cpl => MaskedPsd::cpl(
+                    exp,
+                    self.cpl.begf_mant(),
+                    self.cpl.endf_mant(),
+                    self.fscod,
+                    ba,
+                    Some((self.dba, MAX_FBW)),
+                ),
+                AllocSlot::Lfe => MaskedPsd::fbw(exp, LFE_END_MANT, self.fscod, ba, None),
+            };
+            cell.mask_key = Some(mask_key);
+            cell.hist_key = None;
         }
-        if i >= end {
-            break;
+        let hist_key = (ba.all_snr_offsets_zero(), ba.snroffset());
+        if cell.hist_key != Some(hist_key) {
+            let mut hist = [0u32; 16];
+            cell.masked
+                .for_each_bap(hist_key.0, hist_key.1, &BAPTAB, |_, bap| {
+                    hist[(bap & 15) as usize] += 1;
+                });
+            cell.hist = hist;
+            cell.hist_key = Some(hist_key);
         }
-        j += 1;
+    }
+
+    /// Pointer counts of block `blk` over every channel whose mantissas
+    /// the block carries.
+    fn block_hist(&self, blk: usize) -> [u32; 16] {
+        let mut total = [0u32; 16];
+        let mut add = |slot: usize| {
+            let cell = &self.cells[slot * self.blocks + blk];
+            if cell.hist_key.is_some() {
+                for (sum, count) in total.iter_mut().zip(&cell.hist) {
+                    *sum += count;
+                }
+            }
+        };
+        for ch in 0..self.nchan {
+            add(ch);
+        }
+        // The coupling channel's mantissas ride with the first coupled
+        // channel; without one they are not transmitted.
+        if self.cpl.in_use && (0..self.nchan).any(|ch| self.cpl.chincpl[ch]) {
+            add(self.nchan);
+        }
+        if self.lfeon {
+            add(self.nchan + 1);
+        }
+        total
+    }
+
+    /// Mantissa bits of the frame for the selected offsets. The bap 1 /
+    /// 2 / 4 mantissas are grouped across the channels of a block
+    /// (§7.3.5): three, three and two to a 5-, 7- and 7-bit group.
+    pub(crate) fn used(&self) -> u32 {
+        let mut total = 0u32;
+        for blk in 0..self.blocks {
+            let hist = self.block_hist(blk);
+            total += 5 * hist[1].div_ceil(3) + 7 * hist[2].div_ceil(3) + 7 * hist[4].div_ceil(2);
+            for bap in [3usize, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
+                total += hist[bap] * QUANTIZATION_BITS[bap] as u32;
+            }
+        }
+        total
+    }
+
+    /// Six times a lower bound of [`used`](Self::used) that never
+    /// decreases when an SNR offset is raised: grouped mantissas are
+    /// charged their fractional share (5/3, 7/3, 7/2 bits) instead of
+    /// whole groups. Every pointer is non-decreasing in the SNR offset
+    /// and the per-mantissa charge is increasing in the pointer, so the
+    /// bound is monotone even though the exact, group-rounded count is
+    /// not.
+    pub(crate) fn used_lower_bound_x6(&self) -> u64 {
+        let mut total = 0u64;
+        for blk in 0..self.blocks {
+            let hist = self.block_hist(blk);
+            total += 10 * u64::from(hist[1]) + 14 * u64::from(hist[2]) + 21 * u64::from(hist[4]);
+            for bap in [3usize, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
+                total += 6 * u64::from(hist[bap]) * u64::from(QUANTIZATION_BITS[bap]);
+            }
+        }
+        total
     }
 }
 
@@ -3312,88 +3688,14 @@ pub(crate) fn compute_bap_cpl(
         bap_out[start..end].fill(0);
         return;
     }
-    let mut psd = [0i32; N_COEFFS];
-    for bin in start..end {
-        psd[bin] = 3072 - ((exp[bin] as i32) << 7);
-    }
-    let bndstrt = MASKTAB[start] as usize;
-    let bndend = MASKTAB[end - 1] as usize + 1;
-    let mut bndpsd = [0i32; 50];
-    {
-        let mut j = start;
-        let mut k = bndstrt;
-        loop {
-            let lastbin = (BNDTAB[k] as usize + BNDSZ[k] as usize).min(end);
-            bndpsd[k] = psd[j];
-            j += 1;
-            while j < lastbin {
-                bndpsd[k] = logadd(bndpsd[k], psd[j]);
-                j += 1;
-            }
-            k += 1;
-            if end <= lastbin {
-                break;
-            }
-        }
-    }
-    let sdecay = SLOWDEC[ba.sdcycod as usize];
-    let fdecay = FASTDEC[ba.fdcycod as usize];
-    let sgain = SLOWGAIN[ba.sgaincod as usize];
-    let dbknee = DBPBTAB[ba.dbpbcod as usize];
-    let floor = FLOORTAB[ba.floorcod as usize];
-    let fgain = FASTGAIN[ba.fgaincod as usize];
-    let snroffset = (((ba.csnroffst as i32 - 15) << 4) + ba.fsnroffst as i32) << 2;
-    // §7.2.2.4 cpl path. cpl_fleak / cpl_sleak default to 0 (no
-    // cplleake transmitted), giving fastleak_init = slowleak_init = 0
-    // and the +768 offset applied in the decoder.
-    let mut fastleak = 768i32;
-    let mut slowleak = 768i32;
-    let mut excite = [0i32; 50];
-    for bin in bndstrt..bndend {
-        fastleak -= fdecay;
-        fastleak = fastleak.max(bndpsd[bin] - fgain);
-        slowleak -= sdecay;
-        slowleak = slowleak.max(bndpsd[bin] - sgain);
-        excite[bin] = fastleak.max(slowleak);
-    }
-    let hth_row = &HTH[fscod as usize];
-    let mut mask = [0i32; 50];
-    for bin in bndstrt..bndend {
-        let mut exc = excite[bin];
-        if bndpsd[bin] < dbknee {
-            exc += (dbknee - bndpsd[bin]) >> 2;
-        }
-        mask[bin] = exc.max(hth_row[bin] as i32);
-    }
-    // §7.2.2.6 dba — coupling-channel variant. The decoder applies the
-    // cpl-channel deltba segments to the same `mask[]` array before
-    // bap[] is computed, even though the cpl excitation path is the
-    // simpler `fastleak.max(slowleak)` branch.
-    if let Some((plan, idx)) = dba {
-        apply_dba_segments(plan, idx, &mut mask);
-    }
-    let mut i = start;
-    let mut j = MASKTAB[start] as usize;
-    loop {
-        let lastbin = (BNDTAB[j] as usize + BNDSZ[j] as usize).min(end);
-        let mut m = mask[j];
-        m -= snroffset;
-        m -= floor;
-        if m < 0 {
-            m = 0;
-        }
-        m &= 0x1fe0;
-        m += floor;
-        while i < lastbin {
-            let addr = ((psd[i] - m) >> 5).clamp(0, 63) as usize;
-            bap_out[i] = BAPTAB[addr];
-            i += 1;
-        }
-        if i >= end {
-            break;
-        }
-        j += 1;
-    }
+    MaskedPsd::cpl(exp, start, end, fscod, ba, dba).for_each_bap(
+        false,
+        ba.snroffset(),
+        &BAPTAB,
+        |i, bap| {
+            bap_out[i] = bap;
+        },
+    );
 }
 
 fn logadd(a: i32, b: i32) -> i32 {
@@ -3969,73 +4271,73 @@ pub(crate) fn tune_snroffst_with_plan_ends(
     // tie cplfsnr ≡ fsnr (the cpl pseudo-channel and the fbw channels
     // share the same sub-band SNR offset). This is sub-optimal but
     // adequate for an initial coupling-encode implementation.
+    let mut eval = AllocEval::new(exps, end, end_ch, nchan, fscod, cpl, dba, lfeon);
+    // Select the allocation of the frame-level candidate `cand` in every
+    // channel-block: the fbw channels with `cand` itself, the coupling
+    // and LFE pseudo-channels with their own fine offset and fast gain.
+    let select_frame = |eval: &mut AllocEval, cand: &BitAllocParams| {
+        for ch in 0..nchan {
+            for blk in 0..exps[ch].len() {
+                eval.select(AllocSlot::Fbw(ch), blk, cand);
+            }
+        }
+        if cpl.in_use {
+            let mut cpl_ba = *cand;
+            cpl_ba.fsnroffst = cand.cplfsnroffst;
+            cpl_ba.fgaincod = cand.cplfgaincod;
+            for blk in 0..exps[nchan].len() {
+                eval.select(AllocSlot::Cpl, blk, &cpl_ba);
+            }
+        }
+        if lfeon {
+            let mut lfe_ba = *cand;
+            lfe_ba.fsnroffst = cand.lfefsnroffst;
+            lfe_ba.fgaincod = cand.lfefgaincod;
+            for blk in 0..exps[nchan + 1].len() {
+                eval.select(AllocSlot::Lfe, blk, &lfe_ba);
+            }
+        }
+    };
+    let candidate = |combined: i32| {
+        let mut cand = *ba;
+        cand.csnroffst = (combined >> 4) as u8;
+        cand.fsnroffst = (combined & 15) as u8;
+        cand.cplfsnroffst = cand.fsnroffst;
+        cand.lfefsnroffst = cand.fsnroffst;
+        cand
+    };
+    // The answer is the LARGEST combined offset `16·csnroffst +
+    // fsnroffst` (0..=1023) whose mantissas fit the budget. The exact
+    // bit count is not monotone in the offset (group rounding), so the
+    // search is two-step: a bisection on the monotone lower bound finds
+    // the highest offset that can possibly fit — every offset above it
+    // is over budget by the bound alone — and a downward walk from
+    // there takes the first offset whose exact count fits. Same result
+    // as testing all 1024 offsets.
     let mut best = *ba;
     let mut best_offset: i32 = -1;
-    for csnr in 0..=63u8 {
-        for fsnr in 0..=15u8 {
-            let mut cand = *ba;
-            cand.csnroffst = csnr;
-            cand.fsnroffst = fsnr;
-            cand.cplfsnroffst = fsnr;
-            cand.lfefsnroffst = fsnr;
-            // baps slot layout: 0..nchan = fbw, nchan = cpl, nchan+1 = lfe.
-            let mut baps: Vec<Vec<[u8; N_COEFFS]>> =
-                vec![vec![[0u8; N_COEFFS]; exps[0].len()]; nchan + 2];
-            for ch in 0..nchan {
-                let ch_end = end_ch.map_or(end, |e| e[ch]);
-                for blk in 0..exps[ch].len() {
-                    compute_bap(
-                        &exps[ch][blk],
-                        ch_end,
-                        fscod,
-                        &cand,
-                        &mut baps[ch][blk],
-                        Some((dba, ch)),
-                    );
-                }
+    let budget_x6 = 6 * u64::from(budget);
+    let bound_fits = |combined: i32, eval: &mut AllocEval| {
+        select_frame(eval, &candidate(combined));
+        eval.used_lower_bound_x6() <= budget_x6
+    };
+    if bound_fits(0, &mut eval) {
+        let (mut low, mut high) = (0i32, 1023i32);
+        while low < high {
+            let mid = (low + high + 1) / 2;
+            if bound_fits(mid, &mut eval) {
+                low = mid;
+            } else {
+                high = mid - 1;
             }
-            if cpl.in_use {
-                let cpl_idx = nchan;
-                let begf_mant = cpl.begf_mant();
-                let endf_mant = cpl.endf_mant();
-                let mut cpl_ba = cand;
-                cpl_ba.fsnroffst = cand.cplfsnroffst;
-                cpl_ba.fgaincod = cand.cplfgaincod;
-                for blk in 0..exps[cpl_idx].len() {
-                    compute_bap_cpl(
-                        &exps[cpl_idx][blk],
-                        begf_mant,
-                        endf_mant,
-                        fscod,
-                        &cpl_ba,
-                        &mut baps[cpl_idx][blk],
-                        Some((dba, MAX_FBW)),
-                    );
-                }
-            }
-            if lfeon {
-                let lfe_idx = nchan + 1;
-                let mut lfe_ba = cand;
-                lfe_ba.fsnroffst = cand.lfefsnroffst;
-                lfe_ba.fgaincod = cand.lfefgaincod;
-                for blk in 0..exps[lfe_idx].len() {
-                    compute_bap(
-                        &exps[lfe_idx][blk],
-                        LFE_END_MANT,
-                        fscod,
-                        &lfe_ba,
-                        &mut baps[lfe_idx][blk],
-                        None,
-                    );
-                }
-            }
-            let used = mantissa_bits_total_ends(&baps, end, end_ch, nchan, cpl, lfeon);
-            if used <= budget {
-                let combined = (csnr as i32) * 16 + fsnr as i32;
-                if combined > best_offset {
-                    best_offset = combined;
-                    best = cand;
-                }
+        }
+        for combined in (0..=low).rev() {
+            let cand = candidate(combined);
+            select_frame(&mut eval, &cand);
+            if eval.used() <= budget {
+                best_offset = combined;
+                best = cand;
+                break;
             }
         }
     }
@@ -4088,60 +4390,31 @@ pub(crate) fn tune_snroffst_with_plan_ends(
     // We don't tune cplfsnroffst / lfefsnroffst per-channel here —
     // they're singletons in the bitstream syntax and the cpl/lfe
     // pseudo-channels don't need it for the current test inputs.
-    let recompute_used = |ba_in: &BitAllocParams| -> u32 {
-        let mut bps: Vec<Vec<[u8; N_COEFFS]>> =
-            vec![vec![[0u8; N_COEFFS]; exps[0].len()]; nchan + 2];
+    let mut recompute_used = |ba_in: &BitAllocParams| -> u32 {
         for ch in 0..nchan {
             let mut ch_ba = *ba_in;
             ch_ba.fsnroffst = ba_in.fsnroffst_ch[ch];
-            let ch_end = end_ch.map_or(end, |e| e[ch]);
             for blk in 0..exps[ch].len() {
-                compute_bap(
-                    &exps[ch][blk],
-                    ch_end,
-                    fscod,
-                    &ch_ba,
-                    &mut bps[ch][blk],
-                    Some((dba, ch)),
-                );
+                eval.select(AllocSlot::Fbw(ch), blk, &ch_ba);
             }
         }
         if cpl.in_use {
-            let cpl_idx = nchan;
-            let begf_mant = cpl.begf_mant();
-            let endf_mant = cpl.endf_mant();
             let mut cpl_ba = *ba_in;
             cpl_ba.fsnroffst = ba_in.cplfsnroffst;
             cpl_ba.fgaincod = ba_in.cplfgaincod;
-            for blk in 0..exps[cpl_idx].len() {
-                compute_bap_cpl(
-                    &exps[cpl_idx][blk],
-                    begf_mant,
-                    endf_mant,
-                    fscod,
-                    &cpl_ba,
-                    &mut bps[cpl_idx][blk],
-                    Some((dba, MAX_FBW)),
-                );
+            for blk in 0..exps[nchan].len() {
+                eval.select(AllocSlot::Cpl, blk, &cpl_ba);
             }
         }
         if lfeon {
-            let lfe_idx = nchan + 1;
             let mut lfe_ba = *ba_in;
             lfe_ba.fsnroffst = ba_in.lfefsnroffst;
             lfe_ba.fgaincod = ba_in.lfefgaincod;
-            for blk in 0..exps[lfe_idx].len() {
-                compute_bap(
-                    &exps[lfe_idx][blk],
-                    LFE_END_MANT,
-                    fscod,
-                    &lfe_ba,
-                    &mut bps[lfe_idx][blk],
-                    None,
-                );
+            for blk in 0..exps[nchan + 1].len() {
+                eval.select(AllocSlot::Lfe, blk, &lfe_ba);
             }
         }
-        mantissa_bits_total_ends(&bps, end, end_ch, nchan, cpl, lfeon)
+        eval.used()
     };
 
     // Per-channel greedy bumps, **least-served first with fairness
@@ -4501,48 +4774,28 @@ pub(crate) fn tune_per_block_snroffst_with_plan(
     // Helper: compute current total mantissa bits across all blocks
     // under the current `plan`, plus per-block snroffste overhead
     // delta vs the pre-#170 baseline (block-0-only emission).
+    // The redistribution always walks every fbw channel to the common
+    // `end` (the per-block tuner predates per-channel bandwidths).
+    let eval = std::cell::RefCell::new(AllocEval::new(
+        exps, end, None, nchan, fscod, cpl, dba, lfeon,
+    ));
     let recompute = |plan: &PerBlockSnr| -> u32 {
-        let mut bps: Vec<Vec<[u8; N_COEFFS]>> =
-            vec![vec![[0u8; N_COEFFS]; exps[0].len()]; nchan + 2];
+        let mut eval = eval.borrow_mut();
         for blk in 0..BLOCKS_PER_FRAME {
             for ch in 0..nchan {
                 let ch_ba = plan.ba_for_fbw(ba, blk, ch);
-                compute_bap(
-                    &exps[ch][blk],
-                    end,
-                    fscod,
-                    &ch_ba,
-                    &mut bps[ch][blk],
-                    Some((dba, ch)),
-                );
+                eval.select(AllocSlot::Fbw(ch), blk, &ch_ba);
             }
             if cpl.in_use {
-                let cpl_idx = nchan;
                 let cpl_ba = plan.ba_for_cpl(ba, blk);
-                compute_bap_cpl(
-                    &exps[cpl_idx][blk],
-                    cpl.begf_mant(),
-                    cpl.endf_mant(),
-                    fscod,
-                    &cpl_ba,
-                    &mut bps[cpl_idx][blk],
-                    Some((dba, MAX_FBW)),
-                );
+                eval.select(AllocSlot::Cpl, blk, &cpl_ba);
             }
             if lfeon {
-                let lfe_idx = nchan + 1;
                 let lfe_ba = plan.ba_for_lfe(ba, blk);
-                compute_bap(
-                    &exps[lfe_idx][blk],
-                    LFE_END_MANT,
-                    fscod,
-                    &lfe_ba,
-                    &mut bps[lfe_idx][blk],
-                    None,
-                );
+                eval.select(AllocSlot::Lfe, blk, &lfe_ba);
             }
         }
-        mantissa_bits_total(&bps, end, nchan, cpl, lfeon)
+        eval.used()
     };
 
     // Per-block snroffste overhead bits when set to 1 (block 0 was
@@ -5548,6 +5801,156 @@ pub(crate) fn reconstruct_cplco(cplcoexp: u8, cplcomant: u8, mstrcplco: u8) -> f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `AllocEval` is the pair `compute_bap` / `compute_bap_cpl` +
+    /// `mantissa_bits_total_ends` computed incrementally: for random
+    /// exponent sets, coupling on and off, with and without an LFE and
+    /// across the whole SNR-offset range it returns the same bit count,
+    /// and its lower bound is a monotone floor of it.
+    #[test]
+    fn alloc_eval_matches_the_reference_bit_count() {
+        // Table 7.16 must be monotone for the lower-bound argument.
+        assert!(BAPTAB.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        let mut seed = 0x2545_f491_u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let base = BitAllocParams {
+            sdcycod: 2,
+            fdcycod: 1,
+            sgaincod: 1,
+            dbpbcod: 2,
+            floorcod: 4,
+            csnroffst: 0,
+            fsnroffst: 0,
+            fsnroffst_ch: [0u8; MAX_FBW],
+            cplfsnroffst: 0,
+            lfefsnroffst: 0,
+            fgaincod: 4,
+            cplfgaincod: 3,
+            lfefgaincod: 5,
+        };
+        for round in 0..24 {
+            let nchan = 1 + round % 5;
+            let lfeon = round % 2 == 0;
+            let fscod = (round % 3) as u8;
+            let cpl = if nchan >= 2 && round % 3 != 0 {
+                let mut plan = CouplingPlan {
+                    in_use: true,
+                    begf: (round % 6) as u8,
+                    endf: 9,
+                    ..CouplingPlan::default()
+                };
+                plan.nsubbnd = 3 + plan.endf as usize - plan.begf as usize;
+                for ch in 0..nchan {
+                    // Leave the first channel out now and then.
+                    plan.chincpl[ch] = !(ch == 0 && round % 4 == 1);
+                }
+                plan
+            } else {
+                CouplingPlan::default()
+            };
+            let end = if cpl.in_use {
+                cpl.begf_mant()
+            } else {
+                200 + round
+            };
+            let ends: Vec<usize> = (0..nchan).map(|ch| end - 12 * (ch % 3)).collect();
+            let end_ch = (round % 2 == 1 && !cpl.in_use).then_some(&ends[..]);
+            // Smooth-ish random exponents, a different envelope per block.
+            let exps: Vec<Vec<[u8; N_COEFFS]>> = (0..nchan + 2)
+                .map(|_| {
+                    (0..BLOCKS_PER_FRAME)
+                        .map(|_| {
+                            let mut e = [24u8; N_COEFFS];
+                            let mut level = 4 + (next() % 12) as i32;
+                            for value in e.iter_mut() {
+                                level = (level + (next() % 5) as i32 - 2).clamp(0, 24);
+                                *value = level as u8;
+                            }
+                            e
+                        })
+                        .collect()
+                })
+                .collect();
+            let dba = DbaPlan::default();
+            let mut eval = AllocEval::new(&exps, end, end_ch, nchan, fscod, &cpl, &dba, lfeon);
+            let mut previous_bound = 0u64;
+            for combined in (0..1024).step_by(7).chain([1023]) {
+                let mut cand = base;
+                cand.csnroffst = (combined >> 4) as u8;
+                cand.fsnroffst = (combined & 15) as u8;
+                cand.cplfsnroffst = cand.fsnroffst;
+                cand.lfefsnroffst = cand.fsnroffst;
+                // Every third offset gives one channel its own fine offset.
+                let own = (combined % 3 == 0).then_some(((combined / 3) & 15) as u8);
+                let mut cpl_ba = cand;
+                cpl_ba.fsnroffst = cand.cplfsnroffst;
+                cpl_ba.fgaincod = cand.cplfgaincod;
+                let mut lfe_ba = cand;
+                lfe_ba.fsnroffst = cand.lfefsnroffst;
+                lfe_ba.fgaincod = cand.lfefgaincod;
+
+                let mut baps: Vec<Vec<[u8; N_COEFFS]>> =
+                    vec![vec![[0u8; N_COEFFS]; BLOCKS_PER_FRAME]; nchan + 2];
+                for blk in 0..BLOCKS_PER_FRAME {
+                    for ch in 0..nchan {
+                        let mut ch_ba = cand;
+                        if let (Some(fine), 0) = (own, ch) {
+                            ch_ba.fsnroffst = fine;
+                        }
+                        let ch_end = end_ch.map_or(end, |e| e[ch]);
+                        compute_bap(
+                            &exps[ch][blk],
+                            ch_end,
+                            fscod,
+                            &ch_ba,
+                            &mut baps[ch][blk],
+                            Some((&dba, ch)),
+                        );
+                        eval.select(AllocSlot::Fbw(ch), blk, &ch_ba);
+                    }
+                    if cpl.in_use {
+                        compute_bap_cpl(
+                            &exps[nchan][blk],
+                            cpl.begf_mant(),
+                            cpl.endf_mant(),
+                            fscod,
+                            &cpl_ba,
+                            &mut baps[nchan][blk],
+                            Some((&dba, MAX_FBW)),
+                        );
+                        eval.select(AllocSlot::Cpl, blk, &cpl_ba);
+                    }
+                    if lfeon {
+                        compute_bap(
+                            &exps[nchan + 1][blk],
+                            LFE_END_MANT,
+                            fscod,
+                            &lfe_ba,
+                            &mut baps[nchan + 1][blk],
+                            None,
+                        );
+                        eval.select(AllocSlot::Lfe, blk, &lfe_ba);
+                    }
+                }
+                let reference = mantissa_bits_total_ends(&baps, end, end_ch, nchan, &cpl, lfeon);
+                assert_eq!(eval.used(), reference, "round {round} offset {combined}");
+                let bound = eval.used_lower_bound_x6();
+                assert!(bound <= 6 * u64::from(reference));
+                // Group rounding adds at most 4 + 6 + 3 bits per block.
+                assert!(6 * u64::from(reference) <= bound + 6 * 13 * BLOCKS_PER_FRAME as u64);
+                if own.is_none() {
+                    assert!(bound >= previous_bound, "round {round} offset {combined}");
+                    previous_bound = bound;
+                }
+            }
+        }
+    }
     use oxideav_core::{CodecId, CodecParameters, SampleFormat};
 
     /// Walk the decoder's grouped-exponent reconstruction (matches

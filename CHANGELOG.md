@@ -53,6 +53,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- E-AC-3 decoder: a hostile packet whose first syncframe is concealed
+  (no program channels) panicked with an out-of-bounds index when a
+  mono / stereo downmix was requested; the §7.8 matrix input is now
+  bounded by the channels the program actually has. Found by the
+  `decode_frames` fuzz target once it started requesting stereo.
 - Decoder (AC-3 and E-AC-3): the §7.3.4 dither generator returned its
   whole 16-bit register after a one-bit shift, so values landing on
   adjacent transform coefficients correlated at 0.5 and a sparsely-set
@@ -69,6 +74,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Performance, output bit-identical (`examples/throughput.rs`; 5.1,
+  single thread, × real time before → after): AC-3 encode 0.7 → 25.6,
+  E-AC-3 encode 0.6 → 19.7 (SPX + coupling 1.2 → 36.3, AHT 2.1 →
+  42.6); AC-3 decode 253 → 469, E-AC-3 decode 228 → 402; JOC object
+  rendering 8–10 → 37–44. Tabulated forward-MDCT kernels, a
+  mask-once / bisected SNR-offset search, memoised exponent-cadence
+  runs, cached IMDCT twiddles and FFT stage tables, tabulated `2^-exp`,
+  debug switches read once per process, and QMF / object-mix loops
+  nested for independent accumulators.
 - API hygiene: `DrcMode` (enum) and the records `CrcStatus`,
   `DrcSettings`, `encoder::AudioProductionParams`,
   `encoder::MetadataParams`, `eac3::EcplParams`, `eac3::SpxParams`,

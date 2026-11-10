@@ -27,16 +27,71 @@
 //! combined round-trip gain is `1.0`.
 
 use std::f32::consts::PI;
+use std::sync::OnceLock;
+
+/// Cosine kernels of the three forward transforms, laid out
+/// `[n][k]` so the transform can walk the input once and update every
+/// coefficient's running sum in a contiguous (vectorisable) inner loop.
+///
+/// Each entry is computed with exactly the expression the direct form
+/// evaluates per term, so tabulating changes no output bit.
+struct Kernels {
+    /// 512 × 256, α = 0.
+    long: Vec<f32>,
+    /// 256 × 128, α = −1 (first short transform).
+    short_first: Vec<f32>,
+    /// 256 × 128, α = +1 (second short transform).
+    short_second: Vec<f32>,
+}
+
+fn kernels() -> &'static Kernels {
+    static KERNELS: OnceLock<Kernels> = OnceLock::new();
+    KERNELS.get_or_init(|| {
+        let n: usize = 512;
+        let two_pi_over_4n = 2.0 * PI / (4.0 * n as f32);
+        let pi_over_4 = PI / 4.0;
+        let mut long = vec![0.0f32; 512 * 256];
+        for nn in 0..n {
+            for k in 0..256 {
+                let two_k_plus_1 = (2 * k + 1) as f32;
+                let phase_b = pi_over_4 * two_k_plus_1; // α = 0 → (1+α) = 1
+                let phase = two_pi_over_4n * (2 * nn + 1) as f32 * two_k_plus_1 + phase_b;
+                long[nn * 256 + k] = phase.cos();
+            }
+        }
+        let short = |alpha: f32| {
+            let n: usize = 256;
+            // (2π/4N)·(2n+1)·(2k+1) = (π/2N)·(2n+1)·(2k+1).
+            let pi_over_2n = PI / (2.0 * n as f32);
+            let quarter_pi = PI / 4.0;
+            let mut table = vec![0.0f32; 256 * 128];
+            for nn in 0..n {
+                for k in 0..128 {
+                    let two_k_plus_1 = (2 * k + 1) as f32;
+                    let phase_offset = quarter_pi * two_k_plus_1 * (1.0 + alpha);
+                    let phase = pi_over_2n * (2 * nn + 1) as f32 * two_k_plus_1 + phase_offset;
+                    table[nn * 128 + k] = phase.cos();
+                }
+            }
+            table
+        };
+        Kernels {
+            long,
+            short_first: short(-1.0),
+            short_second: short(1.0),
+        }
+    })
+}
 
 /// 512-point forward MDCT (§8.2.3.2, α=0 long transform).
 ///
 /// `input`  : 512 windowed time-domain samples.
 /// `output` : 256 MDCT coefficients — indices 0..N/2.
 ///
-/// The reference implementation is `O(N^2)` — 256 × 512 ≈ 128 k
-/// multiply-adds per block. For a 48 kHz stereo frame we run it 12
-/// times per syncframe, well inside budget for a pure-Rust encoder
-/// whose job is correctness first.
+/// Direct form, `O(N^2)`: 256 × 512 multiply-adds per block against the
+/// tabulated kernel. Every coefficient accumulates its terms in input
+/// order (`n` ascending), so the result is bit-identical to evaluating
+/// the §8.2.3.2 sum coefficient by coefficient.
 pub fn mdct_512(input: &[f32; 512], output: &mut [f32; 256]) {
     let n: usize = 512;
     // §8.2.3.2 mandates a `-2/N` normalisation. Combined with the
@@ -44,17 +99,14 @@ pub fn mdct_512(input: &[f32; 512], output: &mut [f32; 256]) {
     // analysis-synthesis round-trip lands on unity gain (to within
     // window-table rounding).
     let scale: f32 = -2.0 / n as f32;
-    let two_pi_over_4n = 2.0 * PI / (4.0 * n as f32);
-    let pi_over_4 = PI / 4.0;
-    for k in 0..256 {
-        let mut s = 0.0f32;
-        let two_k_plus_1 = (2 * k + 1) as f32;
-        let phase_b = pi_over_4 * two_k_plus_1; // α = 0 → (1+α) = 1
-        for nn in 0..n {
-            let phase = two_pi_over_4n * (2 * nn + 1) as f32 * two_k_plus_1 + phase_b;
-            s += input[nn] * phase.cos();
+    let mut sums = [0.0f32; 256];
+    for (&x, row) in input.iter().zip(kernels().long.as_chunks::<256>().0) {
+        for (s, &c) in sums.iter_mut().zip(row) {
+            *s += x * c;
         }
-        output[k] = scale * s;
+    }
+    for (out, s) in output.iter_mut().zip(sums) {
+        *out = scale * s;
     }
 }
 
@@ -75,23 +127,26 @@ pub fn mdct_512(input: &[f32; 512], output: &mut [f32; 256]) {
 ///
 /// `input`  : 256 windowed time-domain samples (one half of the
 ///            short-block pair).
-/// `alpha`  : −1 for the first short transform, +1 for the second.
+/// `second` : `false` for the first short transform (α = −1), `true`
+///            for the second (α = +1).
 /// `output` : 128 MDCT coefficients.
-fn mdct_256_half(input: &[f32; 256], alpha: f32, output: &mut [f32; 128]) {
+fn mdct_256_half(input: &[f32; 256], second: bool, output: &mut [f32; 128]) {
     let n: usize = 256;
     let scale: f32 = -2.0 / n as f32;
-    // (2π/4N)·(2n+1)·(2k+1) = (π/2N)·(2n+1)·(2k+1).
-    let pi_over_2n = PI / (2.0 * n as f32);
-    let quarter_pi = PI / 4.0;
-    for k in 0..128 {
-        let mut s = 0.0f32;
-        let two_k_plus_1 = (2 * k + 1) as f32;
-        let phase_offset = quarter_pi * two_k_plus_1 * (1.0 + alpha);
-        for nn in 0..n {
-            let phase = pi_over_2n * (2 * nn + 1) as f32 * two_k_plus_1 + phase_offset;
-            s += input[nn] * phase.cos();
+    let kernels = kernels();
+    let table = if second {
+        &kernels.short_second
+    } else {
+        &kernels.short_first
+    };
+    let mut sums = [0.0f32; 128];
+    for (&x, row) in input.iter().zip(table.as_chunks::<128>().0) {
+        for (s, &c) in sums.iter_mut().zip(row) {
+            *s += x * c;
         }
-        output[k] = scale * s;
+    }
+    for (out, s) in output.iter_mut().zip(sums) {
+        *out = scale * s;
     }
 }
 
@@ -125,8 +180,8 @@ pub fn mdct_256_pair(input: &[f32; 512], output: &mut [f32; 256]) {
     let mut x1 = [0.0f32; 128];
     let mut x2 = [0.0f32; 128];
     // First short transform uses α=−1, the second α=+1 (§8.2.3.2).
-    mdct_256_half(&h1, -1.0, &mut x1);
-    mdct_256_half(&h2, 1.0, &mut x2);
+    mdct_256_half(&h1, false, &mut x1);
+    mdct_256_half(&h2, true, &mut x2);
     for k in 0..128 {
         output[2 * k] = x1[k];
         output[2 * k + 1] = x2[k];
@@ -138,6 +193,58 @@ mod tests {
     use super::*;
     use crate::audblk;
     use crate::tables::WINDOW;
+
+    /// The tabulated transforms are the §8.2.3.2 sums, bit for bit: each
+    /// coefficient accumulates `x[n]·cos(..)` over ascending `n` with the
+    /// kernel evaluated by the same expression.
+    #[test]
+    fn tabulated_kernels_reproduce_the_direct_sums_exactly() {
+        let mut seed = 0x1234_5678_u32;
+        let mut input = [0.0f32; 512];
+        for value in &mut input {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *value = (seed >> 8) as f32 / (1 << 23) as f32 - 1.0;
+        }
+        let mut long = [0.0f32; 256];
+        mdct_512(&input, &mut long);
+        let n = 512usize;
+        let two_pi_over_4n = 2.0 * PI / (4.0 * n as f32);
+        for k in 0..256 {
+            let two_k_plus_1 = (2 * k + 1) as f32;
+            let phase_b = (PI / 4.0) * two_k_plus_1;
+            let mut s = 0.0f32;
+            for (nn, x) in input.iter().enumerate() {
+                let phase = two_pi_over_4n * (2 * nn + 1) as f32 * two_k_plus_1 + phase_b;
+                s += x * phase.cos();
+            }
+            assert_eq!(
+                long[k].to_bits(),
+                ((-2.0 / n as f32) * s).to_bits(),
+                "long k={k}"
+            );
+        }
+
+        let mut pair = [0.0f32; 256];
+        mdct_256_pair(&input, &mut pair);
+        let n = 256usize;
+        let pi_over_2n = PI / (2.0 * n as f32);
+        for (half, alpha) in [(0usize, -1.0f32), (1, 1.0)] {
+            for k in 0..128 {
+                let two_k_plus_1 = (2 * k + 1) as f32;
+                let phase_offset = (PI / 4.0) * two_k_plus_1 * (1.0 + alpha);
+                let mut s = 0.0f32;
+                for nn in 0..n {
+                    let phase = pi_over_2n * (2 * nn + 1) as f32 * two_k_plus_1 + phase_offset;
+                    s += input[half * 256 + nn] * phase.cos();
+                }
+                assert_eq!(
+                    pair[2 * k + half].to_bits(),
+                    ((-2.0 / n as f32) * s).to_bits(),
+                    "short half={half} k={k}"
+                );
+            }
+        }
+    }
 
     /// Forward MDCT followed by the decoder's IMDCT should approximately
     /// invert under the AC-3 windowing + TDAC overlap-add rule. We feed

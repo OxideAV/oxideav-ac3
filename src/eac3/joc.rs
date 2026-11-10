@@ -52,6 +52,41 @@ pub struct JocMetadata {
     pub(super) object_updates: Vec<JocObjectUpdate>,
 }
 
+impl JocMetadata {
+    /// Synthetic 5.X metadata: object `n` is reconstructed from JOC
+    /// channel `routing[n] % 5` alone (order L, R, C, Ls, Rs) with unit
+    /// gain in every parameter band, and `oamd_payload` carries the
+    /// object properties. For tests, benches and fuzz harnesses.
+    #[doc(hidden)]
+    pub fn synthetic(sequence_count: u16, oamd_payload: Vec<u8>, routing: &[usize]) -> Self {
+        Self {
+            complexity_index: 1,
+            group_id: 0,
+            oamd_payload,
+            joc_payload: Vec::new(),
+            downmix_config: 0,
+            num_objects: routing.len().min(255) as u8,
+            extension_config: 0,
+            sequence_count,
+            num_channels: 5,
+            clip_gain: 1.0,
+            object_updates: routing
+                .iter()
+                .map(|&channel| {
+                    let mut coefficients = vec![0.0; 5];
+                    coefficients[channel % 5] = 1.0;
+                    JocObjectUpdate::Parameters {
+                        num_bands: 1,
+                        slope: false,
+                        offsets: Vec::new(),
+                        coefficients,
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum JocObjectUpdate {
     /// No side information was sent for this object; retain the previous frame's
