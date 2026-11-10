@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.12...v0.0.13) - 2026-11-10
+
+### Other
+
+- neutral names for the programme-matrix tests; AHT rate-distortion gap analysed
+- encoders 20-40x, decoders ~1.8x, JOC rendering ~4.5x, output bit-identical; concealed-frame downmix panic fixed
+- decorrelated §7.3.4 dither generator; programme-content decode matrix vs the black-box decoder ([#13](https://github.com/OxideAV/oxideav-ac3/pull/13))
+- JOC objects render to a caller-selected speaker layout (stereo .. 9.1.6) ([#20](https://github.com/OxideAV/oxideav-ac3/pull/20))
+- trim the coupling sweeps (quarter-second streams, de-duplicated default region) for debug-profile CI time ([#13](https://github.com/OxideAV/oxideav-ac3/pull/13))
+- noise-ceiling-aware decode-vs-ffmpeg gates + segment dropout check; local broadcast-capture gate uses them ([#13](https://github.com/OxideAV/oxideav-ac3/pull/13))
+- standard coupling in the encoder (SPX co-active, derived cplendf) + §7.3.4 dither of zero-bit coupled bins ([#13](https://github.com/OxideAV/oxideav-ac3/pull/13))
+- API hygiene: non_exhaustive option/info records + builders
+
 ### Added
 
 - E-AC-3 decoder: **JOC objects render to a caller-selected speaker
