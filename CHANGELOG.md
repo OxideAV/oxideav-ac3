@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- E-AC-3 decoder: **JOC objects render to a caller-selected speaker
+  layout** — `stereo`, `5.1`, `5.1.2`, `5.1.4`, `7.1`, `7.1.2`, `7.1.4`,
+  `9.1.6` (`eac3::JocLayout`, speakers as `eac3::JocSpeaker`). Typed
+  options `decoder::Eac3DecoderOptions` with
+  `decoder::make_eac3_decoder_with_options` /
+  `make_eac3_decoder_with_joc_layout`; on the registry path the
+  `joc_layout` entry of `CodecParameters::options` (schema registered
+  with the `eac3` decoder). A multichannel layout fixes the output
+  shape: object frames are rendered with a layered equal-power balance
+  panner driven by the OAMD position, size, channel lock and zone
+  constraints (TS 103 420 geometry: clause 4.2.1, Tables A.7, B.10,
+  20, 21; the panning law is this crate's design), every other frame
+  routes its coded channels to their own speakers, and
+  `Decoder::output_params` describes the layout (#20).
+- OAMD bed objects keep their speaker label (Tables 12 / 13) and are
+  rendered — at their own speaker, or panned at its Table B.10 position
+  when the layout lacks it. Bed programs previously fell back to the
+  channel downmix.
+
 - E-AC-3 encoder: standard coupling (`cpl`, `cpl_begf`, `cpl_endf`
   options; Annex E `ecplinu = 0`), co-active with SPX through the Table
   E1.4 derived (possibly negative) `cplendf` — the issue-#13 broadcast

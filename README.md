@@ -32,7 +32,8 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
    (`acmod ∈ {3, 5, 7}`).
 7. [`encoder`] — base AC-3 encoder.
 8. [`eac3`] — Annex E decoder + encoder, including opt-in JOC/OAMD
-   object reconstruction and stereo speaker rendering.
+   object reconstruction and rendering to a selectable speaker layout
+   (stereo … 9.1.6).
 9. [`crc`] — §7.10.1 CRC-16 over poly 0x8005, shared between the encoder
    and the opt-in `decoder::verify_packet_crc` residue check.
 10. [`drc`] — §6.1.9 / §7.6 / §7.7 dynamic-range-control + dialogue-
@@ -233,16 +234,13 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   the same checks, so a broadcast capture with SPX noise blending and
   dither — the norm — is judged against its own noise ceiling instead
   of an unreachable 50 dB.
-- **Opt-in JOC object presentation**
-  (`decoder::make_eac3_decoder_with_joc`) parses EC-3 Extension Type A
+- **Opt-in JOC object presentation** parses EC-3 Extension Type A
   and EMDF metadata from declared E-AC-3 skip fields, reconstructs up to
   16 object signals with the TS 103 420 sparse/QMF pipeline, applies
-  dynamic OAMD updates, and renders a stereo speaker presentation. The
-  existing decoder factories retain their compatibility downmix, and the
-  opt-in decoder falls back to that path on absent, malformed, or
-  unsupported metadata. This is a standards-derived speaker renderer,
-  not Dolby's proprietary binaural/headphone renderer; encoding JOC is
-  outside its scope.
+  dynamic OAMD updates, and renders the objects to a **caller-selected
+  speaker layout** — see "JOC object rendering" below. This is a
+  standards-derived speaker renderer, not Dolby's proprietary
+  binaural/headphone renderer; encoding JOC is outside its scope.
 - Encoder — independent + dependent substream pairs for 1.0 / 2.0 / 5.1
   / 7.1 layouts, with adaptive / frame-based exponent strategies,
   fractional syncframes (§E.2.3.1.5 — see below) and the §3.7
@@ -486,6 +484,103 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   a TPNP corruption sweep, and the external decoder binary accepts
   the syntax (27.4 dB on impulse-train content).
 
+### JOC object rendering (target speaker layout)
+
+An E-AC-3 stream with joint object coding carries a 5.1 downmix plus
+the side information to rebuild up to 16 audio objects and their
+positions (ETSI TS 103 420). The decoder renders those objects to the
+speaker layout you choose:
+
+| `joc_layout` | [`JocLayout`] | channels, in output order |
+| --- | --- | --- |
+| `stereo` | `Stereo` | L, R |
+| `5.1` | `Surround51` | L, R, C, LFE, Ls, Rs |
+| `5.1.2` | `Surround512` | 5.1 + Tsl, Tsr |
+| `5.1.4` | `Surround514` | 5.1 + Tfl, Tfr, Tbl, Tbr |
+| `7.1` | `Surround71` | L, R, C, LFE, Ls, Rs, Lb, Rb |
+| `7.1.2` | `Surround712` | 7.1 + Tsl, Tsr |
+| `7.1.4` | `Surround714` | 7.1 + Tfl, Tfr, Tbl, Tbr |
+| `9.1.6` | `Surround916` | 7.1 + Lw, Rw + Tfl, Tfr, Tsl, Tsr, Tbl, Tbr |
+
+Select it on either construction path:
+
+```rust
+use oxideav_ac3::decoder::{Eac3DecoderOptions, make_eac3_decoder_with_options};
+use oxideav_ac3::eac3::JocLayout;
+use oxideav_core::{CodecId, CodecParameters};
+
+// Direct API (typed options).
+let params = CodecParameters::audio(CodecId::new("eac3"));
+let options = Eac3DecoderOptions::new().with_joc_layout(JocLayout::Surround714);
+let decoder = make_eac3_decoder_with_options(&params, &options)?;
+
+// Registry path: the same option in the parameter bag.
+let mut params = CodecParameters::audio(CodecId::new("eac3"));
+params.options.insert("joc_layout", "7.1.4");
+let decoder = registry.first_decoder(&params)?;
+```
+
+With a multichannel layout the decoder **always** outputs that layout
+(`Decoder::output_params` reports the channel count and channel layout;
+S16 or F32 as usual): frames with valid 5.X JOC/OAMD metadata are
+rendered from the reconstructed objects, and every other frame — a
+stream without object metadata, a malformed or unsupported
+presentation, plain AC-3 — has its coded channels (dependent-substream
+extensions included) routed to their own speakers, so the output shape
+never changes mid-stream. `joc_layout = stereo` is the historical
+`decoder::make_eac3_decoder_with_joc` behaviour: objects are rendered
+when the caller asks for two channels and the §7.8 downmix is the
+fallback. Stereo, 5.1 and 7.1 are described with the matching
+`oxideav-core` `ChannelLayout`; core has no layout with height or wide
+speakers yet, so the others report `ChannelLayout::DiscreteN(n)` and
+[`JocLayout::speakers`] gives the per-slot speaker
+([`JocSpeaker::channel_position`] where core has the position).
+
+**What comes from the specification and what does not.** TS 103 420
+defines the object properties and the geometry they live in — the
+room-anchored coordinate system (clause 4.2.1), the speaker labels and
+their room positions (clause 4.4, Table B.10), the speaker-to-zone
+assignment (Table A.7), the zone-constraint codes (Tables 20 / 21) and
+the bed-channel assignment (Tables 12 / 13) — and stops at the decoder
+interface: how objects become speaker feeds is left to the renderer.
+The panning law here is therefore **this crate's own design**, a
+layered equal-power balance panner:
+
+- speakers are grouped into the listener-plane layer and the top
+  layer, each layer into rows of equal depth, each row ordered left to
+  right (positions per Table B.10; without a back pair the surround
+  pair takes the back wall, as Table A.7 note 2 counts it as the back
+  zone there);
+- a point object is panned with a sine/cosine law between the layers
+  by its height, between the two rows bracketing its depth, and between
+  the two speakers bracketing its left/right position — the squared
+  gains always sum to one; a layout without a top layer keeps the
+  object in the listener plane;
+- object **size** averages the power of up to 3 × 3 × 3 point sources
+  across the object's extent; **channel lock** sends the object to the
+  single nearest speaker; **zone constraints** (and the elevation flag)
+  remove speakers before panning (a speaker stays when at least one of
+  its zones is included; a constraint that would silence the layout is
+  ignored);
+- **bed objects** (speaker-anchored) play from their own speaker when
+  the layout has it and are panned at that speaker's position
+  otherwise; the LFE is bypassed to the LFE channel;
+- gains follow the OAMD update ramps, evaluated on a 32-sample grid and
+  interpolated linearly in between, delayed with the QMF latency.
+
+The stereo renderer keeps its original law (left/right pan by the X
+coordinate, width spreading toward both speakers) and now also accepts
+bed programs. Not rendered: intermediate-spatial-format objects (the
+standard gives their ring geometry no coordinates — such a program
+takes the channel route), screen-anchored scaling (treated as room
+coordinates; no screen size is known to the decoder), object
+divergence and trim, and the 7.X / 5.X + 2 JOC downmix configurations.
+No JOC bitstream is available to this project, so the renderer is
+validated on synthetic JOC/OAMD metadata (unit tests next to the
+renderer: speaker-exact placement, unit power across the room, ramps
+without discontinuities, bed identity, zone / lock / extent behaviour)
+and the layout contract on encoder-made streams (`tests/joc_layout.rs`).
+
 ### Elementary-stream container (`.ac3` / `.eac3` / `.ec3`)
 
 [`container`] registers the raw elementary stream with the runtime's
@@ -544,7 +639,9 @@ runs via the `Fuzz` workflow; corpora seed from the fixture set):
   bytes, incl. the metadata opt-in chains and the fractional-frame
   `convsync` tail.
 - **`decode_frames`** — the registry AC-3 / E-AC-3 packet → PCM path,
-  multiple carved packets on one stateful decoder.
+  multiple carved packets on one stateful decoder, with the
+  `joc_layout` option and the F32 output format picked by the input
+  (a fixed layout must keep its frame shape on every hostile frame).
 - **`eac3_substream_walk`** — a persistent `Eac3DecoderState` over
   syncinfo-split syncframes: substream accumulation + §E.3.8.2
   chanmap channel combination.
@@ -552,8 +649,9 @@ runs via the `Fuzz` workflow; corpora seed from the fixture set):
   (added with the #15 JOC contribution): EC-3 Extension Type A
   signalling, the EMDF container walk with its sparse / dense
   Huffman matrix decode, the standalone OAMD object-element decoder,
-  and the QMF object reconstruction + stereo renderer on every
-  container that parses (corpus seeded with synthetic valid EMDF).
+  and the QMF object reconstruction + object renderer (stereo and a
+  selector-picked multichannel layout) on every container that parses
+  (corpus seeded with synthetic valid EMDF).
 - **`encode_decode_roundtrip`** — structure-aware differential
   testing: a fuzz-picked contract-valid configuration (layout × rate
   × blocks × SPX/AHT/ecpl/TPNP × metadata) encodes arbitrary PCM and

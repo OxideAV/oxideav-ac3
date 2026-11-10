@@ -11,6 +11,8 @@
 
 use std::fmt;
 
+use super::joc_layout::JocSpeaker;
+
 const MAX_OAMD_OBJECTS: usize = 128;
 const MAX_OAMD_ELEMENTS: usize = 31;
 const MAX_VARIABLE_BITS_GROUPS: usize = 4;
@@ -49,11 +51,14 @@ pub(super) struct OamdObjectState {
 }
 
 impl OamdObjectState {
-    fn default_for(kind: OamdObjectKind) -> Self {
-        let position = if matches!(kind, OamdObjectKind::Lfe) {
-            [-1.0, 1.0, -1.0]
-        } else {
-            [0.5, 0.5, 0.0]
+    /// Initial state of an object. A bed object is speaker-anchored
+    /// (clause 5.2.1.4): its position is the room position of its
+    /// speaker label and never changes.
+    fn default_for(kind: OamdObjectKind, label: Option<JocSpeaker>) -> Self {
+        let position = match (kind, label) {
+            (OamdObjectKind::Lfe, _) => [-1.0, 1.0, -1.0],
+            (OamdObjectKind::Bed, Some(speaker)) => speaker.room_position(),
+            _ => [0.5, 0.5, 0.0],
         };
         Self {
             active: true,
@@ -92,6 +97,8 @@ pub(super) struct OamdUpdateBlock {
 #[doc(hidden)]
 pub struct OamdFrame {
     pub(super) kinds: Vec<OamdObjectKind>,
+    /// Speaker label of each bed object (`None` for every other kind).
+    pub(super) labels: Vec<Option<JocSpeaker>>,
     pub(super) starting_objects: Vec<OamdObjectState>,
     pub(super) updates: Vec<OamdUpdateBlock>,
 }
@@ -131,6 +138,7 @@ impl fmt::Display for OamdParseError {
 #[doc(hidden)]
 pub struct OamdDecoder {
     kinds: Vec<OamdObjectKind>,
+    labels: Vec<Option<JocSpeaker>>,
     objects: Vec<OamdObjectState>,
 }
 
@@ -138,6 +146,7 @@ impl OamdDecoder {
     #[doc(hidden)]
     pub fn reset(&mut self) {
         self.kinds.clear();
+        self.labels.clear();
         self.objects.clear();
     }
 
@@ -169,7 +178,16 @@ impl OamdDecoder {
             return Err(OamdParseError::Limit("OAMD object count"));
         }
 
-        let kinds = parse_program_assignment(&mut bits, object_count)?;
+        let (kinds, labels) = parse_program_assignment(&mut bits, object_count)?;
+        let same_program =
+            self.kinds == kinds && self.labels == labels && self.objects.len() == object_count;
+        let default_objects = || -> Vec<OamdObjectState> {
+            kinds
+                .iter()
+                .zip(&labels)
+                .map(|(&kind, &label)| OamdObjectState::default_for(kind, label))
+                .collect()
+        };
         let alternate_data = bits.read_flag("OAMD alternate-object-data flag")?;
         let mut element_count = bits.read(4, "OAMD element count")?;
         if element_count == 0x0f {
@@ -183,14 +201,10 @@ impl OamdDecoder {
             return Err(OamdParseError::Limit("OAMD element count"));
         }
 
-        let mut starting_objects = if self.kinds == kinds && self.objects.len() == object_count {
+        let mut starting_objects = if same_program {
             self.objects.clone()
         } else {
-            kinds
-                .iter()
-                .copied()
-                .map(OamdObjectState::default_for)
-                .collect()
+            default_objects()
         };
         let mut parsed_updates = None;
 
@@ -253,34 +267,72 @@ impl OamdDecoder {
 
         let updates =
             parsed_updates.ok_or(OamdParseError::Invalid("missing OAMD object element"))?;
-        let frame_start = if self.kinds == kinds && self.objects.len() == object_count {
+        let frame_start = if same_program {
             self.objects.clone()
         } else {
-            kinds
-                .iter()
-                .copied()
-                .map(OamdObjectState::default_for)
-                .collect()
+            default_objects()
         };
         self.objects = updates
             .last()
             .map_or(frame_start.clone(), |update| update.objects.clone());
         self.kinds.clone_from(&kinds);
+        self.labels.clone_from(&labels);
 
         Ok(OamdFrame {
             kinds,
+            labels,
             starting_objects: frame_start,
             updates,
         })
     }
 }
 
+/// Speaker labels of the `bed_channel_assignment[]` array elements
+/// (Table 12), by array index.
+const STANDARD_BED_LABELS: [&[JocSpeaker]; 10] = [
+    &[JocSpeaker::Lfe], // RC_LFE2
+    &[JocSpeaker::LeftWide, JocSpeaker::RightWide],
+    &[JocSpeaker::TopBackLeft, JocSpeaker::TopBackRight],
+    &[JocSpeaker::TopSideLeft, JocSpeaker::TopSideRight],
+    &[JocSpeaker::TopFrontLeft, JocSpeaker::TopFrontRight],
+    &[JocSpeaker::LeftBack, JocSpeaker::RightBack],
+    &[JocSpeaker::LeftSurround, JocSpeaker::RightSurround],
+    &[JocSpeaker::Lfe],
+    &[JocSpeaker::Center],
+    &[JocSpeaker::Left, JocSpeaker::Right],
+];
+
+/// Speaker labels of the `nonstd_bed_channel_assignment[]` array
+/// elements (Table 13), by array index.
+const NONSTANDARD_BED_LABELS: [JocSpeaker; 17] = [
+    JocSpeaker::Lfe, // RC_LFE2
+    JocSpeaker::RightWide,
+    JocSpeaker::LeftWide,
+    JocSpeaker::TopBackRight,
+    JocSpeaker::TopBackLeft,
+    JocSpeaker::TopSideRight,
+    JocSpeaker::TopSideLeft,
+    JocSpeaker::TopFrontRight,
+    JocSpeaker::TopFrontLeft,
+    JocSpeaker::RightBack,
+    JocSpeaker::LeftBack,
+    JocSpeaker::RightSurround,
+    JocSpeaker::LeftSurround,
+    JocSpeaker::Lfe,
+    JocSpeaker::Center,
+    JocSpeaker::Right,
+    JocSpeaker::Left,
+];
+
+type ProgramAssignment = (Vec<OamdObjectKind>, Vec<Option<JocSpeaker>>);
+
 fn parse_program_assignment(
     bits: &mut BitCursor<'_>,
     object_count: usize,
-) -> Result<Vec<OamdObjectKind>, OamdParseError> {
+) -> Result<ProgramAssignment, OamdParseError> {
     let dynamic_only = bits.read_flag("OAMD dynamic-only-program flag")?;
     let mut kinds = Vec::with_capacity(object_count);
+    let mut labels = Vec::with_capacity(object_count);
     if dynamic_only {
         if bits.read_flag("OAMD LFE-present flag")? {
             // TS 103 420 places the optional LFE first and excludes it from
@@ -288,9 +340,18 @@ fn parse_program_assignment(
             kinds.push(OamdObjectKind::Lfe);
         }
         kinds.resize(object_count, OamdObjectKind::Dynamic);
-        return Ok(kinds);
+        labels.resize(object_count, None);
+        return Ok((kinds, labels));
     }
 
+    let mut push_bed = |kinds: &mut Vec<OamdObjectKind>, speaker: JocSpeaker| {
+        kinds.push(if speaker == JocSpeaker::Lfe {
+            OamdObjectKind::Lfe
+        } else {
+            OamdObjectKind::Bed
+        });
+        labels.push(Some(speaker));
+    };
     let content = bits.read(4, "OAMD content description")? as u8;
     if content & 0b1000 != 0 {
         let _distribute = bits.read_flag("OAMD bed-channel-distribution flag")?;
@@ -302,32 +363,25 @@ fn parse_program_assignment(
         };
         for _ in 0..bed_count {
             if bits.read_flag("OAMD LFE-only-bed flag")? {
-                kinds.push(OamdObjectKind::Lfe);
+                push_bed(&mut kinds, JocSpeaker::Lfe);
                 continue;
             }
+            // Tables 12 / 13: the labels are listed in array-element
+            // order starting with element 0.
             if bits.read_flag("OAMD standard-bed-assignment flag")? {
                 let assignment = bits.read(10, "OAMD standard-bed assignment")?;
-                // Array indices 0..9 contain 1,2,2,2,2,2,2,1,1,2 speakers.
-                let widths = [1_usize, 2, 2, 2, 2, 2, 2, 1, 1, 2];
-                for (index, width) in widths.into_iter().enumerate() {
+                for (index, speakers) in STANDARD_BED_LABELS.iter().enumerate() {
                     if assignment & (1 << index) != 0 {
-                        if index == 0 || index == 7 {
-                            kinds.push(OamdObjectKind::Lfe);
-                            kinds.extend(std::iter::repeat_n(OamdObjectKind::Bed, width - 1));
-                        } else {
-                            kinds.extend(std::iter::repeat_n(OamdObjectKind::Bed, width));
+                        for &speaker in *speakers {
+                            push_bed(&mut kinds, speaker);
                         }
                     }
                 }
             } else {
                 let assignment = bits.read(17, "OAMD nonstandard-bed assignment")?;
-                for index in 0..17 {
+                for (index, &speaker) in NONSTANDARD_BED_LABELS.iter().enumerate() {
                     if assignment & (1 << index) != 0 {
-                        kinds.push(if matches!(index, 0 | 13) {
-                            OamdObjectKind::Lfe
-                        } else {
-                            OamdObjectKind::Bed
-                        });
+                        push_bed(&mut kinds, speaker);
                     }
                 }
             }
@@ -364,7 +418,8 @@ fn parse_program_assignment(
             "OAMD program-assignment object count",
         ));
     }
-    Ok(kinds)
+    labels.resize(object_count, None);
+    Ok((kinds, labels))
 }
 
 fn parse_object_element(
@@ -710,6 +765,175 @@ impl<'a> BitCursor<'a> {
     }
 }
 
+/// Synthetic OAMD payloads for unit tests of the parser and renderer.
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::OBJECT_ELEMENT_ID;
+
+    /// Render information of one dynamic test object (one update block,
+    /// zero-dB gain).
+    #[derive(Clone, Copy, Debug)]
+    pub(in super::super) struct TestObject {
+        /// Raw `pos3D_X/Y` (0..=62) and signed `pos3D_Z` (−15..=15).
+        pub(in super::super) position: [i16; 3],
+        pub(in super::super) zone_constraints: u32,
+        pub(in super::super) elevation: bool,
+        /// `object_size_bits` (0..=31) for all three axes.
+        pub(in super::super) size: u32,
+        pub(in super::super) snap: bool,
+    }
+
+    impl TestObject {
+        pub(in super::super) fn at(position: [i16; 3]) -> Self {
+            Self {
+                position,
+                zone_constraints: 0,
+                elevation: true,
+                size: 0,
+                snap: false,
+            }
+        }
+    }
+
+    /// The program assignment of a test payload.
+    #[derive(Clone, Copy, Debug)]
+    pub(in super::super) enum TestProgram {
+        /// `b_dyn_object_only_program` with an optional leading LFE.
+        Dynamic { lfe: bool },
+        /// One standard bed (`bed_channel_assignment[]` mask) followed by
+        /// the dynamic objects.
+        Bed { assignment: u32, objects: usize },
+    }
+
+    /// A one-update-block payload: `fixed` objects without render
+    /// information (LFE / bed) followed by `objects`, all ramping over
+    /// `ramp_code` (0 = none, 1 = 512, 2 = 1536 samples).
+    pub(in super::super) fn payload(
+        program: TestProgram,
+        fixed: usize,
+        objects: &[TestObject],
+        ramp_code: u32,
+    ) -> Vec<u8> {
+        let mut object = TestBitWriter::default();
+        object.write(0, 2); // sample offset zero
+        object.write(0, 3); // one update block
+        object.write(0, 6); // block offset zero
+        object.write(ramp_code, 2);
+        object.write(1, 1); // reserved data absent
+        for _ in 0..fixed {
+            write_basic_info(&mut object);
+            object.write(0, 1); // no additional table data
+        }
+        for test in objects {
+            write_basic_info(&mut object);
+            object.write(u32::from(test.position[0].unsigned_abs()), 6);
+            object.write(u32::from(test.position[1].unsigned_abs()), 6);
+            object.write(u32::from(test.position[2] >= 0), 1);
+            object.write(u32::from(test.position[2].unsigned_abs()), 4);
+            object.write(0, 1); // no distance
+            object.write(test.zone_constraints, 3);
+            object.write(u32::from(test.elevation), 1);
+            if test.size == 0 {
+                object.write(0, 2); // point object
+            } else {
+                object.write(1, 2);
+                object.write(test.size, 5);
+            }
+            object.write(0, 1); // room coordinates
+            object.write(u32::from(test.snap), 1);
+            object.write(0, 1); // no additional table data
+        }
+        let object_data = object.into_bytes();
+
+        let mut payload = TestBitWriter::default();
+        payload.write(0, 2); // version zero
+        let count = fixed + objects.len();
+        payload.write(u32::try_from(count - 1).expect("object count"), 5);
+        match program {
+            TestProgram::Dynamic { lfe } => {
+                payload.write(1, 1); // dynamic-only program
+                payload.write(u32::from(lfe), 1);
+            }
+            TestProgram::Bed {
+                assignment,
+                objects,
+            } => {
+                payload.write(0, 1);
+                payload.write(if objects > 0 { 0b1010 } else { 0b1000 }, 4);
+                payload.write(0, 1); // no bed-channel distribution
+                payload.write(0, 1); // one bed instance
+                payload.write(0, 1); // not LFE-only
+                payload.write(1, 1); // standard assignment
+                payload.write(assignment, 10);
+                if objects > 0 {
+                    payload.write(u32::try_from(objects - 1).expect("dynamic count"), 5);
+                }
+            }
+        }
+        payload.write(0, 1); // no alternate data
+        payload.write(1, 4); // one element
+        payload.write(u32::from(OBJECT_ELEMENT_ID), 4);
+        // The element is one byte longer than the object data: the
+        // discard flag, the data, seven bits of zero padding.
+        payload.write_variable(u32::try_from(object_data.len()).expect("test element size"));
+        payload.write(0, 1); // retain unknown element
+        for byte in &object_data {
+            payload.write(u32::from(*byte), 8);
+        }
+        payload.write(0, 7);
+        payload.into_bytes()
+    }
+
+    fn write_basic_info(bits: &mut TestBitWriter) {
+        bits.write(0, 1); // active
+        bits.write(0, 2); // zero-dB gain
+        bits.write(1, 1); // default priority
+    }
+
+    #[derive(Default)]
+    struct TestBitWriter {
+        bits: Vec<bool>,
+    }
+
+    impl TestBitWriter {
+        fn write(&mut self, value: u32, width: usize) {
+            for shift in (0..width).rev() {
+                self.bits.push((value >> shift) & 1 != 0);
+            }
+        }
+
+        /// `variable_bits_max(4, ..)` (clause 5.5.1), one or two groups.
+        fn write_variable(&mut self, value: u32) {
+            if value < 16 {
+                self.write(value, 4);
+                self.write(0, 1);
+            } else {
+                let rest = value - 16;
+                assert!(rest < 256);
+                self.write(rest >> 4, 4);
+                self.write(1, 1);
+                self.write(rest & 15, 4);
+                self.write(0, 1);
+            }
+        }
+
+        fn into_bytes(mut self) -> Vec<u8> {
+            while !self.bits.len().is_multiple_of(8) {
+                self.bits.push(false);
+            }
+            self.bits
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|byte| {
+                    byte.iter()
+                        .fold(0_u8, |value, bit| (value << 1) | u8::from(*bit))
+                })
+                .collect()
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::float_cmp)] // Synthetic integer coordinates have exact decoded values.
 mod tests {
@@ -731,6 +955,48 @@ mod tests {
         assert_eq!(frame.updates[0].objects[1].position, [0.0, 0.5, 0.0]);
         assert_eq!(frame.updates[0].objects[2].position, [1.0, 0.5, 0.0]);
         assert_eq!(frame.updates[0].objects[1].linear_gain(), 1.0);
+    }
+
+    /// Table 12: a standard bed lists its labels in array-element order
+    /// and every bed object is anchored at its speaker.
+    #[test]
+    fn standard_bed_assignment_yields_speaker_labels_and_positions() {
+        use super::test_support::{TestObject, TestProgram, payload};
+        // Elements 9 (L/R), 8 (C), 7 (LFE), 6 (Ls/Rs) and 4 (Tfl/Tfr).
+        let assignment = 0b11_1101_0000;
+        let payload = payload(
+            TestProgram::Bed {
+                assignment,
+                objects: 1,
+            },
+            8,
+            &[TestObject::at([62, 0, 15])],
+            0,
+        );
+        let mut decoder = OamdDecoder::default();
+        let frame = decoder.decode(&payload).expect("decode bed OAMD");
+        let labels: Vec<_> = frame.labels.iter().flatten().copied().collect();
+        assert_eq!(
+            labels,
+            [
+                JocSpeaker::TopFrontLeft,
+                JocSpeaker::TopFrontRight,
+                JocSpeaker::LeftSurround,
+                JocSpeaker::RightSurround,
+                JocSpeaker::Lfe,
+                JocSpeaker::Center,
+                JocSpeaker::Left,
+                JocSpeaker::Right,
+            ]
+        );
+        assert_eq!(frame.kinds[4], OamdObjectKind::Lfe);
+        assert_eq!(frame.kinds[8], OamdObjectKind::Dynamic);
+        assert_eq!(frame.labels[8], None);
+        assert_eq!(frame.joc_object_indices().count(), 8);
+        let last = &frame.updates[0].objects;
+        assert_eq!(last[0].position, JocSpeaker::TopFrontLeft.room_position());
+        assert_eq!(last[5].position, [0.5, 0.0, 0.0]);
+        assert_eq!(last[8].position, [1.0, 0.0, 1.0]);
     }
 
     fn make_dynamic_test_payload() -> Vec<u8> {

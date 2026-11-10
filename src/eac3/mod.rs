@@ -153,6 +153,7 @@ pub mod encoder;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod joc;
+pub mod joc_layout;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod joc_qmf;
@@ -194,4 +195,5 @@ pub use encoder::{
     make_encoder_with_ecpl, make_encoder_with_spx, make_encoder_with_spx_ecpl,
     make_encoder_with_tpnp,
 };
+pub use joc_layout::{JocLayout, JocSpeaker, ParseJocLayoutError};
 pub use spxenc::SpxParams;

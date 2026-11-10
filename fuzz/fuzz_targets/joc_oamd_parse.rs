@@ -5,12 +5,14 @@
 //! (payload-config validation, OAMD + JOC payload extraction, sparse /
 //! dense Huffman matrix decode), the standalone OAMD object-element
 //! decoder, and — whenever a container parses — the QMF object
-//! reconstruction + stereo renderer with PCM synthesized from the
-//! input tail. All of these paths receive at most one declared 511-byte
+//! reconstruction + object renderer (stereo and one selector-picked
+//! multichannel layout: panner, bed objects, zone constraints, channel
+//! lock, extent) with PCM synthesized from the input tail. All of these paths receive at most one declared 511-byte
 //! skip field in real streams, so the harness asserts panic-freedom
 //! and bounded allocation on hostile bytes well past that envelope.
 
 use libfuzzer_sys::fuzz_target;
+use oxideav_ac3::eac3::JocLayout;
 use oxideav_ac3::eac3::joc::{parse_ec3_extension_type_a, parse_joc_emdf};
 use oxideav_ac3::eac3::joc_renderer::JocRenderer;
 use oxideav_ac3::eac3::oamd::OamdDecoder;
@@ -48,5 +50,17 @@ fuzz_target!(|data: &[u8]| {
         // (the second pass exercises the discontinuity reset).
         let _ = renderer.render_stereo(&metadata, &pcm, 6, 7, true);
         let _ = renderer.render_stereo(&metadata, &pcm, 6, 7, true);
+
+        let layout = JocLayout::ALL[usize::from(selector >> 4) % JocLayout::ALL.len()];
+        let channels = usize::from(layout.channel_count());
+        let mut renderer = JocRenderer::with_layout(layout);
+        for _ in 0..2 {
+            if let Ok(rendered) = renderer.render(&metadata, &pcm, 6, 7, true) {
+                assert_eq!(rendered.len(), 1536 * channels);
+                assert!(rendered.iter().all(|sample| sample.is_finite()));
+            }
+        }
+        let bed = renderer.render_channel_bed(&pcm, 6, 7, true, &[]);
+        assert_eq!(bed.len(), 1536 * channels);
     }
 });

@@ -36,7 +36,8 @@
 //!    Transform on fbw / LFE / coupling channels, §3.6 spectral
 //!    extension with §3.6.4.2.3 SPXATTEN border notch, and §3.7.2
 //!    transient pre-noise processing, plus opt-in TS 103 420 JOC/OAMD
-//!    object reconstruction and stereo speaker rendering. Encoder covers
+//!    object reconstruction and rendering to a selectable speaker
+//!    layout ([`eac3::JocLayout`]). Encoder covers
 //!    indep+dep-substream pairs for 1.0 / 2.0 / 5.1 / 7.1 layouts,
 //!    fractional syncframes (§E.2.3.1.5 `numblkscod` 0/1/2), and the
 //!    full Annex E tool set: SPX, AHT, enhanced coupling, and
@@ -173,18 +174,21 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         CodecInfo::new(eac3_cid.clone())
             .capabilities(eac3_dec_caps.clone())
             .decoder(make_eac3_decoder)
+            .decoder_options::<decoder::Eac3DecoderOptions>()
             .tag(CodecTag::wave_format(0xA7)),
     );
     reg.register(
         CodecInfo::new(eac3_cid.clone())
             .capabilities(eac3_dec_caps.clone())
             .decoder(make_eac3_decoder)
+            .decoder_options::<decoder::Eac3DecoderOptions>()
             .tag(CodecTag::mp4_object_type(0xA6)),
     );
     reg.register(
         CodecInfo::new(eac3_cid.clone())
             .capabilities(eac3_dec_caps)
             .decoder(make_eac3_decoder)
+            .decoder_options::<decoder::Eac3DecoderOptions>()
             .tag(CodecTag::matroska("A_EAC3")),
     );
     reg.register(
