@@ -134,7 +134,7 @@ impl Eac3DecoderState {
     pub fn reseed_noise(&mut self, seed: u32) {
         let s = if seed == 0 { 0x6D2B_79F5 } else { seed };
         for st in [&mut self.indep_state, &mut self.dep_state] {
-            st.dither_lfsr_state = (s & 0xFFFF).max(1);
+            st.dither_lfsr_state = s;
             st.spx_noise_lfsr = s.rotate_left(16) | 1;
         }
     }

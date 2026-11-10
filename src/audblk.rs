@@ -300,7 +300,7 @@ pub struct Ac3State {
     pub audblk_start_bits: u64,
     /// Which block we are currently parsing (0..6).
     pub blkidx: usize,
-    /// 16-bit LFSR state driving the `bap=0` dither replacement
+    /// Generator state (non-zero) driving the `bap=0` dither replacement
     /// (§7.3.4). Persisted across audio blocks and syncframes so the
     /// dither sequence has a smooth long-period character.
     pub dither_lfsr_state: u32,
@@ -1636,23 +1636,27 @@ fn calc_lowcomp(a: i32, b0: i32, b1: i32, bin: usize) -> i32 {
     a
 }
 
-/// 16-bit Galois LFSR used to generate dither for `bap=0` mantissas
-/// (§7.3.4). The spec says "any reasonably random sequence may be
-/// used" — we use the classic x^16 + x^14 + x^13 + x^11 + 1 polynomial
-/// because it has a maximal 65535-sample period and the output looks
-/// like white noise to within a few bits. Seed is arbitrary but
-/// fixed so decodes are deterministic.
+/// Dither value for a `bap = 0` mantissa (§7.3.4): uniform in
+/// `[-0.707, 0.707)`, the spec's "optimum" scaling.
+///
+/// The spec leaves the sequence to the decoder ("any reasonably random
+/// sequence may be used"). Each call advances a 32-bit xorshift
+/// generator one full step and takes 16 well-mixed bits, so successive
+/// values — which land on adjacent transform coefficients — are
+/// uncorrelated. (The previous generator shifted a 16-bit register by a
+/// single bit per value and returned the whole register: neighbouring
+/// values `x` and `2x mod 1` correlate at 0.5, and a register with few
+/// bits set produced runs of near-identical full-scale values — dither
+/// that was neither spectrally flat within a block nor steady in level
+/// from block to block.) The seed is fixed so decodes are deterministic.
 pub(crate) fn dither_lfsr(state: &mut u32) -> f32 {
-    // Advance the 16-bit LFSR one step and return a uniform value in
-    // the range `[-0.707, 0.707)` — the spec's "optimum" scaling
-    // (0.707 ≈ 1/√2). Uses the classic Fibonacci taps at bits
-    // 15, 13, 12, 10 of a 16-bit state.
-    let bit = ((*state >> 15) ^ (*state >> 13) ^ (*state >> 12) ^ (*state >> 10)) & 1;
-    *state = ((*state << 1) | bit) & 0xFFFF;
-    // Center around zero: bit15 of the 16-bit state becomes the sign,
-    // lower 15 bits provide magnitude.
-    let signed = (*state as i32).wrapping_sub(0x8000) as f32 / 32768.0;
-    signed * 0.707
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    let word = x.wrapping_mul(0x9E37_79B1) >> 16;
+    (word as i32 - 0x8000) as f32 / 32768.0 * 0.707
 }
 
 /// Unpack + dequantize mantissas for all channels (§7.3).
@@ -2477,6 +2481,59 @@ pub fn imdct_512(x: &[f32; 256], out: &mut [f32; 512]) {
             s += x[k] * phase.cos();
         }
         out[nn] = scale * s;
+    }
+}
+
+#[cfg(test)]
+mod dither_tests {
+    use super::*;
+
+    /// §7.3.4 dither: uniform in ±0.707, and — because successive values
+    /// fill adjacent transform coefficients — uncorrelated from one value
+    /// to the next, with no runs of near-identical values.
+    #[test]
+    fn dither_values_are_uniform_and_uncorrelated() {
+        let mut state = 0x1234_u32;
+        let n = 200_000;
+        let values: Vec<f64> = (0..n).map(|_| f64::from(dither_lfsr(&mut state))).collect();
+        assert!(values.iter().all(|v| v.abs() <= f64::from(0.707_f32)));
+        let mean = values.iter().sum::<f64>() / n as f64;
+        let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+        assert!(mean.abs() < 0.005, "mean {mean}");
+        // Uniform on ±a has variance a² / 3.
+        let want = 0.707_f64 * 0.707 / 3.0;
+        assert!((variance / want - 1.0).abs() < 0.02, "variance {variance}");
+        for lag in 1..=16 {
+            let correlation = values
+                .iter()
+                .zip(&values[lag..])
+                .map(|(a, b)| (a - mean) * (b - mean))
+                .sum::<f64>()
+                / ((n - lag) as f64 * variance);
+            assert!(
+                correlation.abs() < 0.02,
+                "lag {lag}: correlation {correlation}"
+            );
+        }
+        // Block-level steadiness: the power of every 12-value group (one
+        // coupling sub-band) stays below three times nominal — a uniform
+        // variable peaks at exactly three times its mean power, so only
+        // a run of full-scale values reaches it.
+        for (index, group) in values.as_chunks::<12>().0.iter().enumerate() {
+            let power = group.iter().map(|v| v * v).sum::<f64>() / 12.0;
+            assert!(power < 2.6 * want, "group {index}: power {power}");
+        }
+        // A small seed (the reseed path accepts any non-zero value) is
+        // mixed from the first draw on.
+        let mut small = 1_u32;
+        let first: Vec<f32> = (0..8).map(|_| dither_lfsr(&mut small)).collect();
+        let spread = first.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
+        assert!(spread > 0.2, "{first:?}");
+        assert!(
+            first
+                .windows(2)
+                .all(|pair| (pair[0] - pair[1]).abs() > 1.0e-3)
+        );
     }
 }
 

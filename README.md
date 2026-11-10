@@ -234,6 +234,33 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   the same checks, so a broadcast capture with SPX noise blending and
   dither — the norm — is judged against its own noise ceiling instead
   of an unreachable 50 dB.
+  A third leg feeds the **foreign encoder programme-like material**
+  (`generated_program_matrix_*`): harmonic music over a noise bed,
+  syllable-gated speech-like noise and sparse click / tone-burst
+  transients, every channel with its own pitch and noise generator, as
+  mono / stereo / 5.1 at 32 / 44.1 / 48 kHz from starved to transparent
+  rates (mono 32–128, stereo 48–384, 5.1 128–768 kb/s) plus the
+  encoder's earliest and latest coupling start — 135 streams, 459
+  channels. Every stream decodes with zero zero-filled frames and no
+  segment dropout; 320 channels sit at ≥ 50 dB against the reference
+  decoder (up to 93.0 dB), and the 139 below it are dither-limited:
+  they track their own decoder-private noise ceiling at 0.11 dB mean,
+  0.68 dB rms, 3.2 dB worst (lowest absolute figure 34.7 dB with a
+  34.8 dB ceiling, on a 128 kb/s mono speech cell where most bins are
+  zero-bit). No real broadcast capture is available to the repository
+  (the staged corpus is synthetic and the reporter's stream is not
+  redistributable), so this matrix and the env-gated local-vector gate
+  stand in for one. The matrix's one finding was in the decoder-private
+  noise itself: the §7.3.4 dither generator shifted a 16-bit register
+  one bit per value and returned the whole register, so neighbouring
+  transform coefficients received values correlated at 0.5 and a
+  sparsely-set register produced runs of near-identical full-scale
+  values (measured on a transient cell: eight adjacent zero-bit bins of
+  one block all near −0.7, 4.7 dB above nominal dither power and 8 dB
+  above the reference decoder in that block). The generator is now a
+  full-step 32-bit xorshift with a multiplicative output mix — values
+  uniform in ±0.707, uncorrelated at every lag, steady from block to
+  block (pinned by `dither_values_are_uniform_and_uncorrelated`).
 - **Opt-in JOC object presentation** parses EC-3 Extension Type A
   and EMDF metadata from declared E-AC-3 skip fields, reconstructs up to
   16 object signals with the TS 103 420 sparse/QMF pipeline, applies

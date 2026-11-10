@@ -319,6 +319,27 @@ fn assert_decode_matches_ffmpeg_floor(
     want_rate: u32,
     floor_db: f64,
 ) {
+    assert_decode_matches_ffmpeg_margin(
+        tag,
+        es,
+        want_channels,
+        want_rate,
+        floor_db,
+        NOISE_MARGIN_DB,
+    );
+}
+
+/// Same gate with an explicit margin under the decoder-private noise
+/// ceiling (sparse transient programmes concentrate the dither in a few
+/// blocks, so a two-decode noise estimate of them scatters more).
+fn assert_decode_matches_ffmpeg_margin(
+    tag: &str,
+    es: &[u8],
+    want_channels: usize,
+    want_rate: u32,
+    floor_db: f64,
+    margin_db: f64,
+) {
     let (ours, channels, rate, zero_filled) =
         our_decode(es).unwrap_or_else(|| panic!("{tag}: our decoder failed on the stream"));
     assert_eq!(channels, want_channels, "{tag}: channel count");
@@ -339,7 +360,7 @@ fn assert_decode_matches_ffmpeg_floor(
     for (ch, p) in psnrs.iter().enumerate() {
         // The fixed floor, lowered only as far as the stream's own
         // decoder-private noise forces it.
-        let floor = floor_db.min(ceiling[ch] - NOISE_MARGIN_DB);
+        let floor = floor_db.min(ceiling[ch] - margin_db);
         assert!(
             *p >= floor,
             "{tag}: ch{ch} PSNR {p:.2} dB below the {floor:.2} dB floor (lag {lag}, noise ceiling {:.2} dB)",
@@ -538,6 +559,141 @@ fn generated_stereo_44100_decodes_like_ffmpeg() {
         return;
     };
     assert_decode_matches_ffmpeg("generated stereo 44.1kHz 128k", &es, 2, 44100);
+}
+
+/// Per-channel lavfi expressions of programme-like material (no real
+/// broadcast capture is available to the repository, so the foreign
+/// encoder is fed content with the properties of one): `music` is a
+/// harmonic stack with slow level motion over a noise bed, `speech` a
+/// syllable-gated noise + pitch mix, `transients` sparse clicks and
+/// tone bursts over near-silence (the block-switching / pre-noise
+/// trigger). Channel `ch` gets its own pitch and noise generator so no
+/// two channels are identical (coupling and rematrixing see real
+/// inter-channel differences).
+fn program_expr(kind: &str, ch: usize) -> String {
+    let f = 110.0 * (1.0 + 0.31 * ch as f64);
+    let r = ch * 4;
+    match kind {
+        "music" => format!(
+            "(0.5+0.4*sin(2*PI*{am}*t))*(0.16*sin(2*PI*{f}*t)+0.10*sin(2*PI*{f2}*t)+0.07*sin(2*PI*{f3}*t)+0.04*sin(2*PI*{f4}*t))+0.02*(random({r})*2-1)",
+            am = 0.7 + 0.2 * ch as f64,
+            f2 = f * 3.0,
+            f3 = f * 7.0,
+            f4 = f * 29.0,
+        ),
+        "speech" => format!(
+            "max(0,sin(2*PI*{syl}*t))*(0.12*(random({r})*2-1)+0.15*sin(2*PI*{f}*t)*sin(2*PI*{f2}*t))",
+            syl = 3.1 + 0.4 * ch as f64,
+            f2 = f * 11.0,
+        ),
+        _ => format!(
+            "0.7*lt(mod(t+{d},0.37),0.0006)+0.4*sin(2*PI*{f2}*t)*lt(mod(t+{d},0.53),0.012)+0.001*(random({r})*2-1)",
+            d = 0.05 * ch as f64,
+            f2 = f * 17.0,
+        ),
+    }
+}
+
+/// Margin under the noise ceiling for the programme matrix (measured
+/// spread over the 139 channels below 50 dB: 0.7 dB rms, 3.2 dB worst).
+const PROGRAM_NOISE_MARGIN_DB: f64 = 6.0;
+
+/// One cell of the programme matrix: generate, decode with both
+/// decoders, run the noise-ceiling-aware gate + dropout check.
+fn program_cell(kind: &str, channels: usize, rate: u32, kbps: u32, extra: &[&str]) {
+    let layout = match channels {
+        1 => "mono",
+        2 => "stereo",
+        _ => "5.1",
+    };
+    let exprs: Vec<String> = (0..channels)
+        .map(|ch| {
+            if channels == 6 && ch == 3 {
+                // LFE: low-frequency content only.
+                "0.3*sin(2*PI*45*t)*(0.5+0.5*sin(2*PI*0.9*t))".to_string()
+            } else {
+                program_expr(kind, ch)
+            }
+        })
+        .collect();
+    // Commas inside an expression must be escaped in a filter description.
+    let lavfi = format!(
+        "aevalsrc={}:c={layout}:s={rate}:d=1",
+        exprs.join("|").replace(',', "\\,")
+    );
+    let tag = format!("prog_{kind}_{channels}ch_{rate}_{kbps}k_{}", extra.len());
+    let bitrate = format!("{kbps}k");
+    let mut args = vec!["-b:a", bitrate.as_str()];
+    args.extend_from_slice(extra);
+    let Some(es) = ffmpeg_generate(&tag, &lavfi, &args) else {
+        eprintln!("{tag}: ffmpeg could not generate — skipping cell");
+        return;
+    };
+    assert_decode_matches_ffmpeg_margin(
+        &format!(
+            "program {kind} {channels}ch {rate} Hz {kbps}k {}",
+            extra.join(" ")
+        ),
+        &es,
+        channels,
+        rate,
+        PSNR_FLOOR_DB,
+        PROGRAM_NOISE_MARGIN_DB,
+    );
+}
+
+/// Programme-like content from the foreign encoder across the
+/// broadcast operating points: mono / stereo / 5.1, 32 / 44.1 / 48 kHz,
+/// starved to transparent rates.
+fn program_matrix_at(rate: u32) {
+    if !ffmpeg_present() {
+        eprintln!("ffmpeg unavailable — skipping");
+        return;
+    }
+    for kind in ["music", "speech", "transients"] {
+        for (channels, rates) in [
+            (1usize, &[32u32, 64, 128][..]),
+            (2, &[48, 96, 192, 384][..]),
+            (6, &[128, 224, 448, 768][..]),
+        ] {
+            for &kbps in rates {
+                program_cell(kind, channels, rate, kbps, &[]);
+            }
+        }
+        // The foreign encoder's explicit coupling geometry on programme
+        // material: earliest and latest coupling start.
+        for band in ["1", "15"] {
+            program_cell(
+                kind,
+                2,
+                rate,
+                96,
+                &["-channel_coupling", "1", "-cpl_start_band", band],
+            );
+            program_cell(
+                kind,
+                6,
+                rate,
+                256,
+                &["-channel_coupling", "1", "-cpl_start_band", band],
+            );
+        }
+    }
+}
+
+#[test]
+fn generated_program_matrix_48k_decodes_like_ffmpeg() {
+    program_matrix_at(48_000);
+}
+
+#[test]
+fn generated_program_matrix_44k_decodes_like_ffmpeg() {
+    program_matrix_at(44_100);
+}
+
+#[test]
+fn generated_program_matrix_32k_decodes_like_ffmpeg() {
+    program_matrix_at(32_000);
 }
 
 // ---------------------------------------------------------------------------

@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   20, 21; the panning law is this crate's design), every other frame
   routes its coded channels to their own speakers, and
   `Decoder::output_params` describes the layout (#20).
+- Decode-vs-reference programme matrix (`generated_program_matrix_*`):
+  the black-box encoder is fed music-, speech- and transient-like
+  material as mono / stereo / 5.1 at 32 / 44.1 / 48 kHz across starved
+  to transparent rates and both coupling extremes — 135 streams, each
+  held to the 50 dB / noise-ceiling gate with the per-segment dropout
+  check (#13).
 - OAMD bed objects keep their speaker label (Tables 12 / 13) and are
   rendered — at their own speaker, or panned at its Table B.10 position
   when the layout lacks it. Bed programs previously fell back to the
@@ -47,6 +53,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Decoder (AC-3 and E-AC-3): the §7.3.4 dither generator returned its
+  whole 16-bit register after a one-bit shift, so values landing on
+  adjacent transform coefficients correlated at 0.5 and a sparsely-set
+  register produced runs of near-identical full-scale values (noise
+  neither spectrally flat within a block nor steady in level between
+  blocks; +4.7 dB over nominal measured on one transient block). It is
+  now a full-step 32-bit xorshift with a mixed 16-bit output: uniform
+  in ±0.707 and uncorrelated at every lag. Decoded waveforms change in
+  their dither component only (#13).
 - Decoder (AC-3 and E-AC-3): zero-bit coupling-channel mantissas are
   now dithered per coupled channel after decoupling when that
   channel's `dithflag` is set (§7.3.4); they were left at zero, leaving
