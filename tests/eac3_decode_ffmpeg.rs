@@ -319,7 +319,7 @@ fn assert_decode_matches_ffmpeg_floor(
     want_rate: u32,
     floor_db: f64,
 ) {
-    assert_decode_matches_ffmpeg_margin(
+    assert_decode_matches_reference_margin(
         tag,
         es,
         want_channels,
@@ -332,7 +332,7 @@ fn assert_decode_matches_ffmpeg_floor(
 /// Same gate with an explicit margin under the decoder-private noise
 /// ceiling (sparse transient programmes concentrate the dither in a few
 /// blocks, so a two-decode noise estimate of them scatters more).
-fn assert_decode_matches_ffmpeg_margin(
+fn assert_decode_matches_reference_margin(
     tag: &str,
     es: &[u8],
     want_channels: usize,
@@ -626,10 +626,10 @@ fn program_cell(kind: &str, channels: usize, rate: u32, kbps: u32, extra: &[&str
     let mut args = vec!["-b:a", bitrate.as_str()];
     args.extend_from_slice(extra);
     let Some(es) = ffmpeg_generate(&tag, &lavfi, &args) else {
-        eprintln!("{tag}: ffmpeg could not generate — skipping cell");
+        eprintln!("{tag}: the black-box encoder could not generate — skipping cell");
         return;
     };
-    assert_decode_matches_ffmpeg_margin(
+    assert_decode_matches_reference_margin(
         &format!(
             "program {kind} {channels}ch {rate} Hz {kbps}k {}",
             extra.join(" ")
@@ -647,7 +647,7 @@ fn program_cell(kind: &str, channels: usize, rate: u32, kbps: u32, extra: &[&str
 /// starved to transparent rates.
 fn program_matrix_at(rate: u32) {
     if !ffmpeg_present() {
-        eprintln!("ffmpeg unavailable — skipping");
+        eprintln!("black-box validator unavailable — skipping");
         return;
     }
     for kind in ["music", "speech", "transients"] {
@@ -682,17 +682,17 @@ fn program_matrix_at(rate: u32) {
 }
 
 #[test]
-fn generated_program_matrix_48k_decodes_like_ffmpeg() {
+fn generated_program_matrix_48k_decodes_like_reference() {
     program_matrix_at(48_000);
 }
 
 #[test]
-fn generated_program_matrix_44k_decodes_like_ffmpeg() {
+fn generated_program_matrix_44k_decodes_like_reference() {
     program_matrix_at(44_100);
 }
 
 #[test]
-fn generated_program_matrix_32k_decodes_like_ffmpeg() {
+fn generated_program_matrix_32k_decodes_like_reference() {
     program_matrix_at(32_000);
 }
 

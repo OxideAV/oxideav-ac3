@@ -770,9 +770,23 @@ fixed at `cplbegf = 8` / paired sub-bands / block-0 refresh), transient
 coding at high rates (AC-3 transients/384 −12 dB — the short-block
 path and per-block offset redistribution stop scaling above 192 kbps),
 noise-like content (pink −1..−4 dB) and the 5.1 surround/centre balance
-(−1.4..−5 dB). AHT now codes stationary content 2-23 dB *below* the
-standard path (its tuner never received the exponent bound) and is a
-follow-up of its own. The reference decoder accepts every stream shape
+(−1.4..−5 dB). AHT codes a steady tone 3.5–19 dB *below* the standard
+path (`eac3_rate_curves`, stereo 440 Hz: 96 kb/s 42.0 vs 45.6 dB,
+192 kb/s 52.6 vs 71.3 dB, 448 kb/s 75.6 vs 88.6 dB). The r486 reading
+of that gap: the AHT SNR-offset search is exact (it already bounds the
+single exponent set by the frame maximum), and the loss is in the
+transform itself. With the §3.4.5 constants as deployed the inverse
+DCT is not orthonormal — independent quantisation noise of variance σ²
+on the six AHT coefficients of a bin comes back as 6σ² on each block's
+coefficient (+7.8 dB) — so AHT only pays where the energy collapses
+into one or two AHT coefficients and the rest quantise to the short
+GAQ codewords. A tone whose MDCT phase advances from block to block
+(440 Hz moves 0.35 cycle per block) spreads over all six and keeps the
+full 7.8 dB penalty at equal mantissa width. The fix is therefore an
+election, not a retune: `chahtinu[ch]` per channel (and AHT-aware
+`hebap` offsets) chosen by exact bit cost at equal noise against the
+standard path — which needs AHT and non-AHT channels to coexist in one
+frame, a structural encoder change recorded as the next step. The reference decoder accepts every stream shape
 this encoder emits at these rates; the sole residual decoder
 disagreement is a block in which the channels' `blksw` flags differ
 (the reference corrupts the unswitched channel's overlap region — the
