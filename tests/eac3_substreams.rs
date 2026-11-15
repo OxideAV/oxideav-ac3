@@ -13,6 +13,7 @@ use common::es::{
     with_substreamid,
 };
 use oxideav_ac3::eac3::Eac3DecoderState;
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
 const RATE: u32 = 48_000;
 const FRAMES: usize = 10;
@@ -185,4 +186,158 @@ fn packet_without_the_selected_program_is_rejected() {
     let p1 = as_program(&stereo_program(7), 1);
     let mut st = Eac3DecoderState::default();
     assert!(oxideav_ac3::eac3::decode_eac3_packet(&mut st, &p1[0]).is_err());
+}
+
+/// The dependent frame of each packet of `packets`, re-mapped by
+/// `chanmap` (Table E2.5 bit weights), appended to the matching packet
+/// of `onto` in place of its own dependent frame.
+fn with_dependent_from(onto: &[Vec<u8>], packets: &[Vec<u8>], chanmap: u16) -> Vec<Vec<u8>> {
+    onto.iter()
+        .zip(packets)
+        .map(|(a, b)| {
+            let indep = syncframes(a)
+                .into_iter()
+                .map(|r| &a[r])
+                .find(|f| strmtyp(f) != 1)
+                .unwrap();
+            let dep = syncframes(b)
+                .into_iter()
+                .map(|r| &b[r])
+                .find(|f| strmtyp(f) == 1)
+                .unwrap();
+            let mut dep = dep.to_vec();
+            assert_eq!(dep[6] & 0x30, 0x10, "chanmap present, no compr word");
+            set_bits(&mut dep, 52, 16, u32::from(chanmap));
+            fix_crc(&mut dep);
+            [indep, &dep[..]].concat()
+        })
+        .collect()
+}
+
+const LS_RS: u16 = (1 << (15 - 3)) | (1 << (15 - 4));
+
+/// §E.3.8.2: dependent-substream channels at a location the
+/// independent substream already carries REPLACE that channel. A
+/// dependent substream mapped to Ls / Rs leaves the program at six
+/// channels with its surrounds taken from the dependent substream —
+/// in the 16-bit output too.
+#[test]
+fn replacing_dependent_channels_reach_the_output() {
+    let a = seven_one_program(8);
+    let b = seven_one_program(9);
+    let (want_a, _) = decode_packets(&mut Eac3DecoderState::default(), &a);
+    let (want_b, _) = decode_packets(&mut Eac3DecoderState::default(), &b);
+    let packets = with_dependent_from(&a, &b, LS_RS);
+    let mut st = Eac3DecoderState::default();
+    let (got, ch) = decode_packets(&mut st, &packets);
+    assert_eq!(ch, 6, "replacement does not grow the program");
+    assert_eq!(st.frames_zero_filled, 0);
+    for (i, frame) in got.iter().enumerate() {
+        // Bit-stream order L C R Ls Rs LFE.
+        for c in [0, 1, 2, 5] {
+            assert_eq!(
+                channel(frame, 6, c),
+                channel(&want_a[i], 8, c),
+                "frame {i} ch {c}"
+            );
+        }
+        for c in 0..2 {
+            assert_eq!(
+                channel(frame, 6, 3 + c),
+                channel(&want_b[i], 8, 6 + c),
+                "frame {i}: surround {c} comes from the dependent substream"
+            );
+        }
+    }
+}
+
+fn registry_decode(packets: &[Vec<u8>], channels: Option<u16>) -> Vec<Vec<u8>> {
+    let mut params = CodecParameters::audio(CodecId::new("eac3"));
+    params.channels = channels;
+    let mut dec = oxideav_ac3::decoder::make_eac3_decoder(&params).unwrap();
+    packets
+        .iter()
+        .map(|p| {
+            dec.send_packet(&Packet::new(0, TimeBase::new(1, 48_000), p.clone()))
+                .unwrap();
+            match dec.receive_frame().unwrap() {
+                Frame::Audio(af) => af.data.into_iter().next().unwrap(),
+                _ => panic!("audio frame expected"),
+            }
+        })
+        .collect()
+}
+
+/// §E.3.8.2: "Decoders reproducing 5.1 or fewer channels from a
+/// program containing greater than 5.1 channels shall decode only
+/// independent substream 0 and skip all associated dependent
+/// substreams." A stereo or 5.1 target must not see the surrounds a
+/// dependent substream substitutes for the 5.1 program's.
+#[test]
+fn small_targets_decode_the_independent_substream_only() {
+    let a = seven_one_program(8);
+    let b = seven_one_program(9);
+    let with_dep = with_dependent_from(&a, &b, LS_RS);
+    let indep_only: Vec<Vec<u8>> = a
+        .iter()
+        .map(|p| {
+            let r = syncframes(p)
+                .into_iter()
+                .find(|r| strmtyp(&p[r.clone()]) != 1)
+                .unwrap();
+            p[r].to_vec()
+        })
+        .collect();
+    for target in [1u16, 2, 6] {
+        assert!(
+            registry_decode(&with_dep, Some(target)) == registry_decode(&indep_only, Some(target)),
+            "{target}-channel target ignores dependent substreams"
+        );
+    }
+    // No target: the complete program (here with replaced surrounds).
+    assert!(registry_decode(&with_dep, None) != registry_decode(&indep_only, None));
+}
+
+/// §E.3.8.5: when the complete program is reproduced, "the compr and
+/// dynrng metadata words carried in independent substream 0 shall be
+/// ignored. The decoder shall instead use the compr and dynrng
+/// metadata words carried by the associated dependent substream" —
+/// for every substream of the program.
+#[test]
+fn program_dynamic_range_words_come_from_the_dependent_substream() {
+    let pcm = test_pcm(8, RATE, FRAMES * 1536, 12);
+    // Same audio, same budget; only the per-block dynrng word differs
+    // (0x00 = unity, 0xE0 = one 6 dB step down).
+    let unity = encode_packets(8, RATE, 768_000, &[("dynrng", "0")], &pcm);
+    let cut = encode_packets(8, RATE, 768_000, &[("dynrng", "224")], &pcm);
+    let (want_unity, _) = decode_packets(&mut Eac3DecoderState::default(), &unity);
+    let (want_cut, _) = decode_packets(&mut Eac3DecoderState::default(), &cut);
+    assert_ne!(
+        want_unity, want_cut,
+        "the two words must give different gains"
+    );
+
+    // Independent frame asks for the cut, dependent frame for unity.
+    let mixed = with_dependent_from(&cut, &unity, 1 << (15 - 6));
+    let (got, ch) = decode_packets(&mut Eac3DecoderState::default(), &mixed);
+    assert_eq!(ch, 8);
+    assert_eq!(
+        got, want_unity,
+        "the dependent substream's word governs all eight channels"
+    );
+
+    // The 5.1 program on its own keeps the independent substream's word.
+    let mut st = Eac3DecoderState::default();
+    st.set_dependent_substreams(false);
+    let (got51, ch51) = decode_packets(&mut st, &mixed);
+    assert_eq!(ch51, 6);
+    for (i, frame) in got51.iter().enumerate() {
+        for c in 0..6 {
+            assert_eq!(
+                channel(frame, 6, c),
+                channel(&want_cut[i], 8, c),
+                "frame {i} ch {c}"
+            );
+        }
+    }
 }

@@ -413,21 +413,24 @@ impl Decoder for Ac3Decoder {
         // settings, not per-frame state.
         self.state.drc = self.drc;
         self.eac3_state.set_drc(self.drc);
-        self.eac3_state.set_program(self.program);
-        self.eac3_state.set_crc_check(self.crc_check);
+        self.apply_eac3_settings();
         Ok(())
     }
 }
 
 impl Ac3Decoder {
     fn new(params: &CodecParameters, prefer_ltrt: bool, joc_layout: Option<JocLayout>) -> Self {
-        Self {
+        // Program selection and CRC policy from the option bag (the
+        // factories that validate the bag report a malformed value;
+        // here it falls back to the defaults).
+        let options = Eac3DecoderOptions::from_codec_options(&params.options).unwrap_or_default();
+        let mut decoder = Self {
             codec_id: params.codec_id.clone(),
             time_base: TimeBase::new(1, 48_000),
             pending: std::collections::VecDeque::new(),
             framer: Framer::default(),
-            crc_check: false,
-            program: 0,
+            crc_check: options.crc_check,
+            program: options.program & 7,
             last_good_ac3: None,
             ac3_frames_concealed: 0,
             eof: false,
@@ -441,15 +444,31 @@ impl Ac3Decoder {
             joc_renderer: JocRenderer::with_layout(joc_layout.unwrap_or_default()),
             last_sample_rate: None,
             params_generation: 0,
-        }
+        };
+        decoder.apply_eac3_settings();
+        decoder
     }
 
     /// Apply the program selection and CRC policy of `options`.
     fn configure(&mut self, options: &Eac3DecoderOptions) {
         self.crc_check = options.crc_check;
         self.program = options.program & 7;
+        self.apply_eac3_settings();
+    }
+
+    /// Push the decoder-lifetime settings into the E-AC-3 frame
+    /// decoder's state.
+    fn apply_eac3_settings(&mut self) {
         self.eac3_state.set_program(self.program);
         self.eac3_state.set_crc_check(self.crc_check);
+        // Annex E §E.3.8.2: a decoder reproducing 5.1 or fewer channels
+        // "shall decode only independent substream 0 and skip all
+        // associated dependent substreams" — they may replace channels
+        // of the 5.1 program with versions meant for the larger
+        // layout. An object presentation works on the whole program.
+        let small_target = matches!(self.requested_channels, Some(n) if n <= 6);
+        self.eac3_state
+            .set_dependent_substreams(!(small_target && self.joc_layout.is_none()));
     }
 
     /// The multichannel layout every output frame has, when one was

@@ -113,6 +113,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the packet.
 - A dependent substream that cannot be decoded is concealed in place
   instead of being dropped, so the program keeps its channel count.
+- E-AC-3 decoder, programs with dependent substreams (§E.3.8.2,
+  §E.3.8.5):
+  - a decoder asked for 5.1 or fewer channels (`channels` ≤ 6, without
+    an object layout) now decodes the independent substream alone, as
+    the clause requires. Dependent substreams were always combined in
+    first, so a 7.1 program whose dependent substream re-codes Ls / Rs
+    was downmixed from the 7.1 surrounds, and a 6-channel request
+    returned eight channels.
+    `Eac3DecoderState::set_dependent_substreams(false)` does the same
+    at the frame level.
+  - when the complete program is reproduced, the `dynrng` / `compr`
+    words of the last dependent substream govern every substream of
+    the program (it is decoded first; its per-block gains replace the
+    others' own). Each substream used to apply its own words.
+  - dependent channels that only REPLACE channels of the independent
+    substream (no new location) were combined in the float program but
+    not in `DecodedFrame::pcm_s16le`.
 - E-AC-3 decoder, transient pre-noise processing (§3.7.2): the
   pre-noise length `PN` is counted from "the leading edge of the audio
   coding block prior to the block containing the transient" — the

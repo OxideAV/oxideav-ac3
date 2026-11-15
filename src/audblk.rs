@@ -349,6 +349,18 @@ pub struct Ac3State {
     /// 1534 samples before the frame's first sample. Empty until the
     /// first E-AC-3 frame is decoded.
     pub tpnp_history: Vec<f32>,
+
+    /// Linear dynamic-range gain this substream's own `dynrng` /
+    /// `compr` words resolved to in each block of the frame decoded
+    /// last (E-AC-3 only).
+    pub block_gains: [f32; BLOCKS_PER_FRAME],
+    /// Annex E §E.3.8.5: when a program is reproduced with its
+    /// dependent substreams, the dynamic-range words of the last
+    /// dependent substream "shall apply to all substreams in the
+    /// program, including the independent substream". Set by the
+    /// packet walker for the frame about to be decoded: the per-block
+    /// gains that replace this substream's own.
+    pub gain_override: Option<[f32; BLOCKS_PER_FRAME]>,
 }
 
 /// Output samples kept per channel for §E.3.7.2: the synthesis buffer
@@ -416,6 +428,8 @@ impl Ac3State {
             ecpl_state: crate::eac3::ecpl::EcplState::new(),
             drc: crate::drc::DrcSettings::default(),
             tpnp_history: Vec::new(),
+            block_gains: [1.0; BLOCKS_PER_FRAME],
+            gain_override: None,
         }
     }
 }

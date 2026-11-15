@@ -554,6 +554,17 @@ pub fn decode_indep_audblks(
                 state.channels[1].dynrng = state.drc.resolve_block_gain(0x00, compr_ch2);
             }
         }
+        // §E.3.8.5: the gain this substream's own words ask for is
+        // recorded (the last dependent substream's governs the whole
+        // program), and replaced when the walker supplies the
+        // program's.
+        state.block_gains[blk] = state.channels[0].dynrng;
+        if let Some(program) = state.gain_override {
+            audblk::set_program_dynrng(state, nfchans, lfeon, program[blk]);
+            if bsi.acmod == 0 {
+                state.channels[1].dynrng = program[blk];
+            }
+        }
 
         // ---- spectral extension strategy block (§E.1.3.5 / §E.3.6) ----
         //
@@ -2447,6 +2458,8 @@ fn build_syncinfo_shim(bsi: &Eac3Bsi) -> SyncInfo {
         // pair to index a doubled-row HTH"; we approximate with the
         // closest non-reduced row. PSNR will be a bit off on reduced
         // streams; round-3 follow-up to fix.
+        // (No clause of Annex E names the Table 7.15 column for
+        // fscod == 3; this choice is unverified.)
         24_000 | 22_050 | 16_000 => 2,
         _ => 0,
     };
