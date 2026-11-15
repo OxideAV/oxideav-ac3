@@ -53,6 +53,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- E-AC-3 encoder: a frame whose elected exponent plan left no room for
+  the coding tools' own syntax (SPX / coupling coordinates, per-block
+  SNR offsets, transient pre-noise words) failed with "bit budget
+  overflow" instead of falling back. The tool and metadata reserve is
+  now fixed before the plan is elected, every budget guard counts it,
+  the LFE cadence collapses with the full-bandwidth plan, AHT frames
+  fall to D45 anchors when D15 cannot fit, and transient pre-noise
+  words are dropped for a frame that cannot carry them. Found by the
+  scheduled `encode_decode_roundtrip` fuzz run (7.1 pair, 96 kb/s at
+  44.1 kHz, SPX, near-silent input); the input is replayed by
+  `tests/fuzz_regressions.rs`.
 - E-AC-3 decoder: a hostile packet whose first syncframe is concealed
   (no program channels) panicked with an out-of-bounds index when a
   mono / stereo downmix was requested; the §7.8 matrix input is now

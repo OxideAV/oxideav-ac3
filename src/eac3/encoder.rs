@@ -2153,7 +2153,7 @@ impl Eac3Encoder {
         } else {
             None
         };
-        let transproce = tpnp_plan
+        let mut transproce = tpnp_plan
             .as_ref()
             .is_some_and(|p| p.iter().any(Option::is_some));
 
@@ -2286,6 +2286,201 @@ impl Eac3Encoder {
                 }
             }
         }
+        // When `snroffststr != 0`, the audblk carries per-block SNR
+        // offsets instead of the single frame-level pair in audfrm. Those
+        // extra header bits must be reserved out of the mantissa budget,
+        // or the bit-allocation tuner would fill the frame and the
+        // per-block offsets would push the syncframe past `frame_bytes`.
+        // Net extra bits vs the `snroffststr == 0` baseline:
+        //   * audfrm drops `frmcsnroffst`(6) + `frmfsnroffst`(4) = 10.
+        //   * each block adds an explicit `snroffste`(1) except block 0,
+        //     plus `csnroffst`(6) plus the fine offsets.
+        //   * snroffststr==1: one shared `blkfsnroffst`(4) per block.
+        //   * snroffststr==2: `fsnroffst[ch]`(4·nfchans) + LFE(4) per
+        //     block (no coupling slot — cplinu==0 throughout).
+        // When `snroffststr != 0` the audblk carries per-block SNR
+        // offsets instead of the single frame-level pair in audfrm. Those
+        // extra header bits must be reserved out of the mantissa budget,
+        // or the bit-allocation tuner would fill the frame and the
+        // per-block offsets would push the syncframe past `frame_bytes`.
+        // The `snroffststr == 0` default path reserves nothing, so its
+        // output is byte-identical to before this change. Net extra bits
+        // vs the baseline:
+        //   * audfrm drops `frmcsnroffst`(6) + `frmfsnroffst`(4) = 10.
+        //   * each block adds an explicit `snroffste`(1) except block 0,
+        //     plus `csnroffst`(6) plus the fine offsets.
+        //   * snroffststr==1: one shared `blkfsnroffst`(4) per block.
+        //   * snroffststr==2: `fsnroffst[ch]`(4·nfchans) + LFE(4) per
+        //     block (no coupling slot — cplinu==0 throughout).
+        // Both non-zero strategies reserve the SAME (worst-case, i.e.
+        // `snroffststr == 2`) overhead so that `1` and `2` tune against an
+        // identical mantissa budget — making their decoded PCM bit-exact
+        // to each other, which the round-trip test asserts. The `1` mode
+        // leaves a few reserved bits unused as extra padding; that does
+        // not change the bit allocation.
+        let snr_reserve_bits: u32 = if self.snroffststr == 0 {
+            0
+        } else {
+            let per_block_fine = 4 * nfchans as u32 + if sub.lfeon { 4 } else { 0 };
+            let explicit_snroffste = (nblks as u32) - 1; // blk 0 implicit
+            let per_block = nblks as u32 * (6 + per_block_fine);
+            (per_block + explicit_snroffste).saturating_sub(10)
+        };
+        // SPX header bits over the SPX-off baseline (which spends one
+        // bit per block on the disabled `spxinu`/`spxstre` slot). The
+        // reserve always assumes the worst case — an explicit
+        // `spxbndstrce == 1` band structure — so the default-banding
+        // and explicit-banding emissions tune against an identical
+        // mantissa budget and decode bit-identically (pinned by test).
+        let spx_reserve_bits: u32 = match &spx_geom {
+            None => 0,
+            Some(g) => {
+                // Block-0 strategy: chinspx (explicit unless mono) +
+                // spxstrtf(2) + spxbegf(3) + spxendf(3) + spxbndstrce(1)
+                // + explicit structure flags. spxinu itself replaces the
+                // baseline's 1-bit slot (no delta).
+                let chinspx = if sub.acmod == 0x1 { 0 } else { nfchans as u32 };
+                let strat = chinspx + 2 + 3 + 3 + 1 + (g.end_subbnd - g.begin_subbnd - 1) as u32;
+                // Coordinates: spxblnd(5) + mstrspxco(2) + 6 bits/band.
+                let payload = 5 + 2 + 6 * g.nbnds as u32;
+                // Attenuation (audfrm): chinspxatten(1) + spxattencod(5)
+                // per fbw channel when signalled.
+                let atten = if self.spx.as_ref().is_some_and(|p| p.atten_code.is_some()) {
+                    6 * nfchans as u32
+                } else {
+                    0
+                };
+                // blk 0: payload (spxcoe implicit); blk 3: 1 + payload;
+                // blks 1/2/4/5: 1-bit spxcoe each. Only channels in
+                // SPX carry coordinates (mixed chinspx).
+                let n_spx = in_spx.iter().filter(|&&v| v).count() as u32;
+                strat + atten + n_spx * (payload + (1 + payload) + 4)
+            }
+        };
+        // AHT header bits over the AHT-off baseline: one chahtinu bit
+        // per fbw channel in audfrm (the 2-bit chgaqmod fields are
+        // accounted inside the AHT mantissa cost).
+        let aht_reserve_bits: u32 = if self.aht {
+            nfchans as u32 + u32::from(sub.lfeon) + 8
+        } else {
+            0
+        };
+        // Enhanced-coupling header bits over what the shared (base-AC-3
+        // shaped) overhead model already counts once `cpl.in_use` is set.
+        // The model prices AC-3 standard-coupling syntax: strategy fields
+        // on BOTH anchor blocks, per-block `cplcoe` bits and one
+        // block-0 `mstrcplco + 8·nbnd` coordinate payload per coupled
+        // channel. True Annex E enhanced coupling emits its strategy on
+        // block 0 only but carries a much larger coordinate block —
+        // `ecplangleintrp` every block plus per-channel exist bits,
+        // 5-bit amplitudes, 6+3-bit angle/chaos pairs and a transient
+        // flag. Reserve the (worst-case: block-3 full refresh) true cost
+        // minus the modelled cost, with a small slop; over-reservation
+        // only pads the frame, under-reservation would overflow the
+        // hard bit-budget check below.
+        let ecpl_reserve_bits: u32 = match &ecpl_geom {
+            None => 0,
+            Some(g) => {
+                let nb = g.necplbnd as u32;
+                let nch = nfchans as u32;
+                let chincpl_bits = if sub.acmod == 0x2 { 0 } else { nch };
+                let strategy = 1 + chincpl_bits + 4 + if g.spx_bounded { 0 } else { 4 } + 1;
+                // Coordinates: block 0 (implicit exist bits) + block 3
+                // (explicit, worst-case refresh) + 4 reuse blocks, plus
+                // one ecplangleintrp bit per block.
+                let blk0 = 5 * nb + (nch - 1) * (5 * nb + 9 * nb + 1);
+                let blk3 = (1 + 5 * nb) + (nch - 1) * (2 + 5 * nb + 9 * nb + 1);
+                let reuse = 4 * (1 + 3 * (nch - 1));
+                let true_coords = 6 + blk0 + blk3 + reuse;
+                // Modelled by `overhead_bits_for_ends` with cpl.in_use:
+                let modelled_strategy = 2
+                    * (nch
+                        + 8
+                        + u32::from(sub.acmod == 0x2)
+                        + (g.end_subbnd - g.begin_subbnd - 1) as u32);
+                let modelled_coords = 6 * nch + nch * (2 + 8 * nb);
+                (strategy + true_coords + 16).saturating_sub(modelled_strategy + modelled_coords)
+            }
+        };
+        // Standard-coupling header bits over the shared overhead model
+        // (which prices the strategy on BOTH anchor blocks, one `cplcoe`
+        // bit per coupled channel per block and ONE block-0 coordinate
+        // payload). This encoder emits the strategy once (block 0, the
+        // audfrm `cplstre` reuse covers the rest) but refreshes the
+        // coordinates on block 3 too: reserve the true cost minus the
+        // modelled cost, with a small slop.
+        let stdcpl_reserve_bits: u32 = match &stdcpl_geom {
+            None => 0,
+            Some(g) => {
+                let nch = nfchans as u32;
+                let nb = g.nbnd as u32;
+                let chincpl_bits = if sub.acmod == 0x2 { 0 } else { nch };
+                let phs = u32::from(sub.acmod == 0x2);
+                let strategy = 1 + chincpl_bits + phs + 4 + if g.spx_bounded { 0 } else { 4 } + 1;
+                let payload = 2 + 8 * nb;
+                let true_coords = nch * (2 * payload + (nblks as u32 - 1));
+                let modelled_strategy = 2 * (nch + 8 + phs + g.nsubbnd.saturating_sub(1) as u32);
+                let modelled_coords = nblks as u32 * nch + nch * payload;
+                (strategy + true_coords + 16).saturating_sub(modelled_strategy + modelled_coords)
+            }
+        };
+        // Optional metadata words (compr / mixing / informational
+        // blocks / per-block dynrng) on top of the fixed layout.
+        let meta_reserve_bits: u32 = self
+            .meta
+            .reserve_bits(sub.acmod, sub.lfeon, sub.strmtyp == 0);
+        // §2.3.2.21-23 transient pre-noise data on top of the
+        // baseline (which spends one transproce bit either way):
+        // chintransproc per fbw channel + loc/len words per carrier.
+        let mut tpnp_reserve_bits: u32 = if transproce {
+            nfchans as u32 * (1 + 10 + 8)
+        } else {
+            0
+        };
+        // Transient pre-noise words are optional per frame: when the
+        // cheapest legal exponent layout (one block-0 D45 anchor per
+        // channel) cannot carry them inside this syncframe, the frame
+        // goes out with `transproce = 0` instead of overflowing.
+        if transproce {
+            let cheapest = {
+                let mut a = [0u8; BLOCKS_PER_FRAME];
+                a[0] = 3;
+                vec![a; nfchans]
+            };
+            let single_anchor: [u8; BLOCKS_PER_FRAME] = [1, 0, 0, 0, 0, 0];
+            let floor_bits = overhead_bits_for_ends(
+                &single_anchor[..nblks],
+                Some(&cheapest),
+                ch_end_mant,
+                Some(&end_mant_ch),
+                nfchans,
+                &coupling_plan_for(ecpl_geom.as_ref(), stdcpl_geom.as_ref(), nfchans),
+                &DbaPlan::default(),
+                sub.acmod,
+                sub.lfeon,
+            ) + 64
+                + snr_reserve_bits
+                + spx_reserve_bits
+                + aht_reserve_bits
+                + ecpl_reserve_bits
+                + stdcpl_reserve_bits
+                + meta_reserve_bits;
+            if floor_bits + tpnp_reserve_bits >= (sub.frame_bytes * 8) as u32 {
+                transproce = false;
+                tpnp_reserve_bits = 0;
+            }
+        }
+        // Every tool / metadata reserve above depends on the frame's
+        // geometry only, so it is fixed before the exponent plan is
+        // elected: the plan guard below and the SNR tuner budget against
+        // the same figure.
+        let tool_reserve_bits: u32 = snr_reserve_bits
+            + spx_reserve_bits
+            + aht_reserve_bits
+            + ecpl_reserve_bits
+            + stdcpl_reserve_bits
+            + meta_reserve_bits
+            + tpnp_reserve_bits;
         // Exponent-strategy selection (§7.1.3 / §5.4.3.22 / §E.2.3.2).
         // Every fbw channel elects its own refresh cadence + D15/D25/D45
         // per anchor by measured bit cost (`elect_exponent_cadence`);
@@ -2318,7 +2513,7 @@ impl Eac3Encoder {
         );
         let fscod = self.fscod;
         let bpcb = (sub.frame_bytes * 8 / (nfchans.max(1) * nblks)) as u32;
-        let exp_strategies: [u8; BLOCKS_PER_FRAME] = if fixed_plan || self.aht || cpl_on {
+        let mut exp_strategies: [u8; BLOCKS_PER_FRAME] = if fixed_plan || self.aht || cpl_on {
             legacy
         } else if sub.lfeon {
             let lfe_bap = |x: &[u8; N_COEFFS]| -> [u8; N_COEFFS] {
@@ -2338,12 +2533,28 @@ impl Eac3Encoder {
         } else {
             [1, 0, 0, 0, 0, 0]
         };
-        // §3.4.2: LFE AHT eligibility needs nlferegs == 1 — a single
-        // D15 anchor at block 0.
-        let lfe_exp_strategies: [u8; BLOCKS_PER_FRAME] = if self.aht {
-            [1, 0, 0, 0, 0, 0]
-        } else {
-            exp_strategies
+        // AHT frames: D15 on every channel is the dearest single-anchor
+        // layout; when even the syntax + D15 exponents cannot leave a
+        // mantissa byte, fall to D45 anchors.
+        let aht_tight = self.aht && {
+            let d15 = {
+                let mut a = [0u8; BLOCKS_PER_FRAME];
+                a[0] = 1;
+                vec![a; nfchans]
+            };
+            overhead_bits_for_ends(
+                &exp_strategies[..nblks],
+                Some(&d15),
+                ch_end_mant,
+                Some(&end_mant_ch),
+                nfchans,
+                &CouplingPlan::default(),
+                &DbaPlan::default(),
+                sub.acmod,
+                sub.lfeon,
+            ) + 64
+                + tool_reserve_bits
+                >= (sub.frame_bytes * 8) as u32
         };
         let chexpstr_plan: Vec<[u8; BLOCKS_PER_FRAME]> = if self.aht {
             // §3.4.2 AHT eligibility: nchregs[ch] == 1 — a single
@@ -2355,7 +2566,14 @@ impl Eac3Encoder {
             let mut out = vec![[0u8; BLOCKS_PER_FRAME]; nfchans];
             for ch in 0..nfchans {
                 preprocess_d15(&mut exps[ch][0][..ch_end_mant]);
-                let strat = pick_strategy_for_block(&exps[ch][0], ch_end_mant);
+                // A frame whose syntax leaves no room for the fine
+                // strategies takes D45 on every channel (the cheapest
+                // legal anchor) regardless of spectral smoothness.
+                let strat = if aht_tight {
+                    3
+                } else {
+                    pick_strategy_for_block(&exps[ch][0], ch_end_mant)
+                };
                 out[ch][0] = strat;
                 if strat >= 2 {
                     let grpsize = if strat == 2 { 2 } else { 4 };
@@ -2423,9 +2641,7 @@ impl Eac3Encoder {
                     sub.acmod,
                     sub.lfeon,
                 ) + 64
-                    + self
-                        .meta
-                        .reserve_bits(sub.acmod, sub.lfeon, sub.strmtyp == 0);
+                    + tool_reserve_bits;
                 if probe >= budget {
                     // One block-0 D45 anchor per channel — the
                     // cheapest legal frame (an elected second anchor
@@ -2434,6 +2650,13 @@ impl Eac3Encoder {
                     for p in plan.iter_mut() {
                         *p = [0u8; BLOCKS_PER_FRAME];
                         p[0] = 3; // D45
+                    }
+                    // The elected LFE cadence shrinks to its single
+                    // block-0 anchor too. With a coupling channel the
+                    // frame-wide cadence also times the carrier's
+                    // exponent refresh and stays as it is.
+                    if !fixed_plan && !cpl_on {
+                        exp_strategies = [1, 0, 0, 0, 0, 0];
                     }
                 }
                 plan
@@ -2460,6 +2683,14 @@ impl Eac3Encoder {
                 }
             }
             plan
+        };
+        let exp_strategies = exp_strategies;
+        // §3.4.2: LFE AHT eligibility needs nlferegs == 1 — a single
+        // D15 anchor at block 0.
+        let lfe_exp_strategies: [u8; BLOCKS_PER_FRAME] = if self.aht {
+            [1, 0, 0, 0, 0, 0]
+        } else {
+            exp_strategies
         };
         if sub.lfeon {
             // AHT LFE: one exponent set per frame from the per-bin
@@ -2678,176 +2909,16 @@ impl Eac3Encoder {
                 sub.acmod,
                 sub.lfeon,
             ) + 64
-                + self
-                    .meta
-                    .reserve_bits(sub.acmod, sub.lfeon, sub.strmtyp == 0);
+                + tool_reserve_bits;
             if probe >= (sub.frame_bytes * 8) as u32 {
                 crate::encoder::DbaPlan::default()
             } else {
                 dba_plan
             }
         };
-        // When `snroffststr != 0`, the audblk carries per-block SNR
-        // offsets instead of the single frame-level pair in audfrm. Those
-        // extra header bits must be reserved out of the mantissa budget,
-        // or the bit-allocation tuner would fill the frame and the
-        // per-block offsets would push the syncframe past `frame_bytes`.
-        // Net extra bits vs the `snroffststr == 0` baseline:
-        //   * audfrm drops `frmcsnroffst`(6) + `frmfsnroffst`(4) = 10.
-        //   * each block adds an explicit `snroffste`(1) except block 0,
-        //     plus `csnroffst`(6) plus the fine offsets.
-        //   * snroffststr==1: one shared `blkfsnroffst`(4) per block.
-        //   * snroffststr==2: `fsnroffst[ch]`(4·nfchans) + LFE(4) per
-        //     block (no coupling slot — cplinu==0 throughout).
-        // When `snroffststr != 0` the audblk carries per-block SNR
-        // offsets instead of the single frame-level pair in audfrm. Those
-        // extra header bits must be reserved out of the mantissa budget,
-        // or the bit-allocation tuner would fill the frame and the
-        // per-block offsets would push the syncframe past `frame_bytes`.
-        // The `snroffststr == 0` default path reserves nothing, so its
-        // output is byte-identical to before this change. Net extra bits
-        // vs the baseline:
-        //   * audfrm drops `frmcsnroffst`(6) + `frmfsnroffst`(4) = 10.
-        //   * each block adds an explicit `snroffste`(1) except block 0,
-        //     plus `csnroffst`(6) plus the fine offsets.
-        //   * snroffststr==1: one shared `blkfsnroffst`(4) per block.
-        //   * snroffststr==2: `fsnroffst[ch]`(4·nfchans) + LFE(4) per
-        //     block (no coupling slot — cplinu==0 throughout).
-        // Both non-zero strategies reserve the SAME (worst-case, i.e.
-        // `snroffststr == 2`) overhead so that `1` and `2` tune against an
-        // identical mantissa budget — making their decoded PCM bit-exact
-        // to each other, which the round-trip test asserts. The `1` mode
-        // leaves a few reserved bits unused as extra padding; that does
-        // not change the bit allocation.
-        let snr_reserve_bits: u32 = if self.snroffststr == 0 {
-            0
-        } else {
-            let per_block_fine = 4 * nfchans as u32 + if sub.lfeon { 4 } else { 0 };
-            let explicit_snroffste = (nblks as u32) - 1; // blk 0 implicit
-            let per_block = nblks as u32 * (6 + per_block_fine);
-            (per_block + explicit_snroffste).saturating_sub(10)
-        };
-        // SPX header bits over the SPX-off baseline (which spends one
-        // bit per block on the disabled `spxinu`/`spxstre` slot). The
-        // reserve always assumes the worst case — an explicit
-        // `spxbndstrce == 1` band structure — so the default-banding
-        // and explicit-banding emissions tune against an identical
-        // mantissa budget and decode bit-identically (pinned by test).
-        let spx_reserve_bits: u32 = match &spx_geom {
-            None => 0,
-            Some(g) => {
-                // Block-0 strategy: chinspx (explicit unless mono) +
-                // spxstrtf(2) + spxbegf(3) + spxendf(3) + spxbndstrce(1)
-                // + explicit structure flags. spxinu itself replaces the
-                // baseline's 1-bit slot (no delta).
-                let chinspx = if sub.acmod == 0x1 { 0 } else { nfchans as u32 };
-                let strat = chinspx + 2 + 3 + 3 + 1 + (g.end_subbnd - g.begin_subbnd - 1) as u32;
-                // Coordinates: spxblnd(5) + mstrspxco(2) + 6 bits/band.
-                let payload = 5 + 2 + 6 * g.nbnds as u32;
-                // Attenuation (audfrm): chinspxatten(1) + spxattencod(5)
-                // per fbw channel when signalled.
-                let atten = if self.spx.as_ref().is_some_and(|p| p.atten_code.is_some()) {
-                    6 * nfchans as u32
-                } else {
-                    0
-                };
-                // blk 0: payload (spxcoe implicit); blk 3: 1 + payload;
-                // blks 1/2/4/5: 1-bit spxcoe each. Only channels in
-                // SPX carry coordinates (mixed chinspx).
-                let n_spx = in_spx.iter().filter(|&&v| v).count() as u32;
-                strat + atten + n_spx * (payload + (1 + payload) + 4)
-            }
-        };
-        // AHT header bits over the AHT-off baseline: one chahtinu bit
-        // per fbw channel in audfrm (the 2-bit chgaqmod fields are
-        // accounted inside the AHT mantissa cost).
-        let aht_reserve_bits: u32 = if self.aht {
-            nfchans as u32 + u32::from(sub.lfeon) + 8
-        } else {
-            0
-        };
-        // Enhanced-coupling header bits over what the shared (base-AC-3
-        // shaped) overhead model already counts once `cpl.in_use` is set.
-        // The model prices AC-3 standard-coupling syntax: strategy fields
-        // on BOTH anchor blocks, per-block `cplcoe` bits and one
-        // block-0 `mstrcplco + 8·nbnd` coordinate payload per coupled
-        // channel. True Annex E enhanced coupling emits its strategy on
-        // block 0 only but carries a much larger coordinate block —
-        // `ecplangleintrp` every block plus per-channel exist bits,
-        // 5-bit amplitudes, 6+3-bit angle/chaos pairs and a transient
-        // flag. Reserve the (worst-case: block-3 full refresh) true cost
-        // minus the modelled cost, with a small slop; over-reservation
-        // only pads the frame, under-reservation would overflow the
-        // hard bit-budget check below.
-        let ecpl_reserve_bits: u32 = match &ecpl_geom {
-            None => 0,
-            Some(g) => {
-                let nb = g.necplbnd as u32;
-                let nch = nfchans as u32;
-                let chincpl_bits = if sub.acmod == 0x2 { 0 } else { nch };
-                let strategy = 1 + chincpl_bits + 4 + if g.spx_bounded { 0 } else { 4 } + 1;
-                // Coordinates: block 0 (implicit exist bits) + block 3
-                // (explicit, worst-case refresh) + 4 reuse blocks, plus
-                // one ecplangleintrp bit per block.
-                let blk0 = 5 * nb + (nch - 1) * (5 * nb + 9 * nb + 1);
-                let blk3 = (1 + 5 * nb) + (nch - 1) * (2 + 5 * nb + 9 * nb + 1);
-                let reuse = 4 * (1 + 3 * (nch - 1));
-                let true_coords = 6 + blk0 + blk3 + reuse;
-                // Modelled by `overhead_bits_for_ends` with cpl.in_use:
-                let modelled_strategy = 2
-                    * (nch
-                        + 8
-                        + u32::from(sub.acmod == 0x2)
-                        + (g.end_subbnd - g.begin_subbnd - 1) as u32);
-                let modelled_coords = 6 * nch + nch * (2 + 8 * nb);
-                (strategy + true_coords + 16).saturating_sub(modelled_strategy + modelled_coords)
-            }
-        };
-        // Standard-coupling header bits over the shared overhead model
-        // (which prices the strategy on BOTH anchor blocks, one `cplcoe`
-        // bit per coupled channel per block and ONE block-0 coordinate
-        // payload). This encoder emits the strategy once (block 0, the
-        // audfrm `cplstre` reuse covers the rest) but refreshes the
-        // coordinates on block 3 too: reserve the true cost minus the
-        // modelled cost, with a small slop.
-        let stdcpl_reserve_bits: u32 = match &stdcpl_geom {
-            None => 0,
-            Some(g) => {
-                let nch = nfchans as u32;
-                let nb = g.nbnd as u32;
-                let chincpl_bits = if sub.acmod == 0x2 { 0 } else { nch };
-                let phs = u32::from(sub.acmod == 0x2);
-                let strategy = 1 + chincpl_bits + phs + 4 + if g.spx_bounded { 0 } else { 4 } + 1;
-                let payload = 2 + 8 * nb;
-                let true_coords = nch * (2 * payload + (nblks as u32 - 1));
-                let modelled_strategy = 2 * (nch + 8 + phs + g.nsubbnd.saturating_sub(1) as u32);
-                let modelled_coords = nblks as u32 * nch + nch * payload;
-                (strategy + true_coords + 16).saturating_sub(modelled_strategy + modelled_coords)
-            }
-        };
-        // Optional metadata words (compr / mixing / informational
-        // blocks / per-block dynrng) on top of the fixed layout.
-        let meta_reserve_bits: u32 = self
-            .meta
-            .reserve_bits(sub.acmod, sub.lfeon, sub.strmtyp == 0);
-        // §2.3.2.21-23 transient pre-noise data on top of the
-        // baseline (which spends one transproce bit either way):
-        // chintransproc per fbw channel + loc/len words per carrier.
-        let tpnp_reserve_bits: u32 = if transproce {
-            nfchans as u32 * (1 + 10 + 8)
-        } else {
-            0
-        };
-        let tuner_frame_bytes = sub.frame_bytes.saturating_sub(
-            (snr_reserve_bits
-                + spx_reserve_bits
-                + aht_reserve_bits
-                + ecpl_reserve_bits
-                + stdcpl_reserve_bits
-                + meta_reserve_bits
-                + tpnp_reserve_bits)
-                .div_ceil(8) as usize,
-        );
+        let tuner_frame_bytes = sub
+            .frame_bytes
+            .saturating_sub(tool_reserve_bits.div_ceil(8) as usize);
         // Pass chexpstr_plan so the overhead calculator accounts for
         // D25/D45 exponent savings when sizing the mantissa budget.
         let tuned_ba = if let Some(x) = &aht_x {
