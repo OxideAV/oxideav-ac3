@@ -27,7 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tail of the last good block followed by silence, and the next frame
   fades in through its own window. Frames that fail to decode for any
   other reason are concealed the same way (they were hard-cut to
-  zeros, and the state reset dropped the DRC configuration). Option
+  zeros, and the state reset dropped the DRC configuration). The
+  check condemns frames only once the stream has shown a CRC word that
+  verifies, so a stream without usable CRC words still decodes. Option
   `crc` (`Eac3DecoderOptions::with_crc_check`, also honoured by the
   AC-3 factory) switches the check off; the frame-level
   `decode_eac3_packet` keeps it off unless
@@ -88,26 +90,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Eac3AudioProduction::new`, `IndepProgramShape::new`, and `with_*`
   setters on `DrcSettings`, `MetadataParams`, `AudioProductionParams`,
   `EcplParams`, `SpxParams` and the four `Eac3*` metadata records.
-
-### Changed
-
-- Decoder throughput, output bit-identical (41 of 42 comparison
-  streams hash the same as before the round; the 42nd is the
-  spectral-extension attenuation fix): 5.1 AC-3 399 → 514 × real time,
-  5.1 E-AC-3 362 → 458 ×, with the syncframe CRC now verified on every
-  frame (medians of seven alternating runs, see the README).
-  - the bit allocation of a channel is kept when a block reuses its
-    exponents and changes no allocation parameter (§7.2), instead of
-    being recomputed for every channel of every block;
-  - grouped mantissas (bap 1 / 2 / 4) come from code-word tables, not
-    per-group division;
-  - the CRC register advances four message bytes per step from
-    tables, and the AC-3 `crc1` / `crc2` check is one pass;
-  - windowing and overlap-add run in one loop without scratch copies;
-  - no per-frame heap traffic for exponent runs or the AHT coefficient
-    cache (allocated only for a frame that signals AHT), no 16-bit
-    packing pass when the caller wants float or a downmix, no
-    intermediate copy of the AC-3 program.
 
 ### Fixed
 
@@ -208,6 +190,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spectral holes in coupled high bands at low rates (#13).
 
 ### Changed
+
+- Decoder throughput, output bit-identical (41 of 42 comparison
+  streams hash the same as before the round; the 42nd is the
+  spectral-extension attenuation fix): 5.1 AC-3 399 → 514 × real time,
+  5.1 E-AC-3 362 → 458 ×, with the syncframe CRC now verified on every
+  frame (medians of seven alternating runs, see the README).
+  - the bit allocation of a channel is kept when a block reuses its
+    exponents and changes no allocation parameter (§7.2), instead of
+    being recomputed for every channel of every block;
+  - grouped mantissas (bap 1 / 2 / 4) come from code-word tables, not
+    per-group division;
+  - the CRC register advances four message bytes per step from
+    tables, and the AC-3 `crc1` / `crc2` check is one pass;
+  - windowing and overlap-add run in one loop without scratch copies;
+  - no per-frame heap traffic for exponent runs or the AHT coefficient
+    cache (allocated only for a frame that signals AHT), no 16-bit
+    packing pass when the caller wants float or a downmix, no
+    intermediate copy of the AC-3 program.
 
 - Performance, output bit-identical (`examples/throughput.rs`; 5.1,
   single thread, × real time before → after): AC-3 encode 0.7 → 25.6,

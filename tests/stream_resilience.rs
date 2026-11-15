@@ -413,3 +413,38 @@ fn input_without_any_syncframe_is_reported() {
     }
     assert!(reported, "48 KiB without a syncframe must surface an error");
 }
+
+/// A stream whose CRC words are unusable from the first frame on (an
+/// encoder or a re-packager that does not write them) is decoded as it
+/// stands: the check only condemns frames of a stream that has shown a
+/// CRC word that verifies.
+#[test]
+fn stream_without_usable_crc_words_still_decodes() {
+    for st in [
+        ac3_stream(),
+        eac3_stream(2, 192_000, &[]),
+        eac3_stream(8, 768_000, &[]),
+    ] {
+        let want = decode_chunks(st.id, &st.periods);
+        let mut periods = st.periods.clone();
+        for p in periods.iter_mut() {
+            let frames = if st.id == "eac3" {
+                syncframes(p)
+            } else {
+                std::iter::once(0..p.len()).collect()
+            };
+            for r in frames {
+                // E-AC-3: the trailing CRC word. AC-3: crc1 and crc2.
+                p[r.end - 1] ^= 0xFF;
+                if st.id == "ac3" {
+                    p[r.start + 2] ^= 0xFF;
+                }
+            }
+        }
+        let got = decode_chunks(st.id, &periods);
+        assert_eq!(got.len(), want.len(), "{}", st.id);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(g.data == w.data, "{}: frame {i}", st.id);
+        }
+    }
+}

@@ -2070,7 +2070,7 @@ const GROUP_11_LEVEL: [[f32; 2]; 128] = {
 };
 
 #[allow(clippy::too_many_arguments)]
-#[inline]
+#[inline(always)]
 pub(crate) fn fetch_mantissa(
     br: &mut BitReader,
     bap: u8,
@@ -2815,6 +2815,132 @@ mod short_block_tests {
             rmse > 0.5,
             "direct form and FFT path now match (rmse={rmse:.3}) — promote short_block_direct_form_diverges_from_fft to equality"
         );
+    }
+}
+
+#[cfg(test)]
+mod alloc_reuse_tests {
+    use super::*;
+
+    /// A state with loud narrow peaks over a quiet, uneven floor on
+    /// channel 0 and the coupling pseudo-channel (so decays, gains,
+    /// knee and floor all shape the mask), and a full parameter set.
+    fn state() -> Ac3State {
+        let mut st = Ac3State::new();
+        for ch in [0, MAX_FBW] {
+            for (bin, e) in st.channels[ch].exp.iter_mut().enumerate() {
+                let peak = matches!(bin % 40, 8..=10);
+                *e = if peak {
+                    1
+                } else {
+                    (12 + (bin * 7 + ch) % 9) as u8
+                };
+            }
+        }
+        st.sdcycod = 2;
+        st.fdcycod = 1;
+        st.sgaincod = 1;
+        st.dbpbcod = 2;
+        st.floorcod = 4;
+        st.snroffst_coarse = 30;
+        st.cpl_fleak = 3;
+        st.cpl_sleak = 5;
+        st
+    }
+
+    /// (channel slot, start, end, fscod, fsnroffst, fgaincod, coupling)
+    type Call = (usize, usize, usize, u8, u8, u8, bool);
+
+    fn run(st: &mut Ac3State, c: Call) -> ([u8; N_COEFFS], [i16; 50]) {
+        run_bit_allocation(st, c.0, c.1, c.2, c.3, c.4, c.5, c.6);
+        (st.channels[c.0].bap, st.channels[c.0].mask)
+    }
+
+    /// The allocator's early return must never change its result: after
+    /// any single input changes — an exponent, any parameter code, the
+    /// range, the rate, a delta segment, the leak initialisation — the
+    /// allocation equals the one computed from scratch.
+    #[test]
+    fn allocation_is_reused_only_when_its_inputs_are_unchanged() {
+        let fbw: Call = (0, 0, 181, 0, 7, 4, false);
+        let cpl: Call = (MAX_FBW, 61, 181, 0, 7, 4, true);
+        type Change = (&'static str, fn(&mut Ac3State, &mut Call));
+        let changes: [Change; 16] = [
+            ("nothing", |_, _| {}),
+            ("one exponent", |st, c| st.channels[c.0].exp[c.1 + 20] = 0),
+            ("last exponent in range", |st, c| {
+                st.channels[c.0].exp[c.2 - 1] = 0
+            }),
+            ("sdcycod", |st, _| st.sdcycod = 0),
+            ("fdcycod", |st, _| st.fdcycod = 3),
+            ("sgaincod", |st, _| st.sgaincod = 3),
+            ("dbpbcod", |st, _| st.dbpbcod = 0),
+            ("floorcod", |st, _| st.floorcod = 7),
+            ("csnroffst", |st, _| st.snroffst_coarse = 31),
+            ("fsnroffst", |_, c| c.4 = 15),
+            ("fgaincod", |_, c| c.5 = 6),
+            ("end", |_, c| c.2 -= 12),
+            ("fscod", |_, c| c.3 = 2),
+            ("delta segment", |st, c| {
+                st.deltnseg[c.0] = 1;
+                st.deltoffst[c.0][0] = 9;
+                st.deltlen[c.0][0] = 3;
+                st.deltba[c.0][0] = 7;
+            }),
+            ("fast leak", |st, _| st.cpl_fleak = 6),
+            ("slow leak", |st, _| st.cpl_sleak = 1),
+        ];
+        let mut effective = std::collections::BTreeSet::new();
+        for base in [fbw, cpl] {
+            for (what, change) in changes {
+                // Warm state: an allocation is in place, then one input
+                // changes.
+                let mut warm = state();
+                run(&mut warm, base);
+                let before = (warm.channels[base.0].bap, warm.channels[base.0].mask);
+                let mut call = base;
+                change(&mut warm, &mut call);
+                let got = run(&mut warm, call);
+                // Cold state: the same inputs, computed from scratch.
+                let mut cold = state();
+                let mut cold_call = base;
+                change(&mut cold, &mut cold_call);
+                let want = run(&mut cold, cold_call);
+                assert!(
+                    got.0[call.1..call.2] == want.0[call.1..call.2],
+                    "slot {}: bap after changing {what}",
+                    base.0
+                );
+                assert!(
+                    got.1 == want.1 || what == "end",
+                    "slot {}: mask after {what}",
+                    base.0
+                );
+                if got.0[call.1..call.2] != before.0[call.1..call.2] || got.1 != before.1 {
+                    effective.insert(what);
+                }
+            }
+        }
+        // Every change altered the allocation of at least one of the two
+        // channels, so a stale result would have been caught above.
+        for (what, _) in changes {
+            assert!(
+                what == "nothing" || effective.contains(what),
+                "changing {what} never altered an allocation"
+            );
+        }
+    }
+
+    /// `zero_all_baps` (§7.2.2.1.1) invalidates the kept allocation.
+    #[test]
+    fn zeroed_pointers_are_not_mistaken_for_an_allocation() {
+        let call: Call = (0, 0, 181, 0, 7, 4, false);
+        let mut st = state();
+        let want = run(&mut st, call);
+        zero_all_baps(&mut st, 1, false, false);
+        assert!(st.channels[0].bap.iter().all(|&b| b == 0));
+        let again = run(&mut st, call);
+        assert!(again.0 == want.0);
     }
 }
 

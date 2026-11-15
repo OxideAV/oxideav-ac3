@@ -85,6 +85,24 @@ const CASES: &[Case] = &[
     case("three blocks per syncframe", 2, 192_000, &[("blocks", "3")]),
     case("two blocks per syncframe", 2, 192_000, &[("blocks", "2")]),
     case("one block per syncframe", 2, 384_000, &[("blocks", "1")]),
+    // Block switching (short transforms on the transient blocks) with
+    // the channels coupled.
+    Case {
+        name: "standard coupling across block switches",
+        channels: 2,
+        bit_rate: 192_000,
+        opts: &[("cpl", "1")],
+        settle: 1,
+        transients: true,
+    },
+    Case {
+        name: "block switching 5.1",
+        channels: 6,
+        bit_rate: 448_000,
+        opts: &[],
+        settle: 1,
+        transients: true,
+    },
     Case {
         name: "transient pre-noise processing",
         channels: 2,
@@ -135,6 +153,13 @@ fn a_decoder_joining_mid_stream_agrees_with_one_that_saw_everything() {
         let mut full_state = Eac3DecoderState::default();
         let (full, ch) = decode_packets(&mut full_state, &packets);
         assert_eq!(ch, c.channels, "{}", c.name);
+        if c.name.contains("block switch") {
+            assert!(
+                uses_short_blocks(&packets),
+                "{}: the stream must switch to short transforms",
+                c.name
+            );
+        }
         assert_eq!(full_state.frames_zero_filled, 0, "{}", c.name);
         let per_frame = full[0].len() / ch;
         // Settling is counted in 1536-sample periods.
@@ -225,4 +250,19 @@ fn transient_pre_noise_synthesis_copies_from_the_previous_frame() {
         checked > 200,
         "the stream must place transients early in a frame ({checked} samples checked)"
     );
+}
+
+/// Does any block of any channel of the stream signal `blksw = 1`?
+/// (Reads the first block's flags of every syncframe: they directly
+/// follow the audfrm when `blkswe` is set.)
+fn uses_short_blocks(packets: &[Vec<u8>]) -> bool {
+    packets.iter().any(|p| {
+        syncframes(p).into_iter().any(|r| {
+            let frame = &p[r];
+            let mut br = oxideav_core::bits::BitReader::new(&frame[2..]);
+            let bsi = oxideav_ac3::eac3::bsi::parse_with(&mut br).unwrap();
+            let af = oxideav_ac3::eac3::audfrm::parse_with(&mut br, &bsi).unwrap();
+            af.blkswe && (0..bsi.nfchans).any(|_| br.read_u32(1).unwrap() != 0)
+        })
+    })
 }

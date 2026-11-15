@@ -639,8 +639,8 @@ fn open_unit<'u, 'a>(
     unit: &'u Unit<'a>,
 ) -> (std::borrow::Cow<'u, Eac3Bsi>, Result<AudFrm>, BitReader<'a>) {
     let frame = unit.frame;
-    let crc_failed = state.verify_crc
-        && crate::crc::verify_eac3_syncframe(frame, frame.len()).crc2_ok != Some(true);
+    let crc_ok = !state.verify_crc
+        || crate::crc::verify_eac3_syncframe(frame, frame.len()).crc2_ok == Some(true);
     let mut br = BitReader::new(&frame[2.min(frame.len())..]);
     let header_fits = br.skip(unit.bsi_bits).is_ok();
     let slot = if unit.is_indep {
@@ -651,6 +651,11 @@ fn open_unit<'u, 'a>(
     if state.last_good_bsi.len() <= slot {
         state.last_good_bsi.resize(slot + 1, None);
     }
+    // The check only condemns a frame once the substream has shown a
+    // CRC word that verifies: a stream whose CRC words are unusable
+    // throughout (never one good frame) is decoded as it stands rather
+    // than muted.
+    let crc_failed = !crc_ok && state.last_good_bsi[slot].is_some();
     if crc_failed {
         state.frames_crc_failed += 1;
         // Conceal in the substream's established shape when one is
@@ -668,7 +673,7 @@ fn open_unit<'u, 'a>(
             br,
         );
     }
-    if state.verify_crc && state.last_good_bsi[slot].as_ref() != Some(&unit.bsi) {
+    if state.verify_crc && crc_ok && state.last_good_bsi[slot].as_ref() != Some(&unit.bsi) {
         state.last_good_bsi[slot] = Some(unit.bsi.clone());
     }
     // Audfrm follows BSI in the same bit cursor.

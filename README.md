@@ -498,10 +498,10 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   running-average reference) and emits `transproce` +
   `chintransproc[ch]` + `transprocloc[ch]` (frame-relative, 4-sample
   units) + `transproclen[ch]` — the time-scaling length, set to the
-  pre-noise gap between the containing coding block's leading edge
-  and the transient (exactly the region the decoder's §3.7.2
-  synthesis overwrites; the precise length analysis is encoder
-  tuning — Figure E3.2 is the spec's only sketch). Long transforms
+  transient's offset inside its coding block, which makes the
+  decoder's §3.7.2 copy distance a constant two block hops (the
+  precise length analysis is encoder tuning — Figure E3.2 is the
+  spec's only sketch). Long transforms
   are forced while TPNP is on (the tool corrects long-transform
   pre-noise; block switching avoids it instead), and transient-free
   frames emit `transproce = 0`, byte-identical to the baseline
@@ -510,6 +510,48 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   byte-identical, end-to-end decode through our own §3.7.2 synthesis,
   a TPNP corruption sweep, and the external decoder binary accepts
   the syntax (27.4 dB on impulse-train content).
+
+### E-AC-3 decode: clause-by-clause checklist
+
+Every Annex E syntax element and decode path, the clause that defines
+it (ATSC A/52:2018 Annex E unless a main-body section is named), and
+the test that exercises it. "Join" is `tests/eac3_frame_state.rs`:
+the stream is decoded from its first frame and again from three later
+frames on a fresh decoder, and the decodes must agree sample for
+sample once the signal history is rebuilt. "Black box" names the
+comparison against an external decoder binary (run when one is on
+the machine, skipped otherwise); where there is none, the reason is
+given.
+
+| Element | Clause | Decoder behaviour | Tests | Black box |
+| --- | --- | --- | --- | --- |
+| Stream types 0 / 1 / 2, `substreamid` | §2.3.1.1-2, §3.8.1 | one program is decoded: the selected independent substream (default 0) and the dependent substreams that follow it; other programs are skipped | `tests/eac3_substreams.rs` (`default_selection_…`, `selected_program_…`, `dependent_substreams_stay_with_their_program`) | none — streams with a second program are built by re-labelling our encoder's frames |
+| Dependent substreams, `chanmap` | §2.3.1.7-8, Table E2.5, §3.8.2 | up to eight per program, each with its own history; channels at a location the independent substream carries replace it, new locations extend the program (max 16) | `two_dependent_substreams_keep_separate_history`, `replacing_dependent_channels_reach_the_output`, `splice_*` unit tests | none — the external decoder does not combine dependent substreams |
+| 5.1-or-fewer reproduction | §3.8.2 | a request for ≤ 6 channels decodes the independent substream only | `small_targets_decode_the_independent_substream_only` | — |
+| Program dynamic range | §3.8.5 | with dependent substreams reproduced, the last one's `dynrng` / `compr` govern every substream | `program_dynamic_range_words_come_from_the_dependent_substream` | — |
+| 1 / 2 / 3 / 6 blocks per syncframe | §2.3.1.5, Tables E2.4, E1.3 | `expstre = 1` / `ahte = 0` implicit below six blocks, `blkstrtinfoe` absent on one-block frames, `convsync` / `blkid` outside the informational block | Join (1, 2, 3 blocks); `fractional_frames_*` unit tests | `crafted_broadcast_matrix_*` (1/2/3-block cells, 57–93 dB) |
+| Exponent strategy per block (`expstre = 1`) | §2.3.2.1, Table E1.3 | `chexpstr` / `cplexpstr` / `lfeexpstr` read in audfrm, indexed by block | every encoder-made stream | whole decode-vs-reference harness |
+| Frame-based exponent strategy (`expstre = 0`) | §2.3.2.12-13, Table E2.10 | 5-bit row per channel (and for the coupling channel when any block couples) expanded to six strategies | `frame_based_exponent_strategy_expands_table_e2_10`; all seven staged E-AC-3 fixtures use it | `tests/docs_corpus.rs` (65–91 dB against the reference PCM) |
+| Converter exponent strategy, converter SNR offset | §2.3.2.14-15, §2.3.3.29-30 | parsed and discarded (only an E-AC-3 → AC-3 converter uses them); present on Type 0 only, `convexpstre` explicit below six blocks | `converter_exponent_strategy_arms_on_fractional_frames` | fractional cells of the matrix above |
+| Adaptive hybrid transform | §3.4, Tables E3.1-E3.6, E4.1-E4.7 | `nchregs` / `ncplregs` / `nlferegs` from the parsed strategies; full-bandwidth, coupling and LFE channels; VQ and all four GAQ modes | Join (stereo, 5.1); `aht_*` and `*_aht_*` unit tests | matrix `aht` cells, AHT + `compr` stereo cell |
+| Standard coupling under Annex E | §2.3.3.15, Tables E2.12, E1.4, §3.3.1 | default banding in a frame's first coupling block, signed derived `cplendf` with SPX, first-coordinate and first-leak states | Join (stereo, 5.1, with SPX); `issue13_craft_tests` | geometry and region sweeps (59–92 dB) |
+| Coupling across block switches | §7.4, §5.4.3.1 | a coupled channel's short-transform block takes the coupling channel's coefficients like any other; rematrix and dither follow per channel | Join ("standard coupling across block switches", "block switching 5.1" — the test checks the stream does switch) | programme matrix (transient material, both coupling extremes) |
+| Enhanced coupling | §2.3.3.14-26, §3.5 | strategy, amplitude / angle / chaos with parameter reuse, carrier from the previous / current / next block (previous block carried across frames), §3.3.2 rematrix band count | Join; `ecpl` unit tests; encoder round-trips | none — the external decoder does not implement enhanced coupling |
+| Spectral extension | §2.3.3.1-13, §3.6 | strategy and band structure (default in the first SPX block), coordinates with reuse, translation with wrap, noise blend, coordinate scaling | Join; `spx_*` unit tests; encoder round-trips | matrix `spx` cells (noise blend off: the noise sequence is decoder-private) |
+| SPX attenuation | §2.3.2.24-25, §3.6.4.2.3, Table E3.14 | border filter at the region border and at wrap points, applied after the band RMS is measured | Join; `spx_noise_level_is_measured_before_the_border_filter`, `spx_border_filter_shapes_the_translated_signal` | attenuated-stream energy check (banded energies ± 4 dB) |
+| SPX in the first block of a frame | Table E1.4 (`spxstre`, `firstspxcos`) | block 0 always carries the strategy and every channel's coordinates and blend: nothing is inherited from the previous frame | Join | matrix `spx` cells |
+| Transient pre-noise processing | §2.3.2.21-23, §3.7 | pre-noise counted from the leading edge of the block before the transient's; synthesis buffer read across the frame boundary; transient beyond the frame corrects the tail | `tpnp_tests`; `transient_pre_noise_synthesis_copies_from_the_previous_frame`; Join (two frames to settle) | none — the external decoder ignores the data (its output matches ours with the tool disabled at 93 dB) |
+| SNR offsets | §2.3.2.3, Table E2.9, §2.3.3.27 | strategies 1-3; `snroffste` reuse within the frame, block 0 always explicit | `snroffststr_per_block_roundtrip_*` | matrix (strategy 1) |
+| Bit-allocation parameters | Table E1.4, §5.4.3.30-47, §8.2.12 | `bamode` / `baie`, fast-gain codes (reset to the default in every block without `fgaincode`), leak initialisation, delta bit allocation with reuse; the allocation of a channel is recomputed whenever its exponents or any of these change | Join; `allocation_is_reused_only_when_its_inputs_are_unchanged` | whole harness |
+| State across syncframes | Table E1.3 tail, §5.4.3 | no parsed parameter crosses a frame boundary; signal history does — overlap tail, enhanced-coupling carrier, pre-noise synthesis source | Join (18 configurations × 3 join points) | — |
+| Error detection and concealment | §3.2, §7.10 | CRC verified before decoding; a failing or undecodable frame is replaced by the last good block's overlap tail, then silence; the next frame fades in | `tests/stream_resilience.rs` | — |
+| Reduced sample rates (`fscod2`) | §2.3.1.5, Table E2.3 | header parsed, six blocks, half-rate timing; **the bit-allocation hearing-threshold column for these rates is not stated in the staged text** — the 32 kHz column is used, unverified | header unit tests only | none — no encoder on hand emits these rates |
+
+What a receiver sees on a broadcast stream follows from the last four
+rows: tuning in mid-stream costs one block of fade-in (two frames
+where transient pre-noise data refers back), a second audio service in
+the same stream does not disturb the first, and a damaged frame costs
+that frame.
 
 ### JOC object rendering (target speaker layout)
 
@@ -624,11 +666,54 @@ constant-rate estimate from the first packet's size. Packet counts for
 the playback-corpus cells (AC-3 stereo / 5.1, E-AC-3 5.1) match
 `ffprobe -count_frames` (`tests/elementary_stream.rs`).
 
-The decoder itself accepts a packet carrying **several consecutive
-syncframes** (an MPEG-TS PES payload typically does): it splits the
-packet into presentation periods, drains them through successive
-`receive_frame` calls and advances the timestamps by each period's
-sample count rescaled into the packet's time base.
+### Byte-stream input, CRC check and concealment
+
+The registry decoders treat what they are sent as a byte stream. A
+packet may hold several syncframes, a fraction of one, or begin in the
+middle of one (MPEG-TS PES payloads do all three):
+
+- syncframes are reassembled across packet boundaries; one frame is
+  returned per presentation period (an AC-3 syncframe, or an E-AC-3
+  independent frame with the frames that follow it), through
+  successive `receive_frame` calls;
+- a packet's `pts` belongs to the first period that *commences* in it;
+  later periods follow on by their sample counts, rescaled into the
+  packet's time base;
+- bytes that belong to no syncframe are skipped. A syncword found by
+  scanning counts only when the next syncframe's header follows where
+  it announces, or its CRC verifies (§6.1.2). 32 KiB of input without
+  a syncframe is reported as an error;
+- an access unit split between packets (independent and dependent
+  frames in packets of their own) is held together once the stream
+  has shown how many frames a period has.
+
+One period per packet — what MP4, Matroska and the `.ac3` demuxer
+deliver — decodes exactly as before, with no added latency.
+
+**Damaged frames** (§7.10, Annex E §3.2). The CRC of every syncframe
+is verified before it is decoded (E-AC-3: the frame CRC; AC-3: a frame
+is accepted when either `crc1` or `crc2` verifies, §6.1.2). A frame
+that fails, or that cannot be decoded, is not an error: the decoder
+returns a frame of the usual shape — taken from the substream's last
+good frame, since a damaged header cannot be trusted — carrying the
+overlap tail of the last good block followed by silence, and the next
+frame fades in through its own window. Frame count and timestamps are
+unaffected, so nothing downstream slips. The check condemns frames
+only once the stream has shown a CRC word that verifies: a stream
+whose CRC words are unusable from its first frame on is decoded as it
+stands rather than muted.
+
+| option (`CodecParameters::options`) | values | meaning |
+| --- | --- | --- |
+| `crc` | `true` (default) / `false` | verify syncframe CRCs and conceal failing frames; also `Eac3DecoderOptions::with_crc_check` |
+| `program` | `0` (default) … `7` | independent substream to decode; also `Eac3DecoderOptions::with_program` |
+| `joc_layout` | see below | object presentation |
+
+At the frame level, `eac3::decode_eac3_packet` takes one access unit
+and leaves the CRC check off unless
+`Eac3DecoderState::set_crc_check(true)`;
+`Eac3DecoderState::frames_zero_filled` / `frames_crc_failed` count
+concealed frames.
 
 ### CRC
 
@@ -862,6 +947,50 @@ Remaining headroom is structural and would change output bits: the
 forward MDCT and the JOC QMF bank are still direct-form `O(N²)`
 (an FFT-based form rounds differently), and the cadence election still
 runs the allocator on every candidate run.
+
+**r489 decoder pass** — same example, 10 s of programme, decode stages
+repeated 10 times, single thread, Apple M5 Max, rustc 1.98. The
+machine was shared with other builds, so each figure is the **median
+of five runs** in which the build from before the pass and the current
+build alternate; the ratio is the stable quantity. Output hashes are
+identical, and the decoded output of 42 further streams (the staged
+corpus, the in-tree fixtures and 19 encoder configurations) hashes the
+same on both builds except one — the spectral-extension attenuation
+stream, whose decode changed by the §3.6.4.2.3 fix. The "after"
+column includes the syncframe CRC check, which the "before" build did
+not perform.
+
+| stage (× real time) | before | after | ratio |
+| --- | ---: | ---: | ---: |
+| decode AC-3 5.1 448 kb/s | 445 | 605 | 1.36 |
+| decode E-AC-3 5.1 384 kb/s | 405 | 567 | 1.40 |
+| decode E-AC-3 5.1, SPX + coupling | 506 | 605 | 1.20 |
+| decode E-AC-3 5.1, AHT | 503 | 650 | 1.29 |
+| decode E-AC-3 5.1 → stereo downmix | 358 | 492 | 1.38 |
+| decode E-AC-3 5.1 → 7.1.4 channel route | 310 | 409 | 1.32 |
+
+- **Bit allocation**: the §7.2.2 allocator ran for every channel of
+  every block. A block that reuses its exponents and changes none of
+  the allocation parameters has, by §7.2, the allocation of the block
+  before; the allocator now returns at once when the channel's
+  exponents over the allocated range and every parameter it reads
+  (decay / gain / knee / floor codes, SNR offsets, fast gain, leak
+  initialisation, delta segments, range, rate) equal those of the
+  allocation already in the state.
+- **Grouped mantissas** (bap 1, 2, 4): two or three divisions per
+  group became one table row per code word.
+- **CRC**: verification is new work on the decode path; the register
+  advances four message bytes per step from four 256-entry tables
+  (checked against the bit-serial register), and the AC-3 `crc1` /
+  `crc2` check is a single pass over the frame.
+- **Window + overlap-add** in one loop on the IMDCT output, without
+  the coefficient and PCM scratch copies.
+- **Per-frame allocation and passes removed**: exponent runs decode
+  into a stack array; the 43 KiB AHT coefficient cache is allocated
+  only for a frame that signals AHT; the registry decoder no longer
+  packs a 16-bit copy of every E-AC-3 frame it then discards (float
+  output, downmix, object rendering) nor copies the AC-3 program
+  before packing it.
 
 ## Installation
 

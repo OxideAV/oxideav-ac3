@@ -676,6 +676,103 @@ mod tests {
         out
     }
 
+    /// Table E1.3, converter exponent strategy on fractional frames:
+    /// `convexpstre` is transmitted when `numblkscod != 0x3` and only
+    /// on a Type 0 substream; when set, one 5-bit `convexpstr[ch]`
+    /// follows per full-bandwidth channel ("required to be provided
+    /// once every 6 blocks", §2.3.2.14). The fields after it must be
+    /// read from the right position in all four arms.
+    #[test]
+    fn converter_exponent_strategy_arms_on_fractional_frames() {
+        // Mono, 2 blocks: no expstre / ahte bits, no coupling bits.
+        let head: Vec<(u32, u32)> = vec![
+            (2, 0), // snroffststr
+            (1, 0), // transproce
+            (1, 1), // blkswe
+            (1, 1), // dithflage
+            (1, 1), // bamode
+            (1, 0), // frmfgaincode
+            (1, 1), // dbaflde
+            (1, 1), // skipflde
+            (1, 0), // spxattene
+            (2, 1), // chexpstr[0][0] = D15
+            (2, 0), // chexpstr[1][0] = reuse
+        ];
+        let tail: Vec<(u32, u32)> = vec![
+            (6, 41), // frmcsnroffst
+            (4, 9),  // frmfsnroffst
+            (1, 0),  // blkstrtinfoe
+        ];
+        let cases: [(StreamType, Vec<(u32, u32)>); 4] = [
+            // Type 0, convexpstre = 0.
+            (StreamType::Independent, vec![(1, 0)]),
+            // Type 0, convexpstre = 1 + convexpstr[0].
+            (StreamType::Independent, vec![(1, 1), (5, 0x15)]),
+            // Type 1 and Type 2 carry no converter strategy at all.
+            (StreamType::Dependent, vec![]),
+            (StreamType::Ac3Convert, vec![]),
+        ];
+        for (strmtyp, conv) in cases {
+            let bsi = make_bsi(1, false, 2, strmtyp);
+            let bits: Vec<(u32, u32)> = [head.clone(), conv.clone(), tail.clone()].concat();
+            let want: u32 = bits.iter().map(|(n, _)| *n).sum();
+            let a = parse(&pack_msb(&bits), &bsi).expect("audfrm");
+            assert_eq!(a.bits_consumed, u64::from(want), "{strmtyp:?} {conv:?}");
+            assert_eq!((a.frmcsnroffst, a.frmfsnroffst), (41, 9), "{strmtyp:?}");
+            assert_eq!(a.chexpstr_blk_ch[0][0], 1);
+            assert_eq!(a.chexpstr_blk_ch[1][0], 0);
+        }
+    }
+
+    /// Table E1.3, frame-based exponent strategy (`expstre = 0`): a
+    /// 5-bit Table E2.10 row per channel — and one for the coupling
+    /// channel only when coupling is in use in some block — expands to
+    /// the six per-block strategies.
+    #[test]
+    fn frame_based_exponent_strategy_expands_table_e2_10() {
+        let bsi = make_bsi(2, false, 6, StreamType::Independent);
+        let mut bits: Vec<(u32, u32)> = vec![
+            (1, 0), // expstre = 0
+            (1, 0), // ahte
+            (2, 0), // snroffststr
+            (1, 0), // transproce
+            (1, 0), // blkswe
+            (1, 0), // dithflage
+            (1, 0), // bamode
+            (1, 0), // frmfgaincode
+            (1, 0), // dbaflde
+            (1, 0), // skipflde
+            (1, 0), // spxattene
+            (1, 0), // cplinu[0] = 0
+            (1, 0), // cplstre[1] = 0
+            (1, 1), // cplstre[2] = 1
+            (1, 1), // cplinu[2] = 1
+            (1, 0), // cplstre[3] = 0
+            (1, 0), // cplstre[4] = 0
+            (1, 1), // cplstre[5] = 1
+            (1, 0), // cplinu[5] = 0
+        ];
+        bits.push((5, 12)); // frmcplexpstr: D25 R D45 D25 R R
+        bits.push((5, 9)); // frmchexpstr[0]: D25 R D25 R R D45
+        bits.push((5, 31)); // frmchexpstr[1]: D45 ×6
+        bits.push((5, 0)); // convexpstr[0]
+        bits.push((5, 0)); // convexpstr[1]
+        bits.push((6, 20)); // frmcsnroffst
+        bits.push((4, 3)); // frmfsnroffst
+        bits.push((1, 0)); // blkstrtinfoe
+        let want: u32 = bits.iter().map(|(n, _)| *n).sum();
+        let a = parse(&pack_msb(&bits), &bsi).expect("audfrm");
+        assert_eq!(a.bits_consumed, u64::from(want));
+        assert_eq!(a.cplinu_blk, [false, false, true, true, true, false]);
+        assert_eq!(a.ncplblks, 3);
+        assert_eq!(a.cplexpstr_blk, [2, 0, 3, 2, 0, 0]);
+        let ch0: Vec<u8> = (0..6).map(|b| a.chexpstr_blk_ch[b][0]).collect();
+        let ch1: Vec<u8> = (0..6).map(|b| a.chexpstr_blk_ch[b][1]).collect();
+        assert_eq!(ch0, [2, 0, 2, 0, 0, 3]);
+        assert_eq!(ch1, [3; 6]);
+        assert_eq!((a.frmcsnroffst, a.frmfsnroffst), (20, 3));
+    }
+
     /// 2/0 stereo, 6 blocks, all strategy flags at the encoder's
     /// preferred values (expstre=1, blkswe=1, dithflage=1, bamode=1,
     /// dbaflde=1, skipflde=1; ahte=0, transproce=0, spxattene=0,

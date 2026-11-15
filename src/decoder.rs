@@ -784,22 +784,23 @@ impl Ac3Decoder {
         // §6.1.2: either CRC word verifying accepts the frame. A frame
         // on which both fail is not parsed; it is concealed in the
         // shape of the last frame that did verify (its own header bits
-        // cannot be trusted), or dropped when there is none yet.
-        let damaged = self.crc_check && {
+        // cannot be trusted). The check only condemns a frame once the
+        // stream has shown a CRC word that verifies: a stream whose CRC
+        // words are unusable throughout is decoded as it stands rather
+        // than muted.
+        let crc_ok = !self.crc_check || {
             let status = crc::verify_ac3_syncframe(frame, frame.len());
-            status.crc1_ok != Some(true) && status.crc2_ok != Some(true)
+            status.crc1_ok == Some(true) || status.crc2_ok == Some(true)
         };
-        let bsi: Bsi = if damaged {
-            match &self.last_good_ac3 {
-                Some(good) => good.clone(),
-                None => return Err(Error::invalid("ac3: syncframe CRC mismatch")),
+        let (damaged, bsi): (bool, Bsi) = match &self.last_good_ac3 {
+            Some(good) if !crc_ok => (true, good.clone()),
+            _ => {
+                let bsi = bsi::parse(&data[5..])?;
+                if self.crc_check && crc_ok && self.last_good_ac3.as_ref() != Some(&bsi) {
+                    self.last_good_ac3 = Some(bsi.clone());
+                }
+                (false, bsi)
             }
-        } else {
-            let bsi = bsi::parse(&data[5..])?;
-            if self.crc_check && self.last_good_ac3.as_ref() != Some(&bsi) {
-                self.last_good_ac3 = Some(bsi.clone());
-            }
-            bsi
         };
 
         let src_channels = bsi.nchans as u16;
