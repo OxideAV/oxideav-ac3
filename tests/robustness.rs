@@ -70,11 +70,21 @@ fn first_frame_len(data: &[u8]) -> usize {
 
 /// Drive one fixture through the three corruption families.
 fn sweep_one(id: &str, base: &[u8]) {
+    // With the CRC check on (the default) a corrupted frame is
+    // concealed without being parsed; with it off the corrupted bits
+    // reach the parser and the DSP. Both policies are swept.
+    sweep_one_with(id, base, true);
+    sweep_one_with(id, base, false);
+}
+
+fn sweep_one_with(id: &str, base: &[u8], crc: bool) {
     let mut reg = CodecRegistry::new();
     oxideav_ac3::register_codecs(&mut reg);
-    let mut dec = reg
-        .first_decoder(&CodecParameters::audio(CodecId::new(id)))
-        .expect("make_decoder");
+    let mut params = CodecParameters::audio(CodecId::new(id));
+    params
+        .options
+        .insert("crc", if crc { "true" } else { "false" });
+    let mut dec = reg.first_decoder(&params).expect("make_decoder");
 
     // 1. Every truncation prefix (capped so the test stays quick).
     for t in 0..base.len().min(800) {
@@ -87,8 +97,12 @@ fn sweep_one(id: &str, base: &[u8]) {
     // pure function of the input (deterministic).
     let mut s: u32 = 0xACE1u32 ^ (base.len() as u32);
 
+    // The checked decoder stops at the CRC: a short pass is enough to
+    // cover the reassembly + concealment path.
+    let (flips, junk) = if crc { (300, 150) } else { (2500, 1200) };
+
     // 2. Triple-bit flips on the first real frame.
-    for _ in 0..2500 {
+    for _ in 0..flips {
         let mut m = base[..flen].to_vec();
         for _ in 0..3 {
             let b = (lcg(&mut s) as usize) % bits;
@@ -98,7 +112,7 @@ fn sweep_one(id: &str, base: &[u8]) {
     }
 
     // 3. Sync-prefixed random garbage.
-    for _ in 0..1200 {
+    for _ in 0..junk {
         let len = (lcg(&mut s) % 1800 + 2) as usize;
         let mut v = vec![0u8; len];
         for byte in v.iter_mut() {

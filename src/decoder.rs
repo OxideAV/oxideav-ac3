@@ -32,7 +32,10 @@ use crate::wave_order;
 pub const SAMPLES_PER_FRAME: u32 = 1536;
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    Ok(Box::new(Ac3Decoder::new(params, false, None)))
+    let options = Eac3DecoderOptions::from_codec_options(&params.options)?;
+    let mut decoder = Ac3Decoder::new(params, false, None);
+    decoder.configure(&options);
+    Ok(Box::new(decoder))
 }
 
 /// Dedicated E-AC-3 decoder factory. Identical to [`make_decoder`] —
@@ -57,12 +60,36 @@ pub fn make_eac3_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 /// | key | values | meaning |
 /// | --- | --- | --- |
 /// | `joc_layout` | `stereo`, `5.1`, `5.1.2`, `5.1.4`, `7.1`, `7.1.2`, `7.1.4`, `9.1.6` | render the JOC object presentation to this speaker layout |
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// | `program` | `0`..`7` | independent substream (program) to decode, default `0` |
+/// | `crc` | `true` / `false` | verify each syncframe's CRC and conceal failing frames, default `true` |
+///
+/// The `crc` key is also honoured by the plain AC-3 factory
+/// ([`make_decoder`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Eac3DecoderOptions {
     /// Speaker layout the JOC object presentation is rendered to;
     /// `None` (the default) keeps the channel-based decode.
     pub joc_layout: Option<JocLayout>,
+    /// Independent substream id of the program to decode (Annex E
+    /// §E.3.8.3). Default 0 — "Program 1". Frames of other programs
+    /// are skipped.
+    pub program: u8,
+    /// Verify the CRC of every syncframe before decoding it (Annex E
+    /// §E.3.2; for AC-3 either of `crc1` / `crc2` verifying accepts the
+    /// frame, §6.1.2) and replace a failing frame with the concealment
+    /// signal. Default `true`.
+    pub crc_check: bool,
+}
+
+impl Default for Eac3DecoderOptions {
+    fn default() -> Self {
+        Self {
+            joc_layout: None,
+            program: 0,
+            crc_check: true,
+        }
+    }
 }
 
 impl Eac3DecoderOptions {
@@ -74,6 +101,20 @@ impl Eac3DecoderOptions {
     /// Render the JOC object presentation to `layout`.
     pub fn with_joc_layout(mut self, layout: JocLayout) -> Self {
         self.joc_layout = Some(layout);
+        self
+    }
+
+    /// Decode the program carried by independent substream `id`
+    /// (0..=7).
+    pub fn with_program(mut self, id: u8) -> Self {
+        self.program = id & 7;
+        self
+    }
+
+    /// Switch the syncframe CRC check (and the concealment of failing
+    /// frames) on or off.
+    pub fn with_crc_check(mut self, on: bool) -> Self {
+        self.crc_check = on;
         self
     }
 
@@ -91,22 +132,49 @@ impl Eac3DecoderOptions {
 }
 
 impl CodecOptionsStruct for Eac3DecoderOptions {
-    const SCHEMA: &'static [OptionField] = &[OptionField {
-        name: "joc_layout",
-        kind: OptionKind::Enum(&[
-            "stereo", "5.1", "5.1.2", "5.1.4", "7.1", "7.1.2", "7.1.4", "9.1.6",
-        ]),
-        default: OptionValue::String(String::new()),
-        help: "speaker layout the JOC object presentation is rendered to",
-    }];
+    const SCHEMA: &'static [OptionField] = &[
+        OptionField {
+            name: "joc_layout",
+            kind: OptionKind::Enum(&[
+                "stereo", "5.1", "5.1.2", "5.1.4", "7.1", "7.1.2", "7.1.4", "9.1.6",
+            ]),
+            default: OptionValue::String(String::new()),
+            help: "speaker layout the JOC object presentation is rendered to",
+        },
+        OptionField {
+            name: "program",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "independent substream (program) to decode, 0..7",
+        },
+        OptionField {
+            name: "crc",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(true),
+            help: "verify syncframe CRCs and conceal failing frames",
+        },
+    ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
-        if key == "joc_layout" {
-            let layout = value
-                .as_str()?
-                .parse::<JocLayout>()
-                .map_err(|error| Error::invalid(error.to_string()))?;
-            self.joc_layout = Some(layout);
+        match key {
+            "joc_layout" => {
+                let layout = value
+                    .as_str()?
+                    .parse::<JocLayout>()
+                    .map_err(|error| Error::invalid(error.to_string()))?;
+                self.joc_layout = Some(layout);
+            }
+            "program" => {
+                let id = value.as_u32()?;
+                if id > 7 {
+                    return Err(Error::invalid(format!(
+                        "eac3: program {id} out of range (independent substream ids are 0..7)"
+                    )));
+                }
+                self.program = id as u8;
+            }
+            "crc" => self.crc_check = value.as_bool()?,
+            _ => {}
         }
         Ok(())
     }
@@ -129,6 +197,7 @@ pub fn make_eac3_decoder_with_options(
     options: &Eac3DecoderOptions,
 ) -> Result<Box<dyn Decoder>> {
     let mut decoder = Ac3Decoder::new(params, false, options.joc_layout);
+    decoder.configure(options);
     if let Some(layout) = options.joc_layout {
         match params.channels {
             None => {
@@ -207,12 +276,24 @@ pub fn make_decoder_with_drc(
 struct Ac3Decoder {
     codec_id: CodecId,
     time_base: TimeBase,
-    /// Presentation periods still to be decoded from the last packet
+    /// Presentation periods still to be decoded from the packets
     /// handed to [`Decoder::send_packet`]. A packet may carry several
-    /// consecutive syncframes (an MPEG-TS PES payload typically does);
-    /// [`split_packet`] cuts it into one entry per period and
+    /// consecutive syncframes, a fraction of one, or start in the
+    /// middle of one (an MPEG-TS PES payload can do all three); the
+    /// [`Framer`] cuts the byte stream into one entry per period and
     /// [`Decoder::receive_frame`] drains them in order.
     pending: std::collections::VecDeque<Packet>,
+    /// Syncframe reassembly across packet boundaries.
+    framer: Framer,
+    /// Verify syncframe CRCs and conceal failing frames.
+    crc_check: bool,
+    /// Program (independent substream id) the E-AC-3 path decodes.
+    program: u8,
+    /// BSI of the last AC-3 frame that passed the CRC check: a frame
+    /// that fails it is concealed in this shape.
+    last_good_ac3: Option<Bsi>,
+    /// AC-3 syncframes replaced by the concealment signal.
+    ac3_frames_concealed: u64,
     eof: bool,
     state: Ac3State,
     /// Per-decoder E-AC-3 state — empty in round 1 (no overlap-add
@@ -266,7 +347,7 @@ impl Decoder for Ac3Decoder {
                 "AC-3 decoder: receive_frame must be called before sending another packet",
             ));
         }
-        self.pending = split_packet(packet);
+        self.pending = self.framer.push(packet);
         Ok(())
     }
 
@@ -274,6 +355,12 @@ impl Decoder for Ac3Decoder {
         let pkt = match self.pending.pop_front() {
             Some(p) => p,
             None => {
+                if self.framer.discarded > MAX_UNSYNCED_BYTES {
+                    let n = std::mem::take(&mut self.framer.discarded);
+                    return Err(Error::invalid(format!(
+                        "ac3: no syncframe in the last {n} bytes of input"
+                    )));
+                }
                 return if self.eof {
                     Err(Error::Eof)
                 } else {
@@ -286,6 +373,10 @@ impl Decoder for Ac3Decoder {
 
     fn flush(&mut self) -> Result<()> {
         self.eof = true;
+        // Complete syncframes still held back (their period's end was
+        // never seen) are released; a trailing fragment is dropped.
+        let held = self.framer.finish();
+        self.pending.extend(held);
         Ok(())
     }
 
@@ -311,14 +402,19 @@ impl Decoder for Ac3Decoder {
 
     fn reset(&mut self) -> Result<()> {
         self.pending.clear();
+        self.framer = Framer::default();
         self.eof = false;
         self.state = Ac3State::new();
         self.eac3_state = eac3::Eac3DecoderState::default();
         self.joc_renderer.reset();
-        // Preserve the configured DRC regime across a flush/reset — it is
-        // a decoder-lifetime listener setting, not per-frame state.
+        self.last_good_ac3 = None;
+        // Preserve the configured DRC regime, program selection and CRC
+        // policy across a flush/reset — they are decoder-lifetime
+        // settings, not per-frame state.
         self.state.drc = self.drc;
         self.eac3_state.set_drc(self.drc);
+        self.eac3_state.set_program(self.program);
+        self.eac3_state.set_crc_check(self.crc_check);
         Ok(())
     }
 }
@@ -329,6 +425,11 @@ impl Ac3Decoder {
             codec_id: params.codec_id.clone(),
             time_base: TimeBase::new(1, 48_000),
             pending: std::collections::VecDeque::new(),
+            framer: Framer::default(),
+            crc_check: false,
+            program: 0,
+            last_good_ac3: None,
+            ac3_frames_concealed: 0,
             eof: false,
             state: Ac3State::new(),
             eac3_state: eac3::Eac3DecoderState::default(),
@@ -341,6 +442,14 @@ impl Ac3Decoder {
             last_sample_rate: None,
             params_generation: 0,
         }
+    }
+
+    /// Apply the program selection and CRC policy of `options`.
+    fn configure(&mut self, options: &Eac3DecoderOptions) {
+        self.crc_check = options.crc_check;
+        self.program = options.program & 7;
+        self.eac3_state.set_program(self.program);
+        self.eac3_state.set_crc_check(self.crc_check);
     }
 
     /// The multichannel layout every output frame has, when one was
@@ -658,23 +767,54 @@ impl Ac3Decoder {
                 data.len()
             )));
         }
-        let bsi: Bsi = bsi::parse(&data[5..])?;
+        let frame = &data[..si.frame_length as usize];
+        // §6.1.2: either CRC word verifying accepts the frame. A frame
+        // on which both fail is not parsed; it is concealed in the
+        // shape of the last frame that did verify (its own header bits
+        // cannot be trusted), or dropped when there is none yet.
+        let damaged = self.crc_check && {
+            let status = crc::verify_ac3_syncframe(frame, frame.len());
+            status.crc1_ok != Some(true) && status.crc2_ok != Some(true)
+        };
+        let bsi: Bsi = if damaged {
+            match &self.last_good_ac3 {
+                Some(good) => good.clone(),
+                None => return Err(Error::invalid("ac3: syncframe CRC mismatch")),
+            }
+        } else {
+            let bsi = bsi::parse(&data[5..])?;
+            if self.crc_check && self.last_good_ac3.as_ref() != Some(&bsi) {
+                self.last_good_ac3 = Some(bsi.clone());
+            }
+            bsi
+        };
 
         let src_channels = bsi.nchans as u16;
         let sample_rate = si.sample_rate;
         self.time_base = TimeBase::new(1, sample_rate as i64);
 
         // 1) Decode the syncframe into a source-layout interleaved
-        //    f32 buffer. This contains `nfchans + lfe` channels.
+        //    f32 buffer. This contains `nfchans + lfe` channels. A frame
+        //    that cannot be decoded carries the concealment signal: the
+        //    last good block's overlap tail, then silence.
         let src_samples = SAMPLES_PER_FRAME as usize * src_channels as usize;
         let mut floats = vec![0.0f32; src_samples];
-        audblk::decode_frame(
-            &mut self.state,
-            &si,
-            &bsi,
-            &data[..si.frame_length as usize],
-            &mut floats,
-        )?;
+        let tails: [[f32; SAMPLES_PER_BLOCK]; audblk::MAX_CHANNELS] =
+            std::array::from_fn(|ch| self.state.channels[ch].delay);
+        let decoded = !damaged
+            && audblk::decode_frame(&mut self.state, &si, &bsi, frame, &mut floats).is_ok();
+        if !decoded {
+            for (ch, tail) in tails.iter().enumerate() {
+                self.state.channels[ch].delay = *tail;
+            }
+            audblk::conceal_frame(
+                &mut self.state,
+                bsi.nfchans as usize,
+                bsi.lfeon,
+                &mut floats,
+            );
+            self.ac3_frames_concealed += 1;
+        }
         debug_assert_eq!(
             floats.len(),
             BLOCKS_PER_FRAME * SAMPLES_PER_BLOCK * src_channels as usize
@@ -812,63 +952,367 @@ impl Ac3Decoder {
     }
 }
 
-/// Cut a packet into one sub-packet per presentation period.
+/// Largest syncframe either syntax can describe: 2048 16-bit words
+/// (§E.2.3.1.3).
+const MAX_SYNCFRAME_BYTES: usize = 4096;
+
+/// Upper bound on the bytes the [`Framer`] holds back: one period of
+/// the densest legal access unit (eight independent substreams, each
+/// with eight dependent substreams) would exceed any real stream; a
+/// period that grows past this is released as it stands.
+const MAX_HELD_BYTES: usize = 32 * MAX_SYNCFRAME_BYTES;
+
+/// Input the decoder accepts without finding a syncframe before it
+/// reports an error: enough to join a stream anywhere inside the
+/// longest syncframe several times over.
+const MAX_UNSYNCED_BYTES: usize = 8 * MAX_SYNCFRAME_BYTES;
+
+/// Offset of the next `0x0B77` at or after `from`. When there is none
+/// the result is the buffer length, or one less when the last byte
+/// could be the first half of a syncword.
+fn next_syncword(data: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i + 1 < data.len() {
+        if data[i] == 0x0B && data[i + 1] == 0x77 {
+            return i;
+        }
+        i += 1;
+    }
+    if data.len() > from && data.last() == Some(&0x0B) {
+        data.len() - 1
+    } else {
+        data.len().max(from)
+    }
+}
+
+/// Is the complete candidate syncframe at the start of `rest` a real
+/// one? §6.1.2: a second syncframe header in the place this one
+/// announces, or a verifying CRC word, confirms synchronisation. (The
+/// header test is tried first: it is the cheap one and holds for every
+/// frame of an intact stream but the last.)
+fn candidate_confirmed(rest: &[u8], frame: &crate::container::SyncFrame) -> bool {
+    if crate::container::parse_sync_frame(&rest[frame.len..]).is_some() {
+        return true;
+    }
+    let bytes = &rest[..frame.len];
+    if frame.eac3 {
+        crc::verify_eac3_syncframe(bytes, frame.len).crc2_ok == Some(true)
+    } else {
+        let status = crc::verify_ac3_syncframe(bytes, frame.len);
+        status.crc1_ok == Some(true) || status.crc2_ok == Some(true)
+    }
+}
+
+/// A presentation period being assembled by the [`Framer`].
+struct OpenPeriod {
+    start: usize,
+    pts: Option<i64>,
+    dts: Option<i64>,
+    samples: u32,
+    sample_rate: u32,
+    /// Opened by an Annex E frame: dependent / additional-program
+    /// frames may follow. A base AC-3 frame is a period of its own.
+    eac3: bool,
+    /// Syncframes in the period so far.
+    frames: usize,
+}
+
+/// Syncframe reassembly across packet boundaries.
 ///
 /// Containers that frame AC-3 themselves (MP4, Matroska, the `.ac3`
-/// demuxer) hand over exactly one period per packet and the split is
-/// the identity. Transport-stream PES payloads carry several
-/// consecutive syncframes; each AC-3 frame, and each E-AC-3 program-0
-/// independent frame together with the dependent / additional-program
-/// frames that follow it (Annex E §E.3.8 — the decoder renders program
-/// 0), becomes its own sub-packet. Timestamps advance by the period's
-/// sample count rescaled into the packet's time base; the duration is
-/// set per period. Bytes that do not parse as a syncframe header where
-/// a frame is expected stay attached to the preceding period (or form
-/// the single sub-packet of an unparsable packet) so the frame decoder
-/// reports them exactly as before.
-fn split_packet(packet: &Packet) -> std::collections::VecDeque<Packet> {
-    use crate::container::parse_sync_frame;
-    let data = &packet.data[..];
-    let mut out = std::collections::VecDeque::new();
-    // Period boundaries: offsets of every program-start syncframe.
-    let mut starts: Vec<(usize, u32, u32)> = Vec::new(); // (offset, samples, sample_rate)
-    let mut off = 0usize;
-    while off + 6 <= data.len() {
-        let Some(f) = parse_sync_frame(&data[off..]) else {
-            break;
+/// demuxer) hand over exactly one presentation period per packet and
+/// the framer is the identity. Transport-stream PES payloads are a
+/// byte stream: a payload can carry several syncframes, end part-way
+/// through one, or begin part-way through one. The framer finds the
+/// syncframes, keeps a fragment until the rest of it arrives, skips
+/// bytes that are not part of a syncframe, and releases one sub-packet
+/// per period: each AC-3 frame, and each E-AC-3 program-0 independent
+/// frame together with the dependent / additional-program frames that
+/// follow it (Annex E §E.3.8).
+///
+/// A period whose packet ends exactly on a syncframe boundary is
+/// released at once when it is as long (in syncframes) as the stream's
+/// periods have been so far; a shorter one, or one followed by a
+/// fragment, is held until the next packet shows whether a frame of
+/// the same period or the next period follows. (At the very start of a
+/// stream nothing is known: a packet that ends right after the first
+/// independent frame releases it, and a dependent frame arriving in
+/// the next packet is skipped — once.)
+///
+/// Timestamps: the packet's `pts` / `dts` belong to the first period
+/// that *commences* in that packet; later periods (and a period that
+/// commenced in an earlier packet) follow on by the sample count of
+/// the periods before them, rescaled into the packet's time base.
+#[derive(Default)]
+struct Framer {
+    /// Bytes held back: the complete frames of the period still open
+    /// (if any) followed by a fragment.
+    carry: Vec<u8>,
+    /// Timestamps of the period (or fragment) at the head of `carry`.
+    carry_pts: Option<i64>,
+    carry_dts: Option<i64>,
+    /// Timestamps a period takes when its packet supplies none: the
+    /// end of the period released last.
+    next_pts: Option<i64>,
+    next_dts: Option<i64>,
+    /// Time base, stream index and flags of the last packet (for the
+    /// sub-packets released by [`Framer::finish`]).
+    time_base: Option<TimeBase>,
+    stream_index: u32,
+    /// Bytes discarded since the last syncframe was accepted (or since
+    /// the start): the decoder reports an error when a long run of
+    /// input holds no syncframe at all.
+    discarded: usize,
+    /// Syncframes per period of this stream, as learned so far: the
+    /// length of the last period whose end was seen (the next period's
+    /// first frame followed it), raised when a dependent frame turns
+    /// up after its period was released. A period that ends exactly
+    /// with a packet is released at once only when it is this long.
+    period_frames: usize,
+    /// Syncframes in the period released last, and dependent frames
+    /// skipped since then.
+    last_released_frames: usize,
+    orphans: usize,
+}
+
+impl Framer {
+    /// Timestamps of a period (or fragment) commencing at `pos`: the
+    /// packet's own for the first one in its bytes, the carried ones
+    /// for the head of the carry, else the running end of the period
+    /// before.
+    fn stamps_at(
+        &self,
+        pos: usize,
+        fresh_from: usize,
+        fresh: &mut Option<(Option<i64>, Option<i64>)>,
+    ) -> (Option<i64>, Option<i64>) {
+        if pos >= fresh_from {
+            match fresh.take() {
+                Some((pts, dts)) => (pts.or(self.next_pts), dts.or(self.next_dts)),
+                None => (self.next_pts, self.next_dts),
+            }
+        } else if pos == 0 {
+            (self.carry_pts, self.carry_dts)
+        } else {
+            (self.next_pts, self.next_dts)
+        }
+    }
+
+    /// Add `packet`'s bytes; returns the periods now complete.
+    fn push(&mut self, packet: &Packet) -> std::collections::VecDeque<Packet> {
+        self.time_base = Some(packet.time_base);
+        self.stream_index = packet.stream_index;
+        if self.carry.is_empty() {
+            self.walk(&packet.data, 0, packet, false)
+        } else {
+            let fresh_from = self.carry.len();
+            let mut data = std::mem::take(&mut self.carry);
+            data.extend_from_slice(&packet.data);
+            self.walk(&data, fresh_from, packet, false)
+        }
+    }
+
+    /// End of stream: release the complete frames still held.
+    fn finish(&mut self) -> std::collections::VecDeque<Packet> {
+        let Some(time_base) = self.time_base else {
+            return std::collections::VecDeque::new();
         };
-        if f.program_start {
-            starts.push((off, f.samples, f.sample_rate));
+        if self.carry.is_empty() {
+            return std::collections::VecDeque::new();
         }
-        if off + f.len > data.len() {
-            break;
+        let data = std::mem::take(&mut self.carry);
+        let template = Packet::new(self.stream_index, time_base, Vec::new());
+        self.walk(&data, data.len(), &template, true)
+    }
+
+    /// Walk `data` (the held bytes, then the packet's own bytes from
+    /// `fresh_from`), releasing complete periods and re-filling the
+    /// carry with what must wait.
+    fn walk(
+        &mut self,
+        data: &[u8],
+        fresh_from: usize,
+        packet: &Packet,
+        last: bool,
+    ) -> std::collections::VecDeque<Packet> {
+        use crate::container::parse_sync_frame;
+        let mut out = std::collections::VecDeque::new();
+        // Timestamps for the first period commencing in the packet's
+        // own bytes.
+        let mut fresh = Some((packet.pts, packet.dts));
+        let mut period: Option<OpenPeriod> = None;
+        let mut pos = 0usize;
+        // `expected`: a syncframe should begin at `pos` — the start of
+        // the stream of bytes handed over, or the end of the frame
+        // before. Elsewhere a candidate header must be confirmed.
+        let mut expected = true;
+
+        while data.len() - pos >= 6 {
+            let rest = &data[pos..];
+            let frame = parse_sync_frame(rest).filter(|f| f.len >= 8);
+            let Some(frame) = frame else {
+                // Not a syncframe: the open period ends here; hunt for
+                // the next syncword.
+                self.release(&mut out, period.take(), data, pos, packet, false);
+                let next = next_syncword(data, pos + 1);
+                self.discarded += next - pos;
+                pos = next;
+                expected = false;
+                continue;
+            };
+            if rest.len() < frame.len {
+                break; // a fragment — wait for the rest of it
+            }
+            // A frame that exactly fills the bytes at hand where one
+            // was expected is taken on trust (a container-framed
+            // packet; if damaged it is concealed in place). Any other
+            // candidate must be confirmed by the header of the frame
+            // after it or by its CRC — and when the CRC fails while
+            // the bytes after it are too few to tell but may be the
+            // start of a header, the decision waits for the next
+            // packet. Where a frame was
+            // expected and what follows cannot be a header, the frame
+            // is taken as it is.
+            let tail = &rest[frame.len..];
+            let confirmed = if expected && tail.is_empty() {
+                true
+            } else if tail.len() >= 6 || tail.is_empty() {
+                candidate_confirmed(rest, &frame)
+            } else if !last && (tail == [0x0B] || tail.starts_with(&[0x0B, 0x77])) {
+                if !candidate_confirmed(rest, &frame) {
+                    break;
+                }
+                true
+            } else {
+                expected || candidate_confirmed(rest, &frame)
+            };
+            if !confirmed {
+                self.release(&mut out, period.take(), data, pos, packet, false);
+                let next = next_syncword(data, pos + 1);
+                self.discarded += next - pos;
+                pos = next;
+                expected = false;
+                continue;
+            }
+            self.discarded = 0;
+            if frame.program_start {
+                self.release(&mut out, period.take(), data, pos, packet, true);
+                let (pts, dts) = self.stamps_at(pos, fresh_from, &mut fresh);
+                period = Some(OpenPeriod {
+                    start: pos,
+                    pts,
+                    dts,
+                    samples: frame.samples,
+                    sample_rate: frame.sample_rate,
+                    eac3: frame.eac3,
+                    frames: 1,
+                });
+            } else if let Some(p) = period.as_mut() {
+                p.frames += 1;
+            } else {
+                // A dependent / additional-program frame with no period
+                // open is skipped: its independent frame was lost, or
+                // was released before this frame arrived — in which
+                // case periods of this stream are longer than assumed.
+                self.orphans += 1;
+                self.period_frames = self
+                    .period_frames
+                    .max(self.last_released_frames + self.orphans);
+            }
+            pos += frame.len;
+            expected = true;
         }
-        off += f.len;
+
+        let fragment = &data[pos..];
+        let fragment_opens_period = parse_sync_frame(fragment).is_some_and(|f| f.program_start);
+        let held = period
+            .as_ref()
+            .map_or(fragment.len(), |p| data.len() - p.start);
+        // A period that ends with the bytes at hand is released when it
+        // cannot grow (base AC-3) or is as long as this stream's
+        // periods have been; otherwise the frames still missing are
+        // expected in the next packet.
+        let whole = period
+            .as_ref()
+            .is_some_and(|p| !p.eac3 || (fragment.is_empty() && p.frames >= self.period_frames));
+        if last || whole || fragment_opens_period || held > MAX_HELD_BYTES {
+            self.release(
+                &mut out,
+                period.take(),
+                data,
+                pos,
+                packet,
+                fragment_opens_period,
+            );
+        }
+        if last {
+            return out;
+        }
+        let fragment_may_be_frame = match fragment {
+            [] => false,
+            [0x0B] => true,
+            [0x0B, 0x77, ..] => fragment.len() < 6 || parse_sync_frame(fragment).is_some(),
+            _ => false,
+        };
+        match period {
+            Some(p) => {
+                self.carry_pts = p.pts;
+                self.carry_dts = p.dts;
+                self.carry.extend_from_slice(&data[p.start..]);
+            }
+            None if fragment_may_be_frame => {
+                let (pts, dts) = self.stamps_at(pos, fresh_from, &mut fresh);
+                self.carry_pts = pts;
+                self.carry_dts = dts;
+                let keep = fragment.len().min(MAX_SYNCFRAME_BYTES + 6);
+                self.carry.extend_from_slice(&fragment[..keep]);
+            }
+            None => self.discarded += fragment.len(),
+        }
+        out
     }
-    if starts.len() <= 1 {
-        out.push_back(packet.clone());
-        return out;
-    }
-    let mut pts = packet.pts;
-    let mut dts = packet.dts;
-    for (i, &(start, samples, sample_rate)) in starts.iter().enumerate() {
-        let end = starts.get(i + 1).map_or(data.len(), |n| n.0);
-        let ticks =
-            TimeBase::new(1, i64::from(sample_rate)).rescale(i64::from(samples), packet.time_base);
+
+    /// Release the period `data[period.start..end]` as a sub-packet and
+    /// advance the running timestamps past it.
+    fn release(
+        &mut self,
+        out: &mut std::collections::VecDeque<Packet>,
+        period: Option<OpenPeriod>,
+        data: &[u8],
+        end: usize,
+        packet: &Packet,
+        next_period_seen: bool,
+    ) {
+        let Some(p) = period else {
+            return;
+        };
+        if end <= p.start {
+            return;
+        }
+        self.last_released_frames = p.frames;
+        self.orphans = 0;
+        if next_period_seen {
+            // The period is known to be complete: this is how long the
+            // stream's periods are.
+            self.period_frames = p.frames;
+        } else {
+            self.period_frames = self.period_frames.max(p.frames);
+        }
+        let ticks = TimeBase::new(1, i64::from(p.sample_rate))
+            .rescale(i64::from(p.samples), packet.time_base);
         let mut sub = Packet::new(
             packet.stream_index,
             packet.time_base,
-            data[start..end].to_vec(),
+            data[p.start..end].to_vec(),
         );
-        sub.pts = pts;
-        sub.dts = dts;
+        sub.pts = p.pts;
+        sub.dts = p.dts;
         sub.duration = Some(ticks);
         sub.flags = packet.flags;
+        self.next_pts = p.pts.map(|v| v.saturating_add(ticks));
+        self.next_dts = p.dts.map(|v| v.saturating_add(ticks));
         out.push_back(sub);
-        pts = pts.map(|p| p.saturating_add(ticks));
-        dts = dts.map(|d| d.saturating_add(ticks));
     }
-    out
 }
 
 /// Interleaved f32 PCM as little-endian bytes (the F32 output format).

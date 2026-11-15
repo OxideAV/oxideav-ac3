@@ -2,4 +2,5 @@
 //! `equal_rate_report` example).
 #![allow(dead_code)]
 
+pub mod es;
 pub mod rd;

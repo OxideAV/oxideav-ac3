@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Decoder: **syncframe reassembly across packet boundaries**. The
+  registry decoders treat their input as a byte stream: a packet may
+  hold several syncframes, a fraction of one, or begin in the middle of
+  one (MPEG-TS PES payloads do all three). Fragments are kept until
+  the rest arrives, bytes that belong to no syncframe are skipped
+  (a candidate header found by scanning must be confirmed by the next
+  syncframe's header or by its CRC, §6.1.2), and timestamps follow the
+  PES rule — a packet's `pts` belongs to the first period that
+  commences in it. One-period-per-packet input decodes exactly as
+  before. A long run of input without any syncframe (32 KiB) is
+  reported as an error.
+- Decoder: **CRC verification and error concealment** (§7.10, Annex E
+  §E.3.2). A syncframe whose CRC does not verify (E-AC-3: the frame
+  CRC; AC-3: both `crc1` and `crc2`) is not parsed; it is replaced, in
+  the shape of the last good frame of its substream, by the overlap
+  tail of the last good block followed by silence, and the next frame
+  fades in through its own window. Frames that fail to decode for any
+  other reason are concealed the same way (they were hard-cut to
+  zeros, and the state reset dropped the DRC configuration). Option
+  `crc` (`Eac3DecoderOptions::with_crc_check`, also honoured by the
+  AC-3 factory) switches the check off; the frame-level
+  `decode_eac3_packet` keeps it off unless
+  `Eac3DecoderState::set_crc_check(true)`; `frames_crc_failed` counts
+  the failures.
+- E-AC-3 decoder: **program selection** (§E.3.8.3 / §E.3.8.4). The
+  decoder renders one program: the independent substream selected by
+  the `program` option / `Eac3DecoderOptions::with_program` /
+  `Eac3DecoderState::set_program` (default 0, "Program 1") with the
+  dependent substreams that follow it.
+
 - E-AC-3 decoder: **JOC objects render to a caller-selected speaker
   layout** — `stereo`, `5.1`, `5.1.2`, `5.1.4`, `7.1`, `7.1.2`, `7.1.4`,
   `9.1.6` (`eac3::JocLayout`, speakers as `eac3::JocSpeaker`). Typed
@@ -53,6 +83,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- E-AC-3 decoder: an access unit with **more than one independent
+  substream** (a second program — e.g. an audio-description service —
+  next to the main one) was decoded through a single history and the
+  LAST program was returned: every frame of either program overlapped
+  with the other program's tail and reused its exponents, i.e. noise
+  and dropouts on any multi-program stream. Programs other than the
+  selected one are now skipped (§E.3.8.1: "decode independent
+  substream 0, and skip over any additional independent and dependent
+  substreams"), and a dependent substream is only combined with the
+  independent substream it follows.
+- E-AC-3 decoder: **each dependent substream keeps its own history**
+  (exponents, bit allocation, overlap tails), indexed by its
+  `substreamid`; two or more dependent substreams of one program
+  shared one.
+- E-AC-3 decoder: the bit reader of a syncframe ends at that
+  syncframe's last byte (§7.10.2 item 21) — in a multi-frame packet an
+  over-reading frame could continue into the next frame's bytes.
+- E-AC-3 decoder: trailing bytes after the program's frames (padding,
+  a truncated frame) no longer discard the audio already decoded from
+  the packet.
+- A dependent substream that cannot be decoded is concealed in place
+  instead of being dropped, so the program keeps its channel count.
 - E-AC-3 decoder, spectral extension with attenuation (§3.6.4.2.3):
   the banded RMS energy that scales a band's noise component is now
   measured on the translated coefficients BEFORE the border filter, as

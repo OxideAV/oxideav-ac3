@@ -245,10 +245,22 @@ fn ac3_packet_with_three_syncframes_decodes_three_frames() {
     assert!(d.send_packet(&pkt).is_err());
     // A single frame plus trailing junk stays one period and decodes.
     let mut tail = FIXTURE[..768].to_vec();
-    tail.extend_from_slice(&[0x0B, 0x77, 0x00]);
+    tail.extend_from_slice(&[0x00, 0x01, 0x02]);
     let mut d = oxideav_ac3::decoder::make_decoder(&params).unwrap();
     let got = decode_all(d.as_mut(), &Packet::new(0, TimeBase::new(1, 48_000), tail));
     assert_eq!(got.len(), 1);
+    // A trailing fragment that may be the start of the next syncframe
+    // is kept for the next packet. The frame before it is released at
+    // once — every AC-3 frame is a period of its own.
+    let mut tail = FIXTURE[..768].to_vec();
+    tail.extend_from_slice(&FIXTURE[768..768 + 3]);
+    let mut d = oxideav_ac3::decoder::make_decoder(&params).unwrap();
+    let got = decode_all(d.as_mut(), &Packet::new(0, TimeBase::new(1, 48_000), tail));
+    assert_eq!(got.len(), 1);
+    let rest = FIXTURE[768 + 3..2 * 768].to_vec();
+    let got = decode_all(d.as_mut(), &Packet::new(0, TimeBase::new(1, 48_000), rest));
+    assert_eq!(got.len(), 1, "the fragment completes with the next packet");
+    assert_eq!(got[0].data, expect[1].data);
 }
 
 /// Our E-AC-3 encoder's 7.1 output: each period is an independent 5.1

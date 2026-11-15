@@ -40,7 +40,17 @@ fuzz_target!(|data: &[u8]| {
     if sel & 0x80 != 0 {
         params.sample_format = Some(SampleFormat::F32);
     }
-    let Ok(mut dec) = reg.first_decoder(&params) else {
+    // Two decoders see the same packets: one with the syncframe CRC
+    // check off, so hostile bits reach the parser and the DSP, and one
+    // with the default policy (CRC verified, failing frames concealed).
+    // Both sit behind the packet-boundary reassembly, so a syncframe
+    // carved across packets is decoded whole.
+    let mut unchecked = params.clone();
+    unchecked.options.insert("crc", "false");
+    let Ok(mut dec) = reg.first_decoder(&unchecked) else {
+        return;
+    };
+    let Ok(mut checked) = reg.first_decoder(&params) else {
         return;
     };
     // A fixed multichannel layout promises its shape on every frame.
@@ -56,6 +66,22 @@ fuzz_target!(|data: &[u8]| {
     let chunk = (body.len() / parts).max(1);
     for part in body.chunks(chunk).take(parts) {
         let pkt = Packet::new(0, TimeBase::new(1, 48_000), part.to_vec());
+        if checked.send_packet(&pkt).is_ok() {
+            for _ in 0..8 {
+                match checked.receive_frame() {
+                    Ok(Frame::Audio(frame)) => {
+                        if let Some(channels) = fixed_channels {
+                            assert_eq!(
+                                frame.data[0].len(),
+                                frame.samples as usize * usize::from(channels) * bytes_per_sample
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        }
         if dec.send_packet(&pkt).is_ok() {
             for _ in 0..8 {
                 match dec.receive_frame() {

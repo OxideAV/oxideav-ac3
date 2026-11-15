@@ -406,6 +406,49 @@ impl Ac3State {
     }
 }
 
+impl Ac3State {
+    /// Forget everything parsed from the stream — exponents, bit
+    /// allocation, coupling / spectral-extension strategy, overlap
+    /// tails — while keeping the decoder configuration (DRC settings)
+    /// and the position of the noise generators.
+    pub(crate) fn reset_stream_state(&mut self) {
+        let fresh = Self {
+            drc: self.drc,
+            dither_lfsr_state: self.dither_lfsr_state,
+            spx_noise_lfsr: self.spx_noise_lfsr,
+            frame_counter: self.frame_counter,
+            ..Self::new()
+        };
+        *self = fresh;
+    }
+}
+
+/// Error concealment for one frame of one substream (§7.10 /
+/// §E.3.2): the frame's first block plays out the overlap tail of the
+/// last good block — the falling half of its window, so the signal
+/// reaches zero without a step — and the remaining blocks are silent.
+/// The stream state is then cleared; the next good frame starts from a
+/// zero tail and rises through the first half of its own window.
+///
+/// `out` is the frame's interleaved PCM (`nfchans` full-bandwidth
+/// channels, then the LFE when `lfeon`); every sample is written.
+pub(crate) fn conceal_frame(state: &mut Ac3State, nfchans: usize, lfeon: bool, out: &mut [f32]) {
+    let nchans = nfchans + usize::from(lfeon);
+    out.fill(0.0);
+    if nchans != 0 {
+        let slots = (0..nfchans.min(MAX_FBW)).chain(lfeon.then_some(MAX_FBW + 1));
+        for (pos, slot) in slots.enumerate() {
+            let tail = &state.channels[slot].delay;
+            for (frame, &t) in out.chunks_exact_mut(nchans).zip(tail.iter()) {
+                // Same scaling as the overlap-add of a block whose own
+                // contribution is zero (§7.9.4.1 step 6).
+                frame[pos] = 2.0 * t;
+            }
+        }
+    }
+    state.reset_stream_state();
+}
+
 /// Parse (but do not DSP) one syncframe's 6 audio blocks, returning
 /// the per-block [`AudBlkSideInfo`] snapshots. Used by tests and
 /// introspection tools; the decoder itself calls [`decode_frame`]

@@ -70,10 +70,39 @@ pub struct Eac3DecoderState {
     /// substream. Carries exponent reuse + 256-sample IMDCT delay line
     /// across blocks and frames.
     indep_state: Ac3State,
-    /// Per-channel persistent DSP state for the **dependent** substream.
-    /// Held separately so a dep-substream block's reuse-exponent path
-    /// doesn't read indep exponents.
-    dep_state: Ac3State,
+    /// Per-channel persistent DSP state of the selected program's
+    /// **dependent** substreams, indexed by dependent `substreamid`
+    /// (§E.2.3.1.2: up to eight per independent substream, numbered in
+    /// bit-stream order). Each substream owns its exponent / overlap
+    /// history; the list grows on first sight of an id.
+    dep_states: Vec<Ac3State>,
+    /// Independent `substreamid` of the program this state decodes
+    /// (§E.3.8.3: "The default program selection should always be
+    /// Program 1", i.e. independent substream 0). Frames of every other
+    /// program — independent substreams with another id and the
+    /// dependent substreams that follow them — are skipped.
+    program: u8,
+    /// Whether the selected program's independent frame has been seen
+    /// in the packet being walked; dependent frames are associated with
+    /// the independent frame they follow (§E.2.3.1.2).
+    in_selected_program: bool,
+    /// §E.3.2: verify the syncframe CRC before decoding and substitute
+    /// a concealment signal when it fails. Off for a default state (the
+    /// frame-level entry point is also used on hand-built frames); the
+    /// registry decoder switches it on.
+    verify_crc: bool,
+    /// BSI of the last frame of each substream that passed the CRC
+    /// check — slot 0 the independent substream, slot `1 + id` the
+    /// dependent substream `id`. A frame whose CRC fails is concealed
+    /// in the shape of its substream's last good frame: its own header
+    /// bits cannot be trusted to describe the channel layout.
+    last_good_bsi: Vec<Option<Eac3Bsi>>,
+    /// DRC configuration, re-applied to dependent-substream states as
+    /// they are created.
+    drc: crate::drc::DrcSettings,
+    /// Noise seed set through [`Self::reseed_noise`], re-applied to
+    /// dependent-substream states as they are created.
+    noise_seed: Option<u32>,
     /// Per-frame f32 PCM scratch — the indep substream's PCM in its
     /// native layout immediately after [`decode_indep_substream`]; if
     /// any dep substreams follow in the same packet, their channels
@@ -106,8 +135,14 @@ pub struct Eac3DecoderState {
     /// counter staying at 0 — callers observing audible dropouts (the
     /// issue-#13 symptom) can poll it to distinguish decoder-side
     /// zero-fill from genuinely silent program audio. Counts each
-    /// affected substream frame (indep or dep) once.
+    /// affected substream frame (indep or dep) once. Since the
+    /// concealment rework the substituted signal is the overlap tail of
+    /// the last good block followed by silence, not a hard cut.
     pub frames_zero_filled: u64,
+    /// Subset of [`Self::frames_zero_filled`]: frames replaced because
+    /// their CRC word did not verify (§E.3.2). Only counted while CRC
+    /// verification is on.
+    pub frames_crc_failed: u64,
     /// Physical channel locations of dep-substream channels that were
     /// spliced into [`Self::indep_pcm_f32`] during the most recent
     /// packet, in the order they were appended. Always one entry per
@@ -133,10 +168,52 @@ impl Eac3DecoderState {
     #[doc(hidden)]
     pub fn reseed_noise(&mut self, seed: u32) {
         let s = if seed == 0 { 0x6D2B_79F5 } else { seed };
-        for st in [&mut self.indep_state, &mut self.dep_state] {
+        self.noise_seed = Some(s);
+        for st in std::iter::once(&mut self.indep_state).chain(self.dep_states.iter_mut()) {
             st.dither_lfsr_state = s;
             st.spx_noise_lfsr = s.rotate_left(16) | 1;
         }
+    }
+
+    /// Select the program to decode by its independent `substreamid`
+    /// (0..=7, §E.3.8.3 / §E.3.8.4). The default is program 0. Changing
+    /// the selection clears the per-substream history.
+    pub fn set_program(&mut self, substreamid: u8) {
+        let id = substreamid & 7;
+        if id != self.program {
+            self.program = id;
+            self.indep_state.reset_stream_state();
+            self.dep_states.clear();
+            self.last_good_bsi.clear();
+        }
+    }
+
+    /// Independent `substreamid` of the program being decoded.
+    pub fn program(&self) -> u8 {
+        self.program
+    }
+
+    /// Turn the §E.3.2 CRC check on or off. With the check on, a
+    /// syncframe whose CRC word does not verify is not parsed: its
+    /// channels carry the concealment signal instead.
+    pub fn set_crc_check(&mut self, on: bool) {
+        self.verify_crc = on;
+    }
+
+    /// DSP state of dependent substream `id`, created on first use with
+    /// the decoder's DRC configuration and noise seed.
+    fn dep_state_mut(&mut self, id: u8) -> &mut Ac3State {
+        let idx = usize::from(id & 7);
+        while self.dep_states.len() <= idx {
+            let mut st = Ac3State::new();
+            st.drc = self.drc;
+            if let Some(s) = self.noise_seed {
+                st.dither_lfsr_state = s;
+                st.spx_noise_lfsr = s.rotate_left(16) | 1;
+            }
+            self.dep_states.push(st);
+        }
+        &mut self.dep_states[idx]
     }
 
     /// Read-only view of the indep substream's per-frame interleaved
@@ -167,8 +244,11 @@ impl Eac3DecoderState {
     /// regime. Called by the decoder whenever the caller changes its DRC
     /// configuration.
     pub fn set_drc(&mut self, drc: crate::drc::DrcSettings) {
+        self.drc = drc;
         self.indep_state.drc = drc;
-        self.dep_state.drc = drc;
+        for st in self.dep_states.iter_mut() {
+            st.drc = drc;
+        }
     }
 
     /// Channel-location list assigned to the dep substream when
@@ -339,88 +419,140 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
     let mut off = 0usize;
     state.last_error = None;
     state.dep_locations.clear();
+    state.in_selected_program = false;
     while off + 4 <= data.len() {
+        // A defect after the selected program's independent frame has
+        // been rendered (trailing bytes that are not a syncframe, a
+        // frame cut short by the packet) ends the walk and keeps the
+        // audio already decoded; the same defect before it is an error.
+        let have_program = indep_pcm.is_some();
         // §E.2.2.1 — syncword.
         let sync = u16::from_be_bytes([data[off], data[off + 1]]);
         if sync != SYNCWORD {
+            if have_program {
+                state.last_error = Some(format!("eac3: bad syncword 0x{sync:04X} at offset {off}"));
+                break;
+            }
             return Err(Error::invalid(format!(
                 "eac3: bad syncword 0x{sync:04X} at offset {off} (expected 0x0B77)"
             )));
         }
         // BSI starts at byte off+2.
-        let bsi_data = &data[off + 2..];
-        let mut br = BitReader::new(bsi_data);
-        let bsi = bsi::parse_with(&mut br)?;
-        state.skip_fields.clear();
+        let mut br = BitReader::new(&data[off + 2..]);
+        let bsi = match bsi::parse_with(&mut br) {
+            Ok(b) => b,
+            Err(e) if have_program => {
+                state.last_error = Some(format!("{e}"));
+                break;
+            }
+            Err(e) => return Err(e),
+        };
         let frame_bytes = bsi.frame_bytes as usize;
         if off + frame_bytes > data.len() {
+            if have_program {
+                state.last_error = Some(format!(
+                    "eac3: syncframe at offset {off} claims {frame_bytes} bytes but packet has only {}",
+                    data.len() - off
+                ));
+                break;
+            }
             return Err(Error::invalid(format!(
                 "eac3: syncframe at offset {off} claims {frame_bytes} bytes but packet has only {}",
                 data.len() - off
             )));
         }
-
-        // Audfrm follows BSI in the same bit cursor. AHT (audfrm
-        // returning Unsupported) is recoverable: the silent emit path
-        // handles it by emitting zeros for this frame instead of
-        // bailing the whole packet.
-        let audfrm = match audfrm::parse_with(&mut br, &bsi) {
-            Ok(a) => a,
-            Err(e) => {
-                state.last_error = Some(format!("{e}"));
-                state.frames_zero_filled += 1;
-                let pcm = build_silent_indep(&bsi)?;
-                if matches!(
-                    bsi.strmtyp,
-                    StreamType::Independent | StreamType::Ac3Convert
-                ) {
-                    state.last_indep = Some(IndepProgramShape {
-                        nchans: pcm.channels,
-                        sample_rate: pcm.sample_rate,
-                        samples_per_frame: pcm.samples,
-                    });
-                    indep_pcm = Some(pcm);
-                }
-                off += frame_bytes;
-                continue;
+        if matches!(bsi.strmtyp, StreamType::Reserved) {
+            if have_program {
+                state.last_error = Some("eac3: strmtyp '11' is reserved".into());
+                break;
             }
+            return Err(Error::invalid("eac3: strmtyp '11' is reserved"));
+        }
+
+        // §E.3.8.3 / §E.3.8.4 program selection: decode the selected
+        // independent substream and the dependent substreams that
+        // follow it; skip every other program's frames.
+        let is_indep = !matches!(bsi.strmtyp, StreamType::Dependent);
+        if is_indep {
+            state.in_selected_program = bsi.substreamid == state.program;
+        }
+        if !state.in_selected_program {
+            off += frame_bytes;
+            continue;
+        }
+        state.skip_fields.clear();
+
+        // §E.3.2: the CRC word is verified before any block of the
+        // syncframe is decoded; a failing frame is replaced by the
+        // concealment signal.
+        let crc_failed = state.verify_crc
+            && crate::crc::verify_eac3_syncframe(&data[off..off + frame_bytes], frame_bytes)
+                .crc2_ok
+                != Some(true);
+        // The reader is re-opened on this syncframe alone, so unpacking
+        // can never continue into the next one (§7.10.2 item 21).
+        let consumed = br.bit_position() as u32;
+        let mut br = BitReader::new(&data[off + 2..off + frame_bytes.max(2)]);
+        let header_fits = br.skip(consumed).is_ok();
+        let slot = if is_indep {
+            0
+        } else {
+            1 + usize::from(bsi.substreamid & 7)
+        };
+        if state.last_good_bsi.len() <= slot {
+            state.last_good_bsi.resize(slot + 1, None);
+        }
+        // Audfrm follows BSI in the same bit cursor.
+        let (bsi, audfrm) = if crc_failed {
+            state.frames_crc_failed += 1;
+            // Conceal in the substream's established shape when one is
+            // known and spans the same number of blocks.
+            let shape = match &state.last_good_bsi[slot] {
+                Some(good) if good.num_blocks == bsi.num_blocks => good.clone(),
+                _ => bsi,
+            };
+            (shape, Err(Error::invalid("eac3: syncframe CRC mismatch")))
+        } else {
+            if state.verify_crc {
+                state.last_good_bsi[slot] = Some(bsi.clone());
+            }
+            let audfrm = if header_fits {
+                audfrm::parse_with(&mut br, &bsi)
+            } else {
+                Err(Error::invalid("eac3: syncframe shorter than its BSI"))
+            };
+            (bsi, audfrm)
         };
 
-        match bsi.strmtyp {
-            StreamType::Independent | StreamType::Ac3Convert => {
-                let pcm = decode_indep_substream(state, &bsi, &audfrm, &mut br)?;
-                if let Some(metadata) = decode_substream_joc(&bsi, &state.skip_fields) {
-                    joc_metadata = Some(metadata);
-                }
-                state.last_indep = Some(IndepProgramShape {
-                    nchans: pcm.channels,
-                    sample_rate: pcm.sample_rate,
-                    samples_per_frame: pcm.samples,
-                });
-                indep_pcm = Some(pcm);
+        if is_indep {
+            let pcm = decode_indep_substream(state, &bsi, audfrm, &mut br);
+            if let Some(metadata) = decode_substream_joc(&bsi, &state.skip_fields) {
+                joc_metadata = Some(metadata);
             }
-            StreamType::Dependent => {
-                // Round 3: decode + splice into indep_pcm_f32. On
-                // failure (Unsupported / parse error) we keep the
-                // indep PCM as-is so output is still meaningful.
-                if decode_dep_substream(state, &bsi, &audfrm, &mut br).is_ok()
-                    && let Some(metadata) = decode_substream_joc(&bsi, &state.skip_fields)
-                {
-                    joc_metadata = Some(metadata);
-                }
-            }
-            StreamType::Reserved => {
-                return Err(Error::invalid("eac3: strmtyp '11' is reserved"));
-            }
+            state.last_indep = Some(IndepProgramShape {
+                nchans: pcm.channels,
+                sample_rate: pcm.sample_rate,
+                samples_per_frame: pcm.samples,
+            });
+            indep_pcm = Some(pcm);
+        } else if decode_dep_substream(state, &bsi, audfrm, &mut br).is_ok()
+            && let Some(metadata) = decode_substream_joc(&bsi, &state.skip_fields)
+        {
+            // A dependent substream that cannot be decoded is
+            // concealed inside `decode_dep_substream` (its channels
+            // stay in the layout); only an unresolvable channel map
+            // leaves the independent program as it is.
+            joc_metadata = Some(metadata);
         }
 
         off += frame_bytes;
     }
 
     let mut pcm = indep_pcm.ok_or_else(|| {
-        Error::invalid(
-            "eac3: packet contains no independent substream (only dependent or ac3-convert frames)",
-        )
+        Error::invalid(format!(
+            "eac3: packet contains no frame of independent substream {}",
+            state.program
+        ))
     })?;
 
     // Rebuild the final S16 buffer from the (possibly extended)
@@ -456,21 +588,25 @@ fn decode_substream_joc(bsi: &Eac3Bsi, skip_fields: &[Vec<u8>]) -> Option<JocMet
         .find_map(|field| parse_joc_emdf(field, signal).ok())
 }
 
-/// Decode one independent substream's audblks. Tries the round-2 DSP
-/// path first; on `Error::Unsupported` (or any other DSP error) falls
-/// back to silent PCM of the right shape so the corpus driver sees
-/// a frame-count match.
+/// Decode one independent substream's audblks. A frame that cannot be
+/// decoded — a failed CRC, an audfrm that does not parse, a DSP error —
+/// is replaced by the concealment signal (the last good block's overlap
+/// tail, then silence) and the substream's stream state is cleared so
+/// the next frame starts clean; the returned frame always has the
+/// shape the BSI announces.
 fn decode_indep_substream(
     state: &mut Eac3DecoderState,
     bsi: &Eac3Bsi,
-    audfrm: &AudFrm,
+    audfrm: Result<AudFrm>,
     br: &mut BitReader<'_>,
-) -> Result<DecodedFrame> {
+) -> DecodedFrame {
     let samples = bsi.num_blocks as u32 * SAMPLES_PER_BLOCK as u32;
     let nchans = bsi.nchans as usize;
-    let mut floats = vec![0.0f32; samples as usize * nchans];
+    let mut floats = std::mem::take(&mut state.indep_pcm_f32);
+    floats.clear();
+    floats.resize(samples as usize * nchans, 0.0);
 
-    let dsp_result = dsp::decode_indep_audblks(
+    let dsp_result = decode_or_conceal(
         bsi,
         audfrm,
         br,
@@ -479,16 +615,8 @@ fn decode_indep_substream(
         &mut state.skip_fields,
     );
     if let Err(e) = &dsp_result {
-        // Silent fallback. Reset the per-channel exponent reuse state
-        // so the next frame's reuse-strategy blocks don't pick up
-        // garbage from a half-decoded prior frame.
         state.last_error = Some(format!("{e}"));
         state.frames_zero_filled += 1;
-        state.indep_state = Ac3State::new();
-        state.skip_fields.clear();
-        for v in floats.iter_mut() {
-            *v = 0.0;
-        }
     }
 
     // Cache the indep f32 PCM in its native (acmod, lfeon) layout
@@ -508,7 +636,7 @@ fn decode_indep_substream(
     // `decode_eac3_packet` after all substreams are walked.
     let pcm_s16le = pack_f32_to_s16le(&state.indep_pcm_f32);
 
-    Ok(DecodedFrame {
+    DecodedFrame {
         sample_rate: bsi.sample_rate,
         channels: bsi.nchans as u16,
         samples,
@@ -523,7 +651,37 @@ fn decode_indep_substream(
         dep_locations: Vec::new(),
         dialnorm: bsi.dialnorm,
         joc_metadata: None,
-    })
+    }
+}
+
+/// Run the audblk DSP for one substream frame into `out`; on any
+/// failure render the concealment signal instead and clear the
+/// substream's stream state (decoder configuration and noise
+/// generators survive). Returns the failure, if any, for the caller's
+/// bookkeeping — `out` is fully written either way.
+fn decode_or_conceal(
+    bsi: &Eac3Bsi,
+    audfrm: Result<AudFrm>,
+    br: &mut BitReader<'_>,
+    st: &mut Ac3State,
+    out: &mut [f32],
+    skip_fields: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    // The overlap tails as they stood before this frame: a frame that
+    // fails part-way has already advanced them through blocks whose
+    // content cannot be trusted.
+    let tails: [[f32; SAMPLES_PER_BLOCK]; crate::audblk::MAX_CHANNELS] =
+        std::array::from_fn(|ch| st.channels[ch].delay);
+    let result =
+        audfrm.and_then(|audfrm| dsp::decode_indep_audblks(bsi, &audfrm, br, st, out, skip_fields));
+    if result.is_err() {
+        skip_fields.clear();
+        for (ch, tail) in tails.iter().enumerate() {
+            st.channels[ch].delay = *tail;
+        }
+        crate::audblk::conceal_frame(st, bsi.nfchans as usize, bsi.lfeon, out);
+    }
+    result
 }
 
 /// Decode one dependent substream and splice its `chanmap`-routed
@@ -537,7 +695,7 @@ fn decode_indep_substream(
 fn decode_dep_substream(
     state: &mut Eac3DecoderState,
     bsi: &Eac3Bsi,
-    audfrm: &AudFrm,
+    audfrm: Result<AudFrm>,
     br: &mut BitReader<'_>,
 ) -> Result<u16> {
     let samples = bsi.num_blocks as u32 * SAMPLES_PER_BLOCK as u32;
@@ -577,23 +735,22 @@ fn decode_dep_substream(
 
     // Decode the dep substream into its own f32 buffer. The dep
     // substream's audblks have the same syntax (Table E1.4 doesn't
-    // branch on strmtyp).
+    // branch on strmtyp). A frame that cannot be decoded contributes
+    // the concealment signal, so the program keeps its channel layout.
     let mut dep_floats = vec![0.0f32; samples as usize * dep_nchans];
-    if let Err(e) = dsp::decode_indep_audblks(
+    let mut skip_fields = std::mem::take(&mut state.skip_fields);
+    let dep_result = decode_or_conceal(
         bsi,
         audfrm,
         br,
-        &mut state.dep_state,
+        state.dep_state_mut(bsi.substreamid),
         &mut dep_floats,
-        &mut state.skip_fields,
-    ) {
-        // Silent fallback for the dep substream — leave indep PCM
-        // untouched so the indep program is still audible.
+        &mut skip_fields,
+    );
+    state.skip_fields = skip_fields;
+    if let Err(e) = &dep_result {
         state.last_error = Some(format!("{e}"));
         state.frames_zero_filled += 1;
-        state.dep_state = Ac3State::new();
-        state.skip_fields.clear();
-        return Err(e);
     }
 
     // Splice channels per §E.3.8.2: dep channels whose location already
@@ -611,7 +768,7 @@ fn decode_dep_substream(
     // not appended, so they do not appear here.
     state.dep_locations.extend(extended_locations);
 
-    Ok(state.indep_nchans)
+    dep_result.map(|()| state.indep_nchans)
 }
 
 /// Pack interleaved f32 PCM (range -1..1) into S16LE bytes.
@@ -738,33 +895,6 @@ fn splice_dep_into_indep(
     }
 
     extend_locs
-}
-
-/// Build a silent S16 PCM buffer of the right shape for one
-/// substream. Used as a fallback when a frame can't be DSP-decoded.
-fn build_silent_indep(bsi: &Eac3Bsi) -> Result<DecodedFrame> {
-    // Annex E does not change the §2.2 transform: each audio block
-    // produces 256 PCM samples per channel. Total per syncframe =
-    // num_blocks × 256.
-    let samples = bsi.num_blocks as u32 * 256;
-    let nchans = bsi.nchans as usize;
-    let total_bytes = samples as usize * nchans * 2;
-    let pcm_s16le = vec![0u8; total_bytes];
-    Ok(DecodedFrame {
-        sample_rate: bsi.sample_rate,
-        channels: bsi.nchans as u16,
-        samples,
-        pcm_s16le,
-        acmod: bsi.acmod,
-        lfeon: bsi.lfeon,
-        nfchans: bsi.nfchans,
-        annex_e_mix_levels: bsi.annex_e_mix_levels,
-        // Silent-fallback path emits the indep program only — no
-        // dep channels were spliced.
-        dep_locations: Vec::new(),
-        dialnorm: bsi.dialnorm,
-        joc_metadata: None,
-    })
 }
 
 #[cfg(test)]
