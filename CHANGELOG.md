@@ -89,6 +89,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   setters on `DrcSettings`, `MetadataParams`, `AudioProductionParams`,
   `EcplParams`, `SpxParams` and the four `Eac3*` metadata records.
 
+### Changed
+
+- Decoder throughput, output bit-identical (41 of 42 comparison
+  streams hash the same as before the round; the 42nd is the
+  spectral-extension attenuation fix): 5.1 AC-3 399 → 514 × real time,
+  5.1 E-AC-3 362 → 458 ×, with the syncframe CRC now verified on every
+  frame (medians of seven alternating runs, see the README).
+  - the bit allocation of a channel is kept when a block reuses its
+    exponents and changes no allocation parameter (§7.2), instead of
+    being recomputed for every channel of every block;
+  - grouped mantissas (bap 1 / 2 / 4) come from code-word tables, not
+    per-group division;
+  - the CRC register advances four message bytes per step from
+    tables, and the AC-3 `crc1` / `crc2` check is one pass;
+  - windowing and overlap-add run in one loop without scratch copies;
+  - no per-frame heap traffic for exponent runs or the AHT coefficient
+    cache (allocated only for a frame that signals AHT), no 16-bit
+    packing pass when the caller wants float or a downmix, no
+    intermediate copy of the AC-3 program.
+
 ### Fixed
 
 - E-AC-3 decoder: an access unit with **more than one independent

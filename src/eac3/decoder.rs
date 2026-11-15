@@ -91,6 +91,9 @@ pub struct Eac3DecoderState {
     /// independent substream 0 and skip all associated dependent
     /// substreams." `true` skips them.
     skip_dependent: bool,
+    /// Leave [`DecodedFrame::pcm_s16le`] empty: the caller takes the
+    /// program from [`Self::indep_pcm_f32`] and does its own packing.
+    skip_s16: bool,
     /// §E.3.2: verify the syncframe CRC before decoding and substitute
     /// a concealment signal when it fails. Off for a default state (the
     /// frame-level entry point is also used on hand-built frames); the
@@ -207,6 +210,13 @@ impl Eac3DecoderState {
     /// the larger layout.
     pub fn set_dependent_substreams(&mut self, decode: bool) {
         self.skip_dependent = !decode;
+    }
+
+    /// Skip the 16-bit packing of [`DecodedFrame::pcm_s16le`] (left
+    /// empty) for a caller that reads [`Self::indep_pcm_f32`] instead.
+    #[doc(hidden)]
+    pub fn set_s16_output(&mut self, pack: bool) {
+        self.skip_s16 = !pack;
     }
 
     /// Turn the §E.3.2 CRC check on or off. With the check on, a
@@ -606,7 +616,9 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
     // slots of the independent program and / or extended it.
     if spliced {
         pcm.channels = state.indep_nchans;
-        pcm.pcm_s16le = pack_f32_to_s16le(&state.indep_pcm_f32);
+        if !state.skip_s16 {
+            pcm.pcm_s16le = pack_f32_to_s16le(&state.indep_pcm_f32);
+        }
     }
     // Surface the accumulated dep-channel locations so callers know
     // the physical assignment of the appended channels without
@@ -622,10 +634,10 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
 /// reason there is none) and a bit reader — bounded to this syncframe,
 /// so unpacking can never continue into the next one (§7.10.2 item 21)
 /// — positioned at the first audio block.
-fn open_unit<'a>(
+fn open_unit<'u, 'a>(
     state: &mut Eac3DecoderState,
-    unit: &Unit<'a>,
-) -> (Eac3Bsi, Result<AudFrm>, BitReader<'a>) {
+    unit: &'u Unit<'a>,
+) -> (std::borrow::Cow<'u, Eac3Bsi>, Result<AudFrm>, BitReader<'a>) {
     let frame = unit.frame;
     let crc_failed = state.verify_crc
         && crate::crc::verify_eac3_syncframe(frame, frame.len()).crc2_ok != Some(true);
@@ -645,8 +657,10 @@ fn open_unit<'a>(
         // known and spans the same number of blocks: a damaged frame's
         // own header bits cannot be trusted to describe the layout.
         let shape = match &state.last_good_bsi[slot] {
-            Some(good) if good.num_blocks == unit.bsi.num_blocks => good.clone(),
-            _ => unit.bsi.clone(),
+            Some(good) if good.num_blocks == unit.bsi.num_blocks => {
+                std::borrow::Cow::Owned(good.clone())
+            }
+            _ => std::borrow::Cow::Borrowed(&unit.bsi),
         };
         return (
             shape,
@@ -663,7 +677,7 @@ fn open_unit<'a>(
     } else {
         Err(Error::invalid("eac3: syncframe shorter than its BSI"))
     };
-    (unit.bsi.clone(), audfrm, br)
+    (std::borrow::Cow::Borrowed(&unit.bsi), audfrm, br)
 }
 
 /// Decode the Extension Type A signal and a matching JOC/OAMD EMDF
@@ -729,7 +743,11 @@ fn decode_indep_substream(
     // Pack indep PCM only. If a dep substream follows, the packet-
     // level driver will rebuild the final S16 buffer in
     // `decode_eac3_packet` after all substreams are walked.
-    let pcm_s16le = pack_f32_to_s16le(&state.indep_pcm_f32);
+    let pcm_s16le = if state.skip_s16 {
+        Vec::new()
+    } else {
+        pack_f32_to_s16le(&state.indep_pcm_f32)
+    };
 
     DecodedFrame {
         sample_rate: bsi.sample_rate,
@@ -862,11 +880,8 @@ fn decode_dep_unit(
 /// Pack interleaved f32 PCM (range -1..1) into S16LE bytes.
 fn pack_f32_to_s16le(floats: &[f32]) -> Vec<u8> {
     let mut out = vec![0u8; floats.len() * 2];
-    for (i, s) in floats.iter().enumerate() {
-        let clamped = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
-        let le = clamped.to_le_bytes();
-        out[i * 2] = le[0];
-        out[i * 2 + 1] = le[1];
+    for (dst, s) in out.as_chunks_mut::<2>().0.iter_mut().zip(floats) {
+        *dst = ((s * 32767.0).clamp(-32768.0, 32767.0) as i16).to_le_bytes();
     }
     out
 }

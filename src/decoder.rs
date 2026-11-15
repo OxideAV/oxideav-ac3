@@ -461,6 +461,8 @@ impl Ac3Decoder {
     fn apply_eac3_settings(&mut self) {
         self.eac3_state.set_program(self.program);
         self.eac3_state.set_crc_check(self.crc_check);
+        // Output is packed here, from the float program.
+        self.eac3_state.set_s16_output(false);
         // Annex E §E.3.8.2: a decoder reproducing 5.1 or fewer channels
         // "shall decode only independent substream 0 and skip all
         // associated dependent substreams" — they may replace channels
@@ -669,7 +671,7 @@ impl Ac3Decoder {
             );
             (pack_f32le(&samples), channels)
         } else if matches!(dmx_mode, DownmixMode::Passthrough) {
-            let mut pcm = decoded.pcm_s16le;
+            let mut pcm = pack_f32_to_s16le(self.eac3_state.indep_pcm_f32());
             if dn_gain != 1.0 {
                 // Scale the already-quantised S16 samples in place.
                 for chunk in pcm.as_chunks_mut::<2>().0 {
@@ -752,15 +754,7 @@ impl Ac3Decoder {
             if self.f32_output {
                 (pack_f32le(&out_f32), out_ch as u16)
             } else {
-                // Pack f32 → S16LE.
-                let mut out_bytes = vec![0u8; out_f32.len() * 2];
-                for (i, s) in out_f32.iter().enumerate() {
-                    let clamped = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                    let le = clamped.to_le_bytes();
-                    out_bytes[i * 2] = le[0];
-                    out_bytes[i * 2 + 1] = le[1];
-                }
-                (out_bytes, out_ch as u16)
+                (pack_f32_to_s16le(&out_f32), out_ch as u16)
             }
         };
 
@@ -884,7 +878,7 @@ impl Ac3Decoder {
             }
         };
         let (out_channels, out_samples) = if matches!(dmx_mode, DownmixMode::Passthrough) {
-            (src_channels, floats.clone())
+            (src_channels, floats)
         } else {
             let dmx = Downmix::from_bsi(&bsi, dmx_mode);
             let out_ch = dmx.output_channels() as usize;
@@ -934,15 +928,7 @@ impl Ac3Decoder {
         }
 
         // 3) Pack f32 → S16 interleaved.
-        let bytes_per_sample = SampleFormat::S16.bytes_per_sample();
-        let total_bytes = SAMPLES_PER_FRAME as usize * out_channels as usize * bytes_per_sample;
-        let mut out_bytes = vec![0u8; total_bytes];
-        for (i, s) in out_samples.iter().enumerate() {
-            let clamped = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
-            let le = clamped.to_le_bytes();
-            out_bytes[i * 2] = le[0];
-            out_bytes[i * 2 + 1] = le[1];
-        }
+        let mut out_bytes = pack_f32_to_s16le(&out_samples);
 
         // 4) Reorder bitstream-order channels into WAV-mask order so
         //    consumers that interpret the PCM as a WAVE file (or any
@@ -1336,16 +1322,19 @@ impl Framer {
 
 /// Interleaved f32 PCM as little-endian bytes (the F32 output format).
 fn pack_f32le(samples: &[f32]) -> Vec<u8> {
-    samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+    let mut bytes = vec![0_u8; samples.len() * 4];
+    for (dst, s) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(samples) {
+        *dst = s.to_le_bytes();
+    }
+    bytes
 }
 
 /// Pack interleaved normalized f32 PCM into the decoder's S16LE output
 /// format. Values outside the nominal range saturate instead of wrapping.
 fn pack_f32_to_s16le(samples: &[f32]) -> Vec<u8> {
     let mut bytes = vec![0_u8; samples.len() * 2];
-    for (index, sample) in samples.iter().enumerate() {
-        let value = (*sample * 32_767.0).clamp(-32_768.0, 32_767.0) as i16;
-        bytes[index * 2..index * 2 + 2].copy_from_slice(&value.to_le_bytes());
+    for (dst, sample) in bytes.as_chunks_mut::<2>().0.iter_mut().zip(samples) {
+        *dst = ((*sample * 32_767.0).clamp(-32_768.0, 32_767.0) as i16).to_le_bytes();
     }
     bytes
 }

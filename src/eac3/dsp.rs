@@ -489,8 +489,12 @@ pub fn decode_indep_audblks(
     // we don't blow the audio thread's modest stack budget.
     const AHT_SLOTS: usize = MAX_FBW + 2;
     let lfe_slot = MAX_FBW + 1;
-    let mut aht_coeffs: Vec<[[f32; N_COEFFS]; AHT_BLOCKS]> =
-        vec![[[0.0; N_COEFFS]; AHT_BLOCKS]; AHT_SLOTS];
+    // (Allocated only for a frame that signals AHT.)
+    let mut aht_coeffs: Vec<[[f32; N_COEFFS]; AHT_BLOCKS]> = if audfrm.ahte {
+        vec![[[0.0; N_COEFFS]; AHT_BLOCKS]; AHT_SLOTS]
+    } else {
+        Vec::new()
+    };
     let mut aht_pending: [bool; AHT_SLOTS] = [false; AHT_SLOTS];
     let mut aht_filled: [bool; AHT_SLOTS] = [false; AHT_SLOTS];
     if audfrm.ahte {
@@ -1076,14 +1080,13 @@ pub fn decode_indep_audblks(
             // down and miss bins, but this is the spec's
             // `(cpl_end - cpl_start) / (grpsize × 3)` formula verbatim.
             let ncplgrps = (cpl_end - cpl_start) / (grpsize * 3);
-            let mut raw_exp = vec![0i32; ncplgrps * 3];
-            audblk::decode_exponents(
-                br,
-                cplabsexp << 1,
-                ncplgrps,
-                cplexpstr as usize,
-                &mut raw_exp,
-            )?;
+            let mut raw_buf = [0i32; audblk::EXP_SCRATCH];
+            let Some(raw_exp) = raw_buf.get_mut(..ncplgrps * 3) else {
+                return Err(Error::invalid(
+                    "exponent group count exceeds the transform size",
+                ));
+            };
+            audblk::decode_exponents(br, cplabsexp << 1, ncplgrps, cplexpstr as usize, raw_exp)?;
             let cpl_ch = MAX_FBW;
             for (i, e) in raw_exp.iter().enumerate() {
                 let idx = cpl_start + i * grpsize;
@@ -1131,8 +1134,13 @@ pub fn decode_indep_audblks(
                     3 => (end - 1 + 9) / 12,
                     _ => 0,
                 };
-                let mut raw_exp = vec![0i32; nchgrps * 3];
-                audblk::decode_exponents(br, absexp, nchgrps, chexpstr[ch] as usize, &mut raw_exp)?;
+                let mut raw_buf = [0i32; audblk::EXP_SCRATCH];
+                let Some(raw_exp) = raw_buf.get_mut(..nchgrps * 3) else {
+                    return Err(Error::invalid(
+                        "exponent group count exceeds the transform size",
+                    ));
+                };
+                audblk::decode_exponents(br, absexp, nchgrps, chexpstr[ch] as usize, raw_exp)?;
                 state.channels[ch].exp[0] = absexp.clamp(0, 24) as u8;
                 for (i, e) in raw_exp.iter().enumerate() {
                     let base = i * grpsize + 1;
@@ -1173,8 +1181,13 @@ pub fn decode_indep_audblks(
             state.channels[lfe_ch].end_mant = 7;
             let absexp = br.read_u32(4)? as i32;
             let nlfegrps = 2usize;
-            let mut raw_exp = vec![0i32; nlfegrps * 3];
-            audblk::decode_exponents(br, absexp, nlfegrps, 1, &mut raw_exp)?;
+            let mut raw_buf = [0i32; audblk::EXP_SCRATCH];
+            let Some(raw_exp) = raw_buf.get_mut(..nlfegrps * 3) else {
+                return Err(Error::invalid(
+                    "exponent group count exceeds the transform size",
+                ));
+            };
+            audblk::decode_exponents(br, absexp, nlfegrps, 1, raw_exp)?;
             state.channels[lfe_ch].exp[0] = absexp.clamp(0, 24) as u8;
             for (i, e) in raw_exp.iter().enumerate() {
                 if i + 1 < 7 {
@@ -1604,8 +1617,9 @@ pub fn decode_indep_audblks(
     // low-rate transform coder leaves ahead of a sharp onset. LFE never
     // carries TPNP. Operates in place on the interleaved `out` buffer.
     let total_samples = num_blocks * SAMPLES_PER_BLOCK;
-    if state.tpnp_history.len() != MAX_FBW * audblk::TPNP_HISTORY {
-        state.tpnp_history = vec![0.0; MAX_FBW * audblk::TPNP_HISTORY];
+    if state.tpnp_history.len() != nchans * audblk::TPNP_HISTORY {
+        // First frame, or the substream changed its channel count.
+        state.tpnp_history = vec![0.0; nchans * audblk::TPNP_HISTORY];
     }
     if audfrm.transproce {
         for ch in 0..nfchans {
@@ -1617,28 +1631,20 @@ pub fn decode_indep_audblks(
                 nchans,
                 ch,
                 total_samples,
-                &state.tpnp_history[ch * audblk::TPNP_HISTORY..(ch + 1) * audblk::TPNP_HISTORY],
+                &state.tpnp_history,
                 audfrm.transprocloc[ch],
                 audfrm.transproclen[ch],
             );
         }
     }
-    // Keep the tail of every full-bandwidth channel's output for the
-    // next frame's synthesis buffers.
-    for ch in 0..nfchans {
-        let hist =
-            &mut state.tpnp_history[ch * audblk::TPNP_HISTORY..(ch + 1) * audblk::TPNP_HISTORY];
-        let fresh = total_samples.min(audblk::TPNP_HISTORY);
-        hist.copy_within(fresh.., 0);
-        let keep = audblk::TPNP_HISTORY - fresh;
-        let first = total_samples - fresh;
-        for (slot, frame) in hist[keep..]
-            .iter_mut()
-            .zip(out.chunks_exact(nchans).skip(first))
-        {
-            *slot = frame[ch];
-        }
-    }
+    // Keep the tail of the substream's output for the next frame's
+    // synthesis buffers: a straight copy of the interleaved frame (the
+    // whole of it for a six-block syncframe).
+    let fresh = total_samples.min(audblk::TPNP_HISTORY) * nchans;
+    let hist = &mut state.tpnp_history;
+    let keep = hist.len() - fresh;
+    hist.copy_within(fresh.., 0);
+    hist[keep..].copy_from_slice(&out[out.len() - fresh..]);
     Ok(())
 }
 
@@ -1793,8 +1799,9 @@ fn run_deferred_ecpl_dsp(
 /// Transient pre-noise time-scaling synthesis for one full-bandwidth
 /// channel (§E.3.7.2). Operates in place on the interleaved f32 frame
 /// buffer `out` (stride `nchans`, channel slot `ch`); `history` is the
-/// channel's output before this frame (oldest first, ending with the
-/// sample just before `out`'s first).
+/// substream's output before this frame in the same interleaving
+/// (oldest first, ending with the sample frame just before `out`'s
+/// first).
 ///
 /// The encoder transmits, relative to the first decoded PCM sample of
 /// the frame, the transient location `transprocloc` (in 4-sample units)
@@ -1864,7 +1871,7 @@ fn apply_transient_prenoise(
     // Synthesis buffer from earlier PCM: this frame, or the output
     // before it.
     let src0 = transloc - (2 * TC1 + 2 * pnlen);
-    let hist_len = history.len() as isize;
+    let hist_len = (history.len() / nchans) as isize;
     let mut synth_buf = [0.0f32; 1024];
     for (s, slot) in synth_buf.iter_mut().enumerate().take(synth_len as usize) {
         let idx = src0 + s as isize;
@@ -1873,7 +1880,7 @@ fn apply_transient_prenoise(
         } else if idx >= 0 {
             out[idx as usize * nchans + ch]
         } else if hist_len + idx >= 0 {
-            history[(hist_len + idx) as usize]
+            history[(hist_len + idx) as usize * nchans + ch]
         } else {
             0.0
         };

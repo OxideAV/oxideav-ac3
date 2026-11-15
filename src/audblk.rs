@@ -177,6 +177,37 @@ pub struct ChannelState {
     /// `spxattencod[ch]` — 5-bit index into Table E3.14
     /// (`SPX_ATTEN_TABLE`). Only meaningful when `spx_atten_active`.
     pub spx_atten_code: u8,
+    /// Inputs of the bit allocation that produced the current `psd` /
+    /// `bndpsd` / `mask` / `bap`: every parameter, and the exponents
+    /// over the allocated range (`alloc_exp`). A block that reuses its
+    /// exponents and changes no parameter keeps the allocation (§7.2:
+    /// the allocation is recomputed when exponents are new or `baie`,
+    /// `snroffste` or `deltbaie` is set).
+    pub(crate) alloc_key: Option<AllocKey>,
+    pub(crate) alloc_exp: [u8; N_COEFFS],
+}
+
+/// Everything [`run_bit_allocation`] reads besides the exponents.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct AllocKey {
+    start: u16,
+    end: u16,
+    fscod: u8,
+    sdcycod: u8,
+    fdcycod: u8,
+    sgaincod: u8,
+    dbpbcod: u8,
+    floorcod: u8,
+    csnroffst: u8,
+    fsnroffst: u8,
+    fgaincod: u8,
+    is_coupling: bool,
+    fleak: u8,
+    sleak: u8,
+    /// Delta bit allocation segments (offset, length, value), unused
+    /// entries zero.
+    nseg: u8,
+    segs: [[u8; 3]; 8],
 }
 
 impl Default for ChannelState {
@@ -207,6 +238,8 @@ impl ChannelState {
             spx_sblend: [0.0; 18],
             spx_atten_active: false,
             spx_atten_code: 0,
+            alloc_key: None,
+            alloc_exp: [0; N_COEFFS],
         }
     }
 }
@@ -343,8 +376,8 @@ pub struct Ac3State {
     pub drc: crate::drc::DrcSettings,
 
     /// E-AC-3 transient pre-noise processing (§E.3.7.2): the last
-    /// [`TPNP_HISTORY`] output samples of each full-bandwidth channel,
-    /// oldest first, `MAX_FBW` runs back to back. The time-scaling
+    /// [`TPNP_HISTORY`] output sample frames of the substream, oldest
+    /// first, interleaved as the frame output is. The time-scaling
     /// synthesis buffer of a transient early in a frame starts up to
     /// 1534 samples before the frame's first sample. Empty until the
     /// first E-AC-3 frame is decoded.
@@ -845,14 +878,13 @@ pub(crate) fn parse_audblk_into(
         };
         let ncplgrps = (cpl_end - cpl_start) / (grpsize * 3);
         // Absolute exponent for coupling: cplabsexp << 1 (from 4-bit range 0..15 to full 5-bit 0..30).
-        let mut raw_exp = vec![0i32; ncplgrps * 3];
-        decode_exponents(
-            br,
-            cplabsexp << 1,
-            ncplgrps,
-            cplexpstr as usize,
-            &mut raw_exp,
-        )?;
+        let mut raw_buf = [0i32; EXP_SCRATCH];
+        let Some(raw_exp) = raw_buf.get_mut(..ncplgrps * 3) else {
+            return Err(Error::invalid(
+                "exponent group count exceeds the transform size",
+            ));
+        };
+        decode_exponents(br, cplabsexp << 1, ncplgrps, cplexpstr as usize, raw_exp)?;
         let ch_idx = MAX_FBW;
         // Offset for coupling per spec: cplexp[n + cplstrtmant] = exp[n+1],
         // i.e. the absolute exponent is used as a reference only and the
@@ -933,8 +965,13 @@ pub(crate) fn parse_audblk_into(
                     _ => 0,
                 }
             };
-            let mut raw_exp = vec![0i32; nchgrps * 3];
-            decode_exponents(br, absexp, nchgrps, chexpstr[ch] as usize, &mut raw_exp)?;
+            let mut raw_buf = [0i32; EXP_SCRATCH];
+            let Some(raw_exp) = raw_buf.get_mut(..nchgrps * 3) else {
+                return Err(Error::invalid(
+                    "exponent group count exceeds the transform size",
+                ));
+            };
+            decode_exponents(br, absexp, nchgrps, chexpstr[ch] as usize, raw_exp)?;
             // Place: exp[0] = absexp; exp[i*grpsize + 1 + j] = raw_exp[i]
             state.channels[ch].exp[strt] = absexp.clamp(0, 24) as u8;
             for (i, e) in raw_exp.iter().enumerate() {
@@ -958,8 +995,13 @@ pub(crate) fn parse_audblk_into(
         if lfeexpstr != 0 {
             let absexp = br.read_u32(4)? as i32;
             let nlfegrps = 2usize;
-            let mut raw_exp = vec![0i32; nlfegrps * 3];
-            decode_exponents(br, absexp, nlfegrps, 1, &mut raw_exp)?;
+            let mut raw_buf = [0i32; EXP_SCRATCH];
+            let Some(raw_exp) = raw_buf.get_mut(..nlfegrps * 3) else {
+                return Err(Error::invalid(
+                    "exponent group count exceeds the transform size",
+                ));
+            };
+            decode_exponents(br, absexp, nlfegrps, 1, raw_exp)?;
             state.channels[lfe_ch].exp[0] = absexp.clamp(0, 24) as u8;
             for (i, e) in raw_exp.iter().enumerate() {
                 if i + 1 < 7 {
@@ -1262,6 +1304,10 @@ pub(crate) fn remat_band_count_spx(
     }
 }
 
+/// Room for one channel's decoded exponent run: at most 84 groups of
+/// three (D15 over the full 253-bin bandwidth).
+pub(crate) const EXP_SCRATCH: usize = 256;
+
 /// Decode a grouped exponent run (§7.1.3).
 pub(crate) fn decode_exponents(
     br: &mut BitReader,
@@ -1326,14 +1372,13 @@ pub(crate) fn all_snr_offsets_zero(
 
 /// §7.2.2.1.1: clear every channel's `bap[]` (no mantissas this block).
 pub(crate) fn zero_all_baps(state: &mut Ac3State, nfchans: usize, cpl_in_use: bool, lfeon: bool) {
-    for ch in 0..nfchans {
+    let slots = (0..nfchans)
+        .chain(cpl_in_use.then_some(MAX_FBW))
+        .chain(lfeon.then_some(MAX_FBW + 1));
+    for ch in slots {
         state.channels[ch].bap.fill(0);
-    }
-    if cpl_in_use {
-        state.channels[MAX_FBW].bap.fill(0);
-    }
-    if lfeon {
-        state.channels[MAX_FBW + 1].bap.fill(0);
+        // The pointers no longer belong to a computed allocation.
+        state.channels[ch].alloc_key = None;
     }
 }
 
@@ -1402,6 +1447,58 @@ pub(crate) fn run_bit_allocation(
 ) {
     if end <= start {
         return;
+    }
+    // Same exponents, same parameters → same allocation: the pointers,
+    // PSD and mask left by the last run for this channel still hold.
+    // (With a trace switch set every block is recomputed and printed.)
+    let key = {
+        let dba_idx = if is_coupling { MAX_FBW } else { ch };
+        let nseg = if ch > MAX_FBW {
+            0 // the LFE carries no delta bit allocation
+        } else {
+            state.deltnseg[dba_idx].min(8)
+        };
+        let mut segs = [[0u8; 3]; 8];
+        for (seg, slot) in segs.iter_mut().enumerate().take(nseg) {
+            *slot = [
+                state.deltoffst[dba_idx][seg],
+                state.deltlen[dba_idx][seg],
+                state.deltba[dba_idx][seg],
+            ];
+        }
+        AllocKey {
+            start: start as u16,
+            end: end as u16,
+            fscod,
+            sdcycod: state.sdcycod,
+            fdcycod: state.fdcycod,
+            sgaincod: state.sgaincod,
+            dbpbcod: state.dbpbcod,
+            floorcod: state.floorcod,
+            csnroffst: state.snroffst_coarse,
+            fsnroffst,
+            fgaincod,
+            is_coupling,
+            fleak: if is_coupling { state.cpl_fleak } else { 0 },
+            sleak: if is_coupling { state.cpl_sleak } else { 0 },
+            nseg: nseg as u8,
+            segs,
+        }
+    };
+    {
+        let channel = &state.channels[ch];
+        if channel.alloc_key == Some(key)
+            && channel.alloc_exp[start..end] == channel.exp[start..end]
+            && debug_env("AC3_TRACE_FRAME").is_none()
+        {
+            return;
+        }
+    }
+    {
+        let channel = &mut state.channels[ch];
+        channel.alloc_key = Some(key);
+        let (exp, kept) = (&channel.exp, &mut channel.alloc_exp);
+        kept[start..end].copy_from_slice(&exp[start..end]);
     }
     // 1) Map exponents into PSD (§7.2.2.2).
     for bin in start..end {
@@ -1923,7 +2020,57 @@ pub(crate) fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitRead
     Ok(())
 }
 
+/// §7.3.5 grouped mantissas, one row per code word: the three 3-level
+/// values of a 5-bit `bap = 1` group (`code = 9·m1 + 3·m2 + m3`), the
+/// three 5-level values of a 7-bit `bap = 2` group (`25·m1 + 5·m2 +
+/// m3`) and the two 11-level values of a 7-bit `bap = 4` group
+/// (`11·m1 + m2`). A digit past the level count (only code words no
+/// encoder emits) takes the top level.
+const GROUP_3_LEVEL: [[f32; 3]; 32] = {
+    let mut table = [[0.0f32; 3]; 32];
+    let mut code = 0usize;
+    while code < 32 {
+        let digits = [code / 9, (code % 9) / 3, code % 3];
+        let mut i = 0;
+        while i < 3 {
+            table[code][i] = MANT_LEVEL_3[if digits[i] > 2 { 2 } else { digits[i] }];
+            i += 1;
+        }
+        code += 1;
+    }
+    table
+};
+const GROUP_5_LEVEL: [[f32; 3]; 128] = {
+    let mut table = [[0.0f32; 3]; 128];
+    let mut code = 0usize;
+    while code < 128 {
+        let digits = [code / 25, (code % 25) / 5, code % 5];
+        let mut i = 0;
+        while i < 3 {
+            table[code][i] = MANT_LEVEL_5[if digits[i] > 4 { 4 } else { digits[i] }];
+            i += 1;
+        }
+        code += 1;
+    }
+    table
+};
+const GROUP_11_LEVEL: [[f32; 2]; 128] = {
+    let mut table = [[0.0f32; 2]; 128];
+    let mut code = 0usize;
+    while code < 128 {
+        let digits = [code / 11, code % 11];
+        let mut i = 0;
+        while i < 2 {
+            table[code][i] = MANT_LEVEL_11[if digits[i] > 10 { 10 } else { digits[i] }];
+            i += 1;
+        }
+        code += 1;
+    }
+    table
+};
+
 #[allow(clippy::too_many_arguments)]
+#[inline]
 pub(crate) fn fetch_mantissa(
     br: &mut BitReader,
     bap: u8,
@@ -1945,13 +2092,7 @@ pub(crate) fn fetch_mantissa(
         }
         1 => {
             if *g1n == 0 {
-                let code = br.read_u32(5)? as i32;
-                let m1 = code / 9;
-                let m2 = (code % 9) / 3;
-                let m3 = code % 3;
-                g1[0] = MANT_LEVEL_3[m1.clamp(0, 2) as usize];
-                g1[1] = MANT_LEVEL_3[m2.clamp(0, 2) as usize];
-                g1[2] = MANT_LEVEL_3[m3.clamp(0, 2) as usize];
+                *g1 = GROUP_3_LEVEL[br.read_u32(5)? as usize];
                 *g1n = 3;
             }
             let v = g1[3 - *g1n];
@@ -1960,13 +2101,7 @@ pub(crate) fn fetch_mantissa(
         }
         2 => {
             if *g2n == 0 {
-                let code = br.read_u32(7)? as i32;
-                let m1 = code / 25;
-                let m2 = (code % 25) / 5;
-                let m3 = code % 5;
-                g2[0] = MANT_LEVEL_5[m1.clamp(0, 4) as usize];
-                g2[1] = MANT_LEVEL_5[m2.clamp(0, 4) as usize];
-                g2[2] = MANT_LEVEL_5[m3.clamp(0, 4) as usize];
+                *g2 = GROUP_5_LEVEL[br.read_u32(7)? as usize];
                 *g2n = 3;
             }
             let v = g2[3 - *g2n];
@@ -1979,11 +2114,7 @@ pub(crate) fn fetch_mantissa(
         }
         4 => {
             if *g4n == 0 {
-                let code = br.read_u32(7)? as i32;
-                let m1 = code / 11;
-                let m2 = code % 11;
-                g4[0] = MANT_LEVEL_11[m1.clamp(0, 10) as usize];
-                g4[1] = MANT_LEVEL_11[m2.clamp(0, 10) as usize];
+                *g4 = GROUP_11_LEVEL[br.read_u32(7)? as usize];
                 *g4n = 2;
             }
             let v = g4[2 - *g4n];
@@ -2461,18 +2592,19 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
     let trace_blk_dsp = debug_env("AC3_TRACE_BLK")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
-    for ch in 0..nfchans {
-        let mut coeffs = [0.0f32; 256];
-        coeffs.copy_from_slice(&state.channels[ch].coeffs);
+    for ch in (0..nfchans).chain(bsi.lfeon.then_some(MAX_FBW + 1)) {
+        let channel = &mut state.channels[ch];
         if let Some(tf) = trace_frame_dsp
+            && ch < nfchans
             && tf == state.frame_counter
             && state.blkidx == trace_blk_dsp
         {
+            let coeffs = &channel.coeffs;
             let max_abs = coeffs.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
             let nonzero = coeffs.iter().filter(|&&v| v != 0.0).count();
             eprintln!(
                 "TRACE-DSP ch{} pre-IMDCT max|coeff|={:.6e} nonzero_bins={} blksw={} dynrng={}",
-                ch, max_abs, nonzero, state.channels[ch].blksw, state.channels[ch].dynrng
+                ch, max_abs, nonzero, channel.blksw, channel.dynrng
             );
             eprint!("TRACE-DSP ch{} coeff[0..16]: ", ch);
             for v in &coeffs[..16] {
@@ -2486,43 +2618,20 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
             eprintln!();
         }
         let mut time = [0.0f32; 512];
-        if state.channels[ch].blksw {
-            crate::imdct::imdct_256_pair_fft(&coeffs, &mut time);
+        // The LFE is always a long block (§5.4.3.3).
+        if ch < nfchans && channel.blksw {
+            crate::imdct::imdct_256_pair_fft(&channel.coeffs, &mut time);
         } else {
-            crate::imdct::imdct_512_fft(&coeffs, &mut time);
+            crate::imdct::imdct_512_fft(&channel.coeffs, &mut time);
         }
-        // Apply window.
-        for n in 0..256 {
-            time[n] *= WINDOW[n];
-            time[511 - n] *= WINDOW[n];
+        // Window, then overlap-add per §7.9.4.1: pcm[n] = 2 * (x[n] +
+        // delay[n]); the windowed second half becomes the next block's
+        // delay. The PCM replaces the block's coefficients.
+        let (first, second) = time.split_at(SAMPLES_PER_BLOCK);
+        for n in 0..SAMPLES_PER_BLOCK {
+            channel.coeffs[n] = 2.0 * (first[n] * WINDOW[n] + channel.delay[n]);
+            channel.delay[n] = second[n] * WINDOW[SAMPLES_PER_BLOCK - 1 - n];
         }
-        // Overlap-add: pcm[n] = time[n] + delay[n]; delay[n] = time[256+n]
-        let mut out_pcm = [0.0f32; 256];
-        for n in 0..256 {
-            // Per §7.9.4.1 overlap-add: pcm[n] = 2 * (x[n] + delay[n]).
-            out_pcm[n] = 2.0 * (time[n] + state.channels[ch].delay[n]);
-            state.channels[ch].delay[n] = time[256 + n];
-        }
-        state.channels[ch].coeffs[..256].copy_from_slice(&out_pcm);
-    }
-    if bsi.lfeon {
-        let ch = MAX_FBW + 1;
-        let mut coeffs = [0.0f32; 256];
-        coeffs.copy_from_slice(&state.channels[ch].coeffs);
-        let mut time = [0.0f32; 512];
-        // LFE is always long-block (spec §5.4.3.3).
-        crate::imdct::imdct_512_fft(&coeffs, &mut time);
-        for n in 0..256 {
-            time[n] *= WINDOW[n];
-            time[511 - n] *= WINDOW[n];
-        }
-        let mut out_pcm = [0.0f32; 256];
-        for n in 0..256 {
-            // Per §7.9.4.1 overlap-add: pcm[n] = 2 * (x[n] + delay[n]).
-            out_pcm[n] = 2.0 * (time[n] + state.channels[ch].delay[n]);
-            state.channels[ch].delay[n] = time[256 + n];
-        }
-        state.channels[ch].coeffs[..256].copy_from_slice(&out_pcm);
     }
 }
 

@@ -49,6 +49,72 @@ pub(crate) const AC3_CRC_POLY: u16 = 0x8005;
 /// `init` lets callers chain partial updates — most call-sites use
 /// `init = 0` so the LFSR starts cleared per §7.10.1.
 pub(crate) fn ac3_crc_update(init: u16, data: &[u8]) -> u16 {
+    let mut crc = init;
+    let (words, tail) = data.as_chunks::<4>();
+    for w in words {
+        // Four register steps at once: the register's two bytes and
+        // the first two message bytes each pass through the feedback
+        // 4, 3 and 2 byte-steps deep (tabulated); the last two message
+        // bytes are still inside the register, untouched.
+        crc = CRC_STEP4[usize::from(crc >> 8)]
+            ^ CRC_STEP3[usize::from(crc & 0xFF)]
+            ^ CRC_STEP2[usize::from(w[0])]
+            ^ CRC_STEP1[usize::from(w[1])]
+            ^ (u16::from(w[2]) << 8)
+            ^ u16::from(w[3]);
+    }
+    for &b in tail {
+        crc = crc_step(crc) ^ u16::from(b);
+    }
+    crc
+}
+
+/// The register after one zero byte has been shifted through it:
+/// the low byte moves up, the high byte leaves through the feedback.
+const fn crc_step(crc: u16) -> u16 {
+    CRC_STEP1[(crc >> 8) as usize] ^ (crc << 8)
+}
+
+/// `CRC_STEP1[h]`: the register `h << 8` after eight zero bits — what
+/// a byte leaving the register feeds back into it.
+const CRC_STEP1: [u16; 256] = {
+    let mut table = [0u16; 256];
+    let mut h = 0usize;
+    while h < 256 {
+        let mut reg = (h as u16) << 8;
+        let mut bit = 0;
+        while bit < 8 {
+            let top = reg & 0x8000 != 0;
+            reg <<= 1;
+            if top {
+                reg ^= AC3_CRC_POLY;
+            }
+            bit += 1;
+        }
+        table[h] = reg;
+        h += 1;
+    }
+    table
+};
+
+/// `CRC_STEPn[h]`: the register `h << 8` after `n` zero bytes.
+const fn crc_step_table(prev: &[u16; 256]) -> [u16; 256] {
+    let mut table = [0u16; 256];
+    let mut h = 0usize;
+    while h < 256 {
+        table[h] = crc_step(prev[h]);
+        h += 1;
+    }
+    table
+}
+const CRC_STEP2: [u16; 256] = crc_step_table(&CRC_STEP1);
+const CRC_STEP3: [u16; 256] = crc_step_table(&CRC_STEP2);
+const CRC_STEP4: [u16; 256] = crc_step_table(&CRC_STEP3);
+
+/// The §7.10.1 shift register one bit at a time — the definition the
+/// tabulated [`ac3_crc_update`] is checked against.
+#[cfg(test)]
+fn ac3_crc_update_bitwise(init: u16, data: &[u8]) -> u16 {
     let mut crc: u32 = init as u32;
     for &b in data {
         for i in (0..8).rev() {
@@ -266,8 +332,10 @@ pub fn verify_ac3_syncframe(syncframe: &[u8], frame_bytes: usize) -> CrcStatus {
             };
         }
     };
+    // One pass: the register after the first 5/8 is the `crc1`
+    // residue, and continuing it to the end gives the `crc2` residue.
     let crc1_residue = ac3_crc_update(0, &syncframe[2..crc1_end]);
-    let crc2_residue = ac3_crc_update(0, &syncframe[2..frame_bytes]);
+    let crc2_residue = ac3_crc_update(crc1_residue, &syncframe[crc1_end..frame_bytes]);
     CrcStatus {
         crc1_ok: Some(crc1_residue == 0),
         crc2_ok: Some(crc2_residue == 0),
@@ -307,6 +375,38 @@ pub fn verify_eac3_syncframe(syncframe: &[u8], frame_bytes: usize) -> CrcStatus 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tabulated register update is the bit-serial definition, for
+    /// every start value, alignment and length.
+    #[test]
+    fn tabulated_update_matches_the_bit_serial_register() {
+        let mut seed = 0x2468_ACE1u32;
+        let data: Vec<u8> = (0..4099)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        for (start, len) in [
+            (0, 0),
+            (0, 1),
+            (1, 2),
+            (2, 3),
+            (3, 4),
+            (0, 5),
+            (7, 4092),
+            (0, 4099),
+        ] {
+            for init in [0u16, 1, 0x8000, 0x8005, 0xFFFF, 0x1234] {
+                let slice = &data[start..start + len];
+                assert_eq!(
+                    ac3_crc_update(init, slice),
+                    ac3_crc_update_bitwise(init, slice),
+                    "init {init:#06x}, {len} bytes from {start}"
+                );
+            }
+        }
+    }
 
     /// Spec sanity: a single zero byte shifted through the cleared
     /// LFSR leaves the register at zero (no `1` bits → no XOR).
