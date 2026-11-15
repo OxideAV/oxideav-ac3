@@ -2139,15 +2139,34 @@ fn apply_spectral_extension(state: &mut Ac3State, nfchans: usize) {
             }
         }
 
-        // 1b. §3.6.4.2.3 Transform Coefficient Band Border Filtering —
-        //     after the §3.6.4.1 translation copy AND BEFORE the
-        //     §3.6.4.2.2 banded RMS / §3.6.4.2.4 noise scaling. The
-        //     5-tap symmetric notch filter sits centred on the first
-        //     extension bin, attenuating the 2 bins below and 2 bins
-        //     above the border (filter starts at `spx_begin_tc - 2`).
-        //     The same filter re-applies at each band-internal wrap
-        //     point flagged above (filter starts at the band's start
-        //     minus 2 bins).
+        // 2. Banded RMS energy of the translated coefficients
+        //    (§3.6.4.2.2) — measured BEFORE the border filter: "It is
+        //    important that filtering occurs after the transform
+        //    coefficient translation and banded RMS energy calculation
+        //    but prior to the noise scaling and transform coefficient
+        //    blending calculation" (§3.6.4.2.3).
+        let mut rms = [0.0f32; 18];
+        let mut spxmant = spx_begin_tc;
+        for (bnd, slot) in rms.iter_mut().enumerate().take(nbnds) {
+            let bandsize = state.spx_bndsztab[bnd];
+            let band_hi = (spxmant + bandsize).min(N_COEFFS);
+            let accum: f64 = state.channels[ch].coeffs[spxmant.min(band_hi)..band_hi]
+                .iter()
+                .map(|&v| f64::from(v) * f64::from(v))
+                .sum();
+            if bandsize > 0 {
+                *slot = (accum / bandsize as f64).sqrt() as f32;
+            }
+            spxmant += bandsize;
+        }
+
+        // 3. §3.6.4.2.3 Transform Coefficient Band Border Filtering.
+        //    The 5-tap symmetric notch filter sits centred on the first
+        //    extension bin, attenuating the 2 bins below and 2 bins
+        //    above the border (filter starts at `spx_begin_tc - 2`).
+        //    The same filter re-applies at each band-internal wrap
+        //    point flagged above (filter starts at the band's start
+        //    minus 2 bins).
         if state.channels[ch].spx_atten_active {
             let code = state.channels[ch].spx_atten_code;
             // Baseband / extension region border.
@@ -2165,37 +2184,24 @@ fn apply_spectral_extension(state: &mut Ac3State, nfchans: usize) {
             }
         }
 
-        // 2. Banded RMS energy of the translated coefficients
-        //    (§E.3.6.4.2.2), 3. noise blend (§E.3.6.4.2.4), and
-        //    4. coordinate scaling (§E.3.6.4.3) — fused per band.
+        // 4. Noise blend (§3.6.4.2.4) and 5. coordinate scaling
+        //    (§3.6.4.3) — fused per band.
         let mut spxmant = spx_begin_tc;
         for bnd in 0..nbnds {
             let bandsize = state.spx_bndsztab[bnd];
             let band_lo = spxmant;
             let band_hi = (spxmant + bandsize).min(N_COEFFS);
 
-            // Banded RMS.
-            let mut accum = 0.0f64;
-            for bin in band_lo..band_hi {
-                let v = state.channels[ch].coeffs[bin] as f64;
-                accum += v * v;
-            }
-            let rms = if bandsize > 0 {
-                (accum / bandsize as f64).sqrt() as f32
-            } else {
-                0.0
-            };
-
             let nblend = state.channels[ch].spx_nblend[bnd];
             let sblend = state.channels[ch].spx_sblend[bnd];
-            let nscale = rms * nblend;
+            let nscale = rms[bnd] * nblend;
             let coord = state.channels[ch].spx_coord[bnd];
 
             for bin in band_lo..band_hi {
                 let tctemp = state.channels[ch].coeffs[bin];
                 let ntemp = spx_noise(&mut state.spx_noise_lfsr);
                 let blended = tctemp * sblend + ntemp * nscale;
-                // §E.3.6.4.3 final scale by spxco·32.
+                // §3.6.4.3 final scale by spxco·32.
                 state.channels[ch].coeffs[bin] = blended * coord * 32.0;
             }
 
@@ -2205,6 +2211,70 @@ fn apply_spectral_extension(state: &mut Ac3State, nfchans: usize) {
         // The SPX region is now populated; extend the channel's mantissa
         // count so dynrng + IMDCT process the regenerated bins.
         state.channels[ch].end_mant = state.channels[ch].end_mant.max(spx_end_tc);
+    }
+}
+
+/// §7.5 rematrixing of a 2/0 block: bands flagged in `rematflg` hold
+/// `L+R` / `L−R` and are turned back into `L` / `R`.
+fn apply_rematrix(state: &mut Ac3State) {
+    // --- Rematrixing (§7.5) ---
+    //
+    // Per Tables 7.25 / 7.26 / 7.27 / 7.28, the upper edge of the LAST
+    // rematrix band is NOT a fixed constant — it tracks the lower edge
+    // of the coupling region whenever coupling is in use:
+    //
+    //   • cplinu == 0           : 4 bands, last ends at bin 252 (Table 7.25)
+    //   • cplinu == 1, cplbegf > 2: 4 bands, last ends at A = 36 + 12*cplbegf
+    //   • cplinu == 1, 2 ≥ cplbegf > 0: 3 bands, last ends at A
+    //   • cplinu == 1, cplbegf = 0: 2 bands, last ends at bin 36
+    //
+    // A previous formulation hard-coded the last band's high coefficient at
+    // bin 252 even when coupling was active. On 2/0 frames whose bitstream
+    // enables rematrixing AND coupling above bin 132 (cplbegf=8 in our
+    // transient fixture), this bled the L+R / L-R operation into the
+    // coupling region — bins that had just been re-derived from the
+    // coupling pseudo-channel via cplco coords. The downstream symptom
+    // was a steady PSNR drift across the 6 audblks of every burst-onset
+    // frame: rematrix scrambled the post-decouple coefficients, the
+    // IMDCT rendered the wrong waveform, and overlap-add carried the
+    // error into the next block. Fixing the upper edge to the spec's
+    // cplbegf-dependent boundary restores burst-frame PSNR.
+    {
+        // Enhanced coupling (`skip_decouple`): the band count is the
+        // §E.3.3.2 `ecplbegf` ladder, applied when the flags were read
+        // (flags past the count are cleared there), and the coupled
+        // channels end at the enhanced-coupling begin bin — `end_mant`
+        // bounds every band below, so the fixed Table 7.25 edges apply.
+        let std_cpl = state.cpl_in_use && !state.skip_decouple;
+        let last_high = if std_cpl {
+            // A = 36 + 12 * cplbegf per Tables 7.26 / 7.27.
+            // For cplbegf = 0 (Table 7.28), the last band actually ends
+            // at bin 36 — but with only 2 rematrix bands it never reaches
+            // band index 3, so the value of `last_high` for index 3 is
+            // unused. Compute A unconditionally.
+            36 + 12 * state.cpl_begf as usize
+        } else {
+            252 // Table 7.25 fixed last band high.
+        };
+        // Convert to exclusive upper bound for our `lo..hi` ranges.
+        let last_hi_excl = last_high + 1;
+        let remat_bands: [(usize, usize); 4] =
+            [(13, 25), (25, 37), (37, 61), (61, last_hi_excl.max(61))];
+        let n = remat_band_count(std_cpl, state.cpl_begf);
+        for (i, (lo, hi)) in remat_bands.iter().take(n).enumerate() {
+            if !state.rematflg[i] {
+                continue;
+            }
+            let end_lo = state.channels[0].end_mant.min(*hi);
+            let end_hi = state.channels[1].end_mant.min(*hi);
+            let end = end_lo.min(end_hi);
+            for bin in *lo..end {
+                let l = state.channels[0].coeffs[bin];
+                let r = state.channels[1].coeffs[bin];
+                state.channels[0].coeffs[bin] = l + r;
+                state.channels[1].coeffs[bin] = l - r;
+            }
+        }
     }
 }
 
@@ -2279,57 +2349,8 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
     }
 
     // --- Rematrixing (§7.5) ---
-    //
-    // Per Tables 7.25 / 7.26 / 7.27 / 7.28, the upper edge of the LAST
-    // rematrix band is NOT a fixed constant — it tracks the lower edge
-    // of the coupling region whenever coupling is in use:
-    //
-    //   • cplinu == 0           : 4 bands, last ends at bin 252 (Table 7.25)
-    //   • cplinu == 1, cplbegf > 2: 4 bands, last ends at A = 36 + 12*cplbegf
-    //   • cplinu == 1, 2 ≥ cplbegf > 0: 3 bands, last ends at A
-    //   • cplinu == 1, cplbegf = 0: 2 bands, last ends at bin 36
-    //
-    // A previous formulation hard-coded the last band's high coefficient at
-    // bin 252 even when coupling was active. On 2/0 frames whose bitstream
-    // enables rematrixing AND coupling above bin 132 (cplbegf=8 in our
-    // transient fixture), this bled the L+R / L-R operation into the
-    // coupling region — bins that had just been re-derived from the
-    // coupling pseudo-channel via cplco coords. The downstream symptom
-    // was a steady PSNR drift across the 6 audblks of every burst-onset
-    // frame: rematrix scrambled the post-decouple coefficients, the
-    // IMDCT rendered the wrong waveform, and overlap-add carried the
-    // error into the next block. Fixing the upper edge to the spec's
-    // cplbegf-dependent boundary restores burst-frame PSNR.
     if acmod == 0x2 {
-        let last_high = if state.cpl_in_use {
-            // A = 36 + 12 * cplbegf per Tables 7.26 / 7.27.
-            // For cplbegf = 0 (Table 7.28), the last band actually ends
-            // at bin 36 — but with only 2 rematrix bands it never reaches
-            // band index 3, so the value of `last_high` for index 3 is
-            // unused. Compute A unconditionally.
-            36 + 12 * state.cpl_begf as usize
-        } else {
-            252 // Table 7.25 fixed last band high.
-        };
-        // Convert to exclusive upper bound for our `lo..hi` ranges.
-        let last_hi_excl = last_high + 1;
-        let remat_bands: [(usize, usize); 4] =
-            [(13, 25), (25, 37), (37, 61), (61, last_hi_excl.max(61))];
-        let n = remat_band_count(state.cpl_in_use, state.cpl_begf);
-        for (i, (lo, hi)) in remat_bands.iter().take(n).enumerate() {
-            if !state.rematflg[i] {
-                continue;
-            }
-            let end_lo = state.channels[0].end_mant.min(*hi);
-            let end_hi = state.channels[1].end_mant.min(*hi);
-            let end = end_lo.min(end_hi);
-            for bin in *lo..end {
-                let l = state.channels[0].coeffs[bin];
-                let r = state.channels[1].coeffs[bin];
-                state.channels[0].coeffs[bin] = l + r;
-                state.channels[1].coeffs[bin] = l - r;
-            }
-        }
+        apply_rematrix(state);
     }
 
     // --- Spectral extension synthesis (§E.3.6) ---
@@ -2620,6 +2641,114 @@ mod short_block_tests {
 #[cfg(test)]
 mod spx_tests {
     use super::*;
+
+    /// A stereo SPX state: copy region [25, 61), extension [61, 85) in
+    /// two 12-bin bands, unit-amplitude coded bins.
+    fn spx_state(nblend: f32, sblend: f32) -> Ac3State {
+        let mut st = Ac3State::new();
+        st.spx_in_use = true;
+        st.spx_strtf = 0;
+        st.spx_begin_subbnd = 3;
+        st.spx_end_subbnd = 5;
+        st.spx_nbnds = 2;
+        st.spx_bndsztab[0] = 12;
+        st.spx_bndsztab[1] = 12;
+        let ch = &mut st.channels[0];
+        ch.in_spx = true;
+        ch.end_mant = 61;
+        for (bin, c) in ch.coeffs.iter_mut().enumerate().take(61) {
+            *c = if bin % 2 == 0 { 0.5 } else { -0.5 };
+        }
+        ch.spx_coord = [1.0 / 32.0; 18];
+        ch.spx_nblend = [nblend; 18];
+        ch.spx_sblend = [sblend; 18];
+        st
+    }
+
+    /// §3.6.4.2.3: the border filter runs "after the transform
+    /// coefficient translation and banded RMS energy calculation but
+    /// prior to the noise scaling and transform coefficient blending
+    /// calculation" — so the noise level of a band is set by the
+    /// unfiltered translated coefficients. With a pure-noise blend the
+    /// extension region is therefore the same with and without
+    /// attenuation; only the two coded bins under the border change.
+    #[test]
+    fn spx_noise_level_is_measured_before_the_border_filter() {
+        let mut plain = spx_state(1.0, 0.0);
+        let mut atten = spx_state(1.0, 0.0);
+        atten.channels[0].spx_atten_active = true;
+        atten.channels[0].spx_atten_code = 31;
+        apply_spectral_extension(&mut plain, 1);
+        apply_spectral_extension(&mut atten, 1);
+        assert_eq!(
+            plain.channels[0].coeffs[61..85],
+            atten.channels[0].coeffs[61..85],
+            "noise-only extension bins do not depend on the border filter"
+        );
+        let row = SPX_ATTEN_TABLE[31];
+        assert_eq!(atten.channels[0].coeffs[59], -0.5 * row[0]);
+        assert_eq!(atten.channels[0].coeffs[60], 0.5 * row[1]);
+        // Band energy: unit-variance noise scaled by the band RMS (0.5).
+        let e: f32 = plain.channels[0].coeffs[61..85]
+            .iter()
+            .map(|v| v * v)
+            .sum::<f32>()
+            / 24.0;
+        assert!((e.sqrt() - 0.5).abs() < 0.15, "noise rms {}", e.sqrt());
+    }
+
+    /// With a pure-signal blend the filter shapes the first three
+    /// extension bins by the mirrored taps.
+    #[test]
+    fn spx_border_filter_shapes_the_translated_signal() {
+        let mut st = spx_state(0.0, 1.0);
+        st.channels[0].spx_atten_active = true;
+        st.channels[0].spx_atten_code = 9;
+        apply_spectral_extension(&mut st, 1);
+        let row = SPX_ATTEN_TABLE[9];
+        // Extension bin 61 + k copies coded bin 25 + k (−0.5 on odd
+        // bins, +0.5 on even ones).
+        assert_eq!(st.channels[0].coeffs[61], -0.5 * row[2]);
+        assert_eq!(st.channels[0].coeffs[62], 0.5 * row[1]);
+        assert_eq!(st.channels[0].coeffs[63], -0.5 * row[0]);
+        assert_eq!(st.channels[0].coeffs[64], 0.5);
+    }
+
+    /// §E.3.3.2 / §7.5: in an enhanced-coupling block the rematrix
+    /// band count follows `ecplbegf` (the flags are stored at parse
+    /// time) and every band is bounded by the channels' coded
+    /// bandwidth — a stale standard-coupling `cplbegf` must not trim
+    /// the band list.
+    #[test]
+    fn rematrix_in_an_enhanced_coupling_block_ignores_stale_cplbegf() {
+        let mut st = Ac3State::new();
+        st.cpl_in_use = true;
+        st.skip_decouple = true;
+        st.cpl_begf = 0; // left over from an earlier standard-coupling block
+        st.rematflg = [true; 4];
+        for ch in 0..2 {
+            st.channels[ch].end_mant = 109; // ecpl begin bin
+            st.channels[ch].coeffs = [if ch == 0 { 3.0 } else { 1.0 }; N_COEFFS];
+        }
+        apply_rematrix(&mut st);
+        for bin in [13, 30, 50, 61, 108] {
+            assert_eq!(st.channels[0].coeffs[bin], 4.0, "L at bin {bin}");
+            assert_eq!(st.channels[1].coeffs[bin], 2.0, "R at bin {bin}");
+        }
+        for bin in [12, 109, 200] {
+            assert_eq!(st.channels[0].coeffs[bin], 3.0, "L at bin {bin}");
+            assert_eq!(st.channels[1].coeffs[bin], 1.0, "R at bin {bin}");
+        }
+        // Standard coupling with cplbegf = 0 keeps its two bands.
+        st.skip_decouple = false;
+        for ch in 0..2 {
+            st.channels[ch].end_mant = 37;
+            st.channels[ch].coeffs = [if ch == 0 { 3.0 } else { 1.0 }; N_COEFFS];
+        }
+        apply_rematrix(&mut st);
+        assert_eq!(st.channels[0].coeffs[30], 4.0);
+        assert_eq!(st.channels[0].coeffs[40], 3.0);
+    }
 
     /// Table E3.13: spx sub-band `s` begins at transform coefficient
     /// `25 + 12·s`. Sub-band 17 is the one-past-last marker at tc# 229.

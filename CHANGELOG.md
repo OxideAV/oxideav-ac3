@@ -53,6 +53,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- E-AC-3 decoder, spectral extension with attenuation (§3.6.4.2.3):
+  the banded RMS energy that scales a band's noise component is now
+  measured on the translated coefficients BEFORE the border filter, as
+  the clause requires ("filtering occurs after the transform
+  coefficient translation and banded RMS energy calculation"); it was
+  measured after it, lowering the noise level of every band that
+  starts at a filtered border.
+- E-AC-3 decoder, 2/0 enhanced coupling: the rematrix step sized its
+  band list from the standard-coupling `cplbegf` left over from an
+  earlier block instead of the §E.3.3.2 `ecplbegf` ladder the flags
+  were read with, so flagged bands could be left as sum / difference.
+  Flags past the block's band count are cleared when the flags are
+  read.
 - E-AC-3 encoder: a frame whose elected exponent plan left no room for
   the coding tools' own syntax (SPX / coupling coordinates, per-block
   SNR offsets, transient pre-noise words) failed with "bit budget

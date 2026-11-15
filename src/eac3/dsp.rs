@@ -1003,6 +1003,10 @@ pub fn decode_indep_audblks(
                     let v = br.read_u32(1)? != 0;
                     state.rematflg[rbnd] = v;
                 }
+                // Bands past the count carry no flag in this strategy.
+                for flag in state.rematflg.iter_mut().skip(n_remat) {
+                    *flag = false;
+                }
             }
         }
 
