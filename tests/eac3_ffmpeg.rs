@@ -786,8 +786,8 @@ fn eac3_spx_stereo_band_energy_through_ffmpeg() {
         // SPX-band energy match through the external decoder.
         let mut lo = geom.begin_tc;
         let mut deltas = Vec::new();
-        for bnd in 0..geom.nbnds {
-            let hi = lo + geom.bndsztab[bnd];
+        for &size in &geom.bndsztab[..geom.nbnds] {
+            let hi = lo + size;
             let eo: f64 = orig_prof[lo..hi].iter().sum();
             let ed: f64 = dec_prof[lo..hi].iter().sum();
             deltas.push(10.0 * (ed.max(1e-30) / eo.max(1e-30)).log10());
@@ -857,8 +857,8 @@ fn eac3_spx_atten_band_energy_through_ffmpeg() {
     let dec_prof = mdct_energy_profile(&decoded, 2, 0);
     let mut lo = geom.begin_tc;
     let mut deltas = Vec::new();
-    for bnd in 0..geom.nbnds {
-        let hi = lo + geom.bndsztab[bnd];
+    for &size in &geom.bndsztab[..geom.nbnds] {
+        let hi = lo + size;
         let eo: f64 = orig_prof[lo..hi].iter().sum();
         let ed: f64 = dec_prof[lo..hi].iter().sum();
         deltas.push(10.0 * (ed.max(1e-30) / eo.max(1e-30)).log10());
@@ -1032,8 +1032,8 @@ fn eac3_spx_mixed_membership_through_ffmpeg() {
     let dec0 = mdct_energy_profile(&decoded, 2, 0);
     let mut lo = geom.begin_tc;
     let mut deltas = Vec::new();
-    for bnd in 0..geom.nbnds {
-        let hi = lo + geom.bndsztab[bnd];
+    for &size in &geom.bndsztab[..geom.nbnds] {
+        let hi = lo + size;
         let eo: f64 = orig0[lo..hi].iter().sum();
         let ed: f64 = dec0[lo..hi].iter().sum();
         deltas.push(10.0 * (ed.max(1e-30) / eo.max(1e-30)).log10());

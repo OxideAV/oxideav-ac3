@@ -132,9 +132,9 @@ fn side_info_extraction_is_consistent() {
             // are mandatory, not the explicit transmission.)
             if i == 0 {
                 assert!(s.cplstre, "blk0 must have cplstre=1");
-                for ch in 0..b.nfchans as usize {
+                for (ch, &strategy) in s.chexpstr[..b.nfchans as usize].iter().enumerate() {
                     assert_ne!(
-                        s.chexpstr[ch], 0,
+                        strategy, 0,
                         "blk0 ch{ch} exponent strategy must be 'new' (!=reuse)"
                     );
                 }
