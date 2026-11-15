@@ -341,7 +341,20 @@ pub struct Ac3State {
     /// behaviour is unchanged unless a caller opts in via the decoder's
     /// DRC API.
     pub drc: crate::drc::DrcSettings,
+
+    /// E-AC-3 transient pre-noise processing (§E.3.7.2): the last
+    /// [`TPNP_HISTORY`] output samples of each full-bandwidth channel,
+    /// oldest first, `MAX_FBW` runs back to back. The time-scaling
+    /// synthesis buffer of a transient early in a frame starts up to
+    /// 1534 samples before the frame's first sample. Empty until the
+    /// first E-AC-3 frame is decoded.
+    pub tpnp_history: Vec<f32>,
 }
+
+/// Output samples kept per channel for §E.3.7.2: the synthesis buffer
+/// starts `2·TC1 + 2·PN` samples before the transient, with `TC1 = 256`
+/// and a pre-noise length `PN` below 512.
+pub(crate) const TPNP_HISTORY: usize = 1536;
 
 impl Default for Ac3State {
     fn default() -> Self {
@@ -402,6 +415,7 @@ impl Ac3State {
             skip_decouple: false,
             ecpl_state: crate::eac3::ecpl::EcplState::new(),
             drc: crate::drc::DrcSettings::default(),
+            tpnp_history: Vec::new(),
         }
     }
 }

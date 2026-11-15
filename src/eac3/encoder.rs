@@ -288,11 +288,18 @@ fn validate_min_rate(sub: &SubstreamLayout, nblks: usize, meta_bits: u32) -> Res
 /// (with an absolute floor so noise-level content never triggers).
 /// Returns `(transprocloc, transproclen)` — the group index (already
 /// in the §2.3.2.22 4-sample units) and the time-scaling length in
-/// samples (the pre-noise gap between the containing coding block's
-/// leading edge and the transient, capped at the 8-bit field) — or
-/// `None` when the frame carries no usable transient (none found, or
-/// the transient sits on a block boundary where no pre-noise gap
-/// exists).
+/// samples — or `None` when the frame carries no usable transient
+/// (none found, or the transient sits on a block boundary, which this
+/// encoder leaves to the transform).
+///
+/// The length is the transient's offset inside its coding block
+/// (capped at the 8-bit field). In the decoder (§3.7.2) the replacement
+/// audio for sample `d` is sample `d − (TC1 + PN − transproclen)`, with
+/// `PN` counted from the leading edge of the block before the
+/// transient's block (`PN = 256 + offset`): this choice makes the copy
+/// distance a constant 512 samples — two block hops — whatever the
+/// offset. A waveform-matched length (the clause's "time scaling
+/// synthesis analysis") is encoder tuning this encoder does not do.
 fn detect_tpnp_transient(pcm: &[f32]) -> Option<(u16, u16)> {
     const GROUP: usize = 4;
     const WARMUP_GROUPS: usize = 16;
@@ -2139,11 +2146,8 @@ impl Eac3Encoder {
         // 4-sample units (§2.3.2.22); `transproclen` is the
         // time-scaling-synthesis length in samples (§2.3.2.23 — the
         // exact analysis is encoder tuning, only sketched by Figure
-        // E3.2; we scale over the pre-noise gap between the
-        // containing block's leading edge and the transient, which is
-        // precisely the region the decoder's §3.7.2 synthesis
-        // overwrites). A transient on a block boundary carries no
-        // pre-noise gap, so the channel is skipped.
+        // E3.2; see `detect_tpnp_transient` for the value chosen
+        // here). A transient on a block boundary is skipped.
         let tpnp_plan: Option<Vec<Option<(u16, u16)>>> = if self.tpnp {
             Some(
                 (0..nfchans)

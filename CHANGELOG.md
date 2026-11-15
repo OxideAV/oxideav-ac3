@@ -33,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `decode_eac3_packet` keeps it off unless
   `Eac3DecoderState::set_crc_check(true)`; `frames_crc_failed` counts
   the failures.
+- `tests/eac3_frame_state.rs`: sixteen encoder configurations (every
+  channel layout, standard / enhanced coupling, spectral extension with
+  and without attenuation, AHT, 1/2/3/6-block syncframes, transient
+  pre-noise processing) are decoded from the first frame and from
+  three later frames on a fresh decoder; the decodes agree sample for
+  sample once the signal history (overlap tail, enhanced-coupling
+  carrier, pre-noise synthesis source) is rebuilt — no parsed state
+  crosses a syncframe boundary.
 - E-AC-3 decoder: **program selection** (§E.3.8.3 / §E.3.8.4). The
   decoder renders one program: the independent substream selected by
   the `program` option / `Eac3DecoderOptions::with_program` /
@@ -105,6 +113,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the packet.
 - A dependent substream that cannot be decoded is concealed in place
   instead of being dropped, so the program keeps its channel count.
+- E-AC-3 decoder, transient pre-noise processing (§3.7.2): the
+  pre-noise length `PN` is counted from "the leading edge of the audio
+  coding block prior to the block containing the transient" — the
+  start of the first transform that contains the transient — as the
+  clause states; it was counted from the start of the transient's own
+  block, so the synthesis replaced less than half of the pre-noise
+  (and nothing at all for a transient on a block boundary) with audio
+  copied from the wrong distance. The synthesis buffer now reads the
+  output of the previous frame(s) where it starts before the current
+  one (it was clamped to the frame's first sample), and a transient
+  located in the next frame corrects the part of its window that falls
+  in the current frame. No black-box decoder on hand applies this tool
+  (the one used elsewhere in the tests ignores the transmitted data),
+  so the path is pinned by the clause's pseudo-code alone.
 - E-AC-3 decoder, spectral extension with attenuation (§3.6.4.2.3):
   the banded RMS energy that scales a band's noise component is now
   measured on the translated coefficients BEFORE the border filter, as
