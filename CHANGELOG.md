@@ -207,8 +207,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Decoder throughput, output bit-identical (41 of 42 comparison
   streams hash the same as before the round; the 42nd is the
-  spectral-extension attenuation fix): 5.1 AC-3 399 → 514 × real time,
-  5.1 E-AC-3 362 → 458 ×, with the syncframe CRC now verified on every
+  spectral-extension attenuation fix): 5.1 AC-3 496 → 676 × real time,
+  5.1 E-AC-3 450 → 628 ×, with the syncframe CRC now verified on every
   frame (medians of seven alternating runs, see the README).
   - the bit allocation of a channel is kept when a block reuses its
     exponents and changes no allocation parameter (§7.2), instead of

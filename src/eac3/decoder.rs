@@ -222,15 +222,17 @@ impl Eac3DecoderState {
             return false;
         };
         units.iter().any(|unit| {
-            let intact = !self.verify_crc
-                || crate::crc::verify_eac3_syncframe(unit.frame, unit.frame.len()).crc2_ok
-                    == Some(true);
             let mut br = BitReader::new(&unit.frame[2..]);
-            if !intact || br.skip(unit.bsi_bits).is_err() {
+            if br.skip(unit.bsi_bits).is_err() {
                 return false;
             }
             let audfrm = audfrm::parse_with(&mut br, &unit.bsi);
+            // The CRC pass only when the answer would be yes (a frame
+            // that fails it is concealed and needs no look-ahead).
             tail_uses_ecpl(self, unit, &audfrm)
+                && (!self.verify_crc
+                    || crate::crc::verify_eac3_syncframe(unit.frame, unit.frame.len()).crc2_ok
+                        == Some(true))
         })
     }
 

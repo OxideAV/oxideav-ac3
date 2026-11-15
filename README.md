@@ -773,9 +773,13 @@ runs via the `Fuzz` workflow; corpora seed from the fixture set):
   multiple carved packets on one stateful decoder, with the
   `joc_layout` option and the F32 output format picked by the input
   (a fixed layout must keep its frame shape on every hostile frame).
+  Two decoders see the same packets: one with the CRC check off, so
+  hostile bits reach the parser and the DSP, and one with the default
+  policy (reassembly, CRC, concealment, enhanced-coupling hold-back).
 - **`eac3_substream_walk`** — a persistent `Eac3DecoderState` over
   syncinfo-split syncframes: substream accumulation + §E.3.8.2
-  chanmap channel combination.
+  chanmap channel combination, with the bytes after each frame
+  offered as the look-ahead access unit.
 - **`joc_oamd_parse`** — the TS 103 420 JOC/OAMD metadata surface
   (added with the #15 JOC contribution): EC-3 Extension Type A
   signalling, the EMDF container walk with its sparse / dense
@@ -821,7 +825,18 @@ of a channel-less concealed frame — both fixed and pinned
 (`tests/joc_layout.rs`, `tests/robustness.rs`), then 559k runs clean;
 `joc_oamd_parse` gained a structure-aware leg that synthesizes OAMD
 programs (dynamic and bed, every object property) and renders them
-through each layout — 3.4M + 30k runs clean.
+through each layout — 3.4M + 30k runs clean. r489: the scheduled
+`encode_decode_roundtrip` run found a contract-valid configuration
+(7.1 pair, 96 kb/s at 44.1 kHz, SPX, near-silent input) whose
+independent substream overflowed its syncframe — the exponent-plan
+guard did not count the SPX coordinate reserve; fixed (every budget
+guard now shares one tool / metadata reserve) and replayed by
+`tests/fuzz_regressions.rs`. After the decoder work of the round all
+six targets ran 630 s each without a finding: `decode_frames` 604k
+runs, `eac3_substream_walk` 2.09M, `parse_headers` 24.2M,
+`joc_oamd_parse` 149k, `encode_decode_roundtrip` 27.7k,
+`ac3_encode_decode_roundtrip` 38.1k; the two decode targets were then
+run another 630 s each on the final code (712k and 2.56M runs, clean).
 
 ## Equal-rate position
 
@@ -970,7 +985,7 @@ runs the allocator on every candidate run.
 **r489 decoder pass** — same example, 10 s of programme, decode stages
 repeated 10 times, single thread, Apple M5 Max, rustc 1.98. The
 machine was shared with other builds, so each figure is the **median
-of five runs** in which the build from before the pass and the current
+of seven runs** in which the build from before the pass and the current
 build alternate; the ratio is the stable quantity. Output hashes are
 identical, and the decoded output of 42 further streams (the staged
 corpus, the in-tree fixtures and 19 encoder configurations) hashes the
@@ -981,12 +996,12 @@ not perform.
 
 | stage (× real time) | before | after | ratio |
 | --- | ---: | ---: | ---: |
-| decode AC-3 5.1 448 kb/s | 445 | 605 | 1.36 |
-| decode E-AC-3 5.1 384 kb/s | 405 | 567 | 1.40 |
-| decode E-AC-3 5.1, SPX + coupling | 506 | 605 | 1.20 |
-| decode E-AC-3 5.1, AHT | 503 | 650 | 1.29 |
-| decode E-AC-3 5.1 → stereo downmix | 358 | 492 | 1.38 |
-| decode E-AC-3 5.1 → 7.1.4 channel route | 310 | 409 | 1.32 |
+| decode AC-3 5.1 448 kb/s | 496 | 676 | 1.36 |
+| decode E-AC-3 5.1 384 kb/s | 450 | 628 | 1.40 |
+| decode E-AC-3 5.1, SPX + coupling | 566 | 668 | 1.18 |
+| decode E-AC-3 5.1, AHT | 570 | 755 | 1.33 |
+| decode E-AC-3 5.1 → stereo downmix | 391 | 561 | 1.43 |
+| decode E-AC-3 5.1 → 7.1.4 channel route | 342 | 455 | 1.33 |
 
 - **Bit allocation**: the §7.2.2 allocator ran for every channel of
   every block. A block that reuses its exponents and changes none of
