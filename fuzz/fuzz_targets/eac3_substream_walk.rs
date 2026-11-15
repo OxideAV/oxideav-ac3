@@ -4,11 +4,12 @@
 //! syncinfo frame-length table and feeds each to `decode_eac3_packet`
 //! on a persistent `Eac3DecoderState` — the path that accumulates
 //! independent + dependent substreams into one program and applies
-//! the §E.3.8.2 replace-or-extend chanmap channel combination.
+//! the §E.3.8.2 replace-or-extend chanmap channel combination, with
+//! the following bytes offered as the look-ahead access unit.
 //! Bounded to 32 frames.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_ac3::eac3::{Eac3DecoderState, decode_eac3_packet};
+use oxideav_ac3::eac3::{Eac3DecoderState, decode_eac3_packet_with_next};
 use oxideav_ac3::syncinfo;
 
 fuzz_target!(|data: &[u8]| {
@@ -23,7 +24,11 @@ fuzz_target!(|data: &[u8]| {
             .map(|s| s.frame_length as usize)
             .unwrap_or(rest.len())
             .clamp(1, rest.len());
-        let _ = decode_eac3_packet(&mut st, &rest[..flen]);
+        // The bytes after the frame stand in for the next access unit
+        // (the enhanced-coupling look-ahead parses its first block on a
+        // scratch state).
+        let next = (flen < rest.len()).then(|| &rest[flen..]);
+        let _ = decode_eac3_packet_with_next(&mut st, &rest[..flen], next);
         off += flen;
     }
 });

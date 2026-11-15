@@ -376,7 +376,7 @@ pub struct Ac3State {
     pub drc: crate::drc::DrcSettings,
 
     /// E-AC-3 transient pre-noise processing (§E.3.7.2): the last
-    /// [`TPNP_HISTORY`] output sample frames of the substream, oldest
+    /// 1536 output sample frames of the substream, oldest
     /// first, interleaved as the frame output is. The time-scaling
     /// synthesis buffer of a transient early in a frame starts up to
     /// 1534 samples before the frame's first sample. Empty until the
@@ -394,6 +394,34 @@ pub struct Ac3State {
     /// packet walker for the frame about to be decoded: the per-block
     /// gains that replace this substream's own.
     pub gain_override: Option<[f32; BLOCKS_PER_FRAME]>,
+
+    /// Did the last block of the frame decoded last use enhanced
+    /// coupling? `None` until a frame has been decoded. When it did,
+    /// that block's carrier needs the first block of the following
+    /// frame (Annex E §3.5.5.1: the non-aliased coupling channel is
+    /// built from the previous, current and next blocks).
+    pub ecpl_at_frame_end: Option<bool>,
+    /// Parse-only pass (E-AC-3): walk the frame's side information and
+    /// mantissas on this — scratch — state without rendering audio, to
+    /// answer one question about it.
+    pub(crate) probe: Probe,
+    /// Answer of a [`Probe::FirstBlockCarrier`] pass.
+    pub(crate) probe_carrier: Option<Box<[f32; N_COEFFS]>>,
+}
+
+/// What a parse-only pass over an E-AC-3 frame is after.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum Probe {
+    /// A normal decode.
+    #[default]
+    Off,
+    /// The enhanced-coupling channel coefficients of block 0 (stored
+    /// in `probe_carrier`; `None` when block 0 does not use enhanced
+    /// coupling). Stops after block 0.
+    FirstBlockCarrier,
+    /// Whether the frame's last block uses enhanced coupling (stored
+    /// in `ecpl_at_frame_end`).
+    TailCoupling,
 }
 
 /// Output samples kept per channel for §E.3.7.2: the synthesis buffer
@@ -463,6 +491,9 @@ impl Ac3State {
             tpnp_history: Vec::new(),
             block_gains: [1.0; BLOCKS_PER_FRAME],
             gain_override: None,
+            ecpl_at_frame_end: None,
+            probe: Probe::Off,
+            probe_carrier: None,
         }
     }
 }

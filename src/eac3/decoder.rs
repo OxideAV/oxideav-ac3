@@ -82,15 +82,15 @@ pub struct Eac3DecoderState {
     /// program — independent substreams with another id and the
     /// dependent substreams that follow them — are skipped.
     program: u8,
-    /// Whether the selected program's independent frame has been seen
-    /// in the packet being walked; dependent frames are associated with
-    /// the independent frame they follow (§E.2.3.1.2).
-    in_selected_program: bool,
     /// §E.3.8.2: "Decoders reproducing 5.1 or fewer channels from a
     /// program containing greater than 5.1 channels shall decode only
     /// independent substream 0 and skip all associated dependent
     /// substreams." `true` skips them.
     skip_dependent: bool,
+    /// Scratch substream state for parse-only passes over a frame (the
+    /// enhanced-coupling look-ahead, see
+    /// [`decode_eac3_packet_with_next`]).
+    scratch: Option<Box<Ac3State>>,
     /// Leave [`DecodedFrame::pcm_s16le`] empty: the caller takes the
     /// program from [`Self::indep_pcm_f32`] and does its own packing.
     skip_s16: bool,
@@ -210,6 +210,28 @@ impl Eac3DecoderState {
     /// the larger layout.
     pub fn set_dependent_substreams(&mut self, decode: bool) {
         self.skip_dependent = !decode;
+    }
+
+    /// Would decoding the access unit `data` benefit from the access
+    /// unit after it — does a frame of the selected program end in a
+    /// block that uses enhanced coupling (§3.5.5.1)? A caller that can
+    /// wait for the next access unit passes it to
+    /// [`decode_eac3_packet_with_next`].
+    pub fn wants_next(&mut self, data: &[u8]) -> bool {
+        let Ok((units, _)) = locate_units(self, data) else {
+            return false;
+        };
+        units.iter().any(|unit| {
+            let intact = !self.verify_crc
+                || crate::crc::verify_eac3_syncframe(unit.frame, unit.frame.len()).crc2_ok
+                    == Some(true);
+            let mut br = BitReader::new(&unit.frame[2..]);
+            if !intact || br.skip(unit.bsi_bits).is_err() {
+                return false;
+            }
+            let audfrm = audfrm::parse_with(&mut br, &unit.bsi);
+            tail_uses_ecpl(self, unit, &audfrm)
+        })
     }
 
     /// Skip the 16-bit packing of [`DecodedFrame::pcm_s16le`] (left
@@ -459,73 +481,67 @@ struct DepOutput {
 /// dependent substreams' channels combined in per §E.3.8.2 unless
 /// [`Eac3DecoderState::set_dependent_substreams`] switched them off.
 pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<DecodedFrame> {
-    if data.len() < 4 {
-        return Err(Error::invalid("eac3: packet too short for syncinfo"));
-    }
-    state.last_error = None;
-    state.dep_locations.clear();
-    state.in_selected_program = false;
+    decode_eac3_packet_with_next(state, data, None)
+}
 
-    // ---- Pass 1: locate the selected program's syncframes. ----
-    let mut units: Vec<Unit<'_>> = Vec::new();
+/// Locate the syncframes of the selected program in `data` (§E.3.8.3 /
+/// §E.3.8.4: the selected independent substream and the dependent
+/// substreams that follow it; every other program's frames are
+/// skipped). A defect after the program's independent frame (trailing
+/// bytes that are not a syncframe, a frame cut short by the packet)
+/// ends the walk, keeps the frames found and is returned as a note;
+/// the same defect before it is an error.
+fn locate_units<'a>(
+    state: &Eac3DecoderState,
+    data: &'a [u8],
+) -> Result<(Vec<Unit<'a>>, Option<String>)> {
+    let mut units: Vec<Unit<'a>> = Vec::new();
     let mut have_program = false;
+    let mut in_selected_program = false;
     let mut off = 0usize;
+    let mut note = None;
     while off + 4 <= data.len() {
-        // A defect after the selected program's independent frame
-        // (trailing bytes that are not a syncframe, a frame cut short
-        // by the packet) ends the walk and keeps the frames found; the
-        // same defect before it is an error.
-        let defect = |state: &mut Eac3DecoderState, msg: String| -> Result<()> {
-            if have_program {
-                state.last_error = Some(msg);
-                Ok(())
-            } else {
-                Err(Error::invalid(msg))
-            }
-        };
         // §E.2.2.1 — syncword.
         let sync = u16::from_be_bytes([data[off], data[off + 1]]);
-        if sync != SYNCWORD {
-            defect(
-                state,
-                format!("eac3: bad syncword 0x{sync:04X} at offset {off} (expected 0x0B77)"),
-            )?;
-            break;
-        }
-        // BSI starts at byte off+2.
         let mut br = BitReader::new(&data[off + 2..]);
-        let bsi = match bsi::parse_with(&mut br) {
-            Ok(b) => b,
+        let defect = if sync != SYNCWORD {
+            Some(format!(
+                "eac3: bad syncword 0x{sync:04X} at offset {off} (expected 0x0B77)"
+            ))
+        } else {
+            None
+        };
+        // BSI starts at byte off+2.
+        let parsed = match defect {
+            Some(msg) => Err(Error::invalid(msg)),
+            None => bsi::parse_with(&mut br).and_then(|bsi| {
+                let frame_bytes = bsi.frame_bytes as usize;
+                if off + frame_bytes > data.len() {
+                    Err(Error::invalid(format!(
+                        "eac3: syncframe at offset {off} claims {frame_bytes} bytes but packet has only {}",
+                        data.len() - off
+                    )))
+                } else if matches!(bsi.strmtyp, StreamType::Reserved) {
+                    Err(Error::invalid("eac3: strmtyp '11' is reserved"))
+                } else {
+                    Ok(bsi)
+                }
+            }),
+        };
+        let bsi = match parsed {
+            Ok(bsi) => bsi,
             Err(e) if have_program => {
-                state.last_error = Some(format!("{e}"));
+                note = Some(format!("{e}"));
                 break;
             }
             Err(e) => return Err(e),
         };
         let frame_bytes = bsi.frame_bytes as usize;
-        if off + frame_bytes > data.len() {
-            defect(
-                state,
-                format!(
-                    "eac3: syncframe at offset {off} claims {frame_bytes} bytes but packet has only {}",
-                    data.len() - off
-                ),
-            )?;
-            break;
-        }
-        if matches!(bsi.strmtyp, StreamType::Reserved) {
-            defect(state, "eac3: strmtyp '11' is reserved".into())?;
-            break;
-        }
-
-        // §E.3.8.3 / §E.3.8.4 program selection: the selected
-        // independent substream and the dependent substreams that
-        // follow it; every other program's frames are skipped.
         let is_indep = !matches!(bsi.strmtyp, StreamType::Dependent);
         if is_indep {
-            state.in_selected_program = bsi.substreamid == state.program;
+            in_selected_program = bsi.substreamid == state.program;
         }
-        if state.in_selected_program && (is_indep || !state.skip_dependent) {
+        if in_selected_program && (is_indep || !state.skip_dependent) {
             have_program |= is_indep;
             units.push(Unit {
                 frame: &data[off..off + frame_bytes],
@@ -536,6 +552,48 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
         }
         off += frame_bytes;
     }
+    Ok((units, note))
+}
+
+/// [`decode_eac3_packet`] with a look at the access unit that follows.
+///
+/// Enhanced coupling (§3.5.5.1) builds the coupling channel of a block
+/// from the previous, the current and the NEXT block, so the last
+/// block of a syncframe needs the first block of the following one.
+/// `next` is the following access unit of the same stream (or `None`
+/// at the end of the stream / when it is not at hand): its first block
+/// is parsed, not rendered, on a scratch state. Without it that block
+/// is taken not to use enhanced coupling, which leaves time-domain
+/// aliasing in the last block of every frame of a stream that does.
+/// Streams without enhanced coupling decode identically either way.
+pub fn decode_eac3_packet_with_next(
+    state: &mut Eac3DecoderState,
+    data: &[u8],
+    next: Option<&[u8]>,
+) -> Result<DecodedFrame> {
+    if data.len() < 4 {
+        return Err(Error::invalid("eac3: packet too short for syncinfo"));
+    }
+    state.last_error = None;
+    state.dep_locations.clear();
+
+    // ---- Pass 1: locate the selected program's syncframes. ----
+    let (units, note) = locate_units(state, data)?;
+    if note.is_some() {
+        state.last_error = note;
+    }
+    // The following access unit's frames, for the look-ahead: its
+    // first period only.
+    let next_units: Vec<Unit<'_>> = match next {
+        Some(bytes) if bytes.len() >= 4 => {
+            let mut found = locate_units(state, bytes).map_or_else(|_| Vec::new(), |(u, _)| u);
+            if let Some(end) = found.iter().skip(1).position(|u| u.is_indep) {
+                found.truncate(end + 1);
+            }
+            found
+        }
+        _ => Vec::new(),
+    };
 
     // ---- Pass 2: decode, one period (independent frame + its
     // dependent frames) at a time. ----
@@ -569,16 +627,24 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
         dep_out.resize_with(deps.len(), || None);
         let mut program_gains = None;
         if let Some((last, earlier)) = deps.split_last() {
-            let (out, gains) = decode_dep_unit(state, last, &indep.bsi, None);
+            let (out, gains) = decode_dep_unit(state, last, &indep.bsi, None, &next_units);
             program_gains = gains;
             dep_out[deps.len() - 1] = out;
             for (slot, unit) in dep_out.iter_mut().zip(earlier) {
-                *slot = decode_dep_unit(state, unit, &indep.bsi, program_gains).0;
+                *slot = decode_dep_unit(state, unit, &indep.bsi, program_gains, &next_units).0;
             }
         }
 
         let (bsi, audfrm, mut br) = open_unit(state, indep);
-        let pcm = decode_indep_substream(state, &bsi, audfrm, &mut br, program_gains);
+        let carrier = next_carrier(state, indep, &audfrm, &next_units);
+        let pcm = decode_indep_substream(
+            state,
+            &bsi,
+            audfrm,
+            &mut br,
+            program_gains,
+            carrier.as_deref(),
+        );
         if let Some(metadata) = decode_substream_joc(&bsi, &state.skip_fields) {
             joc_metadata = Some(metadata);
         }
@@ -627,6 +693,90 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
     pcm.dep_locations.clone_from(&state.dep_locations);
     pcm.joc_metadata = joc_metadata;
     Ok(pcm)
+}
+
+/// Does the frame `unit` (whose audfrm is `audfrm`) need to look at the
+/// first block of its substream's next frame — i.e. can its last block
+/// use enhanced coupling? Coupling must be in use in that block, and
+/// the substream must not be known to end its frames without enhanced
+/// coupling; when nothing is known yet (stream start, after a
+/// concealed frame) the frame itself is parsed on the scratch state to
+/// find out.
+fn tail_uses_ecpl(state: &mut Eac3DecoderState, unit: &Unit<'_>, audfrm: &Result<AudFrm>) -> bool {
+    let Ok(audfrm) = audfrm else {
+        return false;
+    };
+    let last = (unit.bsi.num_blocks as usize).saturating_sub(1);
+    if !audfrm.cplinu_blk[last] {
+        return false;
+    }
+    let known = if unit.is_indep {
+        state.indep_state.ecpl_at_frame_end
+    } else {
+        state
+            .dep_states
+            .get(usize::from(unit.bsi.substreamid & 7))
+            .and_then(|st| st.ecpl_at_frame_end)
+    };
+    if let Some(known) = known {
+        return known;
+    }
+    let scratch = state
+        .scratch
+        .get_or_insert_with(|| Box::new(Ac3State::new()));
+    let mut br = BitReader::new(&unit.frame[2..]);
+    let fits = br.skip(unit.bsi_bits).is_ok()
+        && audfrm::parse_with(&mut br, &unit.bsi).is_ok_and(|af| {
+            dsp::probe_frame(
+                &unit.bsi,
+                &af,
+                &mut br,
+                scratch,
+                crate::audblk::Probe::TailCoupling,
+            )
+        });
+    fits && scratch.ecpl_at_frame_end == Some(true)
+}
+
+/// The enhanced-coupling channel coefficients of the first block of
+/// the frame that follows `unit` in its substream, when `unit`'s last
+/// block needs them (§3.5.5.1) and that frame is among `next_units`,
+/// intact, and opens with enhanced coupling.
+fn next_carrier(
+    state: &mut Eac3DecoderState,
+    unit: &Unit<'_>,
+    audfrm: &Result<AudFrm>,
+    next_units: &[Unit<'_>],
+) -> Option<Box<[f32; crate::audblk::N_COEFFS]>> {
+    let follower = next_units
+        .iter()
+        .find(|n| n.is_indep == unit.is_indep && n.bsi.substreamid == unit.bsi.substreamid)?;
+    if !tail_uses_ecpl(state, unit, audfrm) {
+        return None;
+    }
+    let frame = follower.frame;
+    if state.verify_crc
+        && crate::crc::verify_eac3_syncframe(frame, frame.len()).crc2_ok != Some(true)
+    {
+        return None;
+    }
+    let mut br = BitReader::new(&frame[2..]);
+    br.skip(follower.bsi_bits).ok()?;
+    let audfrm = audfrm::parse_with(&mut br, &follower.bsi).ok()?;
+    if !audfrm.cplinu_blk[0] {
+        return None;
+    }
+    let scratch = state
+        .scratch
+        .get_or_insert_with(|| Box::new(Ac3State::new()));
+    dsp::probe_frame(
+        &follower.bsi,
+        &audfrm,
+        &mut br,
+        scratch,
+        crate::audblk::Probe::FirstBlockCarrier,
+    );
+    scratch.probe_carrier.take()
 }
 
 /// Prepare one syncframe for decoding: CRC verdict (§E.3.2), the BSI
@@ -712,6 +862,7 @@ fn decode_indep_substream(
     audfrm: Result<AudFrm>,
     br: &mut BitReader<'_>,
     program_gains: Option<[f32; crate::audblk::BLOCKS_PER_FRAME]>,
+    next_carrier: Option<&[f32; crate::audblk::N_COEFFS]>,
 ) -> DecodedFrame {
     let samples = bsi.num_blocks as u32 * SAMPLES_PER_BLOCK as u32;
     let nchans = bsi.nchans as usize;
@@ -726,7 +877,10 @@ fn decode_indep_substream(
         &mut state.indep_state,
         &mut floats,
         &mut state.skip_fields,
-        program_gains,
+        FrameContext {
+            program_gains,
+            next_carrier,
+        },
     );
     if let Err(e) = &dsp_result {
         state.last_error = Some(format!("{e}"));
@@ -772,6 +926,18 @@ fn decode_indep_substream(
     }
 }
 
+/// What a substream frame takes from the rest of its program and
+/// stream.
+#[derive(Clone, Copy)]
+struct FrameContext<'a> {
+    /// §E.3.8.5: the program's per-block dynamic-range gains, when
+    /// they replace the substream's own.
+    program_gains: Option<[f32; crate::audblk::BLOCKS_PER_FRAME]>,
+    /// §3.5.5.1: the enhanced-coupling channel of the first block of
+    /// the substream's next frame.
+    next_carrier: Option<&'a [f32; crate::audblk::N_COEFFS]>,
+}
+
 /// Run the audblk DSP for one substream frame into `out`; on any
 /// failure render the concealment signal instead and clear the
 /// substream's stream state (decoder configuration and noise
@@ -784,16 +950,21 @@ fn decode_or_conceal(
     st: &mut Ac3State,
     out: &mut [f32],
     skip_fields: &mut Vec<Vec<u8>>,
-    program_gains: Option<[f32; crate::audblk::BLOCKS_PER_FRAME]>,
+    context: FrameContext<'_>,
 ) -> Result<()> {
+    let FrameContext {
+        program_gains,
+        next_carrier,
+    } = context;
     // The overlap tails as they stood before this frame: a frame that
     // fails part-way has already advanced them through blocks whose
     // content cannot be trusted.
     let tails: [[f32; SAMPLES_PER_BLOCK]; crate::audblk::MAX_CHANNELS] =
         std::array::from_fn(|ch| st.channels[ch].delay);
     st.gain_override = program_gains;
-    let result =
-        audfrm.and_then(|audfrm| dsp::decode_indep_audblks(bsi, &audfrm, br, st, out, skip_fields));
+    let result = audfrm.and_then(|audfrm| {
+        dsp::decode_audblks(bsi, &audfrm, br, st, out, skip_fields, next_carrier)
+    });
     st.gain_override = None;
     if result.is_err() {
         skip_fields.clear();
@@ -817,11 +988,13 @@ fn decode_dep_unit(
     unit: &Unit<'_>,
     indep: &Eac3Bsi,
     program_gains: Option<[f32; crate::audblk::BLOCKS_PER_FRAME]>,
+    next_units: &[Unit<'_>],
 ) -> (
     Option<DepOutput>,
     Option<[f32; crate::audblk::BLOCKS_PER_FRAME]>,
 ) {
     let (bsi, audfrm, mut br) = open_unit(state, unit);
+    let carrier = next_carrier(state, unit, &audfrm, next_units);
     // §E.2.3.1.2: dependent substreams "must contain the same number
     // of blocks per syncframe ... as the independent substream with
     // which they are associated".
@@ -862,7 +1035,10 @@ fn decode_dep_unit(
         st,
         &mut floats,
         &mut skip_fields,
-        program_gains,
+        FrameContext {
+            program_gains,
+            next_carrier: carrier.as_deref(),
+        },
     );
     let gains = result.is_ok().then_some(st.block_gains);
     if let Err(e) = &result {

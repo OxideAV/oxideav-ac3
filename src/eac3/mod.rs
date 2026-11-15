@@ -103,12 +103,13 @@
 //!   block" carrier source is now threaded from the prior frame's last
 //!   enhanced-coupling block (carried on [`ecpl::EcplState`], §E.3.5.5.1);
 //!   the prior-frame edge no longer collapses to a zero carrier. The
-//!   frame's last block's "next block" still uses a zero carrier (it lives
-//!   in a not-yet-decoded frame — streaming lookahead is out of scope).
+//!   frame's last block's "next block" is the first block of the
+//!   following syncframe, parsed ahead when the caller supplies the
+//!   next access unit ([`decode_eac3_packet_with_next`]).
 //!   Standard coupling is fully in.
-//! * **Cross-frame transient pre-noise reference** (§E.3.7.1) is
-//!   clamped to the current frame; intra-frame transients (§E.3.7.2)
-//!   are fully synthesised.
+//! * **Transient pre-noise processing** (§E.3.7.2): the synthesis
+//!   buffer of a transient early in a frame is read from the output
+//!   of the frame(s) before it, kept per substream.
 //! * **Standard-coupling default banding** (§E.2.3.3.15 Table E2.12):
 //!   when `cplbndstrce == 0` in the first coupling block of a frame the
 //!   decoder now applies the `defcplbndstrc[]` default structure
@@ -188,7 +189,7 @@ pub use bsi::{
     BSID_BASE_AC3_MAX, Bsi as Eac3Bsi, DrcSource, EAC3_BSID, PanInfo, PremixCompression,
     PremixCompressionWord, ProgramScaleFactor,
 };
-pub use decoder::{Eac3DecoderState, decode_eac3_packet};
+pub use decoder::{Eac3DecoderState, decode_eac3_packet, decode_eac3_packet_with_next};
 pub use ecplenc::EcplParams;
 pub use encoder::{
     CODEC_ID_STR, make_encoder, make_encoder_with_aht, make_encoder_with_blocks,

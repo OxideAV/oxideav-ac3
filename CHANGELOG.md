@@ -115,6 +115,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the packet.
 - A dependent substream that cannot be decoded is concealed in place
   instead of being dropped, so the program keeps its channel count.
+- E-AC-3 decoder, enhanced coupling across the syncframe boundary
+  (§3.5.5.1): the non-aliased coupling channel of a block is built
+  from the previous, the current and the NEXT block, and for the last
+  block of a syncframe the next block is in the following syncframe.
+  The decoder used a zero block there, leaving time-domain aliasing in
+  the last block of every frame — on a two-tone stereo stream the
+  rotated channel's frame-boundary blocks measured 15.1 dB against the
+  source where the blocks inside the frame reach 25.2 dB; they now
+  measure 24.4 dB. The first block of the next access unit is parsed
+  ahead on a scratch state (`eac3::decode_eac3_packet_with_next`,
+  `Eac3DecoderState::wants_next`); the registry decoder holds a period
+  that needs it until the next one arrives (`NeedMore`, one packet of
+  latency, timestamps unchanged; `flush` releases the last). Streams
+  without enhanced coupling are unaffected.
 - E-AC-3 decoder, programs with dependent substreams (§E.3.8.2,
   §E.3.8.5):
   - a decoder asked for 5.1 or fewer channels (`channels` ≤ 6, without

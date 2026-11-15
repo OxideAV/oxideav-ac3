@@ -130,10 +130,12 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   transform coefficients via the §E.3.5.5.4 complex product — replacing
   the standard §7.4 decouple. Block 0's "previous block" carrier source
   is threaded across the frame boundary from the prior frame's last
-  enhanced-coupling block (carried on `EcplState`, §E.3.5.5.1), so the
-  prior-frame edge no longer collapses to a zero carrier; the frame's
-  last block's "next block" still uses a zero carrier (it lives in a
-  not-yet-decoded frame — streaming lookahead is out of scope). Three
+  enhanced-coupling block (carried on `EcplState`, §E.3.5.5.1), and the
+  last block's "next block" is the first block of the following
+  syncframe: the decoder parses that block ahead (on a scratch state,
+  not rendered) so the coupling channel of every block is free of
+  time-domain aliasing — see the look-ahead note under "Byte-stream
+  input". Three
   enhanced-coupling conformance defects fixed in r406, pinned by the
   new encoder round-trips: `chincpl[ch]` is read directly after
   `ecplinu` (BEFORE the standard/enhanced strategy split — the prior
@@ -397,7 +399,10 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
   against the carrier the decoder will actually reconstruct (each bin
   through the final exponent + bap quantiser; the previous frame's
   carried quantised last block at the frame head, zero after the
-  tail), refreshed on blocks 0/3 with §2.3.3.21-22 reuse thrift when
+  tail — the decoder now uses the next frame's first block there, so
+  the last block's coordinates are measured against a slightly
+  different carrier; closing that needs one block of encoder
+  look-ahead and is a recorded follow-up), refreshed on blocks 0/3 with §2.3.3.21-22 reuse thrift when
   the block-3 refresh quantises identically. **Chaos coordinates**
   (Table E3.12, on by default via `EcplParams::chaos` / the
   `ecpl_chaos` option) are derived from the measured per-band
@@ -536,7 +541,8 @@ given.
 | Adaptive hybrid transform | §3.4, Tables E3.1-E3.6, E4.1-E4.7 | `nchregs` / `ncplregs` / `nlferegs` from the parsed strategies; full-bandwidth, coupling and LFE channels; VQ and all four GAQ modes | Join (stereo, 5.1); `aht_*` and `*_aht_*` unit tests | matrix `aht` cells, AHT + `compr` stereo cell |
 | Standard coupling under Annex E | §2.3.3.15, Tables E2.12, E1.4, §3.3.1 | default banding in a frame's first coupling block, signed derived `cplendf` with SPX, first-coordinate and first-leak states | Join (stereo, 5.1, with SPX); `issue13_craft_tests` | geometry and region sweeps (59–92 dB) |
 | Coupling across block switches | §7.4, §5.4.3.1 | a coupled channel's short-transform block takes the coupling channel's coefficients like any other; rematrix and dither follow per channel | Join ("standard coupling across block switches", "block switching 5.1" — the test checks the stream does switch) | programme matrix (transient material, both coupling extremes) |
-| Enhanced coupling | §2.3.3.14-26, §3.5 | strategy, amplitude / angle / chaos with parameter reuse, carrier from the previous / current / next block (previous block carried across frames), §3.3.2 rematrix band count | Join; `ecpl` unit tests; encoder round-trips | none — the external decoder does not implement enhanced coupling |
+| Enhanced coupling | §2.3.3.14-26, §3.5 | strategy, amplitude / angle / chaos with parameter reuse, §3.3.2 rematrix band count | Join; `ecpl` unit tests; encoder round-trips | none — the external decoder does not implement enhanced coupling |
+| Enhanced coupling across the frame boundary | §3.5.5.1 | the carrier of a block is built from the previous, current and next block: the previous frame's last block is carried, and the next frame's first block is parsed ahead | `tests/eac3_ecpl_lookahead.rs` — the rotated channel's frame-boundary blocks measure 24.4 dB against the source with the next block (25.2 dB inside the frame), 15.1 dB without | none, as above |
 | Spectral extension | §2.3.3.1-13, §3.6 | strategy and band structure (default in the first SPX block), coordinates with reuse, translation with wrap, noise blend, coordinate scaling | Join; `spx_*` unit tests; encoder round-trips | matrix `spx` cells (noise blend off: the noise sequence is decoder-private) |
 | SPX attenuation | §2.3.2.24-25, §3.6.4.2.3, Table E3.14 | border filter at the region border and at wrap points, applied after the band RMS is measured | Join; `spx_noise_level_is_measured_before_the_border_filter`, `spx_border_filter_shapes_the_translated_signal` | attenuated-stream energy check (banded energies ± 4 dB) |
 | SPX in the first block of a frame | Table E1.4 (`spxstre`, `firstspxcos`) | block 0 always carries the strategy and every channel's coordinates and blend: nothing is inherited from the previous frame | Join | matrix `spx` cells |
@@ -688,7 +694,20 @@ middle of one (MPEG-TS PES payloads do all three):
   has shown how many frames a period has.
 
 One period per packet — what MP4, Matroska and the `.ac3` demuxer
-deliver — decodes exactly as before, with no added latency.
+deliver — decodes exactly as before, with no added latency, with one
+exception:
+
+**Enhanced-coupling look-ahead.** The last block of a syncframe that
+uses enhanced coupling needs the first block of the next syncframe
+(Annex E §3.5.5.1). For such a stream `receive_frame` answers
+`NeedMore` until the following period has arrived, then returns the
+frame — one packet of latency in the call pattern, no shift of the
+audio or its timestamps; `flush` releases the last frame. Streams
+without enhanced coupling are never held (the decoder learns which
+kind a stream is from its first coupled frame). At the frame level,
+`eac3::decode_eac3_packet_with_next` takes the following access unit;
+`decode_eac3_packet` treats the frame as followed by nothing, which
+leaves aliasing in the last block of every enhanced-coupling frame.
 
 **Damaged frames** (§7.10, Annex E §3.2). The CRC of every syncframe
 is verified before it is decoded (E-AC-3: the frame CRC; AC-3: a frame

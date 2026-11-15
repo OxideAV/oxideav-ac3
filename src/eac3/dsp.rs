@@ -323,6 +323,10 @@ mod skip_field_tests {
 /// Every declared audio-block `skipfld` is returned in `skip_fields` in
 /// block order. The bytes are read through the existing bit cursor, so
 /// bit-unaligned reserved-data payloads are preserved exactly.
+///
+/// The frame's last block is treated as followed by a block without
+/// enhanced coupling (the packet walker in `eac3::decoder` supplies
+/// the look-ahead).
 pub fn decode_indep_audblks(
     bsi: &Eac3Bsi,
     audfrm: &AudFrm,
@@ -330,6 +334,43 @@ pub fn decode_indep_audblks(
     state: &mut Ac3State,
     out: &mut [f32],
     skip_fields: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    decode_audblks(bsi, audfrm, br, state, out, skip_fields, None)
+}
+
+/// Parse-only pass over one substream frame on the scratch state
+/// `scratch` (see [`audblk::Probe`]); no audio is rendered. Returns
+/// `false` when the frame does not parse.
+pub(crate) fn probe_frame(
+    bsi: &Eac3Bsi,
+    audfrm: &AudFrm,
+    br: &mut BitReader<'_>,
+    scratch: &mut Ac3State,
+    probe: audblk::Probe,
+) -> bool {
+    scratch.probe = probe;
+    scratch.probe_carrier = None;
+    scratch.ecpl_at_frame_end = None;
+    let ok = decode_audblks(bsi, audfrm, br, scratch, &mut [], &mut Vec::new(), None).is_ok();
+    scratch.probe = audblk::Probe::Off;
+    ok
+}
+
+/// [`decode_indep_audblks`] with the enhanced-coupling look-ahead:
+/// `next_carrier` holds the enhanced-coupling channel coefficients of
+/// the first block of the substream's NEXT frame (zero outside its
+/// region), or `None` when that block does not use enhanced coupling
+/// or is not known. §3.5.5.1 builds the non-aliased coupling channel of
+/// a block from the previous, the current and the next block; for the
+/// last block of a frame the next block is in the following syncframe.
+pub(crate) fn decode_audblks(
+    bsi: &Eac3Bsi,
+    audfrm: &AudFrm,
+    br: &mut BitReader<'_>,
+    state: &mut Ac3State,
+    out: &mut [f32],
+    skip_fields: &mut Vec<Vec<u8>>,
+    next_carrier: Option<&[f32; N_COEFFS]>,
 ) -> Result<()> {
     skip_fields.clear();
     // Phase-B audfrm finalisation when AHT is in use. The audfrm parser
@@ -1528,6 +1569,27 @@ pub fn decode_indep_audblks(
         // coefficients (the carrier source) + strategy + coords + the
         // coupled-channel set, plus the full per-channel state needed to
         // run DSP later, and skip the immediate `dsp_block` + PCM emit.
+        // Enhanced-coupling channel coefficients of this block (zero
+        // outside the region).
+        let ecpl_mant = ecpl_in_use.then(|| {
+            let mut mant = [0.0f32; 256];
+            let start = state.cpl_begf_mant.min(256);
+            let end_c = state.cpl_endf_mant.min(256).max(start);
+            mant[start..end_c].copy_from_slice(&state.channels[MAX_FBW].coeffs[start..end_c]);
+            mant
+        });
+        match state.probe {
+            audblk::Probe::Off => {}
+            audblk::Probe::FirstBlockCarrier => {
+                state.probe_carrier = ecpl_mant.map(Box::new);
+                return Ok(());
+            }
+            audblk::Probe::TailCoupling => {
+                state.ecpl_at_frame_end = Some(ecpl_in_use);
+                continue;
+            }
+        }
+        state.ecpl_at_frame_end = Some(ecpl_in_use);
         if ecpl_in_use {
             if !frame_has_ecpl {
                 // First ecpl block of the frame — remember where deferral
@@ -1541,15 +1603,11 @@ pub fn decode_indep_audblks(
                 first_deferred_blk = blk;
             }
             frame_has_ecpl = true;
-            if let Some(strat) = &ecpl_strategy {
+            if let (Some(strat), Some(mant)) = (&ecpl_strategy, ecpl_mant) {
                 let mut chincpl = [false; super::ecpl::ECPL_MAX_FBW];
                 for (ch, slot) in chincpl.iter_mut().enumerate().take(nfchans) {
                     *slot = state.channels[ch].in_coupling;
                 }
-                let mut mant = [0.0f32; 256];
-                let start = state.cpl_begf_mant.min(256);
-                let end_c = state.cpl_endf_mant.min(256);
-                mant[start..end_c].copy_from_slice(&state.channels[MAX_FBW].coeffs[start..end_c]);
                 ecpl_blocks[blk] = Some(super::ecpl::EcplBlock {
                     mant,
                     strategy: strat.clone(),
@@ -1607,7 +1665,11 @@ pub fn decode_indep_audblks(
             nchans,
             lfeon,
             out,
+            next_carrier,
         );
+    }
+    if state.probe != audblk::Probe::Off {
+        return Ok(());
     }
 
     // ---- Transient pre-noise processing (§E.3.7.2) ----
@@ -1673,9 +1735,12 @@ pub fn decode_indep_audblks(
 /// on [`super::ecpl::EcplState`] and used as block 0's `prev`; otherwise the
 /// §E.3.5.5.1 "set to zero" rule applies and a zero buffer is used. This
 /// frame's final enhanced-coupling block is in turn recorded for the next
-/// frame. The "next block" of the frame's last block lives in a frame not
-/// yet decoded, so it remains zero (true streaming lookahead is out of
-/// scope).
+/// frame. The "next block" of the frame's last block is block 0 of the
+/// following syncframe: `next_carrier` supplies its enhanced-coupling
+/// coefficients when the caller could look ahead (the packet walker
+/// parses that block on a scratch state); without it the zero buffer is
+/// used, which is exact only when that block does not use enhanced
+/// coupling.
 #[allow(clippy::too_many_arguments)]
 fn run_deferred_ecpl_dsp(
     state: &mut Ac3State,
@@ -1689,6 +1754,7 @@ fn run_deferred_ecpl_dsp(
     nchans: usize,
     lfeon: bool,
     out: &mut [f32],
+    next_carrier: Option<&[f32; N_COEFFS]>,
 ) {
     let n_deferred = deferred_channels.len();
     // Zero neighbour for frame-edge blocks (§E.3.5.5.1 "set to zero").
@@ -1714,6 +1780,13 @@ fn run_deferred_ecpl_dsp(
     let mut prev_frame_block = zero_block.clone();
     if let Some(carried) = state.ecpl_state.prev_frame_last_mant() {
         prev_frame_block.mant = *carried;
+    }
+    // Cross-frame "next block" for the frame's last block: block 0 of
+    // the following frame, when the caller could look ahead and that
+    // block uses enhanced coupling; else the zero block.
+    let mut next_frame_block = zero_block.clone();
+    if let Some(carrier) = next_carrier {
+        next_frame_block.mant = *carrier;
     }
 
     for i in 0..n_deferred {
@@ -1747,7 +1820,7 @@ fn run_deferred_ecpl_dsp(
             let next = if abs_blk + 1 < ecpl_blocks.len() {
                 ecpl_blocks[abs_blk + 1].as_ref().unwrap_or(&zero_block)
             } else {
-                &zero_block
+                &next_frame_block
             };
             // Per-channel transform-coefficient buffers; pre-seed with
             // the already-decoded independent (low-frequency) region so

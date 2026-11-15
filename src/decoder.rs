@@ -285,6 +285,12 @@ struct Ac3Decoder {
     pending: std::collections::VecDeque<Packet>,
     /// Syncframe reassembly across packet boundaries.
     framer: Framer,
+    /// The single pending period is being held until the period after
+    /// it arrives: its last block uses enhanced coupling, whose carrier
+    /// needs the first block of the next syncframe (Annex E §3.5.5.1).
+    /// `Some(false)`: the pending period was examined and needs no
+    /// look-ahead.
+    held: Option<bool>,
     /// Verify syncframe CRCs and conceal failing frames.
     crc_check: bool,
     /// Program (independent substream id) the E-AC-3 path decodes.
@@ -342,16 +348,39 @@ impl Decoder for Ac3Decoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if !self.pending.is_empty() {
+        // A period held back for its look-ahead (receive_frame answered
+        // NeedMore) stays at the head; anything else must be drained
+        // first.
+        let holding = self.pending.len() == 1 && self.held == Some(true);
+        if !self.pending.is_empty() && !holding {
             return Err(Error::other(
                 "AC-3 decoder: receive_frame must be called before sending another packet",
             ));
         }
-        self.pending = self.framer.push(packet);
+        let released = self.framer.push(packet);
+        self.pending.extend(released);
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
+        // The last pending period waits for the one after it when its
+        // final block needs that period's first block; at the end of
+        // the stream it is decoded without.
+        if !self.eof && self.pending.len() == 1 {
+            let wants = match self.held {
+                Some(wants) => wants,
+                None => {
+                    let data = &self.pending[0].data;
+                    let eac3 = data.len() > 5 && data[5] >> 3 > bsi::MAX_BSID_BASE;
+                    eac3 && self.eac3_state.wants_next(data)
+                }
+            };
+            self.held = Some(wants);
+            if wants {
+                return Err(Error::NeedMore);
+            }
+        }
+        self.held = None;
         let pkt = match self.pending.pop_front() {
             Some(p) => p,
             None => {
@@ -402,6 +431,7 @@ impl Decoder for Ac3Decoder {
 
     fn reset(&mut self) -> Result<()> {
         self.pending.clear();
+        self.held = None;
         self.framer = Framer::default();
         self.eof = false;
         self.state = Ac3State::new();
@@ -429,6 +459,7 @@ impl Ac3Decoder {
             time_base: TimeBase::new(1, 48_000),
             pending: std::collections::VecDeque::new(),
             framer: Framer::default(),
+            held: None,
             crc_check: options.crc_check,
             program: options.program & 7,
             last_good_ac3: None,
@@ -560,7 +591,10 @@ impl Ac3Decoder {
 
     fn process_eac3_frame(&mut self, pkt: &Packet) -> Result<Frame> {
         let data = &pkt.data[..];
-        let decoded = eac3::decode_eac3_packet(&mut self.eac3_state, data)?;
+        // The period after this one, when it has arrived: the
+        // enhanced-coupling look-ahead.
+        let next = self.pending.front().map(|p| &p.data[..]);
+        let decoded = eac3::decode_eac3_packet_with_next(&mut self.eac3_state, data, next)?;
         let channels = decoded.channels;
 
         // Resolve the §7.8 downmix mode from the requested target.
